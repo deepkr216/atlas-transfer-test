@@ -145,10 +145,37 @@ def cmd_program(conn: sqlite3.Connection, name: str) -> str:
             ORDER BY j.job_name, s.ordinal""", (n,)).fetchall()
         callers = _callers_of(conn, n)
         tx = conn.execute("SELECT tran_code, system FROM transaction_def WHERE UPPER(program)=?", (n,)).fetchall()
-        if not steps and not callers and not tx:
+        # A control-card member (PARMLIB/CNTL) is asked about by name too:
+        # "where is SRTCLM used" is a job question, not a program question.
+        # Effective (expanded) steps carry the job name; a bare PROC row is
+        # shown only when no job expands that PROC; a job step's own
+        # //PROCSTEP.DD override is shown once, on the effective step.
+        cards = conn.execute("""
+            SELECT j.job_name, s.step_name, s.from_proc, d.dd_name, d.dsn_resolved, m.name AS jm, d.line, pd.proc_name
+            FROM dd d JOIN step s ON s.id=d.step_id LEFT JOIN job j ON j.id=s.job_id
+            LEFT JOIN member m ON m.id=j.member_id LEFT JOIN proc_def pd ON pd.id=s.proc_id
+            WHERE UPPER(d.card_member)=?
+              AND NOT (s.proc_id IS NOT NULL AND EXISTS (SELECT 1 FROM step x WHERE x.from_proc=pd.proc_name))
+              AND NOT (s.proc_called IS NOT NULL AND EXISTS (SELECT 1 FROM step x WHERE x.job_id=s.job_id
+                                                            AND x.parent_step=s.step_name))
+            ORDER BY j.job_name, s.ordinal, d.line""", (n,)).fetchall()
+        other = conn.execute("SELECT kind, path FROM member WHERE UPPER(name)=? ORDER BY authoritative DESC",
+                             (n,)).fetchall()
+        if not steps and not callers and not tx and not cards and not other:
             return f"# {name}\n\n**NOT FOUND** - no member with this name, and nothing indexed runs or calls it.\n"
-        out = [f"# Program {n}\n\n**Source not indexed** (no member with this PROGRAM-ID or name). "
-               f"What the estate knows about it:\n"]
+        if other:
+            out = [f"# {n}\n\n**Not a program**: indexed as a `{other[0]['kind']}` member (`{other[0]['path']}`). "
+                   f"What the estate knows about it:\n"]
+        else:
+            out = [f"# Program {n}\n\n**Source not indexed** (no member with this PROGRAM-ID or name). "
+                   f"What the estate knows about it:\n"]
+        if cards:
+            out.append("\n### Used as control cards by\n")
+            out.append(table(["job / PROC", "step", "DD", "library(member)", "cite"],
+                             [(c["job_name"] or f"(PROC {c['proc_name']})", c["step_name"], c["dd_name"],
+                               c["dsn_resolved"], f"{c['from_proc'] or c['jm'] or c['proc_name']}:{c['line']}")
+                              for c in cards]))
+            out.append("Its text is loaded as that step's cards: `job <JOB>` shows the resolved program / sort fields.\n")
         if steps:
             out.append("\n### Runs in\n")
             out.append(table(["job", "step", "launcher", "cite"],
@@ -159,8 +186,9 @@ def cmd_program(conn: sqlite3.Connection, name: str) -> str:
         if callers:
             out.append("\n### Called by\n")
             out.append(table(["caller", "kind"], callers))
-        out.append("\n> Obtain the source or the compile listing to go further; until then its datasets, "
-                   "tables and callees are unknown, not empty.\n")
+        if not other:
+            out.append("\n> Obtain the source or the compile listing to go further; until then its datasets, "
+                       "tables and callees are unknown, not empty.\n")
         return "".join(out)
     out = [f"# Program {name.upper()}\n"]
     if len(progs) > 1:
@@ -357,14 +385,24 @@ def cmd_job(conn: sqlite3.Connection, name: str) -> str:
             if d["dsn_resolved"]:
                 g = f"({d['gdg_rel']})" if d["gdg_rel"] else ""
                 ovr = " (override)" if d["is_override"] else ""
-                drows.append((d["dd_name"] or "  +concat", f"{d['dsn_resolved']}{g}{ovr}", d["disp"] or "",
+                extra = ""
+                if d["is_temp"]:
+                    extra += " (job-local &&)"
+                if d["dsn"] and d["dsn"].startswith("*."):
+                    extra += f" (via {d['dsn']})"
+                if d["card_member"]:
+                    n = len(d["sysin_text"].strip().splitlines()) if d["sysin_text"] else 0
+                    extra += (f" -> {n} card lines loaded from member" if n
+                              else " -> card member NOT indexed: this step's cards are unknown")
+                drows.append((d["dd_name"] or "  +concat", f"{d['dsn_resolved']}{g}{ovr}{extra}", d["disp"] or "",
                               f"{d['mode']} [{d['mode_source']}]"))
             elif d["sysin_text"]:
                 first = d["sysin_text"].strip().splitlines()
                 drows.append((d["dd_name"], f"inline cards ({len(first)} lines): "
                               + " / ".join(x.strip() for x in first[:3])[:90], "", "control"))
             elif d["dsn"]:
-                drows.append((d["dd_name"], f"{d['dsn']} (unresolved)", d["disp"] or "", "unknown"))
+                why = "referback: target step/DD not found" if d["dsn"].startswith("*.") else "unresolved"
+                drows.append((d["dd_name"], f"{d['dsn']} ({why})", d["disp"] or "", "unknown"))
         if drows:
             out.append(table(["DD", "dataset / cards", "DISP", "direction [source]"], drows))
         cards = conn.execute("SELECT card_kind, pos, length, fmt FROM card_field_ref WHERE step_id=? ORDER BY pos",
@@ -397,7 +435,25 @@ def cmd_job(conn: sqlite3.Connection, name: str) -> str:
     mids = []
     for j in jobs:
         out.append(f"\n## {j['member_name']}  `{j['path']}`" + ("  **[authoritative]**" if j["authoritative"] else "") + "\n")
+        inproc = conn.execute("SELECT proc_name FROM proc_def WHERE member_id=? AND instream=1 ORDER BY line",
+                              (j["member_id"],)).fetchall()
+        if inproc:
+            out.append("Instream PROCs defined in this member (they shadow cataloged PROCs of the same name): "
+                       + ", ".join(p["proc_name"] for p in inproc) + "\n")
         render_steps("job_id=? AND from_proc IS NULL", j["id"], j["member_name"], j["id"])
+        temps = conn.execute("""
+            SELECT d.dsn_resolved AS dsn, s.step_name, d.dd_name, d.mode FROM dd d JOIN step s ON s.id=d.step_id
+            WHERE s.job_id=? AND d.is_temp=1 AND NOT (s.proc_called IS NOT NULL AND d.dd_name LIKE '%.%')
+            ORDER BY d.dsn_resolved, s.ordinal, d.line""", (j["id"],)).fetchall()
+        if temps:
+            by: Dict[str, List[str]] = {}
+            for t in temps:
+                by.setdefault(t["dsn"], []).append(f"{t['step_name']} {t['dd_name']} ({t['mode']})")
+            out.append("\n### Job-local (&&) datasets\n")
+            out.append("These exist only while this job runs. No other job can read them, so they are "
+                       "not dataset lineage and `dataset` hides them:\n")
+            for dsn, uses in by.items():
+                out.append(f"- `{dsn}`: " + " -> ".join(uses) + "\n")
         mids.append(j["member_id"])
     for p in procs:
         out.append(f"\n## PROC {p['proc_name']}  `{p['path']}`  symbolics: `{p['symbolics'] or '{}'}`\n")
@@ -771,6 +827,15 @@ def cmd_dataset(conn: sqlite3.Connection, dsn: str) -> str:
     rows = conn.execute("""SELECT * FROM v_dataset_flow WHERE UPPER(dsn) LIKE ? ORDER BY dsn, mode, job_name""",
                         (f"%{dsn.upper()}%",)).fetchall()
     out = [f"# Dataset {dsn.upper()}\n"]
+    hidden = 0
+    if not dsn.startswith("&&"):
+        # &&TEMP names repeat across unrelated jobs; showing them here would
+        # join jobs that never share a byte. Ask for the && name to see them.
+        keep = [r for r in rows if not (r["dsn"] or "").startswith("&&")]
+        hidden, rows = len(rows) - len(keep), keep
+    if hidden:
+        out.append(f"> {hidden} row(s) for job-local `&&` datasets hidden - they never leave their job. "
+                   f"Query the `&&NAME` itself, or `job <JOB>`, to see them.\n")
     out.append(table(["dataset", "direction [source]", "system", "program", "job", "step", "gdg", "member"],
                      [(r["dsn"], f"{r['mode']} [{r['mode_source'] or ''}]".replace(" []", ""),
                        r["system"] or "?", r["pgm"], r["job_name"], r["step_name"], r["gdg_rel"] or "",

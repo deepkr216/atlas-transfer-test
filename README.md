@@ -173,10 +173,28 @@ A job is indexed twice: its literal statements, and its **effective steps** —
 every `EXEC PROC=` replaced by the PROC's steps with symbolics resolved in JCL
 precedence (`EXEC PROC=X,SYM=value` › instream `SET` › PROC defaults) and
 `//PROCSTEP.DDNAME` overrides and additions applied, `INCLUDE MEMBER=`
-spliced in first, nested PROCs expanded, `&&TEMP` left alone. `&SYM` and
+spliced in first, nested PROCs expanded, instream PROCs (`// PROC … // PEND`
+inside the job) collected and used before cataloged ones. `&SYM` and
 `&SYM.` forms are substituted and `..` collapsed; anything still containing
 `&` afterwards is reported as `symbolic`, never guessed. GDG relative
 generations are split off so `(+1)` and `(0)` join as one dataset.
+
+Three more shapes that production JCL has and toy JCL does not:
+
+- **Control cards in a library member** — `//SYSIN DD DSN=PROD.PARMLIB(SRTCLM)`.
+  If `SRTCLM` is indexed (fetch the PARMLIB/CNTL libraries as `ctlcard`),
+  its text becomes the step's cards exactly as if coded `DD *`: the TSO
+  `RUN PROGRAM(...)` resolves, sort byte positions and IDCAMS operations are
+  harvested. `program SRTCLM` says which jobs use the member. If the member
+  is not indexed the job dossier says so ("card member NOT indexed").
+- **`&&TEMP` datasets** exist only between the steps of one job. They never
+  become `dataset` rows and `dataset` hides them, so two jobs that both use
+  `&&SORTED` are never joined; `job X` lists them under "Job-local datasets".
+- **Referbacks** `DSN=*.STEP.DD` (also `*.DD`, `*.STEP.PROCSTEP.DD`) are
+  followed to the dataset the earlier DD allocated, after PROC expansion, so
+  lineage has no hole at the job's own intermediate files. A referback to a
+  `(+1)` reads the generation just created - it is not a second writer. A
+  referback whose target does not exist is reported as `referback`.
 
 Because of that, `dataset PROD.CLM.MASTER` lists the *jobs* that create and
 read it (`NIGHTJOB NIGHT.PS010`, direction with its source), not just a PROC

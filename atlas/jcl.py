@@ -91,6 +91,9 @@ class DdFact:
     sysin_text: Optional[str]
     is_override: bool
     line: int
+    card_member: Optional[str] = None   # DSN=LIB(MEMBER): the member whose text became sysin_text
+    is_temp: bool = False               # &&TEMP - exists only between steps of THIS job
+    referback: Optional[str] = None     # DSN=*.STEP.DD as written; resolved after all steps are known
 
 
 @dataclass
@@ -122,6 +125,7 @@ class JclFacts:
     unresolved: List[Tuple[str, str, int]] = dc_field(default_factory=list)  # kind, detail, line
     set_symbols: Dict[str, str] = dc_field(default_factory=dict)     # instream SET only
     includes: List[str] = dc_field(default_factory=list)             # INCLUDE members spliced in
+    instream_procs: Dict[str, "JclFacts"] = dc_field(default_factory=dict)   # // PROC ... // PEND inside a job
 
 
 # --------------------------------------------------------------------------
@@ -130,15 +134,27 @@ class JclFacts:
 
 def parse_jcl(text: str, data: bytes = b"", enc: str = "utf-8",
               extra_symbols: Optional[Dict[str, str]] = None,
-              include_lookup: Optional[Callable[[str], Optional[str]]] = None) -> JclFacts:
+              include_lookup: Optional[Callable[[str], Optional[str]]] = None,
+              member_lookup: Optional[Callable[[str], Optional[str]]] = None) -> JclFacts:
+    """Parse one JCL or PROC member.
+
+    include_lookup(name) -> text of an INCLUDE member (spliced in first).
+    member_lookup(name)  -> text of a control-card member, for
+                            `//SYSIN DD DSN=PROD.PARMLIB(SRTCLM)`: the cards a
+                            step runs on are then known exactly as if instream.
+    """
     included: List[str] = []
     if include_lookup is not None:
         text, included = _splice_includes(text, data, enc, include_lookup)
     stmts = read_jcl(text, data, enc)
-    facts = JclFacts(job_name=None, job_line=0, is_proc=False,
-                     proc_name=None, symbolics=dict(extra_symbols or {}))
-    facts.includes = included
+    job = JclFacts(job_name=None, job_line=0, is_proc=False,
+                   proc_name=None, symbolics=dict(extra_symbols or {}))
+    job.includes = included
 
+    # EXEC/DD statements go to `target`: the member itself, or an instream
+    # PROC (// PROC ... // PEND inside a job) while one is being collected.
+    target: JclFacts = job
+    inproc: Optional[JclFacts] = None
     cur: Optional[StepFact] = None
     ordinal = 0
     last_dd_name = ""
@@ -146,26 +162,43 @@ def parse_jcl(text: str, data: bytes = b"", enc: str = "utf-8",
 
     for st in stmts:
         if st.op == "JOB":
-            facts.job_name = st.name or None
-            facts.job_line = st.start
+            job.job_name = st.name or None
+            job.job_line = st.start
 
         elif st.op == "PROC":
-            # A cataloged PROC's own statement carries its default symbolics.
-            facts.is_proc = True
-            facts.proc_name = st.name or facts.proc_name
-            for k, v in keyword_operands(st.operands).items():
-                facts.symbolics.setdefault(k, _unquote(v))
+            if job.job_name is not None or job.steps:
+                # Instream PROC: its steps belong to the PROC, not to the job.
+                inproc = JclFacts(job_name=None, job_line=st.start, is_proc=True,
+                                  proc_name=(st.name or f"INPROC{len(job.instream_procs) + 1}").upper(),
+                                  symbolics={})
+                for k, v in keyword_operands(st.operands).items():
+                    inproc.symbolics.setdefault(k, _unquote(v))
+                job.instream_procs[inproc.proc_name] = inproc
+                target, cur, ordinal = inproc, None, 0
+            else:
+                # A cataloged PROC's own statement carries its default symbolics.
+                job.is_proc = True
+                job.proc_name = st.name or job.proc_name
+                for k, v in keyword_operands(st.operands).items():
+                    job.symbolics.setdefault(k, _unquote(v))
+
+        elif st.op == "PEND":
+            if inproc is not None:
+                for step in inproc.steps:
+                    _resolve_effective_pgm(step, inproc)
+                inproc = None
+                target, cur, ordinal = job, None, len(job.steps)
 
         elif st.op == "SET":
             # Instream SET wins over PROC defaults for everything after it.
             for k, v in keyword_operands(st.operands).items():
-                facts.symbolics[k] = _unquote(v)
-                facts.set_symbols[k] = _unquote(v)
+                target.symbolics[k] = _unquote(v)
+                target.set_symbols[k] = _unquote(v)
 
         elif st.op == "EXEC":
             ordinal += 1
-            cur = _build_step(st, ordinal, facts)
-            facts.steps.append(cur)
+            cur = _build_step(st, ordinal, target)
+            target.steps.append(cur)
             last_dd_name, concat_seq = "", 0
 
         elif st.op == "DD" and cur is not None:
@@ -173,18 +206,21 @@ def parse_jcl(text: str, data: bytes = b"", enc: str = "utf-8",
                 last_dd_name, concat_seq = st.name, 0
             else:
                 concat_seq += 1          # unnamed DD = concatenation
-            cur.dds.append(_build_dd(st, last_dd_name, concat_seq, facts))
+            cur.dds.append(_build_dd(st, last_dd_name, concat_seq, target, member_lookup))
 
         elif st.op == "INCLUDE":
             m = keyword_operands(st.operands).get("MEMBER")
             if m:
-                facts.unresolved.append(("include_member", _unquote(m), st.start))
+                job.unresolved.append(("include_member", _unquote(m), st.start))
 
-    # Second pass: now that every DD is attached, unwrap the launchers.
-    for step in facts.steps:
-        _resolve_effective_pgm(step, facts)
-
-    return facts
+    # Second pass: now that every DD is attached, unwrap the launchers and
+    # resolve referbacks that point at earlier steps of this member.
+    for step in job.steps:
+        _resolve_effective_pgm(step, job)
+    _resolve_referbacks(job.steps, job, report=not any(s.proc_called for s in job.steps))
+    for p in job.instream_procs.values():
+        _resolve_referbacks(p.steps, p, report=False)
+    return job
 
 
 # --------------------------------------------------------------------------
@@ -225,19 +261,42 @@ def _build_step(st: JclStatement, ordinal: int, facts: JclFacts) -> StepFact:
     )
 
 
+# Libraries whose (MEMBER) is a load module or macro, never control cards.
+_NOT_CARD_DDS = {"STEPLIB", "JOBLIB", "SYSLMOD", "SYSLIB", "DFSRESLB", "IMSACB"}
+
+
 def _build_dd(st: JclStatement, dd_name: str, concat_seq: int,
-              facts: JclFacts) -> DdFact:
+              facts: JclFacts,
+              member_lookup: Optional[Callable[[str], Optional[str]]] = None) -> DdFact:
     kw = keyword_operands(st.operands)
     raw_dsn = kw.get("DSN") or kw.get("DSNAME")
     disp = kw.get("DISP")
 
     dsn = _unquote(raw_dsn) if raw_dsn else None
-    resolved, gdg = (None, None)
-    if dsn:
+    resolved, gdg, referback, card_member, is_temp = None, None, None, None, False
+    sysin = "\n".join(st.inline_data) if st.inline_data else None
+
+    if dsn and dsn.startswith("*."):
+        # DSN=*.STEP.DD reuses what an earlier step allocated: resolved once
+        # every step of the job is known (_resolve_referbacks).
+        referback = dsn
+    elif dsn:
         resolved = substitute_symbols(dsn, facts.symbolics)
         resolved, gdg = _strip_gdg(resolved)
-
-    sysin = "\n".join(st.inline_data) if st.inline_data else None
+        # &&TEMP lives only between the steps of THIS job. It is not a dataset
+        # another job can read, so it must never join two jobs' lineage.
+        is_temp = resolved.startswith("&&")
+        m = _MEMBER_REF.search(resolved)
+        if m and not m.group(1)[0].isdigit() and dd_name.upper().split(".")[-1] not in _NOT_CARD_DDS:
+            # DSN=PROD.PARMLIB(SRTCLM): the control cards live in a member, not
+            # instream. If that member is indexed, its text becomes this DD's
+            # cards, so launchers, sort fields and IDCAMS ops resolve exactly as
+            # for `DD *`. Without this, most production steps have no cards.
+            card_member = m.group(1).upper()
+            if sysin is None and member_lookup is not None:
+                body = member_lookup(card_member)
+                if body is not None:
+                    sysin = body
 
     # `//STEP1.DD1 DD ...` overrides a DD inside a called PROC.
     is_override = "." in dd_name
@@ -256,6 +315,9 @@ def _build_dd(st: JclStatement, dd_name: str, concat_seq: int,
         sysin_text=sysin,
         is_override=is_override,
         line=st.start,
+        card_member=card_member,
+        is_temp=is_temp,
+        referback=referback,
     )
 
 
@@ -599,7 +661,9 @@ def expand_job(job: JclFacts, proc_lookup: Callable[[str], Optional["JclFacts"]]
         if not s.proc_called:
             out.append(s)
             continue
-        proc = proc_lookup(s.proc_called)
+        # An instream PROC (// PROC ... // PEND in this job) shadows a
+        # cataloged one of the same name - that is the JCL rule too.
+        proc = job.instream_procs.get(s.proc_called.upper()) or proc_lookup(s.proc_called)
         if proc is None or not proc.steps:
             s.notes.append(f"PROC {s.proc_called} not in index - its steps are unknown")
             job.unresolved.append(("missing_proc", f"{s.step_name}: PROC {s.proc_called} not found", s.line))
@@ -637,6 +701,7 @@ def expand_job(job: JclFacts, proc_lookup: Callable[[str], Optional["JclFacts"]]
                     used.add(key)
                     nd = replace(d, dsn=o.dsn or d.dsn, disp=o.disp or d.disp,
                                  sysin_text=o.sysin_text or d.sysin_text,
+                                 card_member=o.card_member if o.dsn else d.card_member,
                                  is_override=True, line=o.line)
                 else:
                     nd = replace(d)
@@ -653,26 +718,82 @@ def expand_job(job: JclFacts, proc_lookup: Callable[[str], Optional["JclFacts"]]
 
             if eff.proc_called and depth < max_depth:
                 sub = JclFacts(job_name=job.job_name, job_line=job.job_line, is_proc=False,
-                               proc_name=None, symbolics=dict(symbols), set_symbols=dict(symbols))
+                               proc_name=None, symbolics=dict(symbols), set_symbols=dict(symbols),
+                               instream_procs=job.instream_procs)
                 sub.steps = [eff]
                 out.extend(expand_job(sub, proc_lookup, depth + 1, max_depth))
                 job.unresolved.extend(sub.unresolved)
                 continue
             _resolve_effective_pgm(eff, job)
             out.append(eff)
+    if depth == 0:
+        # Every step is now known, PROC steps included: DSN=*.STEP.DD can be
+        # followed to the dataset it names.
+        _resolve_referbacks(out, job, report=True)
     return out
 
 
 def _resolve_dd(d: DdFact, symbols: Dict[str, str], job: JclFacts, step: StepFact) -> DdFact:
     if not d.dsn:
         return d
+    if d.dsn.startswith("*."):
+        return replace(d, referback=d.dsn, dsn_resolved=None, gdg_rel=None, is_temp=False)
     resolved, gdg = _strip_gdg(substitute_symbols(d.dsn, symbols))
     if "&" in resolved.replace("&&", ""):
         job.unresolved.append(("symbolic",
                                f"{step.step_name} {d.dd_name}: symbolic still unresolved in {resolved}",
                                d.line))
     mode, src = _direction(d.dd_name, gdg, d.disp, f"DSN={resolved},DISP={d.disp or ''}")
-    return replace(d, dsn_resolved=resolved, gdg_rel=gdg, mode=mode, mode_source=src)
+    return replace(d, dsn_resolved=resolved, gdg_rel=gdg, mode=mode, mode_source=src,
+                   is_temp=resolved.startswith("&&"), referback=None)
+
+
+def _resolve_referbacks(steps: List[StepFact], facts: JclFacts, report: bool = True) -> None:
+    """Follow DSN=*.STEP.DD (also *.DD in the same step, *.STEP.PROCSTEP.DD)
+    to the dataset the earlier DD allocated.
+
+    This is how a &&TEMP is usually handed from one step to the next, and how
+    a PROC step picks up what a previous PROC step wrote. Left as text, the
+    consumer step shows no dataset at all and the lineage has a hole exactly
+    where the job's own intermediate file is. The referring DD's own DISP
+    decides direction (the source DD's (+1) is NOT inherited: the referback
+    reads what was created).
+    """
+    for idx, s in enumerate(steps):
+        for i, d in enumerate(s.dds):
+            if not d.referback or d.dsn_resolved:
+                continue
+            parts = d.referback[2:].upper().split(".")
+            ddn, path = parts[-1], parts[:-1]
+            if not path:
+                cands = [s]
+            else:
+                key = ".".join(path)
+                earlier = steps[:idx + 1]
+                cands = [x for x in earlier if x.step_name.upper() == key]
+                if not cands:        # *.PROCSTEP.DD inside a PROC, or *.STEP.PROCSTEP.DD after expansion
+                    cands = [x for x in earlier if x.step_name.upper().endswith("." + key)]
+                if len(cands) > 1 and s.parent_step:
+                    same = [x for x in cands if x.parent_step == s.parent_step]
+                    cands = same or cands
+            src = None
+            for x in reversed(cands):
+                for y in x.dds:
+                    if y.dd_name.upper().split(".")[-1] == ddn and y.dsn_resolved and y is not d:
+                        src = y
+                        break
+                if src:
+                    break
+            if src is None:
+                entry = ("referback",
+                         f"{s.step_name} {d.dd_name}: {d.referback} names no earlier DD with a dataset",
+                         d.line)
+                if report and entry not in facts.unresolved:     # parse and expand both get here
+                    facts.unresolved.append(entry)
+                continue
+            mode, msrc = _direction(d.dd_name, None, d.disp, f"DSN={src.dsn_resolved},DISP={d.disp or ''}")
+            s.dds[i] = replace(d, dsn_resolved=src.dsn_resolved, is_temp=src.is_temp,
+                               card_member=src.card_member, mode=mode, mode_source=msrc)
 
 
 # --------------------------------------------------------------------------

@@ -53,6 +53,10 @@ then the fix, then a row here. Nothing is "fixed" until the test exists.
 | 44 | "Where is column X populated" unanswerable: only table names indexed | No column ↔ host-variable pairing | `ColumnLineage.*`, `ColumnQueries.test_column_report` |
 | 45 | A message built by `STRING` across four lines invisible to `messages` | Only the literal pieces were indexed, never the assembled text | `test_string_and_display_templates`, `test_messages_finds_runtime_templates` |
 | 46 | A program with no source (load module only) reported NOT FOUND although JCL runs it | Dossier required a program row | `test_program_runs_in_shows_the_job_not_the_bare_proc` |
+| 47 | A DB2 batch step "runs IKJEFT01", no sort fields, no IDCAMS ops, because the cards are in `PROD.PARMLIB(MEMBER)` not `DD *` | Only inline data became `sysin_text`; the `(MEMBER)` reference was never followed to the indexed card member | `test_card_member_text_is_attached_to_the_dd`, `test_launcher_resolves_through_the_card_member`, `test_card_member_is_findable_by_name` |
+| 48 | "PROC SRTPROC not found" and the PROC's steps counted as the job's own steps, for a `// PROC … // PEND` coded inside the job | Instream PROCs were flattened into the job instead of collected and expanded by `EXEC` | `test_instream_proc_is_collected_not_flattened_into_the_job`, `test_instream_proc_shadows_cataloged_proc` |
+| 49 | `dataset SORTED` joined two unrelated jobs through `&&SORTED`; `&&TEMP` looked like an estate dataset | Temporary datasets are job-scoped but the `dataset` table is global | `test_temp_is_job_local`, `test_temp_never_becomes_a_dataset_row` |
+| 50 | A step reading `DSN=*.STEP1.SORTOUT` showed no dataset - a hole in lineage exactly at the job's own intermediate file; a referback to a `(+1)` inherited the `+1` and looked like a second writer | Referbacks were kept as text; direction was copied from the source DD | `test_referback_inside_the_proc_follows_the_temp`, `test_referback_across_the_proc_boundary_reads_the_created_generation`, `test_bad_referback_is_reported_not_dropped` |
 
 ## Known gaps (not yet guarded - contributions welcome)
 

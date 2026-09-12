@@ -383,8 +383,12 @@ CREATE TABLE IF NOT EXISTS dd (
     mode_source TEXT,                     -- open_verb|gdg_relative|dd_convention|
                                           -- disp_new_weak|disp_mod_weak|undetermined
                                           -- DISP is NOT direction; see jcl._direction()
-    sysin_text  TEXT,                     -- inline control cards live HERE
+    sysin_text  TEXT,                     -- inline control cards live HERE - also the text of
+                                          -- DSN=LIB(MEMBER) when that card member is indexed
     is_override INTEGER DEFAULT 0,        -- //STEP1.DD1 style override of a PROC DD
+    card_member TEXT,                     -- DSN=PROD.PARMLIB(SRTCLM) -> 'SRTCLM'
+    is_temp     INTEGER DEFAULT 0,        -- &&TEMP: exists only between steps of THIS job;
+                                          -- never a link between two jobs
     line        INTEGER
 );
 CREATE INDEX IF NOT EXISTS ix_dd_step ON dd(step_id);

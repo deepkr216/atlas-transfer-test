@@ -130,7 +130,8 @@ def open_db(path: str, rebuild: bool = False) -> sqlite3.Connection:
                              ("doc_image", "ocr_text", "TEXT"), ("member", "system", "TEXT"),
                              ("step", "from_proc", "TEXT"), ("step", "parent_step", "TEXT"),
                              ("dd", "mode_source", "TEXT"), ("transaction_def", "group_name", "TEXT"),
-                             ("transaction_def", "detail", "TEXT")):
+                             ("transaction_def", "detail", "TEXT"), ("dd", "card_member", "TEXT"),
+                             ("dd", "is_temp", "INTEGER DEFAULT 0")):
         _ensure_column(conn, table, col, decl)
     return conn
 
@@ -371,6 +372,13 @@ def _include_text(ctx: Ctx, name: str) -> Optional[str]:
     return _member_text(ctx, name, ("jcl", "proc", "ctlcard", "unknown"))
 
 
+def _card_text(ctx: Ctx, name: str) -> Optional[str]:
+    """`//SYSIN DD DSN=PROD.PARMLIB(SRTCLM)`: the card member's text. Never a
+    COBOL/copybook member of the same name - PARMLIB(CLMRPT2) is cards for
+    CLMRPT2, not the program."""
+    return _member_text(ctx, name, ("ctlcard", "unknown", "sql", "jcl", "proc"))
+
+
 def _proc_facts(ctx: Ctx, name: str) -> Optional[jcl.JclFacts]:
     """Parsed cataloged PROC by name (cached), for expand_job."""
     key = name.upper()
@@ -379,7 +387,8 @@ def _proc_facts(ctx: Ctx, name: str) -> Optional[jcl.JclFacts]:
         for m in ctx.by_name.get(key, []):
             if m.kind in ("proc", "jcl"):
                 text, data, enc = reader.load(m.path)
-                f = jcl.parse_jcl(text, data, enc, include_lookup=lambda n: _include_text(ctx, n))
+                f = jcl.parse_jcl(text, data, enc, include_lookup=lambda n: _include_text(ctx, n),
+                                  member_lookup=lambda n: _card_text(ctx, n))
                 if f.is_proc or m.kind == "proc":
                     facts = f
                     break
@@ -623,7 +632,8 @@ def index_copybook(ctx: Ctx, mem: Mem) -> None:
 def index_jcl(ctx: Ctx, mem: Mem) -> None:
     conn = ctx.conn
     text, data, enc = reader.load(mem.path)
-    facts = jcl.parse_jcl(text, data, enc, include_lookup=lambda n: _include_text(ctx, n))
+    facts = jcl.parse_jcl(text, data, enc, include_lookup=lambda n: _include_text(ctx, n),
+                          member_lookup=lambda n: _card_text(ctx, n))
     job_id = proc_id = None
     if facts.is_proc or mem.kind == "proc":
         cur = conn.execute(
@@ -635,20 +645,23 @@ def index_jcl(ctx: Ctx, mem: Mem) -> None:
                            (mem.id, facts.job_name or mem.name, facts.job_line or 1))
         job_id = cur.lastrowid
 
-    def insert_step(s: jcl.StepFact, ordinal: int) -> int:
+    def insert_step(s: jcl.StepFact, ordinal: int, owner: Optional[Tuple[Optional[int], Optional[int]]] = None) -> int:
+        jid, pid = owner if owner else (job_id, proc_id)
         cur = conn.execute(
             "INSERT INTO step(job_id,proc_id,ordinal,step_name,pgm,proc_called,effective_pgm,launcher,"
             "parm,cond,from_proc,parent_step,line) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (job_id, proc_id, ordinal, s.step_name, s.pgm, s.proc_called, s.effective_pgm,
+            (jid, pid, ordinal, s.step_name, s.pgm, s.proc_called, s.effective_pgm,
              s.launcher, s.parm, s.cond, s.from_proc, s.parent_step, s.line))
         sid = cur.lastrowid
         conn.executemany(
             "INSERT INTO dd(step_id,dd_name,concat_seq,dsn,dsn_resolved,gdg_rel,disp,mode,mode_source,"
-            "sysin_text,is_override,line) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            "sysin_text,is_override,card_member,is_temp,line) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             [(sid, d.dd_name, d.concat_seq, d.dsn, d.dsn_resolved, d.gdg_rel, d.disp, d.mode,
-              d.mode_source, d.sysin_text, int(d.is_override), d.line) for d in s.dds])
+              d.mode_source, d.sysin_text, int(d.is_override), d.card_member, int(d.is_temp), d.line)
+             for d in s.dds])
         for d in s.dds:
-            if d.dsn_resolved:
+            if d.dsn_resolved and not d.is_temp:
+                # &&TEMP is not a dataset of the estate: it cannot link two jobs.
                 base = d.dsn_resolved
                 conn.execute("INSERT OR IGNORE INTO dataset(dsn,is_gdg) VALUES(?,?)",
                              (base, int(d.gdg_rel is not None)))
@@ -685,18 +698,34 @@ def index_jcl(ctx: Ctx, mem: Mem) -> None:
         ctx.bump("steps:proc" if s.proc_called else "steps:launcher" if s.launcher else "steps:pgm")
         return sid
 
+    # Expand BEFORE inserting the job's own steps: a DSN=*.STEP.PROCSTEP.DD
+    # referback in a plain job step resolves only once the PROC steps exist,
+    # and expand_job writes that resolution back onto the job's step objects.
+    effective: List[jcl.StepFact] = []
+    if job_id is not None:
+        effective = jcl.expand_job(facts, lambda n: _proc_facts(ctx, n))
+
     for s in facts.steps:
         insert_step(s, s.ordinal)
 
+    # Instream PROCs (// PROC ... // PEND) are PROCs of this member only.
+    for pname, pf in facts.instream_procs.items():
+        cur = conn.execute(
+            "INSERT INTO proc_def(member_id,proc_name,symbolics,instream,line) VALUES(?,?,?,1,?)",
+            (mem.id, pname, _j(pf.symbolics), pf.job_line or 1))
+        ipid = cur.lastrowid
+        for s in pf.steps:
+            insert_step(s, s.ordinal, owner=(None, ipid))
+        ctx.bump("procs:instream")
+
     # Effective steps: every EXEC PROC= expanded with THIS job's symbolics and
     # //STEP.DD overrides. These rows carry the datasets the job really uses.
-    if job_id is not None:
-        parent_ord = {s.step_name: s.ordinal for s in facts.steps}
-        for i, e in enumerate(jcl.expand_job(facts, lambda n: _proc_facts(ctx, n)), 1):
-            if e.from_proc:
-                top = (e.parent_step or "").split(".")[0]
-                insert_step(e, parent_ord.get(top, 0) * 100 + i)
-                ctx.bump("steps:expanded")
+    parent_ord = {s.step_name: s.ordinal for s in facts.steps}
+    for i, e in enumerate(effective, 1):
+        if e.from_proc:
+            top = (e.parent_step or "").split(".")[0]
+            insert_step(e, parent_ord.get(top, 0) * 100 + i)
+            ctx.bump("steps:expanded")
 
     # A DFHCSDUP deck is usually the SYSIN of a JCL step: harvest it in place.
     for s in facts.steps:
