@@ -612,7 +612,7 @@ def summary(ctx: Ctx, db_path: str, root: str, t0: float) -> None:
 # main
 # --------------------------------------------------------------------------
 
-def main(argv: Optional[List[str]] = None) -> int:
+def _main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Build atlas.db from a mainframe source/document folder.")
     ap.add_argument("root")
     ap.add_argument("--db", default="atlas.db")
@@ -675,6 +675,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     summary(ctx, args.db, args.root, t0)
     conn.close()
     return 0
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    """Any crash becomes a short, redacted atlas-crash.txt you can share."""
+    try:
+        return _main(argv)
+    except Exception as e:                                              # noqa: BLE001
+        from .diag import write_crash
+        text = write_crash(e, sys.argv)
+        print("\n" + text, file=sys.stderr)
+        print("\nSaved to atlas-crash.txt - paste it to get a fix.", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

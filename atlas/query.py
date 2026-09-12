@@ -891,7 +891,7 @@ def cmd_pack(conn: sqlite3.Connection, name: str, max_lines: int) -> str:
 # main
 # --------------------------------------------------------------------------
 
-def main(argv: Optional[List[str]] = None) -> int:
+def _main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Query atlas.db (markdown out, citations in).")
     ap.add_argument("--db", default="atlas.db")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -948,6 +948,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     finally:
         conn.close()
     return 0
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    """Any crash becomes a short, redacted atlas-crash.txt you can share."""
+    try:
+        return _main(argv)
+    except Exception as e:                                              # noqa: BLE001
+        from .diag import write_crash
+        text = write_crash(e, sys.argv)
+        print("\n" + text, file=sys.stderr)
+        print("\nSaved to atlas-crash.txt - paste it to get a fix.", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

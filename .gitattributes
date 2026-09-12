@@ -1,0 +1,8 @@
+# Normalise line endings so the bundle behaves the same on both machines.
+* text=auto
+*.py text eol=lf
+*.sql text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+# Fixtures are column-sensitive; keep them exactly as committed.
+tests/fixtures/* -text

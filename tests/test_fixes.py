@@ -13,7 +13,7 @@ import zipfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 
-from atlas import classify, cobol, docs, expand, ims, jcl, reader, verify_citations  # noqa: E402
+from atlas import classify, cobol, diag, docs, expand, ims, jcl, reader, verify_citations  # noqa: E402
 
 FIX = os.path.join(HERE, "fixtures")
 
@@ -310,6 +310,35 @@ class CitationGate(unittest.TestCase):
     def test_unknown_member_fails(self):
         res, _ = self._check("[[NOSUCH 1 \"x\"]]")
         self.assertEqual(res[0].status, "FAIL")
+
+
+class Diagnostics(unittest.TestCase):
+    """Shareable reports must carry no paths, dataset names or (optionally) member names."""
+
+    def test_redact_strips_paths_dsns_and_names(self):
+        s = diag.redact("failed C:\\estate\\PROD.SRC\\CLMPOST.cbl reading PROD.POLICY.MASTER.KSDS(+1) "
+                        "and /home/u/src/x.cbl in CLMPOST", names=["CLMPOST"])
+        for secret in ("estate", "POLICY", "/home", "CLMPOST"):
+            self.assertNotIn(secret, s)
+        self.assertIn("<path>", s)
+        self.assertIn("<dsn>", s)
+
+    def test_crash_report_is_written_and_clean(self):
+        try:
+            raise ValueError("boom while reading C:\\secret\\lib\\member.cbl")
+        except ValueError as e:
+            with tempfile.TemporaryDirectory() as td:
+                p = os.path.join(td, "crash.txt")
+                txt = diag.write_crash(e, ["build", "C:\\secret\\estate"], path=p)
+                self.assertTrue(os.path.exists(p))
+        self.assertIn("ValueError", txt)
+        self.assertNotIn("secret", txt)
+        self.assertIn("atlas crash", txt)
+
+    def test_report_runs_without_a_db(self):
+        txt = diag.report(os.path.join(FIX, "no-such.db"))
+        self.assertIn("not found", txt)
+        self.assertIn("python", txt)
 
 
 if __name__ == "__main__":
