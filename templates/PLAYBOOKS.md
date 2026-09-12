@@ -117,6 +117,55 @@ definitions were loaded and how many dynamic CALLs are unresolved; the model
 repeats those caveats and recommends the export that would close them. Never
 recommend deletion from this report alone.
 
+## A7. Value-domain change (a new code value, or codes merged)
+
+Question shape: "Gender gets a new value N; son (3) and daughter (4) both
+become 4; spouse sometimes uses 5. What has to change?"
+
+This is not a search for the fields - it is an inventory of every place a
+specific VALUE is assumed. Four queries, run for each affected field in each
+system's copy of it:
+
+```
+python -m atlas.query --db atlas.db values   WS-GENDER-CD           > v1.md   # observed domain
+python -m atlas.query --db atlas.db values   WS-REL-CD              > v2.md
+python -m atlas.query --db atlas.db pair     WS-REL-CD WS-GENDER-CD > p.md    # cross-field rules
+python -m atlas.query --db atlas.db messages GENDER                 > m1.md   # message texts
+python -m atlas.query --db atlas.db messages RELATION               > m2.md
+python -m atlas.query --db atlas.db field    WS-GENDER-CD           > f.md    # copies, skew, refs
+python -m atlas.query --db atlas.db copybook <record copybook>      > c.md    # jobs, datasets, readers
+```
+
+What each inventory gives the design:
+
+- **`values`** - every value the code knows: documented by an 88-level, set,
+  tested (including tests through 88 names that never mention the value),
+  used in SQL predicates/SET/INSERT on the matching column, compared by
+  sort INCLUDE/OMIT cards. Two lines matter most: **USED BUT NOT DOCUMENTED**
+  (the special-case `5` nobody wrote down) and **documented but never used**.
+- **`pair`** - every statement where the two fields (or their 88s) are used
+  together: the "son must be male" validations and the "if relationship 3
+  then gender M" derivations. Every row is a rule that the new value
+  invalidates or redefines.
+- **`messages`** - every message literal naming the old rule, with the field
+  it is moved to; plus documents mentioning the term.
+- **`field` / `copybook`** - the physical spread: copies per system with
+  offset/length (skew!), programs, jobs, datasets written and who reads them,
+  callers. The value change does not move bytes, so file contracts survive -
+  but every reader that tests the old values is on this list.
+
+The model then produces, in FACTS: per system, the value table, the rule
+list, the message list, the reader list. In INFERENCE: for each rule, keep /
+rewrite / delete; for each message, new text; for each reader outside the
+mainframe (interface_edge rows), a contract note. The mandatory HUMAN MUST
+VERIFY items: values that exist in data but not in code (compare against the
+tables' actual distinct values), screens (BMS/MFS validation and picklists
+are not parsed), DB2 CHECK constraints and lookup tables, and any program the
+index could not expand.
+
+Tests come straight from `values`: every old value, every new value, every
+pair combination the rules mention, and one value outside all of them.
+
 ---
 
 ## D1. Change design document (two passes)

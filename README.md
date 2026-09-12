@@ -48,6 +48,9 @@ python -m atlas.query --db atlas.db program  CLMPOST
 python -m atlas.query --db atlas.db job      CLMNIGHT
 python -m atlas.query --db atlas.db field    PM-POLICY-STATUS
 python -m atlas.query --db atlas.db literal  E001               # where is this code set / tested / shown
+python -m atlas.query --db atlas.db values   WS-GENDER-CD       # every value the code assumes (incl. undocumented)
+python -m atlas.query --db atlas.db pair     WS-REL-CD WS-GENDER-CD   # cross-field rules (son must be male)
+python -m atlas.query --db atlas.db messages GENDER             # message texts naming a rule
 python -m atlas.query --db atlas.db copybook PMASTREC           # impact
 python -m atlas.query --db atlas.db callers  RATECALC --depth 3
 python -m atlas.query --db atlas.db dataset  PROD.POLICY.EXTRACT

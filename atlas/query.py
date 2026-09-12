@@ -35,7 +35,9 @@ import sys
 from collections import defaultdict, deque
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
-from . import reader
+import re
+
+from . import cobol, reader
 
 
 # --------------------------------------------------------------------------
@@ -592,15 +594,21 @@ def cmd_field(conn: sqlite3.Connection, name: str) -> str:
     return "".join(out)
 
 
-def cmd_literal(conn: sqlite3.Connection, value: str) -> str:
+def cmd_literal(conn: sqlite3.Connection, value: str, field: Optional[str] = None,
+                like: bool = False) -> str:
     v = value.strip().strip("'\"")
-    rows = conn.execute("""SELECT l.literal, l.context, l.field, l.line, l.member_id,
+    where = "UPPER(l.literal) LIKE UPPER(?)" if like else "(l.literal=? OR UPPER(l.literal)=?)"
+    args: list = [v if "%" in v else f"%{v}%"] if like else [v, v.upper()]
+    if field:
+        # Common values (3, 'M') appear everywhere; the field is what makes them specific.
+        where += " AND (UPPER(l.field)=? OR UPPER(l.field) LIKE ?)"
+        args += [field.upper(), f"{field.upper()}/%"]
+    rows = conn.execute(f"""SELECT l.literal, l.context, l.field, l.line, l.member_id,
                                   p.id AS pid, p.program_id AS pname, m.name AS member_name, m.kind
                            FROM literal_ref l
                            LEFT JOIN program p ON p.id=l.program_id JOIN member m ON m.id=l.member_id
-                           WHERE l.literal=? OR UPPER(l.literal)=? ORDER BY l.context, m.name, l.line""",
-                        (v, v.upper())).fetchall()
-    out = [f"# Literal '{v}'\n"]
+                           WHERE {where} ORDER BY l.context, m.name, l.line""", args).fetchall()
+    out = [f"# Literal '{v}'" + (f" on field {field.upper()}" if field else "") + "\n"]
     if not rows:
         out.append("**not found** as a literal anywhere (VALUE, 88, MOVE, IF/WHEN, DISPLAY). "
                    "It may be built by STRING/arithmetic, read from a table, or spelled differently.\n")
@@ -615,21 +623,24 @@ def cmd_literal(conn: sqlite3.Connection, value: str) -> str:
             for r in groups.get(c, []):
                 where = r["pname"] if r["pid"] else f"{r['member_name']} ({r['kind']})"
                 ct = cite(conn, r["pid"], r["line"]) if r["pid"] else f"{r['member_name']}:{r['line']}"
-                key = (c, r["field"] or "", ct.split(" (via")[0])
+                key = (r["literal"], c, r["field"] or "", ct.split(" (via")[0])
                 if key in seen:
                     continue              # same copybook line seen via several programs
                 seen.add(key)
-                res.append((c, where, r["field"] or "", ct))
+                res.append((r["literal"], c, where, r["field"] or "", ct))
         return res
 
+    hdr = ["literal", "how", "where", "field / column", "cite"]
     out.append("\n### Defined (VALUE / 88-level)\n")
-    out.append(table(["how", "where", "field", "cite"], rows_for(["value", "cond88"])))
+    out.append(table(hdr, rows_for(["value", "cond88"])))
     out.append("\n### Set (MOVE / STRING)\n")
-    out.append(table(["how", "program", "field", "cite"], rows_for(["move_to", "string"])))
+    out.append(table(hdr, rows_for(["move_to", "string"])))
     out.append("\n### Tested (IF / WHEN)\n")
-    out.append(table(["how", "program", "field", "cite"], rows_for(["compare", "when"])))
+    out.append(table(hdr, rows_for(["compare", "when"])))
+    out.append("\n### In SQL (predicate / SET / INSERT)\n")
+    out.append(table(hdr, rows_for(["sql_predicate", "sql_set", "sql_insert"])))
     out.append("\n### Displayed as a literal\n")
-    out.append(table(["how", "program", "", "cite"], rows_for(["display"])))
+    out.append(table(hdr, rows_for(["display"])))
 
     # Follow the value out of each program that sets it.
     out.append("\n### Where the value goes after it is set (cross-program)\n")
@@ -888,6 +899,201 @@ def cmd_pack(conn: sqlite3.Connection, name: str, max_lines: int) -> str:
 
 
 # --------------------------------------------------------------------------
+# value-domain changes: values / pair / messages
+# --------------------------------------------------------------------------
+#
+# "Add gender N; son and daughter both become relationship 4" is a change to
+# the VALUE DOMAIN of two fields. The work is not finding the fields - it is
+# finding every place a specific value is assumed: 88-levels, IF/WHEN tests,
+# SQL predicates, sort INCLUDE cards, derivation rules that tie one field's
+# value to another's, and the messages that name the old rule. These three
+# queries produce those inventories deterministically.
+
+def _norm_val(v: str) -> str:
+    s = v.strip()
+    if re.fullmatch(r"[+-]?\d+", s):
+        return str(int(s))
+    return s
+
+
+def _cond88_map(conn: sqlite3.Connection, name: str) -> Dict[str, List[Tuple[str, str]]]:
+    """value -> [(88-name, member)] for every 88 under any field called `name`."""
+    out: Dict[str, List[Tuple[str, str]]] = defaultdict(list)
+    for r in conn.execute("""SELECT c.name, c.values_lit, m.name AS mem FROM cond88 c JOIN field f ON f.id=c.field_id
+                             JOIN member m ON m.id=f.member_id WHERE UPPER(f.name)=?""", (name.upper(),)):
+        raw = _jl(r["values_lit"])
+        vals = [cobol._norm_lit(v) for v in raw if v.upper() not in ("THRU", "THROUGH")]
+        if any(x.upper() in ("THRU", "THROUGH") for x in raw) and len(vals) >= 2:
+            out[f"{_norm_val(vals[0])} THRU {_norm_val(vals[1])}"].append((r["name"], r["mem"]))
+        else:
+            for v in vals:
+                out[_norm_val(v)].append((r["name"], r["mem"]))
+    return out
+
+
+def _column_aliases(name: str) -> List[str]:
+    """COBOL field -> plausible DB2 column names (DCLGEN style, prefixes dropped)."""
+    n = name.upper().replace("-", "_")
+    out = [n]
+    for pre in ("WS_", "LK_", "WK_", "W_", "IN_", "OUT_"):
+        if n.startswith(pre):
+            out.append(n[len(pre):])
+    return out
+
+
+def cmd_values(conn: sqlite3.Connection, name: str) -> str:
+    n = name.upper()
+    cols = _column_aliases(n)
+    defs = _field_defs(conn, n)
+    out = [f"# Observed value domain of {n}\n"]
+    if not defs:
+        out.append("> Not defined in any indexed member; the rows below come from literal usage only.\n")
+    documented = _cond88_map(conn, n)
+
+    qc = ",".join("?" * len(cols))
+    rows = conn.execute(f"""
+        SELECT l.literal, l.context, l.line, l.member_id, p.program_id AS pname, p.id AS pid, m.name AS mem
+        FROM literal_ref l LEFT JOIN program p ON p.id=l.program_id JOIN member m ON m.id=l.member_id
+        WHERE (UPPER(l.field)=? AND l.context IN ('move_to','compare','when','string','value'))
+           OR (UPPER(l.field) IN ({qc}) AND l.context LIKE 'sql_%')""", (n, *cols)).fetchall()
+    uses: Dict[str, Dict[str, List[str]]] = defaultdict(lambda: defaultdict(list))
+    for r in rows:
+        v = _norm_val(r["literal"])
+        ct = cite(conn, r["pid"], r["line"]) if r["pid"] else f"{r['mem']}:{r['line']}"
+        uses[v][r["context"]].append(f"{r['pname'] or r['mem']}@{ct}")
+
+    # Tests through 88-level names never mention the literal; join them in.
+    for v, lst in documented.items():
+        for (c88, _mem) in lst:
+            for r in conn.execute("""SELECT p.program_id, p.id AS pid, r.mode, r.line FROM field_ref r
+                                     JOIN program p ON p.id=r.program_id WHERE UPPER(r.name)=?""", (c88.upper(),)):
+                # Say HOW it was reached: a test through an 88 name never mentions
+                # the value, which is exactly why a grep for 'M' misses it.
+                uses[v][f"via 88 {c88} ({r['mode']})"].append(
+                    f"via 88 {c88} {r['program_id']}@{cite(conn, r['pid'], r['line'])}")
+
+    # Sort/INCLUDE cards comparing these bytes to constants.
+    for d in defs:
+        if d["kind"] != "copybook":
+            continue
+        lo, hi = d["offset"] + 1, d["offset"] + d["length"]
+        for c in conn.execute("""SELECT c.raw, c.card_kind, j.job_name, s.step_name FROM card_field_ref c
+                                 JOIN step s ON s.id=c.step_id LEFT JOIN job j ON j.id=s.job_id
+                                 WHERE c.pos<=? AND c.pos+c.length-1>=? AND c.card_kind IN ('INCLUDE','OMIT')""", (hi, lo)):
+            for m in re.finditer(r"C'([^']*)'|(?<=,)(\d+)(?=[,)])", c["raw"]):
+                val = m.group(1) if m.group(1) is not None else m.group(2)
+                uses[_norm_val(val)]["sort_card"].append(f"{c['job_name']}.{c['step_name']} {c['card_kind']}")
+
+    all_vals = sorted(set(documented) | set(uses),
+                      key=lambda v: (not v.split(" ")[0].lstrip("+-").isdigit(), v))
+    trows = []
+    for v in all_vals:
+        u = uses.get(v, {})
+
+        def cnt(*prefixes):
+            return sum(len(l) for k, l in u.items() if k.startswith(prefixes))
+
+        where = "; ".join(sorted({w for l in u.values() for w in l})[:4])
+        trows.append((v, ", ".join(sorted({c for c, _m in documented.get(v, [])})) or "(none)",
+                      cnt("move_to", "string", "sql_set", "sql_insert"),
+                      cnt("compare", "when", "via 88"), cnt("sql_predicate"), cnt("sort_card"), where))
+    out.append(table(["value", "documented by 88", "set", "tested", "SQL", "sort cards", "where (first few)"], trows))
+
+    undocumented = [v for v in all_vals if v not in documented and uses.get(v)
+                    and any(not k.startswith("value") for k in uses[v])]
+    unused = [v for v in all_vals if v in documented and not uses.get(v)]
+    if undocumented:
+        out.append(f"\n**USED BUT NOT DOCUMENTED BY ANY 88-LEVEL:** {', '.join(undocumented)} - undocumented "
+                   f"codes are where a value-domain change breaks silently.\n")
+    if unused:
+        out.append(f"\n**Documented but never set, tested or queried in indexed code:** {', '.join(unused)} "
+                   f"(may be reached via a group MOVE, a table, a screen, or code outside the index).\n")
+    if any(k.startswith("sql") for u in uses.values() for k in u):
+        out.append(f"\nSQL rows are for column name(s) {', '.join(f'`{c}`' for c in cols)} (derived from the field "
+                   f"name); if the column is called something else, run `values <COLUMN>` as well.\n")
+    out.append("\n> This is the domain the CODE knows about. Values that arrive in files, DB2 rows, IMS segments or "
+               "screens are data, not literals - compare against the data's actual distinct values before "
+               "calling the change complete.\n")
+    out.append(unresolved_for(conn, sorted({r["member_id"] for r in rows}), limit=15))
+    return "".join(out)
+
+
+def cmd_pair(conn: sqlite3.Connection, a: str, b: str, window: int = 8) -> str:
+    """Statements where two fields (or their 88-levels) are used together -
+    the validation and derivation rules that bind one value to the other."""
+    a, b = a.upper(), b.upper()
+
+    def names_for(n: str) -> List[str]:
+        names = {n}
+        for r in conn.execute("""SELECT c.name FROM cond88 c JOIN field f ON f.id=c.field_id
+                                 WHERE UPPER(f.name)=?""", (n,)):
+            names.add(r["name"].upper())
+        return sorted(names)
+
+    def refs(names: List[str]):
+        q = ",".join("?" * len(names))
+        return conn.execute(f"SELECT program_id, name, mode, stmt, line FROM field_ref "
+                            f"WHERE UPPER(name) IN ({q})", names).fetchall()
+
+    na, nb = names_for(a), names_for(b)
+    ra, rb = refs(na), refs(nb)
+    by_prog: Dict[int, list] = defaultdict(list)
+    for r in rb:
+        by_prog[r["program_id"]].append(r)
+    hits, seen = [], set()
+    for x in ra:
+        for y in by_prog.get(x["program_id"], []):
+            if abs(x["line"] - y["line"]) > window:
+                continue
+            key = (x["program_id"], x["line"], y["line"])
+            if key in seen:
+                continue
+            seen.add(key)
+            lo = min(x["line"], y["line"])
+            para = conn.execute("SELECT name FROM paragraph WHERE program_id=? AND ? BETWEEN start_line AND end_line",
+                                (x["program_id"], lo)).fetchone()
+            pname = conn.execute("SELECT program_id FROM program WHERE id=?", (x["program_id"],)).fetchone()[0]
+            hits.append((pname, para["name"] if para else "", f"{x['name']} {x['mode']}",
+                         f"{y['name']} {y['mode']}", cite(conn, x["program_id"], x["line"]),
+                         cite(conn, x["program_id"], y["line"])))
+    hits.sort()
+    out = [f"# Statements relating {a} and {b}\n",
+           f"Names searched: {', '.join(na)}  x  {', '.join(nb)}; same program, within {window} lines.\n\n",
+           table(["program", "paragraph", a, b, f"cite {a}", f"cite {b}"], hits)]
+    progs = {h[0] for h in hits}
+    out.append(f"\n{len(hits)} co-reference(s) in {len(progs)} program(s). Each is a cross-field rule "
+               f"(validation or derivation) to re-read; a rule such as 'SON must be MALE' is exactly what a "
+               f"new value invalidates.\n")
+    out.append("> Not covered: rules expressed through a group-level MOVE, a lookup table, a sort card, or a "
+               "screen map.\n")
+    return "".join(out)
+
+
+def cmd_messages(conn: sqlite3.Connection, pattern: str) -> str:
+    pat = pattern if "%" in pattern else f"%{pattern}%"
+    rows = conn.execute("""
+        SELECT l.literal, l.context, l.field, l.line, p.program_id AS pname, p.id AS pid, m.name AS mem
+        FROM literal_ref l LEFT JOIN program p ON p.id=l.program_id JOIN member m ON m.id=l.member_id
+        WHERE UPPER(l.literal) LIKE UPPER(?) AND l.context IN ('display','move_to','value','string')
+        ORDER BY l.literal""", (pat,)).fetchall()
+    groups: Dict[str, List[str]] = defaultdict(list)
+    for r in rows:
+        ct = cite(conn, r["pid"], r["line"]) if r["pid"] else f"{r['mem']}:{r['line']}"
+        tgt = f" -> {r['field']}" if r["field"] else ""
+        groups[r["literal"]].append(f"{r['context']}{tgt} @{r['pname'] or r['mem']} {ct}")
+    out = [f"# Message / text literals matching `{pattern}` ({len(groups)})\n",
+           table(["text", "where"], [(t, "; ".join(w[:5])) for t, w in groups.items()])]
+    docs = conn.execute("SELECT member_name, line_no, substr(text,1,120) FROM src_fts "
+                        "WHERE kind='doc' AND UPPER(text) LIKE UPPER(?) LIMIT 10", (pat,)).fetchall()
+    if docs:
+        out.append("\n### Documents mentioning it (prose, not facts)\n")
+        out.append(table(["document", "section", "excerpt"], [tuple(d) for d in docs]))
+    out.append("\n> Messages held in a DB2 message table, an ISPF message member or an online message file are "
+               "not literals in code; load an unload of that source to cover them.\n")
+    return "".join(out)
+
+
+# --------------------------------------------------------------------------
 # main
 # --------------------------------------------------------------------------
 
@@ -895,8 +1101,17 @@ def _main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Query atlas.db (markdown out, citations in).")
     ap.add_argument("--db", default="atlas.db")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for c in ("program", "job", "field", "literal", "dataset", "copybook"):
+    for c in ("program", "job", "field", "dataset", "copybook", "values"):
         sub.add_parser(c).add_argument("name")
+    s = sub.add_parser("literal")
+    s.add_argument("name")
+    s.add_argument("--field", help="only uses on this field (common values like 3 or 'M' appear everywhere)")
+    s.add_argument("--like", action="store_true", help="substring match instead of exact")
+    s = sub.add_parser("pair")
+    s.add_argument("a")
+    s.add_argument("b")
+    s.add_argument("--window", type=int, default=8)
+    sub.add_parser("messages").add_argument("pattern")
     for c in ("callers", "callees"):
         s = sub.add_parser(c)
         s.add_argument("name")
@@ -928,7 +1143,13 @@ def _main(argv: Optional[List[str]] = None) -> int:
         elif a.cmd == "field":
             print(cmd_field(conn, a.name))
         elif a.cmd == "literal":
-            print(cmd_literal(conn, a.name))
+            print(cmd_literal(conn, a.name, a.field, a.like))
+        elif a.cmd == "values":
+            print(cmd_values(conn, a.name))
+        elif a.cmd == "pair":
+            print(cmd_pair(conn, a.a, a.b, a.window))
+        elif a.cmd == "messages":
+            print(cmd_messages(conn, a.pattern))
         elif a.cmd == "dataset":
             print(cmd_dataset(conn, a.name))
         elif a.cmd == "copybook":

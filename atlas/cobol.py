@@ -507,6 +507,38 @@ def _extract_file_ops(f: ProgramFacts, st: LogicalLine) -> None:
         f.io_ops.append((m.group(2).upper(), "file", op, st.start))
 
 
+_SQL_PRED = re.compile(
+    r"\b([A-Z_][A-Z0-9_]*)\s*(?:=|<>|!=|>=|<=|>|<)\s*('(?:[^']|'')*'|[+-]?\d+(?:\.\d+)?)(?![A-Z0-9_])", re.IGNORECASE)
+_SQL_IN = re.compile(r"\b([A-Z_][A-Z0-9_]*)\s+(?:NOT\s+)?IN\s*\(([^)]*)\)", re.IGNORECASE)
+_SQL_INSERT = re.compile(r"\bINSERT\s+INTO\s+\S+\s*\(([^)]*)\)\s*VALUES\s*\(([^)]*)\)", re.IGNORECASE | re.S)
+_SQL_LIT = re.compile(r"'(?:[^']|'')*'|(?<![A-Z0-9_:])[+-]?\d+(?:\.\d+)?(?![A-Z0-9_])", re.IGNORECASE)
+
+
+def _sql_literals(f: ProgramFacts, inner: str, verb: str, ln: int) -> None:
+    """Column/literal pairs inside SQL: WHERE REL_CD = 3, GENDER_CD IN ('M','F'),
+    SET REL_CD = 4, INSERT ... VALUES. A value-domain change (a new code) has
+    to find these as surely as the COBOL IFs, and they are not COBOL."""
+    up = inner.upper()
+    where_at = up.find(" WHERE ")
+    for m in _SQL_PRED.finditer(inner):
+        col, lit = m.group(1).upper(), m.group(2)
+        if col in ("SELECT", "AND", "OR", "WHEN", "THEN", "ELSE", "SET"):
+            continue
+        ctx = "sql_set" if (verb == "UPDATE" and (where_at < 0 or m.start() < where_at)) else "sql_predicate"
+        f.literal_refs.append((_norm_lit(lit), ctx, col, ln))
+    for m in _SQL_IN.finditer(inner):
+        col = m.group(1).upper()
+        for lit in _SQL_LIT.findall(m.group(2)):
+            f.literal_refs.append((_norm_lit(lit), "sql_predicate", col, ln))
+    m = _SQL_INSERT.search(inner)
+    if m:
+        cols = [c.strip().upper() for c in m.group(1).split(",")]
+        vals = [v.strip() for v in re.split(r",(?=(?:[^']*'[^']*')*[^']*$)", m.group(2))]
+        for col, val in zip(cols, vals):
+            if _SQL_LIT.fullmatch(val):
+                f.literal_refs.append((_norm_lit(val), "sql_insert", col, ln))
+
+
 def _sql_host_modes(f: ProgramFacts, inner: str, ln: int) -> None:
     """Host variables after SELECT/FETCH ... INTO are WRITTEN by DB2; all
     others are read. This is how 'where does this field get populated' finds
@@ -532,6 +564,7 @@ def _extract_sql(f: ProgramFacts, st: LogicalLine) -> None:
         tables = sorted({t.upper() for t in _SQL_TABLE.findall(inner)})
         hvars = sorted({h.upper() for h in _SQL_HOSTVAR.findall(inner)})
         _sql_host_modes(f, inner, st.start)
+        _sql_literals(f, inner, verb.upper(), st.start)
         dynamic = bool(re.search(r"\b(PREPARE|EXECUTE\s+IMMEDIATE)\b", inner, re.IGNORECASE))
         f.sql.append(SqlFact(stmt_type=verb.upper(),
                              cursor_name=cur.group(1).upper() if cur else None,

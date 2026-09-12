@@ -38,7 +38,7 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as td:
         db = os.path.join(td, "smoke.db")
         r = run(["-m", "atlas.build", os.path.join(HERE, "tests", "fixtures"), "--db", db, "--rebuild", "--quiet"])
-        all_ok &= stage("smoke build", r.returncode == 0 and "programs 3" in r.stdout,
+        all_ok &= stage("smoke build", r.returncode == 0 and "programs 4" in r.stdout,
                         "" if r.returncode == 0 else (r.stderr.strip().splitlines() or ["?"])[-1])
 
         checks = [
@@ -49,6 +49,10 @@ def main() -> int:
             (["copybook", "PMASTREC"], ["SAMPPGM", "PROD.POLICY.EXTRACT", "*SORT*"]),
             (["callees", "SAMPPGM"], ["VALIDATE", "RATECALC", "NOT in index"]),
             (["coverage"], ["POLDCL", "scheduler definitions: 0"]),
+            (["values", "WS-REL-CD"], ["NOT DOCUMENTED BY ANY 88-LEVEL", "WS-REL-SON", "MEMBRVAL:33"]),
+            (["values", "WS-GENDER-CD"], ["via 88 WS-GENDER-MALE", "GENDER_CD"]),
+            (["pair", "WS-REL-CD", "WS-GENDER-CD"], ["MEMBRVAL:22", "MEMBRVAL:37"]),
+            (["messages", "GENDER"], ["GENDER MUST BE MALE FOR SON", "MEMBRVAL:29"]),
         ]
         for args, needles in checks:
             r = run(["-m", "atlas.query", "--db", db, *args])
