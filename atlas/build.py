@@ -27,8 +27,8 @@ import re
 import sqlite3
 import sys
 import time
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass, replace
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from . import classify, cobol, copybook, docs, expand, ims, jcl, reader, screens, txn
 from .reader import Line
@@ -121,18 +121,23 @@ def open_db(path: str, rebuild: bool = False) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA foreign_keys=ON")
-    with open(os.path.join(HERE, "schema.sql"), "r", encoding="utf-8") as fh:
-        conn.executescript(fh.read())
-    conn.executescript(EXTRA_SCHEMA)
+    # Views are re-created from the schema every time (their column lists
+    # grow); tables are evolved in place below.
+    conn.execute("DROP VIEW IF EXISTS v_dataset_flow")
     # Columns added after a db was first built: add them in place rather than
-    # forcing a rebuild of a 40,000-member index.
+    # forcing a rebuild of a 40,000-member index. Done BEFORE the schema runs
+    # so a view over a new column can be created on an old database.
     for table, col, decl in (("doc_section", "ordinal", "INTEGER"), ("doc_image", "extracted_path", "TEXT"),
                              ("doc_image", "ocr_text", "TEXT"), ("member", "system", "TEXT"),
                              ("step", "from_proc", "TEXT"), ("step", "parent_step", "TEXT"),
                              ("dd", "mode_source", "TEXT"), ("transaction_def", "group_name", "TEXT"),
                              ("transaction_def", "detail", "TEXT"), ("dd", "card_member", "TEXT"),
-                             ("dd", "is_temp", "INTEGER DEFAULT 0")):
+                             ("dd", "is_temp", "INTEGER DEFAULT 0"), ("step", "guard", "TEXT"),
+                             ("job", "joblib", "TEXT"), ("job", "job_cond", "TEXT"), ("job", "jcllib", "TEXT")):
         _ensure_column(conn, table, col, decl)
+    with open(os.path.join(HERE, "schema.sql"), "r", encoding="utf-8") as fh:
+        conn.executescript(fh.read())
+    conn.executescript(EXTRA_SCHEMA)
     return conn
 
 
@@ -359,41 +364,78 @@ def apply_manifest(ctx: Ctx, manifest_path: str) -> None:
 # copybook resolution
 # --------------------------------------------------------------------------
 
-def _member_text(ctx: Ctx, name: str, kinds: Tuple[str, ...]) -> Optional[str]:
-    for m in ctx.by_name.get(name.upper(), []):
-        if m.kind in kinds:
-            text, _d, _e = reader.load(m.path)
-            return text
-    return None
+def _pick_member(ctx: Ctx, cands: List[Mem], name: str, job_mem: Optional[Mem] = None,
+                 jcllib: Sequence[str] = ()) -> Tuple[Optional[Mem], Optional[str]]:
+    """Choose among same-named members the way the system would: a library
+    named in the job's JCLLIB ORDER first, then the job's own department
+    (member.system), then the manifest's authoritative copy. Two departments
+    each owning a PROC called NIGHTLY is normal; picking the wrong one
+    credits one department's datasets to the other's job. When nothing
+    separates two DIFFERENT copies, the choice is reported, not silent."""
+    if not cands:
+        return None, None
+    order = [x.upper() for x in jcllib]
+
+    def score(m: Mem) -> Tuple[int, int, int]:
+        lib = (m.library or "").upper()
+        return (order.index(lib) if lib in order else len(order),
+                0 if (job_mem is not None and m.system and m.system == job_mem.system) else 1,
+                0 if m.authoritative else 1)
+
+    cands = sorted(cands, key=score)
+    best = cands[0]
+    note = None
+    if len(cands) > 1 and score(cands[1]) == score(best) and cands[1].norm_sha != best.norm_sha:
+        note = (f"{name.upper()}: {len(cands)} different copies and no JCLLIB / department / manifest rule "
+                f"picks one - used {best.path}")
+    return best, note
 
 
-def _include_text(ctx: Ctx, name: str) -> Optional[str]:
+def _member_text(ctx: Ctx, name: str, kinds: Tuple[str, ...], job_mem: Optional[Mem] = None,
+                 jcllib: Sequence[str] = ()) -> Optional[str]:
+    cands = [m for m in ctx.by_name.get(name.upper(), []) if m.kind in kinds]
+    m, _note = _pick_member(ctx, cands, name, job_mem, jcllib)
+    if m is None:
+        return None
+    text, _d, _e = reader.load(m.path)
+    return text
+
+
+def _include_text(ctx: Ctx, name: str, job_mem: Optional[Mem] = None) -> Optional[str]:
     """`// INCLUDE MEMBER=X`: the member's records, spliced in by parse_jcl."""
-    return _member_text(ctx, name, ("jcl", "proc", "ctlcard", "unknown"))
+    return _member_text(ctx, name, ("jcl", "proc", "ctlcard", "unknown"), job_mem)
 
 
-def _card_text(ctx: Ctx, name: str) -> Optional[str]:
+def _card_text(ctx: Ctx, name: str, job_mem: Optional[Mem] = None) -> Optional[str]:
     """`//SYSIN DD DSN=PROD.PARMLIB(SRTCLM)`: the card member's text. Never a
     COBOL/copybook member of the same name - PARMLIB(CLMRPT2) is cards for
     CLMRPT2, not the program."""
-    return _member_text(ctx, name, ("ctlcard", "unknown", "sql", "jcl", "proc"))
+    return _member_text(ctx, name, ("ctlcard", "unknown", "sql", "jcl", "proc"), job_mem)
 
 
-def _proc_facts(ctx: Ctx, name: str) -> Optional[jcl.JclFacts]:
-    """Parsed cataloged PROC by name (cached), for expand_job."""
-    key = name.upper()
-    if key not in ctx.proc_cache:
-        facts = None
-        for m in ctx.by_name.get(key, []):
-            if m.kind in ("proc", "jcl"):
-                text, data, enc = reader.load(m.path)
-                f = jcl.parse_jcl(text, data, enc, include_lookup=lambda n: _include_text(ctx, n),
-                                  member_lookup=lambda n: _card_text(ctx, n))
-                if f.is_proc or m.kind == "proc":
-                    facts = f
-                    break
-        ctx.proc_cache[key] = facts
-    return ctx.proc_cache[key]
+def _parsed_proc(ctx: Ctx, m: Mem) -> Optional[jcl.JclFacts]:
+    """Parsed PROC member (cached per member): None when the member is a job."""
+    if m.id not in ctx.proc_cache:
+        text, data, enc = reader.load(m.path)
+        f = jcl.parse_jcl(text, data, enc, include_lookup=lambda n: _include_text(ctx, n, m),
+                          member_lookup=lambda n: _card_text(ctx, n, m))
+        ctx.proc_cache[m.id] = f if (f.is_proc or m.kind == "proc") else None
+    return ctx.proc_cache[m.id]
+
+
+def _proc_facts(ctx: Ctx, name: str, job_mem: Optional[Mem] = None,
+                job: Optional[jcl.JclFacts] = None) -> Optional[jcl.JclFacts]:
+    """Cataloged PROC by name for expand_job, chosen by the calling job's
+    JCLLIB ORDER and department; an undecidable choice is recorded on the
+    job as `ambiguous_proc`."""
+    cands = [m for m in ctx.by_name.get(name.upper(), []) if m.kind in ("proc", "jcl")
+             and _parsed_proc(ctx, m) is not None]
+    m, note = _pick_member(ctx, cands, name, job_mem, job.jcllib if job else ())
+    if m is None:
+        return None
+    if note and job is not None and ("ambiguous_proc", note, 0) not in job.unresolved:
+        job.unresolved.append(("ambiguous_proc", note, 0))
+    return _parsed_proc(ctx, m)
 
 
 def make_resolver(ctx: Ctx, prog: Mem, notes: List[Tuple[str, str, int]]):
@@ -632,8 +674,15 @@ def index_copybook(ctx: Ctx, mem: Mem) -> None:
 def index_jcl(ctx: Ctx, mem: Mem) -> None:
     conn = ctx.conn
     text, data, enc = reader.load(mem.path)
-    facts = jcl.parse_jcl(text, data, enc, include_lookup=lambda n: _include_text(ctx, n),
-                          member_lookup=lambda n: _card_text(ctx, n))
+    # One member may hold several JOB cards (a job stream): one job row each.
+    for facts in jcl.parse_jcl_all(text, data, enc, include_lookup=lambda n: _include_text(ctx, n, mem),
+                                   member_lookup=lambda n: _card_text(ctx, n, mem)):
+        _index_jcl_facts(ctx, mem, facts)
+    conn.execute("UPDATE member SET parse_status='ok' WHERE id=?", (mem.id,))
+
+
+def _index_jcl_facts(ctx: Ctx, mem: Mem, facts: jcl.JclFacts) -> None:
+    conn = ctx.conn
     job_id = proc_id = None
     if facts.is_proc or mem.kind == "proc":
         cur = conn.execute(
@@ -641,17 +690,20 @@ def index_jcl(ctx: Ctx, mem: Mem) -> None:
             (mem.id, facts.proc_name or mem.name, _j(facts.symbolics), 0, facts.job_line or 1))
         proc_id = cur.lastrowid
     else:
-        cur = conn.execute("INSERT INTO job(member_id,job_name,line) VALUES(?,?,?)",
-                           (mem.id, facts.job_name or mem.name, facts.job_line or 1))
+        cur = conn.execute(
+            "INSERT INTO job(member_id,job_name,line,joblib,job_cond,jcllib) VALUES(?,?,?,?,?,?)",
+            (mem.id, facts.job_name or mem.name, facts.job_line or 1,
+             _j([d.dsn_resolved or d.dsn for d in facts.job_dds if d.dd_name.upper() == "JOBLIB"]),
+             facts.job_cond, _j(facts.jcllib)))
         job_id = cur.lastrowid
 
     def insert_step(s: jcl.StepFact, ordinal: int, owner: Optional[Tuple[Optional[int], Optional[int]]] = None) -> int:
         jid, pid = owner if owner else (job_id, proc_id)
         cur = conn.execute(
             "INSERT INTO step(job_id,proc_id,ordinal,step_name,pgm,proc_called,effective_pgm,launcher,"
-            "parm,cond,from_proc,parent_step,line) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "parm,cond,from_proc,parent_step,guard,line) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (jid, pid, ordinal, s.step_name, s.pgm, s.proc_called, s.effective_pgm,
-             s.launcher, s.parm, s.cond, s.from_proc, s.parent_step, s.line))
+             s.launcher, s.parm, s.cond, s.from_proc, s.parent_step, s.guard, s.line))
         sid = cur.lastrowid
         conn.executemany(
             "INSERT INTO dd(step_id,dd_name,concat_seq,dsn,dsn_resolved,gdg_rel,disp,mode,mode_source,"
@@ -659,20 +711,29 @@ def index_jcl(ctx: Ctx, mem: Mem) -> None:
             [(sid, d.dd_name, d.concat_seq, d.dsn, d.dsn_resolved, d.gdg_rel, d.disp, d.mode,
               d.mode_source, d.sysin_text, int(d.is_override), d.card_member, int(d.is_temp), d.line)
              for d in s.dds])
-        for d in s.dds:
-            if d.dsn_resolved and not d.is_temp:
-                # &&TEMP is not a dataset of the estate: it cannot link two jobs.
-                base = d.dsn_resolved
-                conn.execute("INSERT OR IGNORE INTO dataset(dsn,is_gdg) VALUES(?,?)",
-                             (base, int(d.gdg_rel is not None)))
-                if d.gdg_rel is not None:
-                    conn.execute("UPDATE dataset SET is_gdg=1 WHERE dsn=?", (base,))
+        # Dataset rows come from JOB-level steps only. A bare PROC's rows carry
+        # its DEFAULT symbolics (TEST.CLM.MASTER) - names nobody runs - and
+        # &&TEMP is not a dataset of the estate: it cannot link two jobs.
+        if pid is None:
+            for d in s.dds:
+                if d.dsn_resolved and not d.is_temp:
+                    base = d.dsn_resolved
+                    conn.execute("INSERT OR IGNORE INTO dataset(dsn,is_gdg) VALUES(?,?)",
+                                 (base, int(d.gdg_rel is not None)))
+                    if d.gdg_rel is not None:
+                        conn.execute("UPDATE dataset SET is_gdg=1 WHERE dsn=?", (base,))
         kind = jcl.LAUNCHERS.get(s.launcher or "")
         ctl = "\n".join(d.sysin_text for d in s.dds if d.sysin_text)
         if kind == "sort":
             conn.executemany(
                 "INSERT INTO card_field_ref(step_id,card_kind,pos,length,fmt,raw) VALUES(?,?,?,?,?,?)",
                 [(sid, k, p, ln, fmt, raw) for (k, p, ln, fmt, raw) in jcl.sort_card_fields(ctl)])
+        if kind == "easytrieve":
+            # Easytrieve field definitions are byte positions: a copybook
+            # offset change must find them like sort cards.
+            conn.executemany(
+                "INSERT INTO card_field_ref(step_id,card_kind,pos,length,fmt,raw) VALUES(?,?,?,?,?,?)",
+                [(sid, k, p, ln, fmt, raw) for (k, p, ln, fmt, raw) in jcl.easytrieve_fields(ctl)])
         if kind == "idcams":
             # A VSAM file is born (DEFINE) or dies (DELETE) here; REPRO copies it.
             for op, name, mode in jcl.idcams_ops(ctl):
@@ -689,12 +750,20 @@ def index_jcl(ctx: Ctx, mem: Mem) -> None:
                     if op == "DEFINE GDG":
                         conn.execute("UPDATE dataset SET is_gdg=1 WHERE dsn=?", (name,))
         if kind in ("ftp", "ndm", "usssh"):
+            notes = "; ".join(s.notes)
+            direction = ("both" if "(out)" in notes and "(in)" in notes
+                         else "out" if "(out)" in notes else "in" if "(in)" in notes else None)
             conn.execute(
                 "INSERT INTO interface_edge(member_id,kind,detail,direction,line) VALUES(?,?,?,?,?)",
-                (mem.id, kind, "; ".join(s.notes)[:500], None, s.line))
+                (mem.id, kind, notes[:500], direction, s.line))
         if s.notes:
             conn.execute("UPDATE step SET parm=COALESCE(parm,'') || ' /* ' || ? || ' */' WHERE id=?",
                          ("; ".join(s.notes)[:300], sid))
+        # A second RUN PROGRAM(...) in the same SYSTSIN is a second program
+        # run by this step: its own row, same DDs, so `program X` finds it.
+        for k, extra in enumerate(s.also_runs, 2):
+            insert_step(replace(s, step_name=f"{s.step_name}#{k}", effective_pgm=extra, also_runs=[],
+                                notes=[f"{k}. RUN PROGRAM in the SYSTSIN of {s.step_name}"]), ordinal, owner)
         ctx.bump("steps:proc" if s.proc_called else "steps:launcher" if s.launcher else "steps:pgm")
         return sid
 
@@ -703,7 +772,8 @@ def index_jcl(ctx: Ctx, mem: Mem) -> None:
     # and expand_job writes that resolution back onto the job's step objects.
     effective: List[jcl.StepFact] = []
     if job_id is not None:
-        effective = jcl.expand_job(facts, lambda n: _proc_facts(ctx, n))
+        effective = jcl.expand_job(facts, lambda n: _proc_facts(ctx, n, mem, facts),
+                                   member_lookup=lambda n: _card_text(ctx, n, mem))
 
     for s in facts.steps:
         insert_step(s, s.ordinal)

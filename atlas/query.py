@@ -377,6 +377,8 @@ def cmd_job(conn: sqlite3.Connection, name: str) -> str:
         what = s["effective_pgm"] or (f"PROC {s['proc_called']}" if s["proc_called"] else "?")
         out.append(f"- runs **{what}**" + (f" (JCL says PGM={s['pgm']} - launcher)" if s["launcher"] else "")
                    + (f"; COND={s['cond']}" if s["cond"] else "") + "\n")
+        if s["guard"]:
+            out.append(f"- **runs only when** `{s['guard']}` - not the normal flow of the job\n")
         if s["parm"]:
             out.append(f"- PARM/notes: `{s['parm'][:200]}`\n")
         dds = conn.execute("SELECT * FROM dd WHERE step_id=? ORDER BY line, id", (s["id"],)).fetchall()
@@ -435,6 +437,13 @@ def cmd_job(conn: sqlite3.Connection, name: str) -> str:
     mids = []
     for j in jobs:
         out.append(f"\n## {j['member_name']}  `{j['path']}`" + ("  **[authoritative]**" if j["authoritative"] else "") + "\n")
+        if j["job_cond"]:
+            out.append(f"JOB card COND={j['job_cond']}: applies to every step below.\n")
+        if j["jcllib"]:
+            out.append("JCLLIB ORDER: " + ", ".join(_jl(j["jcllib"])) + " (PROCs and INCLUDEs are searched there first)\n")
+        if j["joblib"]:
+            out.append("JOBLIB: " + ", ".join(_jl(j["joblib"])) + " - the load libraries of every step without "
+                       "its own STEPLIB (shown per step as `[joblib]`)\n")
         inproc = conn.execute("SELECT proc_name FROM proc_def WHERE member_id=? AND instream=1 ORDER BY line",
                               (j["member_id"],)).fetchall()
         if inproc:
@@ -836,11 +845,34 @@ def cmd_dataset(conn: sqlite3.Connection, dsn: str) -> str:
     if hidden:
         out.append(f"> {hidden} row(s) for job-local `&&` datasets hidden - they never leave their job. "
                    f"Query the `&&NAME` itself, or `job <JOB>`, to see them.\n")
+    # A bare PROC's rows carry its DEFAULT symbolics (TEST.CLM.MASTER): shown
+    # only when no indexed job expands that PROC. A job step's own
+    # //PS.DD override is shown once, on the effective step, not also on the
+    # EXEC PROC= step itself.
+    expanded = {r[0].upper() for r in conn.execute("SELECT DISTINCT from_proc FROM step WHERE from_proc IS NOT NULL")}
+    kept, proc_hidden, ov_hidden = [], 0, 0
+    for r in rows:
+        if r["job_name"] is None and r["proc_name"] and r["proc_name"].upper() in expanded:
+            proc_hidden += 1
+            continue
+        if r["proc_called"] and r["job_id"] and conn.execute(
+                "SELECT 1 FROM step WHERE job_id=? AND parent_step=? LIMIT 1",
+                (r["job_id"], r["step_name"])).fetchone():
+            ov_hidden += 1
+            continue
+        kept.append(r)
+    rows = kept
+    if proc_hidden:
+        out.append(f"> {proc_hidden} row(s) from PROC members' default symbolics hidden: the jobs that "
+                   f"expand those PROCs are listed with the real names.\n")
     out.append(table(["dataset", "direction [source]", "system", "program", "job", "step", "gdg", "member"],
                      [(r["dsn"], f"{r['mode']} [{r['mode_source'] or ''}]".replace(" []", ""),
-                       r["system"] or "?", r["pgm"], r["job_name"], r["step_name"], r["gdg_rel"] or "",
-                       os.path.basename(r["path"] or ""))
+                       r["system"] or "?", r["pgm"],
+                       r["job_name"] or (f"(PROC {r['proc_name']} defaults - no indexed job runs it)"
+                                         if r["proc_name"] else ""),
+                       r["step_name"], r["gdg_rel"] or "", os.path.basename(r["path"] or ""))
                       for r in rows]))
+    # delete / alloc / none (IEFBR14 housekeeping) are not writers.
     writers = {r["system"] for r in rows if r["mode"] in ("output", "mod", "both", "create") and r["system"]}
     readers = {r["system"] for r in rows if r["mode"] in ("input", "both") and r["system"]}
     if writers and readers and writers != readers:

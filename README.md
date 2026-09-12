@@ -196,6 +196,30 @@ Three more shapes that production JCL has and toy JCL does not:
   `(+1)` reads the generation just created - it is not a second writer. A
   referback whose target does not exist is reported as `referback`.
 
+And the details that decide whether a job dossier is right or merely
+plausible: the operand field ends at the first blank (trailing comments
+are not part of a DSN), quoted PARMs continue at column 71, a member with
+two JOB cards is two jobs, `JOBLIB` reaches every step without its own
+STEPLIB (`[joblib]`), steps inside `// IF (S1.RC > 4) THEN` are marked
+**runs only when** and the JOB-card `COND` is shown, `PARM.PS010=` /
+`COND.PS020=` / bare `PARM=` on `EXEC PROC` reach the right PROC step,
+override concatenations replace entry by entry and `DD DUMMY` really
+removes the PROC's dataset, an `EXEC PROC=X,HLQ=` override never changes
+the job's own later steps, nested PROCs receive values not `&SYMBOL` text,
+`IEFBR14` steps `delete` / `alloc` and are never writers, `DUMMY` is the
+first operand (not a substring) and `NULLFILE` is DUMMY, TSO `CALL
+'LIB(PGM)'` and a second `RUN PROGRAM` are seen, `RUN PROGRAM(DSNTIAUL)`
+is a utility not an application, `ULU`/`UDR` regions name a **DBD** not a
+PSB, Easytrieve (`EZTPA00`) steps expose their files and byte-position
+fields, batch FTP reads `//INPUT` with the userid/password **redacted
+before storage** and `put`/`get` become dataset rows, Connect:Direct
+`SUBMIT PROC=` follows the process member, `PROD.G.G0012V00` joins its
+GDG, run-time symbols (`%%ODATE`, `&LYYMMDD`) become `<VAR>` and are
+reported. PROCs and INCLUDEs are resolved by the job's `JCLLIB ORDER`,
+then its department, then the manifest - two departments each owning a
+`NIGHTLY` PROC no longer cross - and an undecidable choice is reported as
+`ambiguous_proc`.
+
 Because of that, `dataset PROD.CLM.MASTER` lists the *jobs* that create and
 read it (`NIGHTJOB NIGHT.PS010`, direction with its source), not just a PROC
 with `&HLQ` in it. IDCAMS steps add `create` / `delete` / `input` / `output`

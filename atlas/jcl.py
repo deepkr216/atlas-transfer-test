@@ -51,11 +51,24 @@ LAUNCHERS = {
     "BPXBATCH": "usssh",
     "NDMCOPY": "ndm", "DMBATCH": "ndm",
     "FTP": "ftp",
+    "EZTPA00": "easytrieve", "EZTPLUS": "easytrieve",
+    "SAS": "sas", "SASHOST": "sas",
 }
+
+# IMS utilities that WRITE the database named in PARM=(ULU,util,dbd)
+_IMS_DBD_WRITERS = {"DFSURGL0", "DFSURRL0", "DFSURPR0"}
 
 _RUN_PROGRAM = re.compile(r"\bRUN\s+PROGRAM\s*\(\s*([A-Z0-9@#$]{1,8})\s*\)", re.IGNORECASE)
 _RUN_PLAN = re.compile(r"\bPLAN\s*\(\s*([A-Z0-9@#$]{1,8})\s*\)", re.IGNORECASE)
+_RUN_PARMS = re.compile(r"\bPARMS?\s*\(\s*'([^']*)'\s*\)", re.IGNORECASE)
 _DSN_SYSTEM = re.compile(r"\bDSN\s+SYSTEM\s*\(\s*([A-Z0-9@#$]{1,4})\s*\)", re.IGNORECASE)
+# TSO batch without DB2: CALL 'PROD.LOAD(CLMFIX)' 'parm'
+_TSO_CALL = re.compile(r"\bCALL\s+'([A-Z0-9@#$.]+)\(([A-Z0-9@#$]{1,8})\)'", re.IGNORECASE)
+# Values the scheduler or the system fills in at submit time: Control-M %%ODATE,
+# CA-7 #JI, TWS/OPC &OYYMMDD (caught as a residual & symbol).
+_SCHED_VAR = re.compile(r"%%[A-Z0-9$#@_]+\.?|#J[IO][A-Z0-9]*", re.IGNORECASE)
+# EXEC PROC= operands that are STEP overrides, qualified (PARM.PS1=) or bare.
+_STEP_KEYWORDS = {"PARM", "COND", "TIME", "REGION", "ACCT", "MEMLIMIT"}
 
 # DFSRRC00 PARM=(DLI,pgm,psb,...)  /  (BMP,pgm,psb,...)  /  (MPP,...)
 _IMS_PARM = re.compile(
@@ -112,6 +125,9 @@ class StepFact:
     from_proc: Optional[str] = None      # set on EFFECTIVE steps produced by expand_job
     parent_step: Optional[str] = None    # the job step whose EXEC PROC= produced it
     sym_overrides: Dict[str, str] = dc_field(default_factory=dict)   # EXEC PROC=X,SYM=value
+    step_overrides: Dict[str, str] = dc_field(default_factory=dict)  # PARM.PS1=, COND.PS2=, bare PARM= on EXEC PROC
+    guard: Optional[str] = None          # enclosing // IF (...) THEN / ELSE: the step runs only when true
+    also_runs: List[str] = dc_field(default_factory=list)            # 2nd.. RUN PROGRAM() in one SYSTSIN
 
 
 @dataclass
@@ -126,6 +142,9 @@ class JclFacts:
     set_symbols: Dict[str, str] = dc_field(default_factory=dict)     # instream SET only
     includes: List[str] = dc_field(default_factory=list)             # INCLUDE members spliced in
     instream_procs: Dict[str, "JclFacts"] = dc_field(default_factory=dict)   # // PROC ... // PEND inside a job
+    job_dds: List[DdFact] = dc_field(default_factory=list)           # JOBLIB / DDs coded before the first EXEC
+    jcllib: List[str] = dc_field(default_factory=list)               # // JCLLIB ORDER=(...) search order
+    job_cond: Optional[str] = None                                   # COND= on the JOB card: applies to every step
 
 
 # --------------------------------------------------------------------------
@@ -136,7 +155,19 @@ def parse_jcl(text: str, data: bytes = b"", enc: str = "utf-8",
               extra_symbols: Optional[Dict[str, str]] = None,
               include_lookup: Optional[Callable[[str], Optional[str]]] = None,
               member_lookup: Optional[Callable[[str], Optional[str]]] = None) -> JclFacts:
-    """Parse one JCL or PROC member.
+    """The first (normally the only) job or PROC in the member. See parse_jcl_all."""
+    return parse_jcl_all(text, data, enc, extra_symbols, include_lookup, member_lookup)[0]
+
+
+def parse_jcl_all(text: str, data: bytes = b"", enc: str = "utf-8",
+                  extra_symbols: Optional[Dict[str, str]] = None,
+                  include_lookup: Optional[Callable[[str], Optional[str]]] = None,
+                  member_lookup: Optional[Callable[[str], Optional[str]]] = None) -> List[JclFacts]:
+    """Parse one JCL or PROC member; one JclFacts per JOB card.
+
+    A member holding a job stream (JOBA then JOBB) yields two jobs - the
+    second JOB card never overwrites the first job's name with all steps
+    merged under it.
 
     include_lookup(name) -> text of an INCLUDE member (spliced in first).
     member_lookup(name)  -> text of a control-card member, for
@@ -147,9 +178,23 @@ def parse_jcl(text: str, data: bytes = b"", enc: str = "utf-8",
     if include_lookup is not None:
         text, included = _splice_includes(text, data, enc, include_lookup)
     stmts = read_jcl(text, data, enc)
+    groups: List[List[JclStatement]] = [[]]
+    for st in stmts:
+        if st.op == "JOB" and any(s.op == "JOB" for s in groups[-1]):
+            groups.append([])
+        groups[-1].append(st)
+    out: List[JclFacts] = []
+    for g in groups:
+        f = _parse_statements(g, extra_symbols, member_lookup)
+        f.includes = list(included)
+        out.append(f)
+    return out
+
+
+def _parse_statements(stmts: List[JclStatement], extra_symbols: Optional[Dict[str, str]],
+                      member_lookup: Optional[Callable[[str], Optional[str]]]) -> JclFacts:
     job = JclFacts(job_name=None, job_line=0, is_proc=False,
                    proc_name=None, symbolics=dict(extra_symbols or {}))
-    job.includes = included
 
     # EXEC/DD statements go to `target`: the member itself, or an instream
     # PROC (// PROC ... // PEND inside a job) while one is being collected.
@@ -159,11 +204,32 @@ def parse_jcl(text: str, data: bytes = b"", enc: str = "utf-8",
     ordinal = 0
     last_dd_name = ""
     concat_seq = 0
+    guards: List[str] = []        # enclosing // IF conditions, innermost last
 
     for st in stmts:
         if st.op == "JOB":
             job.job_name = st.name or None
             job.job_line = st.start
+            c = keyword_operands(st.operands).get("COND")
+            if c:
+                job.job_cond = c
+
+        elif st.op == "JCLLIB":
+            m = re.search(r"ORDER=\(?([^)]*)\)?", st.operands, re.IGNORECASE)
+            if m:
+                job.jcllib = [(_unquote(x.strip()) or "").upper() for x in m.group(1).split(",") if x.strip()]
+
+        elif st.op == "IF":
+            # `// IF (S1.RC > 4) THEN`: every step until ELSE/ENDIF runs only
+            # when this is true - error, backout and notify steps are not the
+            # normal flow of the job.
+            guards.append("IF " + re.sub(r"\s+THEN\s*$", "", st.operands.strip(), flags=re.IGNORECASE))
+        elif st.op == "ELSE":
+            if guards:
+                guards[-1] = "ELSE of " + guards[-1].replace("ELSE of ", "", 1)
+        elif st.op == "ENDIF":
+            if guards:
+                guards.pop()
 
         elif st.op == "PROC":
             if job.job_name is not None or job.steps:
@@ -185,7 +251,7 @@ def parse_jcl(text: str, data: bytes = b"", enc: str = "utf-8",
         elif st.op == "PEND":
             if inproc is not None:
                 for step in inproc.steps:
-                    _resolve_effective_pgm(step, inproc)
+                    _resolve_effective_pgm(step, inproc, member_lookup)
                 inproc = None
                 target, cur, ordinal = job, None, len(job.steps)
 
@@ -198,15 +264,26 @@ def parse_jcl(text: str, data: bytes = b"", enc: str = "utf-8",
         elif st.op == "EXEC":
             ordinal += 1
             cur = _build_step(st, ordinal, target)
+            if guards:
+                cur.guard = " AND ".join(guards)
             target.steps.append(cur)
             last_dd_name, concat_seq = "", 0
 
-        elif st.op == "DD" and cur is not None:
+        elif st.op == "DD":
             if st.name:
                 last_dd_name, concat_seq = st.name, 0
             else:
                 concat_seq += 1          # unnamed DD = concatenation
-            cur.dds.append(_build_dd(st, last_dd_name, concat_seq, target, member_lookup))
+            # A `&X` left in a JOB-level DSN is a run-time value (SET missing,
+            # scheduler or system symbol): reported. Overrides of PROC DDs are
+            # resolved again by expand_job with the PROC's symbolics, so they
+            # are not reported here.
+            report = target is job and not job.is_proc and not (cur is not None and cur.proc_called)
+            d = _build_dd(st, last_dd_name, concat_seq, target, member_lookup, report_vars=report)
+            if cur is not None:
+                cur.dds.append(d)
+            elif target is job:
+                job.job_dds.append(d)    # JOBLIB / JOBCAT: coded before the first EXEC
 
         elif st.op == "INCLUDE":
             m = keyword_operands(st.operands).get("MEMBER")
@@ -216,11 +293,25 @@ def parse_jcl(text: str, data: bytes = b"", enc: str = "utf-8",
     # Second pass: now that every DD is attached, unwrap the launchers and
     # resolve referbacks that point at earlier steps of this member.
     for step in job.steps:
-        _resolve_effective_pgm(step, job)
+        _resolve_effective_pgm(step, job, member_lookup)
+    _apply_joblib(job.steps, job.job_dds)
     _resolve_referbacks(job.steps, job, report=not any(s.proc_called for s in job.steps))
     for p in job.instream_procs.values():
         _resolve_referbacks(p.steps, p, report=False)
     return job
+
+
+def _apply_joblib(steps: List[StepFact], job_dds: List[DdFact]) -> None:
+    """A step without STEPLIB loads its program from JOBLIB: copy those DDs
+    onto the step (mode_source 'joblib') so "which load library - which
+    compiled version - ran" is answerable per step."""
+    joblib = [d for d in job_dds if d.dd_name.upper() == "JOBLIB"]
+    if not joblib:
+        return
+    for s in steps:
+        if s.proc_called or any(d.dd_name.upper() == "STEPLIB" for d in s.dds):
+            continue
+        s.dds.extend(replace(d, mode_source="joblib", is_override=False) for d in joblib)
 
 
 # --------------------------------------------------------------------------
@@ -239,25 +330,43 @@ def _build_step(st: JclStatement, ordinal: int, facts: JclFacts) -> StepFact:
         if positional:
             proc_called = positional[0]
 
-    # Any other KEY=VALUE on an EXEC PROC= is a symbolic override for that step.
+    # On an EXEC PROC=: PARM.PS1= / COND.PS2= / bare PARM= are STEP overrides
+    # (applied to the PROC's steps by expand_job); any other KEY=VALUE is a
+    # symbolic override. Neither leaks into the job's own later steps - an
+    # override lives inside the PROC call only.
     overrides: Dict[str, str] = {}
+    step_ov: Dict[str, str] = {}
     if proc_called:
         for k, v in kw.items():
-            if k not in _EXEC_KEYWORDS:
+            head = k.split(".")[0]
+            if head in _STEP_KEYWORDS:
+                step_ov[k] = (_unquote(v) or "") if head == "PARM" else v
+            elif k not in _EXEC_KEYWORDS:
                 overrides[k] = _unquote(v) or ""
-                facts.symbolics[k] = _unquote(v) or ""
+
+    parm = _unquote(kw.get("PARM", "")) or None
+    pgm_s = _unquote(pgm) if pgm else None
+    if not facts.is_proc:
+        # A job's SET symbols apply to its own PARM/PGM (`PARM='&RUNDT'`,
+        # `PGM=DFSRRC00,PARM='DLI,&PGM,&PSB'`). PROC members keep the raw
+        # text: expand_job substitutes with the calling job's values.
+        if parm:
+            parm = substitute_symbols(parm, facts.symbolics)
+        if pgm_s:
+            pgm_s = substitute_symbols(pgm_s, facts.symbolics)
 
     return StepFact(
         ordinal=ordinal,
         step_name=st.name or f"STEP{ordinal:03d}",
-        pgm=_unquote(pgm) if pgm else None,
+        pgm=pgm_s,
         proc_called=_unquote(proc_called) if proc_called else None,
         effective_pgm=None,
         launcher=None,
-        parm=_unquote(kw.get("PARM", "")) or None,
+        parm=parm,
         cond=kw.get("COND"),
         line=st.start,
         sym_overrides=overrides,
+        step_overrides=step_ov,
     )
 
 
@@ -267,7 +376,8 @@ _NOT_CARD_DDS = {"STEPLIB", "JOBLIB", "SYSLMOD", "SYSLIB", "DFSRESLB", "IMSACB"}
 
 def _build_dd(st: JclStatement, dd_name: str, concat_seq: int,
               facts: JclFacts,
-              member_lookup: Optional[Callable[[str], Optional[str]]] = None) -> DdFact:
+              member_lookup: Optional[Callable[[str], Optional[str]]] = None,
+              report_vars: bool = False) -> DdFact:
     kw = keyword_operands(st.operands)
     raw_dsn = kw.get("DSN") or kw.get("DSNAME")
     disp = kw.get("DISP")
@@ -282,6 +392,16 @@ def _build_dd(st: JclStatement, dd_name: str, concat_seq: int,
         referback = dsn
     elif dsn:
         resolved = substitute_symbols(dsn, facts.symbolics)
+        if not facts.is_proc:
+            # Job level: a symbol still unresolved here is filled in at
+            # submit time (missing SET, scheduler %%ODATE / &LYYMMDD, system
+            # symbol). Normalised to <VAR> so writer and reader of a
+            # date-stamped extract still join; the raw text is kept in `dsn`.
+            resolved, found = _variables(resolved)
+            if report_vars:
+                for kind, tok in found:
+                    facts.unresolved.append((kind, f"{dd_name}: {tok} in {dsn} is supplied at run time "
+                                                   f"(SET / scheduler / system symbol), not by this JCL", st.start))
         resolved, gdg = _strip_gdg(resolved)
         # &&TEMP lives only between the steps of THIS job. It is not a dataset
         # another job can read, so it must never join two jobs' lineage.
@@ -322,7 +442,7 @@ def _build_dd(st: JclStatement, dd_name: str, concat_seq: int,
 
 
 # DD names whose direction is fixed by the utility that reads them.
-_INPUT_DDS = {"SORTIN", "SYSUT1", "INFILE", "SYSIN", "SYSTSIN", "STEPLIB", "JOBLIB",
+_INPUT_DDS = {"SORTIN", "SYSUT1", "INFILE", "SYSIN", "SYSTSIN", "STEPLIB", "JOBLIB", "TOOLIN", "SYMNAMES",
               "SYSLIB", "IMSACB", "DFSRESLB", "DFSVSAMP", "IEFRDER", "SYSLMOD"}
 _OUTPUT_DDS = {"SORTOUT", "SYSUT2", "OUTFILE", "SYSPRINT", "SYSOUT", "SYSUDUMP",
                "SYSABEND", "CEEDUMP"}
@@ -350,7 +470,12 @@ def _direction(dd_name: str, gdg: Optional[str], disp: Optional[str],
     up = (operands or "").upper()
     if "SYSOUT=" in up:
         return "sysout", "sysout"
-    if "DUMMY" in up:
+    # DUMMY is the first positional operand, never a substring: a dataset
+    # named PROD.CLM.DUMMY.FILE is real. DSN=NULLFILE is DUMMY's synonym.
+    toks = split_operands(operands or "")
+    if toks and toks[0].strip().upper() == "DUMMY":
+        return "dummy", "dummy"
+    if re.search(r"\bDSN(?:AME)?=NULLFILE\b", up):
         return "dummy", "dummy"
 
     if gdg is not None:
@@ -376,10 +501,18 @@ def _direction(dd_name: str, gdg: Optional[str], disp: Optional[str],
     return "unknown", "undetermined"
 
 
+_GDG_ABS = re.compile(r"\.G(\d{4})V(\d{2})$", re.IGNORECASE)
+
+
 def _strip_gdg(dsn: str) -> Tuple[str, Optional[str]]:
     m = _GDG_REL.search(dsn)
     if m:
         return _GDG_REL.sub("", dsn).strip(), m.group(1)
+    # Absolute generation PROD.G.G0012V00 (restart/rerun JCL) is the same
+    # GDG as PROD.G(0): the rerun job is a reader of the GDG.
+    m = _GDG_ABS.search(dsn)
+    if m:
+        return dsn[:m.start()], f"G{m.group(1)}V{m.group(2)}"
     return dsn, None
 
 
@@ -412,7 +545,8 @@ def substitute_symbols(value: str, symbols: Dict[str, str], depth: int = 0) -> s
 # the important bit: what actually runs
 # --------------------------------------------------------------------------
 
-def _resolve_effective_pgm(step: StepFact, facts: JclFacts) -> None:
+def _resolve_effective_pgm(step: StepFact, facts: JclFacts,
+                           member_lookup: Optional[Callable[[str], Optional[str]]] = None) -> None:
     pgm = (step.pgm or "").upper()
     if not pgm:
         step.effective_pgm = None
@@ -430,17 +564,34 @@ def _resolve_effective_pgm(step: StepFact, facts: JclFacts) -> None:
     if kind == "tso":
         sysin = _dd_text(step, "SYSTSIN")
         if sysin:
-            m = _RUN_PROGRAM.search(sysin)
-            if m:
-                step.effective_pgm = m.group(1).upper()
+            runs = list(_RUN_PROGRAM.finditer(sysin))
+            call = _TSO_CALL.search(sysin)
+            if runs:
+                step.effective_pgm = runs[0].group(1).upper()
                 plan = _RUN_PLAN.search(sysin)
                 sub = _DSN_SYSTEM.search(sysin)
+                parms = _RUN_PARMS.search(sysin)
                 if plan:
                     step.notes.append(f"DB2 plan {plan.group(1).upper()}")
                 if sub:
                     step.notes.append(f"DB2 subsystem {sub.group(1).upper()}")
+                if parms:
+                    step.notes.append(f"RUN PARMS('{parms.group(1)[:80]}')")
+                # Two RUN PROGRAMs in one DSN session: both run, in order.
+                step.also_runs = [r.group(1).upper() for r in runs[1:]]
+                if step.also_runs:
+                    step.notes.append("also runs " + ", ".join(step.also_runs) + " in the same DSN session")
+                if LAUNCHERS.get(step.effective_pgm) == "db2util":
+                    # RUN PROGRAM(DSNTIAUL): a utility, not an application;
+                    # the SQL in SYSIN says which tables it unloads/runs.
+                    step.effective_pgm = f"*{step.effective_pgm}*"
+                    step.notes.append("DB2 utility: tables come from the SQL in SYSIN")
                 return
-            step.notes.append("TSO step with no RUN PROGRAM(...) - may be TSO commands only")
+            if call:
+                step.effective_pgm = call.group(2).upper()
+                step.notes.append(f"TSO CALL from library {call.group(1).upper()}")
+                return
+            step.notes.append("TSO step with no RUN PROGRAM(...) / CALL - may be TSO commands only")
         facts.unresolved.append(
             ("launcher_parm", f"{step.step_name}: IKJEFT01 program not found in SYSTSIN", step.line))
 
@@ -448,13 +599,48 @@ def _resolve_effective_pgm(step: StepFact, facts: JclFacts) -> None:
         parm = step.parm or ""
         m = _IMS_PARM.search(parm)
         if m:
+            region = m.group(1).upper()
             step.effective_pgm = m.group(2).upper()
-            if m.group(3):
+            if region in ("ULU", "UDR") and m.group(3):
+                # Utility regions name a DATABASE in the third position, not
+                # a PSB: image copy / unload / reload jobs belong to the DBD.
+                dbd = m.group(3).upper()
+                step.notes.append(f"DBD {dbd} (utility region {region}: the third value is the database, not a PSB)")
+                mode = "output" if step.effective_pgm in _IMS_DBD_WRITERS else "input"
+                step.dds.append(DdFact(dd_name="*DBD*", concat_seq=0, dsn=dbd, dsn_resolved=dbd, gdg_rel=None,
+                                       disp=None, mode=mode, mode_source="ims_utility", sysin_text=None,
+                                       is_override=False, line=step.line))
+            elif m.group(3):
                 step.notes.append(f"PSB {m.group(3).upper()}")
-            step.notes.append(f"IMS region type {m.group(1).upper()}")
+            step.notes.append(f"IMS region type {region}")
             return
         facts.unresolved.append(
             ("launcher_parm", f"{step.step_name}: DFSRRC00 PARM not parseable: {parm!r}", step.line))
+
+    elif kind == "easytrieve":
+        # The program IS the SYSIN text: FILE statements name the DDs and the
+        # field definitions are byte positions, like sort cards.
+        member = next((d.card_member for d in step.dds if d.dd_name.upper().endswith("SYSIN") and d.card_member), None)
+        step.effective_pgm = f"*EZT:{member}*" if member else "*EASYTRIEVE*"
+        ctl = _dd_text(step, "SYSIN")
+        if ctl:
+            roles = easytrieve_dds(ctl)
+            for i, d in enumerate(step.dds):
+                r = roles.get(d.dd_name.upper())
+                if r and d.mode not in ("sysout", "dummy"):
+                    step.dds[i] = replace(d, mode=r, mode_source="easytrieve_file")
+            step.notes.append("Easytrieve program in SYSIN: files and byte-position fields harvested")
+        else:
+            facts.unresolved.append(
+                ("launcher_parm", f"{step.step_name}: Easytrieve with no SYSIN program text", step.line))
+
+    elif kind == "sas":
+        step.effective_pgm = "*SAS*"
+        if _dd_text(step, "SYSIN"):
+            step.notes.append("SAS program in SYSIN (not parsed: DD roles from DISP/OPEN only)")
+        else:
+            facts.unresolved.append(
+                ("launcher_parm", f"{step.step_name}: SAS with no SYSIN program text", step.line))
 
     elif kind == "sort":
         step.effective_pgm = "*SORT*"
@@ -484,6 +670,18 @@ def _resolve_effective_pgm(step: StepFact, facts: JclFacts) -> None:
     elif kind == "noop":
         step.effective_pgm = "*NOOP*"
         step.notes.append("IEFBR14: the DD statements do the work (allocate/delete)")
+        # The cleanup step is not a writer: DISP=(MOD,DELETE) deletes,
+        # DISP=(NEW,CATLG) allocates an empty dataset, anything else does nothing.
+        for i, d in enumerate(step.dds):
+            if not d.dsn or d.mode in ("sysout", "dummy"):
+                continue
+            status, normal = _disp_parts(d.disp)
+            if status != "NEW" and normal == "DELETE":
+                step.dds[i] = replace(d, mode="delete", mode_source="iefbr14_disp")
+            elif status == "NEW" and normal in ("CATLG", "KEEP"):
+                step.dds[i] = replace(d, mode="alloc", mode_source="iefbr14_disp")
+            else:
+                step.dds[i] = replace(d, mode="none", mode_source="iefbr14_disp")
 
     elif kind == "db2util":
         step.effective_pgm = f"*{pgm}*"
@@ -496,11 +694,63 @@ def _resolve_effective_pgm(step: StepFact, facts: JclFacts) -> None:
         # direction and file names live in the SYSIN / process cards, so the
         # cards are the fact and the step is recorded as an interface.
         step.effective_pgm = f"*{kind.upper()}*"
-        ctl = _dd_text(step, "SYSIN") or _dd_text(step, "STDIN") or ""
         step.notes.append(f"external interface via {pgm}")
-        for m in re.finditer(r"\b(?:open|SNODE=|PNODE=|host|put|get|send|receive)\b\s*[=(]?\s*([^\s,()]+)",
-                             ctl, re.IGNORECASE):
-            step.notes.append(f"interface detail: {m.group(0).strip()[:60]}")
+        # Batch FTP reads //INPUT by default; credentials in those cards must
+        # never reach a pack.
+        for i, d in enumerate(step.dds):
+            if d.sysin_text and d.dd_name.upper().split(".")[-1] in ("INPUT", "SYSIN", "STDIN", "NETRC"):
+                step.dds[i] = replace(d, sysin_text=_redact_credentials(d.sysin_text, kind))
+        ctl = _dd_text(step, "SYSIN") or _dd_text(step, "INPUT") or _dd_text(step, "STDIN") or ""
+        if kind == "ftp":
+            host = (step.parm or "").strip().split()[0].strip("'(") if (step.parm or "").strip() else ""
+            if host and not host.startswith("("):
+                step.notes.append(f"FTP host {host}")
+            for m in re.finditer(r"^\s*(m?put|m?get|send|recv)\s+(\S+)(?:\s+(\S+))?", ctl, re.IGNORECASE | re.MULTILINE):
+                verb = m.group(1).lower()
+                out = verb.endswith("put") or verb == "send"
+                # put 'MVS.DSN' remote  /  get remote 'MVS.DSN'
+                mvs = m.group(2) if out else (m.group(3) or m.group(2))
+                mvs = mvs.strip("'\"").upper()
+                if "/" in mvs or "." not in mvs:          # a remote path, not an MVS name
+                    step.notes.append(f"FTP {verb} {m.group(2)[:40]} ({'out' if out else 'in'})")
+                    continue
+                step.dds.append(DdFact(dd_name="*FTP*", concat_seq=0, dsn=mvs, dsn_resolved=mvs, gdg_rel=None,
+                                       disp=None, mode="input" if out else "output",
+                                       mode_source="ftp_put" if out else "ftp_get", sysin_text=None,
+                                       is_override=False, line=step.line))
+                step.notes.append(f"FTP {verb} {mvs} -> {host or 'peer'} ({'out' if out else 'in'})"
+                                  if out else f"FTP {verb} {mvs} <- {host or 'peer'} (in)")
+        elif kind == "ndm":
+            # DMBATCH SUBMIT PROC=X: the process member holds the COPY FROM/TO.
+            for m in re.finditer(r"\bSUBMIT\s+PROC=([A-Z0-9@#$]{1,8})", ctl, re.IGNORECASE):
+                body = member_lookup(m.group(1).upper()) if member_lookup else None
+                if body is not None:
+                    ctl += "\n" + body
+                    step.notes.append(f"Connect:Direct process {m.group(1).upper()} read from its member")
+                else:
+                    facts.unresolved.append(("ndm_process", f"{step.step_name}: Connect:Direct process member "
+                                                            f"{m.group(1).upper()} not indexed", step.line))
+            for m in re.finditer(r"\b(SNODE|PNODE)\s*=\s*([A-Z0-9@#$.-]+)", ctl, re.IGNORECASE):
+                step.notes.append(f"Connect:Direct {m.group(1).upper()} {m.group(2)}")
+            for m in re.finditer(r"\b(FROM|TO)\s*\(([^)]*)\)", ctl, re.IGNORECASE | re.S):
+                out = m.group(1).upper() == "FROM"       # FROM here = the mainframe file is read and sent
+                for dm in re.finditer(r"DSN\s*=\s*'?([A-Z0-9@#$.]+(?:\([^)]*\))?)'?", m.group(2), re.IGNORECASE):
+                    dsn = dm.group(1).upper()
+                    step.dds.append(DdFact(dd_name="*NDM*", concat_seq=0, dsn=dsn, dsn_resolved=dsn, gdg_rel=None,
+                                           disp=None, mode="input" if out else "output",
+                                           mode_source="ndm_process", sysin_text=None, is_override=False,
+                                           line=step.line))
+                    step.notes.append(f"Connect:Direct {'sends' if out else 'receives'} {dsn} ({'out' if out else 'in'})")
+            for m in re.finditer(r"&DSN\s*=\s*'?([A-Z0-9@#$.]+)'?", ctl, re.IGNORECASE):
+                dsn = m.group(1).upper()
+                if not any(d.dsn_resolved == dsn for d in step.dds):
+                    step.dds.append(DdFact(dd_name="*NDM*", concat_seq=0, dsn=dsn, dsn_resolved=dsn, gdg_rel=None,
+                                           disp=None, mode="unknown", mode_source="ndm_symbolic", sysin_text=None,
+                                           is_override=False, line=step.line))
+                    step.notes.append(f"Connect:Direct process parameter &DSN={dsn} (direction in the process)")
+        else:
+            for m in re.finditer(r"\b(?:open|host|put|get|send|receive)\b\s*[=(]?\s*([^\s,()]+)", ctl, re.IGNORECASE):
+                step.notes.append(f"interface detail: {m.group(0).strip()[:60]}")
         if not ctl:
             facts.unresolved.append(
                 ("launcher_parm", f"{step.step_name}: {pgm} with no inline cards - "
@@ -523,6 +773,105 @@ def _unquote(v: Optional[str]) -> Optional[str]:
     if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
         return v[1:-1]
     return v
+
+
+def _variables(resolved: str) -> Tuple[str, List[Tuple[str, str]]]:
+    """Replace run-time values in a DSN with <VAR>: scheduler tokens
+    (%%ODATE, #JI) and any &SYM that survived substitution. Returns the
+    normalised name and (unresolved kind, token) pairs. &&TEMP is untouched."""
+    found: List[Tuple[str, str]] = []
+
+    def sched(m: "re.Match[str]") -> str:
+        found.append(("scheduler_symbol", m.group(0)))
+        return "<VAR>"
+
+    def sym(m: "re.Match[str]") -> str:
+        found.append(("symbolic", m.group(0)))
+        return "<VAR>"
+
+    s = _SCHED_VAR.sub(sched, resolved)
+    s = _SYMBOL.sub(sym, s)
+    s = re.sub(r"(?:<VAR>)+", "<VAR>", s)
+    return s, found
+
+
+def _disp_parts(disp: Optional[str]) -> Tuple[str, str]:
+    """(status, normal disposition) with JCL defaults: status NEW when omitted,
+    normal DELETE for NEW and KEEP otherwise."""
+    parts = [p.strip().upper() for p in (disp or "").strip().strip("()").split(",")]
+    status = parts[0] if parts and parts[0] else "NEW"
+    normal = parts[1] if len(parts) > 1 and parts[1] else ("DELETE" if status == "NEW" else "KEEP")
+    return status, normal
+
+
+_EZT_FILE = re.compile(r"^\s*FILE\s+([A-Z0-9@#$-]{1,8})\b(.*)$", re.IGNORECASE | re.MULTILINE)
+_EZT_JOBIN = re.compile(r"^\s*JOB\s+INPUT\s*\(?\s*([A-Z0-9@#$-]{1,8})", re.IGNORECASE | re.MULTILINE)
+_EZT_PUT = re.compile(r"^\s*PUT\s+([A-Z0-9@#$-]{1,8})", re.IGNORECASE | re.MULTILINE)
+_EZT_GET = re.compile(r"^\s*GET\s+([A-Z0-9@#$-]{1,8})", re.IGNORECASE | re.MULTILINE)
+# `  CLM-STAT  25  2  A` : name, start byte, length, type (A/N/P/B/W/K/U)
+_EZT_FIELD = re.compile(r"^\s+([A-Z0-9@#$:-]{1,40})\s+(\d{1,5})\s+(\d{1,5})\s+([ANPBWKU])\b(.*)$",
+                        re.IGNORECASE | re.MULTILINE)
+
+
+def easytrieve_dds(text: str) -> Dict[str, str]:
+    """DD name -> input|output from an Easytrieve program: JOB INPUT / GET
+    read, PUT and FILE ... PRINTER write."""
+    roles: Dict[str, str] = {}
+    for m in _EZT_FILE.finditer(text):
+        if re.search(r"\bPRINTER\b", m.group(2), re.IGNORECASE):
+            roles[m.group(1).upper()] = "output"
+        else:
+            roles.setdefault(m.group(1).upper(), "unknown")
+    for rx, role in ((_EZT_JOBIN, "input"), (_EZT_GET, "input"), (_EZT_PUT, "output")):
+        for m in rx.finditer(text):
+            name = m.group(1).upper()
+            if name != "NULL":
+                roles[name] = role if roles.get(name) in (None, "unknown") or roles[name] == role else "both"
+    return roles
+
+
+def easytrieve_fields(text: str) -> List[Tuple[str, int, int, str, str]]:
+    """(card_kind, pos, length, fmt, raw) for Easytrieve field definitions -
+    the same shape as sort cards, so a copybook offset change finds them."""
+    out: List[Tuple[str, int, int, str, str]] = []
+    fmt = {"A": "CH", "N": "ZD", "P": "PD", "B": "BI", "W": "CH", "K": "CH", "U": "CH"}
+    for m in _EZT_FIELD.finditer(text):
+        raw = m.group(0).strip()
+        if raw.upper().startswith(("FILE ", "JOB ", "IF ", "PRINT ", "REPORT ", "LINE ", "TITLE ")):
+            continue
+        out.append(("EZT", int(m.group(2)), int(m.group(3)), fmt.get(m.group(4).upper(), m.group(4).upper()), raw))
+    return out
+
+
+_FTP_CMDS = {"ascii", "binary", "bin", "cd", "lcd", "put", "get", "mput", "mget", "quit", "bye", "close", "open",
+             "dir", "ls", "delete", "rename", "site", "locsite", "sendsite", "quote", "passive", "epsv4", "pwd",
+             "type", "mode", "struct", "prompt", "verbose", "sunique", "append", "mkdir", "rmdir", "cwd", "ebcdic"}
+
+
+def _redact_credentials(text: str, kind: str) -> str:
+    """Batch FTP cards carry the userid and password as bare lines, and
+    Connect:Direct SIGNON carries them in parentheses. A pack of this step
+    would otherwise paste them into a model. The shape is kept, the values
+    are not."""
+    out: List[str] = []
+    for ln in text.splitlines():
+        s = ln.strip()
+        low = s.lower()
+        if kind == "ftp":
+            if re.match(r"^(user|pass|password|acct|account)\b", low):
+                out.append(s.split()[0] + " <redacted>")
+                continue
+            if s and " " not in s and low not in _FTP_CMDS and not s.startswith(("'", ";", "*")):
+                out.append("<redacted>")            # bare userid / password lines
+                continue
+        elif kind == "ndm":
+            if "SIGNON" in s.upper():
+                out.append(re.sub(r"(USERID|PASS(?:WORD)?|PACCT|SACCT)\s*=\s*\([^)]*\)", r"\1=(<redacted>)",
+                                  re.sub(r"(USERID|PASS(?:WORD)?)\s*=\s*[^\s,()]+", r"\1=<redacted>", s,
+                                         flags=re.IGNORECASE), flags=re.IGNORECASE))
+                continue
+        out.append(ln)
+    return "\n".join(out)
 
 
 # --------------------------------------------------------------------------
@@ -647,7 +996,8 @@ def _splice_includes(text: str, data: bytes, enc: str,
 # --------------------------------------------------------------------------
 
 def expand_job(job: JclFacts, proc_lookup: Callable[[str], Optional["JclFacts"]],
-               depth: int = 0, max_depth: int = 5) -> List[StepFact]:
+               depth: int = 0, max_depth: int = 5,
+               member_lookup: Optional[Callable[[str], Optional[str]]] = None) -> List[StepFact]:
     """Effective steps of a job: every EXEC PROC= replaced by the PROC's steps,
     with symbolics resolved in JCL precedence (EXEC overrides > instream SET >
     PROC defaults) and //PROCSTEP.DDNAME overrides and additions applied.
@@ -657,6 +1007,7 @@ def expand_job(job: JclFacts, proc_lookup: Callable[[str], Optional["JclFacts"]]
     where the datasets are. Unresolved symbolics are reported, not hidden.
     """
     out: List[StepFact] = []
+    proc_names_seen = set()
     for s in job.steps:
         if not s.proc_called:
             out.append(s)
@@ -669,45 +1020,72 @@ def expand_job(job: JclFacts, proc_lookup: Callable[[str], Optional["JclFacts"]]
             job.unresolved.append(("missing_proc", f"{s.step_name}: PROC {s.proc_called} not found", s.line))
             out.append(s)
             continue
+        proc_names_seen.add(s.proc_called.upper())
 
         symbols: Dict[str, str] = dict(proc.symbolics)
         symbols.update(job.set_symbols)
-        symbols.update(s.sym_overrides)
+        # `EXEC INNER,HLQ=&HLQ` passes the enclosing value, not the text '&HLQ'.
+        ov_syms = {k: substitute_symbols(v, symbols) for k, v in s.sym_overrides.items()}
+        symbols.update(ov_syms)
 
         # //PROCSTEP.DDNAME overrides; an unqualified DD after EXEC PROC=
-        # applies to the FIRST step of the PROC (JCL rule).
+        # applies to the FIRST step of the PROC (JCL rule). Keyed by
+        # concatenation entry: the n-th override entry replaces the n-th
+        # PROC entry, extra entries are appended, the rest stay.
         first = proc.steps[0].step_name.upper()
-        ov: Dict[Tuple[str, str], DdFact] = {}
+        ov: Dict[Tuple[str, str, int], DdFact] = {}
         for d in s.dds:
             if "." in d.dd_name:
                 ps_name, dn = d.dd_name.upper().split(".", 1)
             else:
                 ps_name, dn = first, d.dd_name.upper()
-            ov[(ps_name, dn)] = d
+            ov[(ps_name, dn, d.concat_seq)] = d
         used: set = set()
+        so = s.step_overrides
 
         for ps in proc.steps:
+            psn = ps.step_name.upper()
             eff = replace(ps,
                           step_name=f"{s.step_name}.{ps.step_name}",
                           from_proc=s.proc_called.upper(), parent_step=s.step_name,
                           dds=[], notes=[],            # re-derived below by _resolve_effective_pgm
                           parm=substitute_symbols(ps.parm, symbols) if ps.parm else ps.parm,
                           pgm=substitute_symbols(ps.pgm, symbols) if ps.pgm else ps.pgm,
-                          sym_overrides=dict(ps.sym_overrides))
+                          guard=" AND ".join(g for g in (s.guard, ps.guard) if g) or None,
+                          sym_overrides=dict(ps.sym_overrides), step_overrides={}, also_runs=[])
+            # PARM.PS= replaces that step's PARM; a bare PARM= replaces the
+            # FIRST step's and nullifies the others' (JCL rule); COND.PS= /
+            # bare COND= likewise for the condition.
+            if f"PARM.{psn}" in so:
+                eff.parm = so[f"PARM.{psn}"] or None
+            elif "PARM" in so:
+                eff.parm = (so["PARM"] or None) if psn == first else None
+            if f"COND.{psn}" in so:
+                eff.cond = so[f"COND.{psn}"]
+            elif "COND" in so:
+                eff.cond = so["COND"]
+
             for d in ps.dds:
-                key = (ps.step_name.upper(), d.dd_name.upper())
+                key = (psn, d.dd_name.upper(), d.concat_seq)
                 o = ov.get(key)
                 if o is not None:
                     used.add(key)
-                    nd = replace(d, dsn=o.dsn or d.dsn, disp=o.disp or d.disp,
-                                 sysin_text=o.sysin_text or d.sysin_text,
-                                 card_member=o.card_member if o.dsn else d.card_member,
-                                 is_override=True, line=o.line)
+                    if o.mode == "dummy":
+                        # //PS.SYSIN DD DUMMY: the PROC's dataset is NOT read.
+                        nd = replace(d, dsn=None, dsn_resolved=None, gdg_rel=None, sysin_text=None,
+                                     card_member=None, referback=None, is_temp=False,
+                                     mode="dummy", mode_source="dummy", is_override=True, line=o.line)
+                    else:
+                        nd = replace(d, dsn=o.dsn or d.dsn, disp=o.disp or d.disp,
+                                     sysin_text=o.sysin_text or d.sysin_text,
+                                     card_member=o.card_member if o.dsn else d.card_member,
+                                     is_override=True, line=o.line)
                 else:
                     nd = replace(d)
                 eff.dds.append(_resolve_dd(nd, symbols, job, eff))
-            for key, o in ov.items():
-                if key[0] == ps.step_name.upper() and key not in used:
+            for key, o in sorted(ov.items(), key=lambda kv: (kv[0][1], kv[0][2])):
+                if key[0] == psn and key not in used:
+                    used.add(key)
                     eff.dds.append(_resolve_dd(replace(o, dd_name=key[1], is_override=True), symbols, job, eff))
             for key in ov:
                 if key[0] not in {p.step_name.upper() for p in proc.steps} and key not in used:
@@ -715,16 +1093,23 @@ def expand_job(job: JclFacts, proc_lookup: Callable[[str], Optional["JclFacts"]]
                                            f"{s.step_name}: override //{key[0]}.{key[1]} names no step in PROC {s.proc_called}",
                                            s.line))
                     used.add(key)
+            if not any(d.dd_name.upper() == "STEPLIB" for d in eff.dds):
+                eff.dds.extend(replace(jd, mode_source="joblib", is_override=False)
+                               for jd in job.job_dds if jd.dd_name.upper() == "JOBLIB")
 
             if eff.proc_called and depth < max_depth:
+                # Nested PROC: only true SET values and what THIS EXEC codes
+                # (already resolved) reach the inner PROC - its own defaults
+                # are not overridden by the outer PROC's defaults.
+                eff.sym_overrides = {k: substitute_symbols(v, symbols) for k, v in eff.sym_overrides.items()}
                 sub = JclFacts(job_name=job.job_name, job_line=job.job_line, is_proc=False,
-                               proc_name=None, symbolics=dict(symbols), set_symbols=dict(symbols),
-                               instream_procs=job.instream_procs)
+                               proc_name=None, symbolics=dict(symbols), set_symbols=dict(job.set_symbols),
+                               instream_procs=job.instream_procs, job_dds=job.job_dds)
                 sub.steps = [eff]
-                out.extend(expand_job(sub, proc_lookup, depth + 1, max_depth))
+                out.extend(expand_job(sub, proc_lookup, depth + 1, max_depth, member_lookup))
                 job.unresolved.extend(sub.unresolved)
                 continue
-            _resolve_effective_pgm(eff, job)
+            _resolve_effective_pgm(eff, job, member_lookup)
             out.append(eff)
     if depth == 0:
         # Every step is now known, PROC steps included: DSN=*.STEP.DD can be
@@ -738,11 +1123,11 @@ def _resolve_dd(d: DdFact, symbols: Dict[str, str], job: JclFacts, step: StepFac
         return d
     if d.dsn.startswith("*."):
         return replace(d, referback=d.dsn, dsn_resolved=None, gdg_rel=None, is_temp=False)
-    resolved, gdg = _strip_gdg(substitute_symbols(d.dsn, symbols))
-    if "&" in resolved.replace("&&", ""):
-        job.unresolved.append(("symbolic",
-                               f"{step.step_name} {d.dd_name}: symbolic still unresolved in {resolved}",
-                               d.line))
+    resolved = substitute_symbols(d.dsn, symbols)
+    resolved, found = _variables(resolved)
+    for kind, tok in found:
+        job.unresolved.append((kind, f"{step.step_name} {d.dd_name}: {tok} still unresolved in {d.dsn}", d.line))
+    resolved, gdg = _strip_gdg(resolved)
     mode, src = _direction(d.dd_name, gdg, d.disp, f"DSN={resolved},DISP={d.disp or ''}")
     return replace(d, dsn_resolved=resolved, gdg_rel=gdg, mode=mode, mode_source=src,
                    is_temp=resolved.startswith("&&"), referback=None)

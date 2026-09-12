@@ -330,7 +330,10 @@ CREATE TABLE IF NOT EXISTS job (
     id          INTEGER PRIMARY KEY,
     member_id   INTEGER NOT NULL REFERENCES member(id) ON DELETE CASCADE,
     job_name    TEXT NOT NULL,
-    line        INTEGER
+    line        INTEGER,
+    joblib      TEXT,                     -- JSON list: //JOBLIB DD concatenation
+    job_cond    TEXT,                     -- COND= on the JOB card (applies to every step)
+    jcllib      TEXT                      -- JSON list: // JCLLIB ORDER=(...) PROC/INCLUDE search order
 );
 CREATE INDEX IF NOT EXISTS ix_job_name ON job(job_name);
 
@@ -364,6 +367,7 @@ CREATE TABLE IF NOT EXISTS step (
     parent_step   TEXT,                   -- and the job step whose EXEC PROC= produced it.
                                           -- Symbolics and //STEP.DD overrides are applied,
                                           -- so THESE rows carry the datasets a job really uses.
+    guard         TEXT,                   -- enclosing // IF (...) THEN / ELSE: runs only when true
     line          INTEGER
 );
 CREATE INDEX IF NOT EXISTS ix_step_pgm  ON step(effective_pgm);
@@ -406,11 +410,13 @@ CREATE TABLE IF NOT EXISTS dataset (
 -- refs are why this cannot be done by string-matching DSNs.
 CREATE VIEW IF NOT EXISTS v_dataset_flow AS
 SELECT d.dsn_resolved AS dsn, s.effective_pgm AS pgm, j.job_name, s.step_name,
-       d.mode, d.mode_source, d.gdg_rel, m.path, m.system, s.from_proc
+       d.mode, d.mode_source, d.gdg_rel, m.path, m.system, s.from_proc,
+       s.proc_called, s.job_id, s.proc_id, pd.proc_name, d.is_temp, d.dd_name
 FROM dd d
 JOIN step s   ON s.id = d.step_id
 LEFT JOIN job j ON j.id = s.job_id
-LEFT JOIN member m ON m.id = j.member_id
+LEFT JOIN proc_def pd ON pd.id = s.proc_id
+LEFT JOIN member m ON m.id = COALESCE(j.member_id, pd.member_id)
 WHERE d.dsn_resolved IS NOT NULL;
 
 -- Byte positions referenced by SORT/MERGE/INCLUDE/OMIT/INREC/OUTREC/OUTFIL

@@ -478,6 +478,26 @@ class JclStatement:
     end: int
     lines: List[int] = dc_field(default_factory=list)
     inline_data: List[str] = dc_field(default_factory=list)   # SYSIN control cards
+    comment: str = ""                                          # text after the operand field
+
+
+def _cut_operands(rest: str) -> Tuple[str, str]:
+    """(operands, comment): the operand field ends at the first blank that is
+    outside quotes and parentheses. Inside an open quote the whole remainder
+    (trailing blanks included, up to col 71) belongs to the string."""
+    depth = 0
+    in_quote = False
+    for i, ch in enumerate(rest):
+        if ch == "'":
+            in_quote = not in_quote
+        elif not in_quote:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth = max(0, depth - 1)
+            elif ch in " \t" and depth == 0:
+                return rest[:i], rest[i:].strip()
+    return (rest if in_quote else rest.rstrip()), ""
 
 
 # The name field may be qualified: //PROCSTEP.DDNAME DD ... overrides a DD
@@ -534,27 +554,48 @@ def read_jcl(text: str, data: bytes = b"", enc: str = "utf-8") -> List[JclStatem
         gd = m.groupdict()
         name = (gd.get("name") or "").strip().upper()
         op = gd["op"].upper()
-        operands = gd["rest"].strip()
+        # The operand field ends at the first blank outside quotes and
+        # parentheses; the rest of the line is a comment. Keeping the comment
+        # glued on turns `DSN=PROD.X   INPUT MASTER` into a dataset that does
+        # not exist and hides the real one from every lineage query.
+        operands, comment = _cut_operands(gd["rest"].lstrip())
+        if op in ("IF", "ELSE", "ENDIF"):
+            operands, comment = gd["rest"].strip(), ""     # relational expressions contain blanks
         lines = [lineno]
         start = lineno
 
         # ---- join continuations -------------------------------------------
-        # A JCL statement continues when the operand field ends with a comma
-        # (and optionally a non-blank in col 72). The next record must start
-        # with '//' and have the operand beginning in cols 4-16.
-        while operands.rstrip().endswith(",") and i + 1 < n:
+        # A statement continues when the operand field ends with a comma, when
+        # a quoted string is still open at column 71, or when column 72 holds
+        # a non-blank. The next record must start with '//' and, for a comma
+        # continuation, resume in cols 4-16; inside a quote it resumes at
+        # column 16 verbatim.
+        while i + 1 < n:
+            in_quote = operands.count("'") % 2 == 1
+            col72 = len(rec) > 71 and rec[71] not in " \t"
+            if not (in_quote or col72 or operands.rstrip().endswith(",")):
+                break
             nxt = records[i + 1].replace("\t", "    ")
             if not nxt.startswith("//") or nxt.startswith("//*"):
                 break
-            cont = _JCL_CONT_ONLY.match(nxt[:71])
-            if not cont:
-                break
-            operands = operands.rstrip() + cont.group("rest").strip()
+            if in_quote:
+                if nxt[2:15].strip():
+                    break
+                operands = operands + nxt[15:71].rstrip()
+            else:
+                cont = _JCL_CONT_ONLY.match(nxt[:71])
+                if not cont:
+                    break
+                more, c2 = _cut_operands(cont.group("rest").lstrip())
+                operands = operands.rstrip() + more
+                if c2:
+                    comment = (comment + " " + c2).strip()
             i += 1
             lines.append(i + 1)
+            rec = nxt
 
-        stmt = JclStatement(name=name, op=op, operands=operands,
-                            start=start, end=i + 1, lines=lines)
+        stmt = JclStatement(name=name, op=op, operands=operands.rstrip(),
+                            start=start, end=i + 1, lines=lines, comment=comment)
 
         # ---- capture inline data for DD * / DD DATA ------------------------
         if op == "DD" and _is_inline_dd(operands):
