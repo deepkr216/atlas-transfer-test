@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.db
+*.db-wal
+*.db-shm
+/out/
+/atlas_out/
+/.claude/settings.local.json

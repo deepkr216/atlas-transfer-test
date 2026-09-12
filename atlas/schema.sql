@@ -1,0 +1,442 @@
+-- ============================================================================
+-- Mainframe Atlas - deterministic fact store for a COBOL/JCL/IMS/DB2 estate.
+--
+-- Design rules:
+--   1. Every row is a FACT extracted by a parser. No LLM output lives here.
+--      Model-written prose goes in `derived_summary`, which is explicitly
+--      marked as unverified and is never joined into an impact answer.
+--   2. Every fact carries member_id + line so any claim can be cited and
+--      re-checked against the source.
+--   3. Anything the parser could not resolve goes in `unresolved`. Nothing is
+--      ever silently dropped - a missing row must never be read as "no link".
+-- ============================================================================
+
+PRAGMA journal_mode = WAL;
+PRAGMA foreign_keys = ON;
+
+-- ---------------------------------------------------------------- inventory
+
+CREATE TABLE IF NOT EXISTS member (
+    id            INTEGER PRIMARY KEY,
+    path          TEXT NOT NULL UNIQUE,   -- absolute path on disk
+    name          TEXT NOT NULL,          -- PDS member name (stem, upper)
+    kind          TEXT NOT NULL,          -- cobol|copybook|jcl|proc|ctlcard|dbd|psb|bms|mfs|sql|doc|unknown
+    library       TEXT,                   -- the folder that acts as the PDS
+    ext           TEXT,
+    sha256        TEXT NOT NULL,          -- content hash -> duplicate detection
+    bytes         INTEGER,
+    lines         INTEGER,
+    fixed_format  INTEGER,                -- 1 = cols 7/72 rules applied
+    authoritative INTEGER DEFAULT 0,      -- 1 = declared production copy (manifest)
+    parse_status  TEXT DEFAULT 'pending', -- ok|partial|failed|skipped
+    parse_error   TEXT,
+    scanned_at    TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_member_name   ON member(name);
+CREATE INDEX IF NOT EXISTS ix_member_kind   ON member(kind);
+CREATE INDEX IF NOT EXISTS ix_member_sha    ON member(sha256);
+
+-- Same member name appearing in >1 library, or same content in >1 path.
+-- The "which copy is production?" question is the #1 source of wrong answers
+-- when analysing a folder dump, so it gets a first-class view.
+CREATE VIEW IF NOT EXISTS v_ambiguous_member AS
+SELECT name, COUNT(*) AS copies, COUNT(DISTINCT sha256) AS distinct_content,
+       GROUP_CONCAT(path, ' | ') AS paths
+FROM member
+WHERE kind IN ('cobol','copybook','jcl','proc','dbd','psb')
+GROUP BY name
+HAVING COUNT(*) > 1;
+
+-- ------------------------------------------------------------------ program
+
+CREATE TABLE IF NOT EXISTS program (
+    id            INTEGER PRIMARY KEY,
+    member_id     INTEGER NOT NULL REFERENCES member(id) ON DELETE CASCADE,
+    program_id    TEXT NOT NULL,          -- from PROGRAM-ID
+    is_initial    INTEGER DEFAULT 0,
+    uses_sql      INTEGER DEFAULT 0,
+    uses_cics     INTEGER DEFAULT 0,
+    uses_dli      INTEGER DEFAULT 0,
+    uses_mq       INTEGER DEFAULT 0,
+    linkage_using TEXT,                   -- JSON array, positional - order matters
+    src_lines     INTEGER,
+    exp_lines     INTEGER                 -- lines after copybook expansion
+);
+CREATE INDEX IF NOT EXISTS ix_program_pid ON program(program_id);
+
+CREATE TABLE IF NOT EXISTS paragraph (
+    id          INTEGER PRIMARY KEY,
+    program_id  INTEGER NOT NULL REFERENCES program(id) ON DELETE CASCADE,
+    section     TEXT,
+    name        TEXT NOT NULL,
+    start_line  INTEGER NOT NULL,
+    end_line    INTEGER NOT NULL,
+    ordinal     INTEGER NOT NULL          -- needed for PERFORM..THRU and fall-through
+);
+CREATE INDEX IF NOT EXISTS ix_para_prog ON paragraph(program_id, ordinal);
+
+CREATE TABLE IF NOT EXISTS perform_edge (
+    id          INTEGER PRIMARY KEY,
+    program_id  INTEGER NOT NULL REFERENCES program(id) ON DELETE CASCADE,
+    from_para   TEXT,
+    to_para     TEXT NOT NULL,
+    thru_para   TEXT,                     -- PERFORM A THRU B
+    line        INTEGER
+);
+
+-- CALL: the single most important cross-program edge, and the one most often
+-- got wrong. kind='dynamic' means the target is a variable - `resolved` holds
+-- literals traced back via MOVE, and may be incomplete. Treat an empty
+-- `resolved` on a dynamic call as UNKNOWN, never as "calls nothing".
+CREATE TABLE IF NOT EXISTS call_edge (
+    id          INTEGER PRIMARY KEY,
+    program_id  INTEGER NOT NULL REFERENCES program(id) ON DELETE CASCADE,
+    kind        TEXT NOT NULL,            -- static|dynamic|cics_link|cics_xctl|proc_call
+    target      TEXT,                     -- literal name, when kind='static'
+    via_var     TEXT,                     -- variable name, when kind='dynamic'
+    resolved    TEXT,                     -- JSON array of candidate targets
+    resolution  TEXT,                     -- how: move_literal|value_clause|unresolved
+    using_args  TEXT,                     -- JSON array, positional
+    line        INTEGER
+);
+CREATE INDEX IF NOT EXISTS ix_call_target ON call_edge(target);
+CREATE INDEX IF NOT EXISTS ix_call_prog   ON call_edge(program_id);
+
+-- ----------------------------------------------------------------- copybook
+
+CREATE TABLE IF NOT EXISTS copy_use (
+    id          INTEGER PRIMARY KEY,
+    member_id   INTEGER NOT NULL REFERENCES member(id) ON DELETE CASCADE,
+    copybook    TEXT NOT NULL,
+    of_library  TEXT,                     -- COPY X OF Y / IN Y
+    replacing   TEXT,                     -- raw REPLACING text; changes field names!
+    line        INTEGER,
+    resolved_member_id INTEGER REFERENCES member(id)
+);
+CREATE INDEX IF NOT EXISTS ix_copy_book ON copy_use(copybook);
+CREATE INDEX IF NOT EXISTS ix_copy_mem  ON copy_use(member_id);
+
+-- Field layout with computed byte offsets. This is what makes "if I change
+-- this field, what breaks" answerable, and what stops the model inventing
+-- field names or generating test data that violates the record layout.
+CREATE TABLE IF NOT EXISTS field (
+    id          INTEGER PRIMARY KEY,
+    member_id   INTEGER NOT NULL REFERENCES member(id) ON DELETE CASCADE,
+    parent_id   INTEGER REFERENCES field(id),
+    level       INTEGER NOT NULL,
+    name        TEXT NOT NULL,
+    qualified   TEXT,                     -- A.B.C path, for OF/IN qualification
+    pic         TEXT,
+    usage       TEXT,                     -- DISPLAY|COMP|COMP-3|COMP-5|POINTER...
+    sign_clause TEXT,
+    occurs      INTEGER,
+    occurs_max  INTEGER,
+    odo_on      TEXT,                     -- OCCURS DEPENDING ON <field>
+    redefines   TEXT,
+    value_lit   TEXT,
+    offset      INTEGER,                  -- 0-based byte offset in the 01 group
+    length      INTEGER,                  -- storage bytes (COMP-3 = packed!)
+    digits      INTEGER,
+    scale       INTEGER,
+    is_group    INTEGER DEFAULT 0,
+    line        INTEGER
+);
+CREATE INDEX IF NOT EXISTS ix_field_name ON field(name);
+CREATE INDEX IF NOT EXISTS ix_field_mem  ON field(member_id);
+
+-- 88-levels are encoded business rules and the best free source of test
+-- conditions in the entire estate.
+CREATE TABLE IF NOT EXISTS cond88 (
+    id          INTEGER PRIMARY KEY,
+    field_id    INTEGER NOT NULL REFERENCES field(id) ON DELETE CASCADE,
+    name        TEXT NOT NULL,
+    values_lit  TEXT,                     -- JSON array of literals/ranges
+    line        INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS field_ref (
+    id          INTEGER PRIMARY KEY,
+    program_id  INTEGER NOT NULL REFERENCES program(id) ON DELETE CASCADE,
+    name        TEXT NOT NULL,
+    mode        TEXT,                     -- read|write|both|test
+    line        INTEGER
+);
+CREATE INDEX IF NOT EXISTS ix_fieldref_name ON field_ref(name);
+
+-- ---------------------------------------------------------------- files/IO
+
+CREATE TABLE IF NOT EXISTS file_decl (
+    id          INTEGER PRIMARY KEY,
+    program_id  INTEGER NOT NULL REFERENCES program(id) ON DELETE CASCADE,
+    select_name TEXT NOT NULL,            -- SELECT <name>
+    assign_dd   TEXT,                     -- ASSIGN TO <ddname>  <- the JCL join key
+    organization TEXT,                    -- SEQUENTIAL|INDEXED|RELATIVE
+    access_mode TEXT,
+    record_key  TEXT,
+    alt_keys    TEXT,                     -- JSON array
+    fd_record   TEXT,                     -- 01 record name under the FD
+    line        INTEGER
+);
+CREATE INDEX IF NOT EXISTS ix_filedecl_dd ON file_decl(assign_dd);
+
+CREATE TABLE IF NOT EXISTS io_op (
+    id          INTEGER PRIMARY KEY,
+    program_id  INTEGER NOT NULL REFERENCES program(id) ON DELETE CASCADE,
+    target      TEXT NOT NULL,            -- file / table / segment name
+    target_kind TEXT NOT NULL,            -- file|db2|ims|mq|cics
+    op          TEXT NOT NULL,            -- READ|WRITE|REWRITE|DELETE|OPEN|CLOSE|START|SELECT|INSERT|...
+    line        INTEGER
+);
+CREATE INDEX IF NOT EXISTS ix_ioop_target ON io_op(target, target_kind);
+
+-- -------------------------------------------------------------------- DB2
+
+CREATE TABLE IF NOT EXISTS sql_stmt (
+    id          INTEGER PRIMARY KEY,
+    member_id   INTEGER NOT NULL REFERENCES member(id) ON DELETE CASCADE,
+    program_id  INTEGER REFERENCES program(id) ON DELETE CASCADE,
+    stmt_type   TEXT,                     -- SELECT|INSERT|UPDATE|DELETE|DECLARE|OPEN|FETCH|CLOSE|CALL|MERGE
+    cursor_name TEXT,
+    tables      TEXT,                     -- JSON array
+    columns     TEXT,                     -- JSON array
+    host_vars   TEXT,                     -- JSON array
+    is_dynamic  INTEGER DEFAULT 0,
+    start_line  INTEGER,
+    end_line    INTEGER,
+    text        TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_sql_prog ON sql_stmt(program_id);
+
+CREATE TABLE IF NOT EXISTS db2_object (
+    id          INTEGER PRIMARY KEY,
+    kind        TEXT NOT NULL,            -- table|view|alias|proc
+    qualifier   TEXT,
+    name        TEXT NOT NULL,
+    source      TEXT,                     -- ddl|dclgen|inferred_from_sql|catalog_unload
+    member_id   INTEGER REFERENCES member(id)
+);
+CREATE INDEX IF NOT EXISTS ix_db2obj_name ON db2_object(name);
+
+-- --------------------------------------------------------------------- IMS
+
+CREATE TABLE IF NOT EXISTS ims_dbd (
+    id          INTEGER PRIMARY KEY,
+    member_id   INTEGER NOT NULL REFERENCES member(id) ON DELETE CASCADE,
+    name        TEXT NOT NULL,
+    access      TEXT,                     -- HDAM|HIDAM|DEDB|INDEX|LOGICAL...
+    line        INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS ims_segment (
+    id          INTEGER PRIMARY KEY,
+    dbd_id      INTEGER NOT NULL REFERENCES ims_dbd(id) ON DELETE CASCADE,
+    name        TEXT NOT NULL,
+    parent      TEXT,
+    bytes       INTEGER,
+    seq_field   TEXT,
+    line        INTEGER
+);
+CREATE INDEX IF NOT EXISTS ix_seg_name ON ims_segment(name);
+
+-- PCB ordering is POSITIONAL. A program addresses PCBs by their index in the
+-- PSB, so `ordinal` is load-bearing: off-by-one here means the analysis names
+-- the wrong database. Store it explicitly and never re-sort this table.
+CREATE TABLE IF NOT EXISTS ims_psb (
+    id          INTEGER PRIMARY KEY,
+    member_id   INTEGER NOT NULL REFERENCES member(id) ON DELETE CASCADE,
+    name        TEXT NOT NULL,
+    psb_type    TEXT,                     -- TP|DB|batch
+    line        INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS ims_pcb (
+    id          INTEGER PRIMARY KEY,
+    psb_id      INTEGER NOT NULL REFERENCES ims_psb(id) ON DELETE CASCADE,
+    ordinal     INTEGER NOT NULL,         -- 1-based position  <- positional!
+    pcb_type    TEXT,                     -- DB|TP|GSAM|IO
+    dbd_name    TEXT,
+    procopt     TEXT,                     -- G|GO|I|R|D|A ... read vs update intent
+    keylen      INTEGER,
+    sensegs     TEXT,                     -- JSON array
+    line        INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS dli_call (
+    id          INTEGER PRIMARY KEY,
+    program_id  INTEGER NOT NULL REFERENCES program(id) ON DELETE CASCADE,
+    interface   TEXT,                     -- CBLTDLI|AIBTDLI|EXEC DLI
+    func        TEXT,                     -- GU|GN|GHU|GNP|ISRT|REPL|DLET|CHKP|XRST|ROLB
+    pcb_arg     TEXT,                     -- the PCB variable as written
+    pcb_ordinal INTEGER,                  -- resolved position, NULL if unresolved
+    ssa_args    TEXT,                     -- JSON array
+    io_area     TEXT,
+    line        INTEGER
+);
+
+-- ---------------------------------------------------------------- JCL / PROC
+
+CREATE TABLE IF NOT EXISTS job (
+    id          INTEGER PRIMARY KEY,
+    member_id   INTEGER NOT NULL REFERENCES member(id) ON DELETE CASCADE,
+    job_name    TEXT NOT NULL,
+    line        INTEGER
+);
+CREATE INDEX IF NOT EXISTS ix_job_name ON job(job_name);
+
+CREATE TABLE IF NOT EXISTS proc_def (
+    id          INTEGER PRIMARY KEY,
+    member_id   INTEGER NOT NULL REFERENCES member(id) ON DELETE CASCADE,
+    proc_name   TEXT NOT NULL,
+    symbolics   TEXT,                     -- JSON object of default values
+    instream    INTEGER DEFAULT 0,
+    line        INTEGER
+);
+CREATE INDEX IF NOT EXISTS ix_proc_name ON proc_def(proc_name);
+
+-- `pgm` is what the EXEC says. `effective_pgm` is what actually runs, after
+-- unwrapping utility launchers - IKJEFT01/DSN runs a DB2 program named in
+-- SYSTSIN, DFSRRC00 runs an IMS program named in its PARM, and PGM=SORT runs
+-- control cards. Analysis that reads `pgm` alone is wrong for every such step.
+CREATE TABLE IF NOT EXISTS step (
+    id            INTEGER PRIMARY KEY,
+    job_id        INTEGER REFERENCES job(id) ON DELETE CASCADE,
+    proc_id       INTEGER REFERENCES proc_def(id) ON DELETE CASCADE,
+    ordinal       INTEGER NOT NULL,
+    step_name     TEXT,
+    pgm           TEXT,
+    proc_called   TEXT,
+    effective_pgm TEXT,
+    launcher      TEXT,                   -- IKJEFT01|DFSRRC00|SORT|IEBGENER|IDCAMS|...
+    parm          TEXT,
+    cond          TEXT,
+    line          INTEGER
+);
+CREATE INDEX IF NOT EXISTS ix_step_pgm  ON step(effective_pgm);
+CREATE INDEX IF NOT EXISTS ix_step_job  ON step(job_id, ordinal);
+
+CREATE TABLE IF NOT EXISTS dd (
+    id          INTEGER PRIMARY KEY,
+    step_id     INTEGER NOT NULL REFERENCES step(id) ON DELETE CASCADE,
+    dd_name     TEXT,                     -- NULL/'' for a concatenation continuation
+    concat_seq  INTEGER DEFAULT 0,
+    dsn         TEXT,                     -- as written, symbolics unresolved
+    dsn_resolved TEXT,                    -- after symbolic substitution
+    gdg_rel     TEXT,                     -- +1 / 0 / -1
+    disp        TEXT,
+    mode        TEXT,                     -- input|output|mod|unknown  (derived from DISP)
+    sysin_text  TEXT,                     -- inline control cards live HERE
+    is_override INTEGER DEFAULT 0,        -- //STEP1.DD1 style override of a PROC DD
+    line        INTEGER
+);
+CREATE INDEX IF NOT EXISTS ix_dd_step ON dd(step_id);
+CREATE INDEX IF NOT EXISTS ix_dd_dsn  ON dd(dsn_resolved);
+
+CREATE TABLE IF NOT EXISTS dataset (
+    id          INTEGER PRIMARY KEY,
+    dsn         TEXT NOT NULL UNIQUE,     -- normalised, GDG base without (+1)
+    is_gdg      INTEGER DEFAULT 0,
+    is_vsam     INTEGER DEFAULT 0,
+    vsam_type   TEXT                      -- KSDS|ESDS|RRDS|AIX|PATH
+);
+
+-- The producer/consumer edge that reveals real batch data flow. GDG relative
+-- refs are why this cannot be done by string-matching DSNs.
+CREATE VIEW IF NOT EXISTS v_dataset_flow AS
+SELECT d.dsn_resolved AS dsn, s.effective_pgm AS pgm, j.job_name, s.step_name,
+       d.mode, d.gdg_rel, m.path
+FROM dd d
+JOIN step s   ON s.id = d.step_id
+LEFT JOIN job j ON j.id = s.job_id
+LEFT JOIN member m ON m.id = j.member_id
+WHERE d.dsn_resolved IS NOT NULL;
+
+-- ----------------------------------------------------- online / interfaces
+
+CREATE TABLE IF NOT EXISTS transaction_def (
+    id          INTEGER PRIMARY KEY,
+    member_id   INTEGER REFERENCES member(id),
+    tran_code   TEXT NOT NULL,
+    system      TEXT,                     -- cics|ims_dc
+    program     TEXT,
+    psb         TEXT,
+    map_or_mfs  TEXT,
+    line        INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS interface_edge (
+    id          INTEGER PRIMARY KEY,
+    member_id   INTEGER NOT NULL REFERENCES member(id) ON DELETE CASCADE,
+    kind        TEXT NOT NULL,            -- mq|ftp|ndm|zosconnect|webservice|flatfile|ims_msw
+    detail      TEXT,                     -- queue name / host / service / dsn
+    direction   TEXT,                     -- in|out|both
+    peer_system TEXT,                     -- filled in by hand from the manifest
+    line        INTEGER
+);
+
+-- ---------------------------------------------------- scheduler (CA-7/CTM/TWS)
+
+CREATE TABLE IF NOT EXISTS sched_job (
+    id          INTEGER PRIMARY KEY,
+    job_name    TEXT NOT NULL,
+    system      TEXT,
+    schedule    TEXT,
+    calendar    TEXT,
+    source      TEXT                      -- which export this came from
+);
+
+CREATE TABLE IF NOT EXISTS sched_dep (
+    id          INTEGER PRIMARY KEY,
+    job_name    TEXT NOT NULL,
+    depends_on  TEXT NOT NULL,
+    kind        TEXT                      -- predecessor|trigger|resource|dataset
+);
+
+-- ------------------------------------------------------------- bookkeeping
+
+-- Anything the parser saw but could not resolve. A grounded answer must report
+-- the relevant rows here alongside its conclusion; an impact analysis with 40
+-- unresolved dynamic CALLs in scope is not a complete impact analysis.
+CREATE TABLE IF NOT EXISTS unresolved (
+    id          INTEGER PRIMARY KEY,
+    member_id   INTEGER REFERENCES member(id) ON DELETE CASCADE,
+    kind        TEXT NOT NULL,            -- dynamic_call|missing_copybook|missing_proc|
+                                          -- unparsed_stmt|symbolic|missing_pgm|launcher_parm
+    detail      TEXT,
+    line        INTEGER
+);
+CREATE INDEX IF NOT EXISTS ix_unres_kind ON unresolved(kind);
+
+-- Line map from expanded source back to (member, line) so every citation
+-- points at a real line in a real member, not at an expansion artefact.
+CREATE TABLE IF NOT EXISTS expand_map (
+    id          INTEGER PRIMARY KEY,
+    program_id  INTEGER NOT NULL REFERENCES program(id) ON DELETE CASCADE,
+    exp_line    INTEGER NOT NULL,
+    src_member  INTEGER NOT NULL REFERENCES member(id),
+    src_line    INTEGER NOT NULL,
+    depth       INTEGER DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS ix_expmap ON expand_map(program_id, exp_line);
+
+-- LLM-written prose. Quarantined on purpose: never joined into a fact query,
+-- always rendered with an "unverified" banner.
+CREATE TABLE IF NOT EXISTS derived_summary (
+    id          INTEGER PRIMARY KEY,
+    member_id   INTEGER NOT NULL REFERENCES member(id) ON DELETE CASCADE,
+    model       TEXT,
+    generated_at TEXT,
+    summary     TEXT,
+    verified_by TEXT                      -- human initials, NULL until reviewed
+);
+
+CREATE TABLE IF NOT EXISTS build_run (
+    id          INTEGER PRIMARY KEY,
+    started_at  TEXT,
+    finished_at TEXT,
+    root        TEXT,
+    members     INTEGER,
+    ok          INTEGER,
+    partial     INTEGER,
+    failed      INTEGER,
+    tool_version TEXT
+);
