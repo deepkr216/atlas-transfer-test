@@ -400,6 +400,46 @@ CREATE TABLE IF NOT EXISTS card_field_ref (
 );
 CREATE INDEX IF NOT EXISTS ix_card_pos ON card_field_ref(pos);
 
+-- ------------------------------------------------------------ screens
+-- BMS maps (CICS) and MFS formats/messages (IMS DC). The first place a code
+-- value is validated online is the program reading the screen field; the
+-- screen definition holds the field's length, picture and default.
+CREATE TABLE IF NOT EXISTS screen (
+    id          INTEGER PRIMARY KEY,
+    member_id   INTEGER NOT NULL REFERENCES member(id) ON DELETE CASCADE,
+    kind        TEXT NOT NULL,            -- bms_map | mfs_fmt | mfs_msg
+    name        TEXT NOT NULL,            -- map / FMT / MSG (MID or MOD) label
+    parent      TEXT,                     -- BMS mapset ; MFS msg -> FMT (SOR=)
+    mode        TEXT,                     -- IN|OUT|INOUT ; INPUT|OUTPUT
+    next_msg    TEXT,                     -- MFS NXT=
+    lang        TEXT,
+    size        TEXT,
+    line        INTEGER
+);
+CREATE INDEX IF NOT EXISTS ix_screen_name ON screen(name);
+
+-- BMS field GENDER is referenced by programs as GENDERI / GENDERO (generated
+-- symbolic map). MFS MFLDs carry a byte OFFSET within the segment data; the
+-- program's I/O copybook mirrors that order, so offset is the join key.
+CREATE TABLE IF NOT EXISTS screen_field (
+    id          INTEGER PRIMARY KEY,
+    screen_id   INTEGER NOT NULL REFERENCES screen(id) ON DELETE CASCADE,
+    name        TEXT,                     -- NULL = unnamed constant/label on the screen
+    ordinal     INTEGER,
+    row         INTEGER,
+    col         INTEGER,
+    length      INTEGER,
+    offset      INTEGER,                  -- MFS only (after the 4-byte LL ZZ)
+    seg         INTEGER,                  -- MFS segment number
+    attrb       TEXT,
+    initial     TEXT,                     -- BMS INITIAL= / MFS default literal
+    picin       TEXT,
+    picout      TEXT,
+    literal     TEXT,                     -- constant field text (labels, trancode)
+    line        INTEGER
+);
+CREATE INDEX IF NOT EXISTS ix_sfield_name ON screen_field(name);
+
 -- ----------------------------------------------------- online / interfaces
 
 CREATE TABLE IF NOT EXISTS transaction_def (

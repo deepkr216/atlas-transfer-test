@@ -22,6 +22,7 @@ python -m atlas.query --db atlas.db literal  <VALUE> [--field <FIELD>] [--like]
 python -m atlas.query --db atlas.db values   <FIELD>          # every value the code assumes
 python -m atlas.query --db atlas.db pair     <FIELD1> <FIELD2> # cross-field rules
 python -m atlas.query --db atlas.db messages <PATTERN>        # message texts naming a rule
+python -m atlas.query --db atlas.db screen   <MAP|MID|MOD>    # screen fields, defaults, validating programs
 python -m atlas.query --db atlas.db copybook <NAME>
 python -m atlas.query --db atlas.db callers|callees <NAME> --depth N
 python -m atlas.query --db atlas.db dataset  <DSN>

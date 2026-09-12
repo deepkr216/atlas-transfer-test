@@ -37,7 +37,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import re
 
-from . import cobol, reader
+from . import cobol, reader, screens
 
 
 # --------------------------------------------------------------------------
@@ -577,6 +577,8 @@ def cmd_field(conn: sqlite3.Connection, name: str) -> str:
     out.append("\n> Group-level MOVEs (MOVE REC-A TO REC-B) touch this field without naming it; check the "
                "parents listed under 'under' with `field <parent>`.\n")
 
+    out.append(_screen_section(conn, name.upper()))
+
     # sort cards overlapping this field's bytes (for copybook definitions)
     hits = []
     for d in defs:
@@ -899,6 +901,104 @@ def cmd_pack(conn: sqlite3.Connection, name: str, max_lines: int) -> str:
 
 
 # --------------------------------------------------------------------------
+# screens (BMS / MFS)
+# --------------------------------------------------------------------------
+
+def _screen_hits(conn: sqlite3.Connection, n: str) -> List[sqlite3.Row]:
+    """Screen fields called n, or whose BMS symbolic name (nI / nO / nL / nF / nA) is n."""
+    base = n[:-1] if len(n) > 2 and n[-1] in "IOLAF" else None
+    names = [n] + ([base] if base else [])
+    q = ",".join("?" * len(names))
+    return conn.execute(f"""
+        SELECT sf.*, s.kind, s.name AS sname, s.mode, s.parent, m.name AS mem
+        FROM screen_field sf JOIN screen s ON s.id=sf.screen_id JOIN member m ON m.id=s.member_id
+        WHERE UPPER(sf.name) IN ({q}) ORDER BY s.kind, s.name""", names).fetchall()
+
+
+def _screen_refs(conn: sqlite3.Connection, field_name: str, kind: str) -> List[sqlite3.Row]:
+    """Program references to a screen field: BMS through the generated
+    symbolic names (GENDERI / GENDERO ...), MFS through the MFLD name."""
+    names = screens.bms_symbolic_names(field_name) if kind == "bms_map" else [field_name.upper()]
+    q = ",".join("?" * len(names))
+    return conn.execute(f"""
+        SELECT p.program_id, p.id AS pid, r.name, r.mode, r.stmt, r.line FROM field_ref r
+        JOIN program p ON p.id=r.program_id WHERE UPPER(r.name) IN ({q})
+        ORDER BY p.program_id, r.line""", names).fetchall()
+
+
+def _screen_section(conn: sqlite3.Connection, n: str) -> str:
+    hits = _screen_hits(conn, n)
+    if not hits:
+        return ""
+    out = ["\n### Screen fields (BMS / MFS)\n"]
+    out.append(table(["screen", "kind", "mode", "field", "row,col", "len", "offset/seg", "attrb",
+                      "default", "PICIN/OUT", "cite"],
+                     [(h["sname"], h["kind"], h["mode"] or "", h["name"],
+                       f"{h['row']},{h['col']}" if h["row"] else "",
+                       h["length"], f"{h['offset']}/{h['seg']}" if h["offset"] is not None else "",
+                       h["attrb"] or "", h["initial"] or "",
+                       "/".join(x for x in (h["picin"], h["picout"]) if x), f"{h['mem']}:{h['line']}")
+                      for h in hits]))
+    rows, seen = [], set()
+    for h in hits:
+        for r in _screen_refs(conn, h["name"], h["kind"]):
+            key = (r["program_id"], r["name"], r["line"])
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append((r["program_id"], h["name"], r["name"], r["mode"], r["stmt"],
+                         cite(conn, r["pid"], r["line"])))
+    if rows:
+        out.append("\n**Programs referencing these screen fields** (this is where online validation lives)\n")
+        out.append(table(["program", "screen field", "as", "mode", "stmt", "cite"], rows))
+    out.append("> BMS programs see a field as `<name>I` (input) / `<name>O` (output). MFS programs address "
+               "the message by BYTE OFFSET in their I/O copybook: match the offset column against `field` "
+               "output for that copybook.\n")
+    return "".join(out)
+
+
+def cmd_screen(conn: sqlite3.Connection, name: str) -> str:
+    n = name.upper()
+    scr = conn.execute("""SELECT s.*, m.name AS mem, m.path FROM screen s JOIN member m ON m.id=s.member_id
+                          WHERE UPPER(s.name)=? OR UPPER(s.parent)=? ORDER BY s.kind, s.name""", (n, n)).fetchall()
+    if not scr:
+        return f"# Screen {n}\n\n**NOT FOUND** - no BMS map/mapset or MFS FMT/MSG with this name is indexed.\n"
+    out = [f"# Screen {n}\n"]
+    mids = set()
+    for s in scr:
+        mids.add(s["member_id"])
+        head = f"\n## {s['kind']} {s['name']}"
+        if s["parent"]:
+            head += f" (in {s['parent']})"
+        head += f"  mode {s['mode'] or '?'}"
+        if s["next_msg"]:
+            head += f"  next {s['next_msg']}"
+        out.append(head + f"  `{s['mem']}:{s['line']}`\n")
+        flds = conn.execute("SELECT * FROM screen_field WHERE screen_id=? ORDER BY ordinal", (s["id"],)).fetchall()
+        out.append(table(["#", "field", "row,col", "len", "offset/seg", "attrb", "default", "constant",
+                          "PICIN/OUT", "line"],
+                         [(f["ordinal"], f["name"] or "", f"{f['row']},{f['col']}" if f["row"] else "",
+                           f["length"], f"{f['offset']}/{f['seg']}" if f["offset"] is not None else "",
+                           f["attrb"] or "", f["initial"] or "", f["literal"] or "",
+                           "/".join(x for x in (f["picin"], f["picout"]) if x), f["line"]) for f in flds]))
+        rows = []
+        for fld in flds:
+            if not fld["name"]:
+                continue
+            for r in _screen_refs(conn, fld["name"], s["kind"]):
+                rows.append((r["program_id"], fld["name"], r["name"], r["mode"], r["stmt"],
+                             cite(conn, r["pid"], r["line"])))
+        if rows:
+            out.append("\n**Programs referencing its fields**\n")
+            out.append(table(["program", "screen field", "as", "mode", "stmt", "cite"], rows))
+        elif s["kind"] != "mfs_fmt":
+            out.append("_No program references found by name. MFS programs address the message by copybook "
+                       "offset; BMS programs use the generated symbolic copybook, which must be in the index._\n")
+    out.append(unresolved_for(conn, sorted(mids)))
+    return "".join(out)
+
+
+# --------------------------------------------------------------------------
 # value-domain changes: values / pair / messages
 # --------------------------------------------------------------------------
 #
@@ -954,7 +1054,7 @@ def cmd_values(conn: sqlite3.Connection, name: str) -> str:
     rows = conn.execute(f"""
         SELECT l.literal, l.context, l.line, l.member_id, p.program_id AS pname, p.id AS pid, m.name AS mem
         FROM literal_ref l LEFT JOIN program p ON p.id=l.program_id JOIN member m ON m.id=l.member_id
-        WHERE (UPPER(l.field)=? AND l.context IN ('move_to','compare','when','string','value'))
+        WHERE (UPPER(l.field)=? AND l.context IN ('move_to','compare','when','string','value','screen_initial'))
            OR (UPPER(l.field) IN ({qc}) AND l.context LIKE 'sql_%')""", (n, *cols)).fetchall()
     uses: Dict[str, Dict[str, List[str]]] = defaultdict(lambda: defaultdict(list))
     for r in rows:
@@ -993,7 +1093,20 @@ def cmd_values(conn: sqlite3.Connection, name: str) -> str:
         def cnt(*prefixes):
             return sum(len(l) for k, l in u.items() if k.startswith(prefixes))
 
-        where = "; ".join(sorted({w for l in u.values() for w in l})[:4])
+        # One example per KIND of use per PROGRAM, so a test through an 88 name
+        # or a sort card stays visible, and every program touching the value
+        # gets at least one citation even when one program produces dozens.
+        examples, seen_kp = [], set()
+        for k in sorted(u):
+            for w in u[k]:
+                prog = w.split("@")[0]
+                if (k, prog) in seen_kp:
+                    continue
+                seen_kp.add((k, prog))
+                examples.append(w)
+        total = sum(len(l) for l in u.values())
+        shown = examples[:8]
+        where = "; ".join(shown) + (f" (+{total - len(shown)} more)" if total > len(shown) else "")
         trows.append((v, ", ".join(sorted({c for c, _m in documented.get(v, [])})) or "(none)",
                       cnt("move_to", "string", "sql_set", "sql_insert"),
                       cnt("compare", "when", "via 88"), cnt("sql_predicate"), cnt("sort_card"), where))
@@ -1011,6 +1124,7 @@ def cmd_values(conn: sqlite3.Connection, name: str) -> str:
     if any(k.startswith("sql") for u in uses.values() for k in u):
         out.append(f"\nSQL rows are for column name(s) {', '.join(f'`{c}`' for c in cols)} (derived from the field "
                    f"name); if the column is called something else, run `values <COLUMN>` as well.\n")
+    out.append(_screen_section(conn, n))
     out.append("\n> This is the domain the CODE knows about. Values that arrive in files, DB2 rows, IMS segments or "
                "screens are data, not literals - compare against the data's actual distinct values before "
                "calling the change complete.\n")
@@ -1028,6 +1142,10 @@ def cmd_pair(conn: sqlite3.Connection, a: str, b: str, window: int = 8) -> str:
         for r in conn.execute("""SELECT c.name FROM cond88 c JOIN field f ON f.id=c.field_id
                                  WHERE UPPER(f.name)=?""", (n,)):
             names.add(r["name"].upper())
+        # A BMS screen field is referenced by programs as nI / nO (symbolic map).
+        if conn.execute("""SELECT 1 FROM screen_field sf JOIN screen s ON s.id=sf.screen_id
+                           WHERE UPPER(sf.name)=? AND s.kind='bms_map' LIMIT 1""", (n,)).fetchone():
+            names.update(screens.bms_symbolic_names(n)[:2])
         return sorted(names)
 
     def refs(names: List[str]):
@@ -1074,7 +1192,8 @@ def cmd_messages(conn: sqlite3.Connection, pattern: str) -> str:
     rows = conn.execute("""
         SELECT l.literal, l.context, l.field, l.line, p.program_id AS pname, p.id AS pid, m.name AS mem
         FROM literal_ref l LEFT JOIN program p ON p.id=l.program_id JOIN member m ON m.id=l.member_id
-        WHERE UPPER(l.literal) LIKE UPPER(?) AND l.context IN ('display','move_to','value','string')
+        WHERE UPPER(l.literal) LIKE UPPER(?)
+          AND l.context IN ('display','move_to','value','string','value_group','screen_initial','screen_literal')
         ORDER BY l.literal""", (pat,)).fetchall()
     groups: Dict[str, List[str]] = defaultdict(list)
     for r in rows:
@@ -1101,7 +1220,7 @@ def _main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Query atlas.db (markdown out, citations in).")
     ap.add_argument("--db", default="atlas.db")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for c in ("program", "job", "field", "dataset", "copybook", "values"):
+    for c in ("program", "job", "field", "dataset", "copybook", "values", "screen"):
         sub.add_parser(c).add_argument("name")
     s = sub.add_parser("literal")
     s.add_argument("name")
@@ -1150,6 +1269,8 @@ def _main(argv: Optional[List[str]] = None) -> int:
             print(cmd_pair(conn, a.a, a.b, a.window))
         elif a.cmd == "messages":
             print(cmd_messages(conn, a.pattern))
+        elif a.cmd == "screen":
+            print(cmd_screen(conn, a.name))
         elif a.cmd == "dataset":
             print(cmd_dataset(conn, a.name))
         elif a.cmd == "copybook":

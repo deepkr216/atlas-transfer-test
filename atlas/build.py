@@ -29,7 +29,7 @@ import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
-from . import classify, cobol, copybook, docs, expand, ims, jcl, reader
+from . import classify, cobol, copybook, docs, expand, ims, jcl, reader, screens
 from .reader import Line
 
 VERSION = "0.1.0"
@@ -348,6 +348,10 @@ def index_cobol(ctx: Ctx, mem: Mem) -> None:
         if depth == 0 or (run and run.via_copy in replaced):
             keep.append(fld)
     _insert_fields(conn, mem.id, keep)
+    conn.executemany(
+        "INSERT INTO literal_ref(member_id,program_id,literal,context,field,line) VALUES(?,?,?,?,?,?)",
+        [(mem.id, pid, lit, ctxt, fld, ln) for (lit, ctxt, fld, ln)
+         in _group_value_literals(copybook.flatten(roots))])
 
     for w in warns:
         if "SYNC" in w or "not compile" in w:
@@ -368,6 +372,35 @@ def index_cobol(ctx: Ctx, mem: Mem) -> None:
 
     status = "partial" if any(k in ("expand",) for (k, _d, _l) in notes) else "ok"
     conn.execute("UPDATE member SET parse_status=? WHERE id=?", (status, mem.id))
+
+
+def _group_value_literals(fields: List[copybook.Field]) -> List[Tuple[str, str, str, int]]:
+    """A long message assembled from consecutive FILLER VALUEs:
+
+        01  WS-MSG-TABLE.
+            05  FILLER  PIC X(15)  VALUE 'RELATIONSHIP/GE'.
+            05  FILLER  PIC X(15)  VALUE 'NDER MISMATCH'.
+
+    Each piece is already a literal_ref; the WHOLE text ('RELATIONSHIP/GENDER
+    MISMATCH') is what a search for 'GENDER' must find, so the group's
+    concatenated value (each piece padded to its PIC length, as storage would
+    be) is emitted as one more literal on the group item.
+    """
+    out: List[Tuple[str, str, str, int]] = []
+    for g in fields:
+        if not g.is_group:
+            continue
+        pieces = []
+        for c in g.children:
+            v = c.value_lit or ""
+            if c.is_group or not (v.startswith("'") or v.startswith('"')):
+                pieces = []
+                break
+            s = cobol._norm_lit(v)
+            pieces.append(s.ljust(c.length)[:c.length] if c.length else s)
+        if len(pieces) >= 2:
+            out.append(("".join(pieces).rstrip(), "value_group", g.name, g.line))
+    return out
 
 
 def _insert_fields(conn: sqlite3.Connection, member_id: int, fields: List[copybook.Field]) -> None:
@@ -395,7 +428,7 @@ def index_copybook(ctx: Ctx, mem: Mem) -> None:
     fields = [f for f in copybook.flatten(roots) if f.name != copybook.SYNTHETIC_ROOT]
     _insert_fields(conn, mem.id, fields)
 
-    lits: List[Tuple[str, str, str, int]] = []
+    lits: List[Tuple[str, str, str, int]] = list(_group_value_literals(fields))
     for f in fields:
         if f.value_lit:
             lits.append((cobol._norm_lit(f.value_lit), "value", f.name, f.line))
@@ -549,9 +582,48 @@ def index_fts_code(ctx: Ctx, mem: Mem) -> None:
     conn.executemany("INSERT INTO src_fts(member_name,kind,line_no,text) VALUES(?,?,?,?)", rows)
 
 
+def _insert_screens(ctx: Ctx, mem: Mem, scr: List[screens.Screen]) -> None:
+    conn = ctx.conn
+    for s in scr:
+        cur = conn.execute(
+            "INSERT INTO screen(member_id,kind,name,parent,mode,next_msg,lang,size,line) VALUES(?,?,?,?,?,?,?,?,?)",
+            (mem.id, s.kind, s.name, s.parent, s.mode, s.next_msg, s.lang, s.size, s.line))
+        sid = cur.lastrowid
+        conn.executemany(
+            "INSERT INTO screen_field(screen_id,name,ordinal,row,col,length,offset,seg,attrb,initial,picin,"
+            "picout,literal,line) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            [(sid, f.name, f.ordinal, f.row, f.col, f.length, f.offset, f.seg, f.attrb, f.initial,
+              f.picin, f.picout, f.literal, f.line) for f in s.fields])
+        # Defaults and on-screen constants are literals too: a default 'U' for
+        # gender, a label 'GENDER:', a fixed transaction code.
+        conn.executemany(
+            "INSERT INTO literal_ref(member_id,program_id,literal,context,field,line) VALUES(?,NULL,?,?,?,?)",
+            [(mem.id, f.initial if f.initial is not None else f.literal,
+              "screen_initial" if f.initial is not None else "screen_literal",
+              f.name or f"{s.name}#{f.ordinal}", f.line)
+             for f in s.fields if (f.initial is not None or f.literal is not None)])
+        conn.executemany("INSERT INTO unresolved(member_id,kind,detail,line) VALUES(?,?,?,?)",
+                         [(mem.id, "screen", w, None) for w in s.warnings])
+    conn.execute("UPDATE member SET parse_status=? WHERE id=?", ("ok" if scr else "partial", mem.id))
+    if not scr:
+        conn.execute("INSERT INTO unresolved(member_id,kind,detail,line) VALUES(?,?,?,?)",
+                     (mem.id, "screen", "no map/format/message macros recognised", None))
+
+
+def index_bms(ctx: Ctx, mem: Mem) -> None:
+    text, _d, _e = reader.load(mem.path)
+    _insert_screens(ctx, mem, screens.parse_bms(text))
+
+
+def index_mfs(ctx: Ctx, mem: Mem) -> None:
+    text, _d, _e = reader.load(mem.path)
+    _insert_screens(ctx, mem, screens.parse_mfs(text))
+
+
 HANDLERS = {
     "cobol": index_cobol, "copybook": index_copybook, "jcl": index_jcl, "proc": index_jcl,
     "dbd": index_dbd, "psb": index_psb, "doc": index_doc,
+    "bms": index_bms, "mfs": index_mfs,
 }
 
 

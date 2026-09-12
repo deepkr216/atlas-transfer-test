@@ -134,7 +134,16 @@ python -m atlas.query --db atlas.db messages GENDER                 > m1.md   # 
 python -m atlas.query --db atlas.db messages RELATION               > m2.md
 python -m atlas.query --db atlas.db field    WS-GENDER-CD           > f.md    # copies, skew, refs
 python -m atlas.query --db atlas.db copybook <record copybook>      > c.md    # jobs, datasets, readers
+python -m atlas.query --db atlas.db values   GENDER                 > s.md    # the SCREEN field: default, validators
+python -m atlas.query --db atlas.db screen   <map or MID/MOD name>  > s2.md   # every field on the screen
 ```
+
+Online: `values` on the *screen* field name (BMS `GENDER`, referenced by
+programs as `GENDERI`/`GENDERO`; MFS by MFLD name and byte offset) lists the
+screen default and the programs that validate the input - that is where a
+new gender value is rejected first. `screen` lists every field on the map or
+message with length, default and offset, so the picklist/validation change
+can be scoped per screen.
 
 What each inventory gives the design:
 

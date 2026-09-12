@@ -34,11 +34,19 @@ then the fix, then a row here. Nothing is "fixed" until the test exists.
 | 26 | Missing copybook silently ignored | Expansion swallowed the failure | `test_missing_copybook_is_a_warning_not_silence` |
 | 27 | Legacy `.doc` counted as "indexed, empty" | No extractor, no report | `test_legacy_binary_is_reported_not_silent` |
 | 28 | A model's citation to a comment line accepted | Gate checked text presence only | `CitationGate.test_citation_to_commented_line_warns` |
+| 29 | `WHEN 3 ALSO 'M'` attributed `'M'` to the relationship field | EVALUATE subject taken as one field; ALSO positions ignored | `ConditionLogic.test_evaluate_also_attaches_when_values_by_position` |
+| 30 | `IF A = 1 AND B = 'M' OR 'F'` recorded `'F'` against A as well as B | Abbreviated-condition scan ran to end of statement instead of to the next compare | `test_abbreviated_or_after_and_is_not_over_attributed` |
+| 31 | `messages GENDER` missed `RELATIONSHIP/GENDER MISMATCH` built from two FILLER VALUEs | Each piece indexed, the whole never assembled | `test_message_assembled_from_fillers`, `ScreensEndToEnd.test_messages_finds_filler_assembled_text` |
+| 32 | Screen validation invisible: program tests `GENDERI`, map field is `GENDER` | BMS symbolic names not derived | `BmsMfsParsing.test_bms_map_fields_defaults_and_symbolic_names`, `test_screen_dossier_links_bms_field_to_validating_program` |
+| 33 | MFS field offsets wrong by 2 on output messages | `ATTR=YES` attribute bytes not counted | `test_mfs_offsets_and_type_inferred_from_fip_fop_label` |
+| 34 | MFS message with no `TYPE=` classified as unknown direction | Shop names MIDs/MODs `…FIP`/`…FOP`; inference from the label with a recorded warning | same test |
+| 35 | Screen labels (`'GENDER:'`) and defaults (`INITIAL='U'`) absent from message/value searches | Screen literals not indexed as literals | `test_values_on_a_screen_field_shows_default_and_validator` |
 
 ## Known gaps (not yet guarded - contributions welcome)
 
 - SYNC alignment slack is flagged, not computed.
 - GO TO and fall-through are not evaluated for dead-paragraph candidates.
-- CICS CSD / IMS SYSGEN loaders for `transaction_def` are not written.
+- Screens are parsed; transaction→program routing (CICS CSD / IMS SYSGEN `APPLCTN`/`TRANSACT`) is not loaded yet.
+- MFS `DO` repeats are expanded with the default 2-digit suffix only; `SUF=` and `BOUND=` are not modelled.
 - PDF text with CID fonts may be garbled; the extractor says so but cannot fix it.
 - Compiler listings are the authoritative expansion; a listing loader would supersede `expand.py`.

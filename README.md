@@ -51,6 +51,7 @@ python -m atlas.query --db atlas.db literal  E001               # where is this 
 python -m atlas.query --db atlas.db values   WS-GENDER-CD       # every value the code assumes (incl. undocumented)
 python -m atlas.query --db atlas.db pair     WS-REL-CD WS-GENDER-CD   # cross-field rules (son must be male)
 python -m atlas.query --db atlas.db messages GENDER             # message texts naming a rule
+python -m atlas.query --db atlas.db screen   MEMMAP             # BMS map / MFS MID-MOD: fields, defaults, validating programs
 python -m atlas.query --db atlas.db copybook PMASTREC           # impact
 python -m atlas.query --db atlas.db callers  RATECALC --depth 3
 python -m atlas.query --db atlas.db dataset  PROD.POLICY.EXTRACT
@@ -75,6 +76,7 @@ change to the toolkit and before copying it to another machine.
 | Expansion | Every program materialised with COPY/INCLUDE inline and REPLACING applied, with a line map back to (member, line) | Fields renamed by REPLACING are invisible to grep; procedure copybooks attributed to the wrong member |
 | JCL / PROC | JOB/EXEC/DD with continuations, inline control cards captured, symbolics resolved (SET > EXEC override > PROC default), GDG base split from `(+1)`, `//STEP.DD` overrides, **effective program** unwrapped from IKJEFT01/DFSRRC00/SORT/IDCAMS/IEBGENER/IEFBR14/DSNUTILB/FTP/NDM, sort-card **byte positions** | Steps attributed to TSO or the IMS region driver; producer/consumer linkage lost through GDG; `DISP` mistaken for direction |
 | IMS | DBD segments/fields/hierarchy; PSB PCBs in **positional** order with PROCOPT, `CMPAT=YES` / TP PCB → I/O PCB first | Off-by-one PCB → wrong database named |
+| Screens | BMS maps (DFHMSD/DFHMDI/DFHMDF): field, position, length, attributes, INITIAL, PICIN/PICOUT, and the generated symbolic names (`GENDERI`/`GENDERO`) that programs actually reference; MFS (FMT/DFLD, MSG/SEG/MFLD): MID/MOD with each MFLD's **byte offset** in the segment, `ATTR=YES` bytes, DO/ENDDO repeats, TYPE inferred from `…FIP`/`…FOP`/`…MID`/`…MOD` labels when missing | Online validation invisible; screen defaults and labels missed by a message search |
 | Documents | .docx/.xlsx/.pptx/.vsdx text, headings, tables, image manifests; PDF best-effort; legacy .doc/.xls reported | Docs indexed as if they were facts |
 
 Every parse failure is recorded on the member; every unresolved reference is a
@@ -125,8 +127,11 @@ code-generation bundle, test conditions, abend triage).
 - **Not a scheduler.** Batch flow lives in CA-7/Control-M/TWS. Export it to CSV
   and load it with `--sched`; until then "dead job" and "what runs before"
   are unanswerable, and the reports say so.
-- **Not online-aware yet.** `transaction_def` exists for CICS CSD / IMS SYSGEN
-  exports; a loader is the next step. Until then transaction→program is unknown.
+- **Screens are parsed; transaction routing is not.** BMS maps and MFS
+  MIDs/MODs are indexed (fields, offsets, defaults, validating programs), but
+  transaction→program comes from the CICS CSD / IMS SYSGEN (`APPLCTN`/
+  `TRANSACT`); `transaction_def` exists for that export and a loader is the
+  next step. Until then "which transaction runs this" is unknown.
 - **Not modelling** SYNC alignment slack, GO TO in dead-paragraph analysis
   (never-PERFORMed paragraphs are *candidates* only), dynamic SQL targets, or
   targets read from control tables (these appear as `unresolved`).

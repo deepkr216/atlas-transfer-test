@@ -849,13 +849,15 @@ def _compare_literals(f: ProgramFacts, frag: str, context: str, ln: int,
                       subject: Optional[str] = None) -> None:
     """IF X = 'A' OR 'B'   /   IF 'A' = X   /   WHEN 'A'   -> literal_refs."""
     found = False
-    for m in _CMP.finditer(frag):
+    matches = [m for m in _CMP.finditer(frag) if m.group(1).upper() not in _RESERVED]
+    for i, m in enumerate(matches):
         fld, lit = m.group(1).upper(), m.group(2)
-        if fld in _RESERVED:
-            continue
         found = True
         f.literal_refs.append((_norm_lit(lit), context, fld, ln))
-        for m2 in _CMP_MORE.finditer(frag, m.end()):
+        # Abbreviated conditions (A = 1 OR 2) belong to the NEAREST preceding
+        # compare only: in `A = 1 AND B = 'M' OR 'F'` the 'F' is B's, not A's.
+        stop = matches[i + 1].start() if i + 1 < len(matches) else len(frag)
+        for m2 in _CMP_MORE.finditer(frag, m.end(), stop):
             f.literal_refs.append((_norm_lit(m2.group(1)), context, fld, ln))
     if not found:
         for m in _CMP_REV.finditer(frag):
@@ -871,7 +873,9 @@ def _compare_literals(f: ProgramFacts, frag: str, context: str, ln: int,
 
 def _extract_field_and_literal_refs(f: ProgramFacts, st: LogicalLine) -> None:
     body = st.text.strip().rstrip(".")
-    eval_subject: Optional[str] = None
+    # EVALUATE A ALSO B ... WHEN 3 ALSO 'M': one subject per ALSO position, and
+    # each WHEN literal attaches to the subject at ITS position.
+    eval_subjects: List[Optional[str]] = []
 
     for verb, frag, off in _split_verbs(body):
         ln = st.line_at(off)          # the verb's own physical line, not the IF's
@@ -974,13 +978,18 @@ def _extract_field_and_literal_refs(f: ProgramFacts, st: LogicalLine) -> None:
             _compare_literals(f, frag, "compare", ln)
 
         elif verb == "EVALUATE":
-            m = _EVAL_SUBJ.match(frag)
-            eval_subject = m.group(1).upper() if m and m.group(1) else None
+            eval_subjects = []
+            for part in re.split(B + "ALSO" + E, frag, flags=re.I):
+                m = _EVAL_SUBJ.match(part.strip())
+                eval_subjects.append(m.group(1).upper() if m and m.group(1) else None)
             _refs(f, _idents(frag), "test", verb, ln)
 
         elif verb == "WHEN":
             _refs(f, _idents(frag), "test", verb, ln)
-            _compare_literals(f, frag, "when", ln, subject=eval_subject)
+            parts = re.split(B + "ALSO" + E, frag, flags=re.I)
+            for i, part in enumerate(parts):
+                subj = eval_subjects[i] if i < len(eval_subjects) else None
+                _compare_literals(f, part, "when", ln, subject=subj)
 
         elif verb == "PERFORM":
             mu = re.search(B + r"UNTIL\s+(.+)$", frag, re.I | re.S)

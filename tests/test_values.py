@@ -39,7 +39,9 @@ class ValueDomainScenario(unittest.TestCase):
         self.assertIn("WS-REL-SON", out)                 # 3 documented by its 88
         self.assertIn("MEMBRVAL:21", out)                # WHEN 3
         self.assertIn("MEMBRVAL:33", out)                # MOVE 2 TO WS-REL-CD
-        self.assertRegex(out, r"never set, tested or queried[^\n]*\b1\b")   # main member never used here
+        # value 1 is tested only in CONDLOGX: uses aggregate across programs
+        self.assertIn("| 1 | WS-REL-MAIN | 0 | 1 |", out)
+        self.assertIn("CONDLOGX:29", out)
 
     def test_values_counts_tests_through_88_names_and_sql_columns(self):
         out = query.cmd_values(self.conn, "WS-GENDER-CD")

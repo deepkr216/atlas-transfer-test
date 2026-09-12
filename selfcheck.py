@@ -38,7 +38,7 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as td:
         db = os.path.join(td, "smoke.db")
         r = run(["-m", "atlas.build", os.path.join(HERE, "tests", "fixtures"), "--db", db, "--rebuild", "--quiet"])
-        all_ok &= stage("smoke build", r.returncode == 0 and "programs 4" in r.stdout,
+        all_ok &= stage("smoke build", r.returncode == 0 and "programs 5" in r.stdout,
                         "" if r.returncode == 0 else (r.stderr.strip().splitlines() or ["?"])[-1])
 
         checks = [
@@ -52,7 +52,10 @@ def main() -> int:
             (["values", "WS-REL-CD"], ["NOT DOCUMENTED BY ANY 88-LEVEL", "WS-REL-SON", "MEMBRVAL:33"]),
             (["values", "WS-GENDER-CD"], ["via 88 WS-GENDER-MALE", "GENDER_CD"]),
             (["pair", "WS-REL-CD", "WS-GENDER-CD"], ["MEMBRVAL:22", "MEMBRVAL:37"]),
-            (["messages", "GENDER"], ["GENDER MUST BE MALE FOR SON", "MEMBRVAL:29"]),
+            (["messages", "GENDER"], ["GENDER MUST BE MALE FOR SON", "MEMBRVAL:29", "RELATIONSHIP/GENDER MISMATCH"]),
+            (["screen", "MEMMAP"], ["| GENDER |", "GENDERI", "CONDLOGX:40"]),
+            (["screen", "MEMFIP"], ["next MEMFOP", "| 5/1 |"]),
+            (["values", "GENDER"], ["Screen fields", "| U |"]),
         ]
         for args, needles in checks:
             r = run(["-m", "atlas.query", "--db", db, *args])
