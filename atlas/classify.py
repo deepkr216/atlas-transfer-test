@@ -56,13 +56,19 @@ _SIG_JOB = re.compile(r"^//\S{1,8}\s+JOB\b", re.M)
 _SIG_PROC = re.compile(r"^//\S{0,8}\s+PROC\b", re.M)
 _SIG_PEND = re.compile(r"^//\S{0,8}\s+PEND\b", re.M)
 _SIG_EXEC = re.compile(r"^//\S{0,8}\s+EXEC\b", re.M)
-_SIG_DBD = re.compile(r"^\s*DBD\s+NAME=", re.I | re.M)
-_SIG_SEGM = re.compile(r"^\s*SEGM\s+NAME=", re.I | re.M)
-_SIG_PSB = re.compile(r"^\s*PSBGEN\b|^\s*PCB\s+TYPE=", re.I | re.M)
+# HLASM macro format: an optional label in column 1, then the operation. A
+# pattern anchored on leading whitespace misses every labelled statement -
+# which is most of them in DBD/PSB source.
+_SIG_DBD = re.compile(r"^(?:[A-Z0-9@#$]{1,8})?\s+DBD\s+NAME=", re.I | re.M)
+_SIG_SEGM = re.compile(r"^(?:[A-Z0-9@#$]{1,8})?\s+SEGM\s+NAME=", re.I | re.M)
+_SIG_PSB = re.compile(r"^(?:[A-Z0-9@#$]{1,8})?\s+PSBGEN\b|^(?:[A-Z0-9@#$]{1,8})?\s+PCB\s+TYPE=",
+                      re.I | re.M)
 _SIG_BMS = re.compile(r"\bDFHMSD\b|\bDFHMDI\b|\bDFHMDF\b", re.I)
 _SIG_MFS = re.compile(r"^\s*(MSG|FMT|DEV|DFLD|MFLD)\s", re.I | re.M)
 _SIG_SQL_DDL = re.compile(r"\bCREATE\s+(TABLE|VIEW|INDEX|TABLESPACE|DATABASE)\b", re.I)
-_SIG_DATA_LEVEL = re.compile(r"^.{0,6}.?\s*(01|05|10|15|03|02)\s+[A-Z0-9][A-Z0-9\-]*",
+# Any level 01-49 plus 66/77/88. Level 49 is the DCLGEN VARCHAR structure and
+# 02/03/04/06/07/15/20 are all common; testing only 01/05/10 misfiles them.
+_SIG_DATA_LEVEL = re.compile(r"^.{0,6}.?\s*(0[1-9]|[1-4]\d|66|77|88)\s+[A-Z0-9][A-Z0-9\-]*",
                              re.I | re.M)
 _SIG_ASM = re.compile(r"^\s*\w*\s+(CSECT|DSECT|START|DFHEIENT)\b", re.I | re.M)
 _SIG_REXX = re.compile(r"^\s*/\*\s*REXX", re.I)

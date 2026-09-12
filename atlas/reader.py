@@ -140,6 +140,16 @@ class LogicalLine:
     # MOVE-TOTALS is indistinguishable from a MOVE statement, and the
     # paragraph list - and therefore the whole PERFORM graph - comes out wrong.
     area_a: bool = False
+    # Physical line number for each character of `text`, when known. A single
+    # statement can hold several verbs on different lines (IF ... MOVE ...
+    # ELSE MOVE ... END-IF); this is what lets each MOVE be cited to ITS line
+    # rather than to the line the IF started on.
+    charmap: Optional[List[int]] = None
+
+    def line_at(self, offset: int) -> int:
+        if self.charmap and 0 <= offset < len(self.charmap):
+            return self.charmap[offset]
+        return self.start
 
     @property
     def upper(self) -> str:
@@ -419,13 +429,15 @@ def cobol_statements(logical: Sequence[LogicalLine]) -> Iterator[LogicalLine]:
             idx = find_terminator(buf, 0, at_line_end=True)
             if idx < 0:
                 break
-            text = buf[:idx + 1].strip()
+            raw_stmt = buf[:idx + 1]
+            text = raw_stmt.strip()
             if text:
-                s_line = lmap[0] if lmap else ll.start
+                lead = len(raw_stmt) - len(raw_stmt.lstrip())
+                s_line = lmap[lead] if lmap and lead < len(lmap) else ll.start
                 e_line = lmap[min(idx, len(lmap) - 1)] if lmap else ll.end
                 yield LogicalLine(text=text, start=s_line, end=e_line,
                                   lines=sorted(set(lmap[:idx + 1])),
-                                  area_a=area_a)
+                                  area_a=area_a, charmap=lmap[lead:idx + 1])
             buf = buf[idx + 1:]
             lmap = lmap[idx + 1:]
             # Anything after the period sits in Area B by definition.
@@ -434,9 +446,10 @@ def cobol_statements(logical: Sequence[LogicalLine]) -> Iterator[LogicalLine]:
             buf, lmap, fresh = "", [], True
 
     if buf.strip():
-        yield LogicalLine(text=buf.strip(), start=lmap[0] if lmap else 0,
+        lead = len(buf) - len(buf.lstrip())
+        yield LogicalLine(text=buf.strip(), start=lmap[lead] if lmap and lead < len(lmap) else 0,
                           end=lmap[-1] if lmap else 0,
-                          lines=sorted(set(lmap)), area_a=area_a)
+                          lines=sorted(set(lmap)), area_a=area_a, charmap=lmap[lead:])
 
 
 _DECIMAL_DOT = re.compile(r"\d\.\d")

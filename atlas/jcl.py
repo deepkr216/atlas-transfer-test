@@ -80,7 +80,8 @@ class DdFact:
     dsn_resolved: Optional[str]
     gdg_rel: Optional[str]
     disp: Optional[str]
-    mode: str
+    mode: str               # input|output|mod|sysout|dummy|unknown
+    mode_source: str        # what decided `mode` - see _direction()
     sysin_text: Optional[str]
     is_override: bool
     line: int
@@ -222,6 +223,8 @@ def _build_dd(st: JclStatement, dd_name: str, concat_seq: int,
     # `//STEP1.DD1 DD ...` overrides a DD inside a called PROC.
     is_override = "." in dd_name
 
+    mode, mode_src = _direction(dd_name, gdg, disp, st.operands)
+
     return DdFact(
         dd_name=dd_name,
         concat_seq=concat_seq,
@@ -229,33 +232,67 @@ def _build_dd(st: JclStatement, dd_name: str, concat_seq: int,
         dsn_resolved=resolved,
         gdg_rel=gdg,
         disp=disp,
-        mode=_disp_to_mode(disp, st.operands),
+        mode=mode,
+        mode_source=mode_src,
         sysin_text=sysin,
         is_override=is_override,
         line=st.start,
     )
 
 
-def _disp_to_mode(disp: Optional[str], operands: str) -> str:
-    """Derive read/write intent from DISP. This is what makes dataset flow real."""
+# DD names whose direction is fixed by the utility that reads them.
+_INPUT_DDS = {"SORTIN", "SYSUT1", "INFILE", "SYSIN", "SYSTSIN", "STEPLIB", "JOBLIB",
+              "SYSLIB", "IMSACB", "DFSRESLB", "DFSVSAMP", "IEFRDER", "SYSLMOD"}
+_OUTPUT_DDS = {"SORTOUT", "SYSUT2", "OUTFILE", "SYSPRINT", "SYSOUT", "SYSUDUMP",
+               "SYSABEND", "CEEDUMP"}
+
+
+def _direction(dd_name: str, gdg: Optional[str], disp: Optional[str],
+               operands: str) -> Tuple[str, str]:
+    """Decide read/write direction, and record WHAT decided it.
+
+    DISP is NOT direction. DISP is serialisation and cataloguing. DISP=OLD is
+    routinely coded on a pre-allocated output dataset, and DISP=SHR datasets
+    are written all day (VSAM update-in-place is everywhere in insurance).
+    Derive direction from DISP alone and the batch lineage graph comes out
+    with arrows pointing the wrong way - and it looks fine.
+
+    Signals, strongest first:
+      1. GDG relative generation: (+1) is created here, (0)/(-n) is read.
+      2. Utility DD-name conventions: SORTIN/SYSUT1 read, SORTOUT/SYSUT2 write.
+      3. DISP=NEW / MOD - weak corroboration only.
+      4. The program's own OPEN INPUT/OUTPUT/I-O verb, joined through
+         SELECT...ASSIGN to this DD name. That join is applied later, in
+         build.py, and OVERRIDES everything above because it is the only
+         signal that reflects what the code actually does.
+    """
     up = (operands or "").upper()
     if "SYSOUT=" in up:
-        return "sysout"
+        return "sysout", "sysout"
     if "DUMMY" in up:
-        return "dummy"
-    if not disp:
-        # No DISP with a DSN usually means NEW by default in a temp alloc.
-        return "unknown"
-    status = disp.strip().lstrip("(").split(",")[0].strip().upper()
-    if status in ("NEW",):
-        return "output"
-    if status in ("MOD",):
-        return "mod"
-    if status in ("SHR", "OLD"):
-        # OLD/SHR is *usually* input, but a program can rewrite in place. Mark
-        # it 'input' and let the program's own OPEN mode refine it later.
-        return "input"
-    return "unknown"
+        return "dummy", "dummy"
+
+    if gdg is not None:
+        try:
+            g = int(gdg)
+        except ValueError:
+            g = None
+        if g is not None:
+            return ("output" if g > 0 else "input"), "gdg_relative"
+
+    base = dd_name.upper().split(".")[-1]
+    if base in _INPUT_DDS or base.startswith("SORTIN"):
+        return "input", "dd_convention"
+    if base in _OUTPUT_DDS or base.startswith("SORTOF"):
+        return "output", "dd_convention"
+
+    if disp:
+        status = disp.strip().lstrip("(").split(",")[0].strip().upper()
+        if status == "NEW":
+            return "output", "disp_new_weak"
+        if status == "MOD":
+            return "mod", "disp_mod_weak"
+    return "unknown", "undetermined"
 
 
 def _strip_gdg(dsn: str) -> Tuple[str, Optional[str]]:
@@ -373,6 +410,21 @@ def _resolve_effective_pgm(step: StepFact, facts: JclFacts) -> None:
         if ctl:
             step.notes.append("DB2 utility driven by SYSIN")
 
+    elif kind in ("ftp", "ndm", "usssh"):
+        # These are the mainframe-to-non-mainframe boundary. The peer system,
+        # direction and file names live in the SYSIN / process cards, so the
+        # cards are the fact and the step is recorded as an interface.
+        step.effective_pgm = f"*{kind.upper()}*"
+        ctl = _dd_text(step, "SYSIN") or _dd_text(step, "STDIN") or ""
+        step.notes.append(f"external interface via {pgm}")
+        for m in re.finditer(r"\b(?:open|SNODE=|PNODE=|host|put|get|send|receive)\b\s*[=(]?\s*([^\s,()]+)",
+                             ctl, re.IGNORECASE):
+            step.notes.append(f"interface detail: {m.group(0).strip()[:60]}")
+        if not ctl:
+            facts.unresolved.append(
+                ("launcher_parm", f"{step.step_name}: {pgm} with no inline cards - "
+                                  f"peer/direction unknown", step.line))
+
     else:
         step.effective_pgm = f"*{pgm}*"
 
@@ -412,4 +464,72 @@ def control_card_params(text: str) -> Dict[str, str]:
         m = re.match(r"^([A-Z0-9_#@$-]{1,32})\s*[=:]\s*(.+)$", line, re.IGNORECASE)
         if m:
             out[m.group(1).upper()] = m.group(2).strip()
+    return out
+
+
+# --------------------------------------------------------------------------
+# DFSORT / SYNCSORT control cards
+# --------------------------------------------------------------------------
+
+_SORT_CARD = re.compile(
+    r"\b(SORT|MERGE|INCLUDE|OMIT|INREC|OUTREC|OUTFIL|JOINKEYS|SUM)\b", re.IGNORECASE)
+# (pos,len[,fmt]) inside FIELDS=/COND=/BUILD=/OUTREC= lists. The format is
+# optional: INREC/OUTREC/OUTFIL BUILD lists are plain (pos,len) pairs, while
+# SORT FIELDS and INCLUDE/OMIT COND carry a format (or a FORMAT= default).
+_CARD_TRIPLE = re.compile(
+    r"(?<![\d:.])(\d{1,5}),(\d{1,5})(?:,([A-Z][A-Z0-9]{0,3}))?(?=[,)\s]|$)", re.IGNORECASE)
+_CARD_FORMAT = re.compile(r"\bFORMAT=([A-Z0-9]{1,4})\b", re.IGNORECASE)
+_NEEDS_FMT = {"SORT", "MERGE", "INCLUDE", "OMIT", "SUM"}
+
+
+def sort_card_fields(text: str) -> List[Tuple[str, int, int, str, str]]:
+    """Byte positions a sort/merge step actually depends on.
+
+    Returns (card_kind, pos_1based, length, format, raw_card). Sort cards are
+    real business logic - filtering (INCLUDE/OMIT), reformatting (INREC/OUTREC/
+    OUTFIL), field derivation - and they address the record BY BYTE POSITION.
+    A copybook change that moves bytes silently breaks every one of these,
+    which is why the impact query joins these positions against computed
+    field offsets instead of hoping somebody remembers the sort step.
+    """
+    out: List[Tuple[str, int, int, str, str]] = []
+    if not text:
+        return out
+    # Join continued cards: a card continues when it ends with a comma.
+    cards: List[str] = []
+    buf = ""
+    for line in text.splitlines():
+        s = line[:71].rstrip()
+        if not s.strip() or s.lstrip().startswith("*"):
+            continue
+        buf = (buf + " " + s.strip()) if buf else s.strip()
+        if not buf.endswith(","):
+            cards.append(buf)
+            buf = ""
+    if buf:
+        cards.append(buf)
+
+    for card in cards:
+        mk = _SORT_CARD.search(card)
+        if not mk:
+            continue
+        kind = mk.group(1).upper()
+        fmt_default = None
+        mf = _CARD_FORMAT.search(card)
+        if mf:
+            fmt_default = mf.group(1).upper()
+        seen = set()
+        for m in _CARD_TRIPLE.finditer(card):
+            pos, ln = int(m.group(1)), int(m.group(2))
+            fmt = (m.group(3) or "").upper()
+            # With FORMAT=xx the triple is (pos,len,order) and 'fmt' is A/D.
+            if fmt in ("A", "D", "") and fmt_default:
+                fmt = fmt_default
+            if not fmt and kind in _NEEDS_FMT:
+                continue          # a bare pair in a SORT/INCLUDE list is not a field ref
+            key = (pos, ln)
+            if key in seen or pos == 0 or ln == 0:
+                continue
+            seen.add(key)
+            out.append((kind, pos, ln, fmt or None, card[:120]))
     return out

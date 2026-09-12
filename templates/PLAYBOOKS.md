@@ -1,0 +1,172 @@
+# Playbooks
+
+Each playbook is: the queries to run (free), what to hand the model (small),
+the output template (fixed), and the gate (mechanical). The model never sees
+the repository; it sees packs.
+
+Common output skeleton for every playbook:
+
+```
+## FACTS            (cited: [[MEMBER line "token"]])
+## INFERENCE        (labelled reasoning over the facts)
+## UNRESOLVED IN SCOPE   (copied verbatim from the query output)
+## NOT SEARCHED     (what was out of scope)
+## HUMAN MUST VERIFY
+```
+
+Gate for every playbook: `python -m atlas.verify_citations answer.md --db atlas.db`
+must print `RESULT: citations verified` (warnings allowed only with an
+explanation in the answer).
+
+---
+
+## A1. Impact of changing a field
+
+Question shape: "If I change `PM-POLICY-STATUS` (PIC/length/values), what breaks?"
+
+```
+python -m atlas.query --db atlas.db field    PM-POLICY-STATUS      > f.md
+python -m atlas.query --db atlas.db copybook PMASTREC              > c.md
+python -m atlas.query --db atlas.db literal  AC                    > l.md   # for each 88 value in play
+```
+
+Hand the model: `f.md`, `c.md`, the relevant `l.md`s, and the change request.
+
+The model must produce, in FACTS: (1) every copybook copy and its offset/length
+for the field, flagging version skew; (2) every program including each copy,
+with REPLACING noted; (3) every job/step running those programs; (4) every
+dataset those steps write and who reads it; (5) every sort/control card whose
+byte range overlaps the field; (6) callers of the including programs (LINKAGE
+may carry the record). In INFERENCE: whether record length changes (then VSAM
+DEFINE RECORDSIZE, DCB/LRECL, VB RDW +4, downstream fixed-width parsers,
+non-mainframe consumers are all in scope), and which programs need
+RECOMPILE-ONLY vs SOURCE-CHANGE vs BIND vs DATA-CONVERSION.
+
+HUMAN MUST VERIFY: unresolved dynamic CALLs in scope, copies not marked
+authoritative, any consumer outside the index.
+
+## A2. What does this job do
+
+```
+python -m atlas.query --db atlas.db job CLMNIGHT > j.md
+```
+
+The model narrates step by step from `j.md` only: effective program (not
+`PGM=`), what the control cards make the step do (quote them), datasets in/out
+with direction source, GDG generation, COND/IF flow. If a step runs a PROC not
+in the index, the step's contents are UNKNOWN. If no scheduler is loaded,
+predecessors are UNKNOWN. Both are stated, not glossed.
+
+## A3. Trace an error / status code
+
+Question shape: "Where does `E001` come from and where is it shown?"
+
+```
+python -m atlas.query --db atlas.db literal E001 > l.md
+```
+
+`l.md` already contains: where the literal is defined (VALUE / 88), set (MOVE),
+tested (IF / WHEN), displayed, and where the value flows after being set -
+positionally through `CALL ... USING` to the callee's LINKAGE, back to callers,
+and through file records to other programs at the same **bytes**. The model
+turns that into a chain with citations, and lists routes it could not follow
+(DB2/IMS/MQ, group-level MOVEs, unresolved CALLs).
+
+If `l.md` says the literal is not found: the code may be built (STRING,
+arithmetic), read from a table, or spelled differently. Say so; do not guess a
+program.
+
+## A4. Where is this field populated / trace a policy number end to end
+
+```
+python -m atlas.query --db atlas.db field POL-NO > f.md         # 'write' references, ranked
+python -m atlas.query --db atlas.db pack  <each writing program> > p.md
+```
+
+Writers include MOVE/COMPUTE targets, `SELECT ... INTO`/`FETCH ... INTO`,
+`READ ... INTO`, `CALL ... USING` (by reference), group-level writes. For the
+end-to-end trace, walk dataset producers/consumers (`dataset`) and CALL
+positions; every hop is a FACT with a citation or it is a gap.
+
+## A5. Abend triage
+
+Inputs the human must paste: the JESMSGLG/JESYSMSG lines, failing job/step,
+abend code or SQLCODE/IMS status. Then:
+
+```
+python -m atlas.query --db atlas.db job  <JOB>     > j.md
+python -m atlas.query --db atlas.db pack <PROGRAM> > p.md
+```
+
+The model gives at most three ranked hypotheses, each with a disconfirming
+check. Per code: S0C7 - which COMP-3/numeric field at the reported offset
+(needs the compile listing to map offset→statement; without it say "cannot
+localise"); S0C4 - LINKAGE/USING count mismatch (compare `linkage_using` vs the
+caller's USING list in `program`); SQLCODE -805/-818 - bind/timestamp, not
+code; -911/-913 - contention, look at the concurrent jobs; IMS AI/AJ/AM -
+PROCOPT vs call function (`ims_pcb.procopt`), GE/GB - SSA/path, not a bug.
+
+## A6. Dead code
+
+```
+python -m atlas.query --db atlas.db dead > d.md
+```
+
+Candidates only. The report states whether the scheduler and online
+definitions were loaded and how many dynamic CALLs are unresolved; the model
+repeats those caveats and recommends the export that would close them. Never
+recommend deletion from this report alone.
+
+---
+
+## D1. Change design document (two passes)
+
+**Pass 1 - facts (no model):** run A1 for every field touched and A2 for every
+job touched; concatenate into `facts.md`.
+
+**Pass 2 - narrative (one model call):** hand `facts.md` + the requirement.
+The design must contain: affected components table (from FACTS, each with a
+change type: RECOMPILE-ONLY / SOURCE-CHANGE / BIND / PSBGEN+ACBGEN /
+DBDGEN+RELOAD / JCL-CHANGE / DATA-CONVERSION / EXTERNAL-CONTRACT); CRUD matrix
+derived from `sql_stmt` verbs, DL/I functions and file OPEN modes; before/after
+data flow; interface contracts in bytes (RECFM, LRECL, RDW, code page, whether
+COMP/COMP-3 crosses the boundary); backout plan per change type (a DBD BYTES
+change has no fast backout - say so); a non-empty risks/unknowns section
+seeded from UNRESOLVED.
+
+## V1. Generating a program / change bundle
+
+```
+python -m atlas.query --db atlas.db pack     <similar existing program>  > exemplar-facts.md
+python -m atlas.query --db atlas.db cite     <similar member> 1-400     > exemplar.cbl
+python -m atlas.query --db atlas.db copybook <each record copybook>     > layout.md
+python -m atlas.query --db atlas.db job      <a job that runs the exemplar> > exemplar-jcl.md
+```
+
+The bundle contains: source (field names only from `layout.md`); copybook
+changes; compile/bind member modelled on the shop's real one; run JCL modelled
+on the real job (real HLQ patterns, real PROC names, real GDG conventions -
+never invented DSNs); control cards with their exact expected layout; PSB/DBD
+and bind implications from the index; and the fixed **HUMAN MUST VERIFY** list
+(offsets/lengths, PROCOPT/SSA, checkpoint frequency, error paragraphs, restart
+logic, anything crossing to a non-mainframe system).
+
+## T1. Test conditions and data
+
+```
+python -m atlas.query --db atlas.db field    <each input field>   > f.md   # 88 values
+python -m atlas.query --db atlas.db pack     <program>            > p.md   # paragraphs, calls, SQL
+python -m atlas.query --db atlas.db copybook <record copybook>    > layout.md
+```
+
+Condition inventory: every 88 value is a positive class, every THRU range gives
+low/high/mid, one value outside all 88s under a field is the mandatory
+negative; every IF gets true and false (implicit false when no ELSE); every
+EVALUATE gets each WHEN plus OTHER. Test records are built to the copybook
+byte layout (COMP-3 packed, correct lengths, RDW if VB) - the parser's numbers,
+not the model's.
+
+Expected results come from the specification, not from reading the program:
+one call with spec + inputs (no source) produces expected outputs; a second
+with the program produces predicted outputs; the diff is the finding.
+Agreement is not proof - it is two readings that agree.

@@ -23,7 +23,12 @@ CREATE TABLE IF NOT EXISTS member (
     kind          TEXT NOT NULL,          -- cobol|copybook|jcl|proc|ctlcard|dbd|psb|bms|mfs|sql|doc|unknown
     library       TEXT,                   -- the folder that acts as the PDS
     ext           TEXT,
-    sha256        TEXT NOT NULL,          -- content hash -> duplicate detection
+    sha256        TEXT NOT NULL,          -- hash of the raw bytes (provenance)
+    norm_sha      TEXT,                   -- hash of cols 8-72 only, trailing blanks
+                                          -- stripped, upper-cased. Raw hashes almost
+                                          -- never collide because cols 1-6 hold
+                                          -- sequence numbers and 73-80 hold change
+                                          -- stamps; THIS is the duplicate detector.
     bytes         INTEGER,
     lines         INTEGER,
     fixed_format  INTEGER,                -- 1 = cols 7/72 rules applied
@@ -40,7 +45,7 @@ CREATE INDEX IF NOT EXISTS ix_member_sha    ON member(sha256);
 -- The "which copy is production?" question is the #1 source of wrong answers
 -- when analysing a folder dump, so it gets a first-class view.
 CREATE VIEW IF NOT EXISTS v_ambiguous_member AS
-SELECT name, COUNT(*) AS copies, COUNT(DISTINCT sha256) AS distinct_content,
+SELECT name, COUNT(*) AS copies, COUNT(DISTINCT norm_sha) AS distinct_content,
        GROUP_CONCAT(path, ' | ') AS paths
 FROM member
 WHERE kind IN ('cobol','copybook','jcl','proc','dbd','psb')
@@ -158,10 +163,30 @@ CREATE TABLE IF NOT EXISTS field_ref (
     id          INTEGER PRIMARY KEY,
     program_id  INTEGER NOT NULL REFERENCES program(id) ON DELETE CASCADE,
     name        TEXT NOT NULL,
-    mode        TEXT,                     -- read|write|both|test
+    mode        TEXT,                     -- read|write|test|display
+    stmt        TEXT,                     -- MOVE|COMPUTE|CALL-USING|EXEC-SQL|READ|...
     line        INTEGER
 );
 CREATE INDEX IF NOT EXISTS ix_fieldref_name ON field_ref(name);
+CREATE INDEX IF NOT EXISTS ix_fieldref_mode ON field_ref(name, mode);
+
+-- Literals are facts. An error code is 'E123' long before it is a field name:
+-- defined by an 88-level or VALUE in a copybook, MOVEd to a field in one
+-- program, compared in another, DISPLAYed in a third. Indexing the literal is
+-- what makes "where does E123 come from and where is it shown" a query
+-- instead of a guess. `field` is the target of a MOVE, the subject of a
+-- comparison/WHEN, the owner of a VALUE, or "<parent>/<88-name>" for an 88.
+CREATE TABLE IF NOT EXISTS literal_ref (
+    id          INTEGER PRIMARY KEY,
+    member_id   INTEGER NOT NULL REFERENCES member(id) ON DELETE CASCADE,
+    program_id  INTEGER REFERENCES program(id) ON DELETE CASCADE,
+    literal     TEXT NOT NULL,
+    context     TEXT NOT NULL,            -- move_to|compare|when|display|string|value|cond88
+    field       TEXT,
+    line        INTEGER
+);
+CREATE INDEX IF NOT EXISTS ix_literal_val ON literal_ref(literal);
+CREATE INDEX IF NOT EXISTS ix_literal_ctx ON literal_ref(literal, context);
 
 -- ---------------------------------------------------------------- files/IO
 
@@ -246,6 +271,13 @@ CREATE TABLE IF NOT EXISTS ims_psb (
     member_id   INTEGER NOT NULL REFERENCES member(id) ON DELETE CASCADE,
     name        TEXT NOT NULL,
     psb_type    TEXT,                     -- TP|DB|batch
+    lang        TEXT,
+    cmpat       TEXT,                     -- CMPAT=YES inserts an I/O PCB in FRONT of
+                                          -- the DB PCBs, shifting every position by 1
+    io_pcb_first INTEGER,                 -- 1 = program's first PCB is the I/O PCB
+                                          -- (CMPAT=YES or TP PCBs present); NULL =
+                                          -- depends on region type (BMP/MPP yes,
+                                          -- DLI batch no) - resolve from the JCL
     line        INTEGER
 );
 
@@ -323,7 +355,10 @@ CREATE TABLE IF NOT EXISTS dd (
     dsn_resolved TEXT,                    -- after symbolic substitution
     gdg_rel     TEXT,                     -- +1 / 0 / -1
     disp        TEXT,
-    mode        TEXT,                     -- input|output|mod|unknown  (derived from DISP)
+    mode        TEXT,                     -- input|output|mod|sysout|dummy|unknown
+    mode_source TEXT,                     -- open_verb|gdg_relative|dd_convention|
+                                          -- disp_new_weak|disp_mod_weak|undetermined
+                                          -- DISP is NOT direction; see jcl._direction()
     sysin_text  TEXT,                     -- inline control cards live HERE
     is_override INTEGER DEFAULT 0,        -- //STEP1.DD1 style override of a PROC DD
     line        INTEGER
@@ -349,6 +384,21 @@ JOIN step s   ON s.id = d.step_id
 LEFT JOIN job j ON j.id = s.job_id
 LEFT JOIN member m ON m.id = j.member_id
 WHERE d.dsn_resolved IS NOT NULL;
+
+-- Byte positions referenced by SORT/MERGE/INCLUDE/OMIT/INREC/OUTREC/OUTFIL
+-- cards. Sort cards are business logic that addresses the record by byte
+-- position; the impact query joins `pos` against computed field offsets so a
+-- copybook change that moves bytes surfaces every sort step it breaks.
+CREATE TABLE IF NOT EXISTS card_field_ref (
+    id          INTEGER PRIMARY KEY,
+    step_id     INTEGER NOT NULL REFERENCES step(id) ON DELETE CASCADE,
+    card_kind   TEXT,                     -- SORT|MERGE|INCLUDE|OMIT|INREC|OUTREC|OUTFIL|JOINKEYS|SUM
+    pos         INTEGER,                  -- 1-based byte position (RDW excluded on VB!)
+    length      INTEGER,
+    fmt         TEXT,                     -- CH|ZD|PD|BI|FI|...
+    raw         TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_card_pos ON card_field_ref(pos);
 
 -- ----------------------------------------------------- online / interfaces
 

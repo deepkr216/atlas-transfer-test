@@ -1,0 +1,15 @@
+{
+  "_comment": "Declare which folders hold PRODUCTION source. Members under these paths (or whose library folder name matches) are marked authoritative; when the same member name exists elsewhere with different content, queries prefer the authoritative copy and say so. Paths are matched case-insensitively as prefixes or as a folder name.",
+  "authoritative": [
+    "C:/estate/PROD.CLAIMS.SRC",
+    "C:/estate/PROD.CLAIMS.COPYLIB",
+    "PROD.POLICY.SRC",
+    "PROD.POLICY.COPYLIB",
+    "PROD.JCLLIB"
+  ],
+  "system_of": {
+    "PROD.CLAIMS.SRC": "CLAIMS",
+    "PROD.POLICY.SRC": "POLICY",
+    "PROD.BILLING.SRC": "BILLING"
+  }
+}
