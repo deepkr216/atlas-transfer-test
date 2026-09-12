@@ -442,16 +442,45 @@ CREATE INDEX IF NOT EXISTS ix_sfield_name ON screen_field(name);
 
 -- ----------------------------------------------------- online / interfaces
 
+-- Transaction -> program routing from the CICS CSD (DEFINE TRANSACTION ...
+-- PROGRAM(...)) and the IMS stage-1 SYSGEN (APPLCTN PSB= / TRANSACT CODE=).
+-- Nothing in COBOL, BMS or MFS holds this; without it an online program
+-- looks dead and "which transaction runs this" is a guess.
 CREATE TABLE IF NOT EXISTS transaction_def (
     id          INTEGER PRIMARY KEY,
-    member_id   INTEGER REFERENCES member(id),
+    member_id   INTEGER REFERENCES member(id) ON DELETE CASCADE,
     tran_code   TEXT NOT NULL,
     system      TEXT,                     -- cics|ims_dc
-    program     TEXT,
+    program     TEXT,                     -- IMS: assumed = PSB name unless GPSB= (see detail)
     psb         TEXT,
+    group_name  TEXT,                     -- CICS GROUP()
     map_or_mfs  TEXT,
+    detail      TEXT,                     -- REMOTESYSTEM, PGMTYPE, assumptions
     line        INTEGER
 );
+CREATE INDEX IF NOT EXISTS ix_txn_code ON transaction_def(tran_code);
+CREATE INDEX IF NOT EXISTS ix_txn_prog ON transaction_def(program);
+
+CREATE TABLE IF NOT EXISTS cics_program (
+    id          INTEGER PRIMARY KEY,
+    member_id   INTEGER REFERENCES member(id) ON DELETE CASCADE,
+    name        TEXT NOT NULL,
+    group_name  TEXT,
+    language    TEXT,
+    line        INTEGER
+);
+
+-- FCT: EXEC CICS READ FILE('POLMAST') names this entry; only the CSD says
+-- which dataset it is.
+CREATE TABLE IF NOT EXISTS cics_file (
+    id          INTEGER PRIMARY KEY,
+    member_id   INTEGER REFERENCES member(id) ON DELETE CASCADE,
+    name        TEXT NOT NULL,
+    dsname      TEXT,
+    group_name  TEXT,
+    line        INTEGER
+);
+CREATE INDEX IF NOT EXISTS ix_cicsfile_name ON cics_file(name);
 
 CREATE TABLE IF NOT EXISTS interface_edge (
     id          INTEGER PRIMARY KEY,

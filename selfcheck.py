@@ -56,6 +56,8 @@ def main() -> int:
             (["screen", "MEMMAP"], ["| GENDER |", "GENDERI", "CONDLOGX:40"]),
             (["screen", "MEMFIP"], ["next MEMFOP", "| 5/1 |"]),
             (["values", "GENDER"], ["Screen fields", "| U |"]),
+            (["transaction", "MEMB"], ["CONDLOGX", "MEMBRVAL", "ims_dc"]),
+            (["program", "CONDLOGX"], ["Online: MEMB (cics)"]),
         ]
         for args, needles in checks:
             r = run(["-m", "atlas.query", "--db", db, *args])

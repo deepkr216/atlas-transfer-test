@@ -117,6 +117,11 @@ definitions were loaded and how many dynamic CALLs are unresolved; the model
 repeats those caveats and recommends the export that would close them. Never
 recommend deletion from this report alone.
 
+For an online program, `transaction <PROGRAM>` shows which CICS transactions
+(CSD) or IMS transactions (stage-1 `APPLCTN`/`TRANSACT`) route to it; if the
+CSD extract or stage-1 source is not in the folder, the routing is UNKNOWN,
+not absent - fetch them (`sources.json` kinds `csd` / `imsgen`).
+
 ## A7. Value-domain change (a new code value, or codes merged)
 
 Question shape: "Gender gets a new value N; son (3) and daughter (4) both

@@ -211,6 +211,16 @@ def cmd_program(conn: sqlite3.Connection, name: str) -> str:
         out.append("\n### Files (SELECT/ASSIGN -> JCL DD -> dataset)\n")
         out.append(table(["file", "DD", "org", "ops", "datasets via JCL", "cite"], frows))
 
+        # EXEC CICS READ FILE('X') names an FCT entry; the CSD says which dataset.
+        cf = conn.execute("""
+            SELECT o.target, GROUP_CONCAT(DISTINCT o.op) AS ops, f.dsname
+            FROM io_op o LEFT JOIN cics_file f ON UPPER(f.name)=UPPER(o.target)
+            WHERE o.program_id=? AND o.target_kind='cics' GROUP BY o.target, f.dsname""", (pid,)).fetchall()
+        if cf:
+            out.append("\n### CICS files (FCT -> dataset, from the CSD)\n")
+            out.append(table(["file", "ops", "dataset"],
+                             [(c["target"], c["ops"], c["dsname"] or "**not in any indexed CSD**") for c in cf]))
+
         # DB2
         sqls = conn.execute("SELECT stmt_type, tables, is_dynamic, start_line FROM sql_stmt WHERE program_id=?",
                             (pid,)).fetchall()
@@ -901,6 +911,36 @@ def cmd_pack(conn: sqlite3.Connection, name: str, max_lines: int) -> str:
 
 
 # --------------------------------------------------------------------------
+# transactions (CICS CSD / IMS stage-1)
+# --------------------------------------------------------------------------
+
+def cmd_transaction(conn: sqlite3.Connection, code: str) -> str:
+    n = code.upper()
+    rows = conn.execute("""SELECT t.*, m.name AS mem FROM transaction_def t LEFT JOIN member m ON m.id=t.member_id
+                           WHERE UPPER(t.tran_code)=? OR UPPER(t.program)=? OR UPPER(t.psb)=?
+                           ORDER BY t.system, t.tran_code""", (n, n, n)).fetchall()
+    out = [f"# Transaction / program {n}\n"]
+    if not rows:
+        loaded = conn.execute("SELECT COUNT(*) FROM transaction_def").fetchone()[0]
+        out.append("**NOT FOUND** in any indexed CSD or IMS stage-1 member. ")
+        out.append("Load the DFHCSDUP extract and the stage-1 source; until then online routing is unknown.\n"
+                   if not loaded else f"({loaded} transactions are indexed - this name is not one of them, "
+                   f"nor a program/PSB they route to.)\n")
+        return "".join(out)
+    out.append(table(["code", "system", "program", "PSB", "group", "detail", "cite"],
+                     [(r["tran_code"], r["system"], r["program"] or "(none)", r["psb"] or "",
+                       r["group_name"] or "", (r["detail"] or "")[:80], f"{r['mem']}:{r['line']}") for r in rows]))
+    for p in sorted({r["program"] for r in rows if r["program"]}):
+        if programs_named(conn, p):
+            out.append(f"- `{p}` is indexed - `program {p}` for its dossier\n")
+        else:
+            out.append(f"- **{p} is not in the index** (no source, or member / PROGRAM-ID / load name differ)\n")
+    out.append("\n> IMS: the load module is assumed to be named as the PSB unless APPLCTN used GPSB=. "
+               "CICS: a REMOTESYSTEM transaction runs in another region.\n")
+    return "".join(out)
+
+
+# --------------------------------------------------------------------------
 # screens (BMS / MFS)
 # --------------------------------------------------------------------------
 
@@ -1220,7 +1260,7 @@ def _main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Query atlas.db (markdown out, citations in).")
     ap.add_argument("--db", default="atlas.db")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for c in ("program", "job", "field", "dataset", "copybook", "values", "screen"):
+    for c in ("program", "job", "field", "dataset", "copybook", "values", "screen", "transaction"):
         sub.add_parser(c).add_argument("name")
     s = sub.add_parser("literal")
     s.add_argument("name")
@@ -1271,6 +1311,8 @@ def _main(argv: Optional[List[str]] = None) -> int:
             print(cmd_messages(conn, a.pattern))
         elif a.cmd == "screen":
             print(cmd_screen(conn, a.name))
+        elif a.cmd == "transaction":
+            print(cmd_transaction(conn, a.name))
         elif a.cmd == "dataset":
             print(cmd_dataset(conn, a.name))
         elif a.cmd == "copybook":

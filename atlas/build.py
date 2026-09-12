@@ -23,13 +23,14 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import sys
 import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
-from . import classify, cobol, copybook, docs, expand, ims, jcl, reader, screens
+from . import classify, cobol, copybook, docs, expand, ims, jcl, reader, screens, txn
 from .reader import Line
 
 VERSION = "0.1.0"
@@ -41,7 +42,7 @@ SKIP_DIRS = {".git", "__pycache__", "node_modules", ".svn", "$RECYCLE.BIN"}
 
 EXTRA_SCHEMA = """
 CREATE VIRTUAL TABLE IF NOT EXISTS src_fts USING fts5(
-    member_name, kind, line_no UNINDEXED, text,
+    member_name, kind, member_id UNINDEXED, line_no UNINDEXED, text,
     tokenize="unicode61 tokenchars '-_#@$:'");
 CREATE TABLE IF NOT EXISTS doc_section(
     id INTEGER PRIMARY KEY,
@@ -70,6 +71,7 @@ class Mem:
     library: str
     norm_sha: str
     authoritative: int = 0
+    skip: bool = False        # unchanged since the last build: facts kept, not re-parsed
 
 
 class Ctx:
@@ -145,47 +147,102 @@ def norm_hash(kind: str, text: str, data: bytes, enc: str) -> Tuple[str, int, in
     return sha(payload.encode("utf-8", "replace")), len(recs), 0
 
 
-def inventory(ctx: Ctx, root: str, limit: Optional[int] = None) -> None:
-    conn = ctx.conn
-    now = time.strftime("%Y-%m-%dT%H:%M:%S")
+def _forget_member(conn: sqlite3.Connection, mid: int) -> None:
+    """Remove a member and everything derived from it - including rows in
+    OTHER members that only reference it, which a cascade cannot reach."""
+    conn.execute("UPDATE copy_use SET resolved_member_id=NULL WHERE resolved_member_id=?", (mid,))
+    conn.execute("DELETE FROM expand_run WHERE src_member=?", (mid,))
+    conn.execute("DELETE FROM src_fts WHERE member_id=?", (mid,))
+    conn.execute("DELETE FROM member WHERE id=?", (mid,))
+
+
+def _scan_files(root: str, limit: Optional[int] = None):
     count = 0
     for dirpath, dirs, files in os.walk(root):
         dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.startswith(".")]
         for fn in sorted(files):
             if fn.startswith("."):
                 continue
-            path = os.path.normpath(os.path.join(dirpath, fn))
-            try:
-                with open(path, "rb") as fh:
-                    data = fh.read()
-            except OSError as e:
-                ctx.bump("unreadable")
-                ctx.say(f"  unreadable: {path} ({e})")
-                continue
-            ext = os.path.splitext(fn)[1].lower()
-            if ext in classify.BINARY_EXTS or ext in docs.LEGACY or ext in (".pdf", ".docx", ".xlsx", ".pptx", ".vsdx"):
-                kind, why = classify.classify(path, "", None)
-                if kind == "binary":
-                    kind = "doc"
-                text, enc, norm, nlines, fixed = "", "binary", sha(data), 0, 0
-            else:
-                text, enc = reader.decode_bytes(data)
-                kind, why = classify.classify(path, text[:8192])
-                norm, nlines, fixed = norm_hash(kind, text, data, enc)
-
-            library = os.path.basename(dirpath)
-            name = os.path.splitext(fn)[0].upper()
-            cur = conn.execute(
-                "INSERT OR REPLACE INTO member(path,name,kind,library,ext,sha256,norm_sha,bytes,lines,"
-                "fixed_format,parse_status,scanned_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                (path, name, kind, library, ext, sha(data), norm, len(data), nlines, fixed, "pending", now))
-            mem = Mem(cur.lastrowid, path, name, kind, library, norm)
-            ctx.members.append(mem)
-            ctx.by_name.setdefault(name, []).append(mem)
-            ctx.bump(f"kind:{kind}")
+            yield dirpath, fn
             count += 1
             if limit and count >= limit:
                 return
+
+
+def inventory(ctx: Ctx, root: str, limit: Optional[int] = None) -> None:
+    """Hash and classify every file; re-index only what changed.
+
+    Incremental by default: a member whose bytes are unchanged keeps its facts.
+    A changed COPYBOOK forces every program that expands it to be re-parsed,
+    because those programs' facts were derived from the old text. Members that
+    vanished from the folder are pruned. `--rebuild` starts from an empty db.
+    """
+    conn = ctx.conn
+    now = time.strftime("%Y-%m-%dT%H:%M:%S")
+    existing = {r[0]: (r[1], r[2], r[3]) for r in
+                conn.execute("SELECT path, id, sha256, parse_status FROM member")}
+
+    found: List[tuple] = []
+    for dirpath, fn in _scan_files(root, limit):
+        path = os.path.normpath(os.path.join(dirpath, fn))
+        try:
+            with open(path, "rb") as fh:
+                data = fh.read()
+        except OSError as e:
+            ctx.bump("unreadable")
+            ctx.say(f"  unreadable: {path} ({e})")
+            continue
+        ext = os.path.splitext(fn)[1].lower()
+        if ext in classify.BINARY_EXTS or ext in docs.LEGACY or ext in (".pdf", ".docx", ".xlsx", ".pptx", ".vsdx"):
+            kind, _why = classify.classify(path, "", None)
+            if kind == "binary":
+                kind = "doc"
+            norm, nlines, fixed = sha(data), 0, 0
+        else:
+            text, enc = reader.decode_bytes(data)
+            kind, _why = classify.classify(path, text[:8192])
+            norm, nlines, fixed = norm_hash(kind, text, data, enc)
+        found.append((path, os.path.splitext(fn)[0].upper(), kind, os.path.basename(dirpath), ext,
+                      sha(data), norm, len(data), nlines, fixed))
+    found_by = {f[0]: f for f in found}
+
+    changed_names = {f[1] for f in found if f[2] in ("copybook", "cobol")
+                     and (f[0] not in existing or existing[f[0]][1] != f[5])}
+    forced: set = set()
+    if changed_names and existing:
+        q = ",".join("?" * len(changed_names))
+        forced = {r[0] for r in conn.execute(
+            f"SELECT DISTINCT m.path FROM copy_use c JOIN member m ON m.id=c.member_id "
+            f"WHERE UPPER(c.copybook) IN ({q})", tuple(changed_names))}
+
+    kept: Dict[str, int] = {}
+    for path, (mid, ex_sha, ex_status) in existing.items():
+        f = found_by.get(path)
+        if f is None:
+            _forget_member(conn, mid)
+            ctx.bump("pruned")
+        elif f[5] == ex_sha and ex_status in ("ok", "partial", "skipped") and path not in forced:
+            kept[path] = mid
+        else:
+            _forget_member(conn, mid)
+            ctx.bump("changed")
+
+    for f in found:
+        path, name, kind, library, ext, sha_, norm, nbytes, nlines, fixed = f
+        if path in kept:
+            mem = Mem(kept[path], path, name, kind, library, norm, skip=True)
+            ctx.bump("unchanged")
+        else:
+            cur = conn.execute(
+                "INSERT INTO member(path,name,kind,library,ext,sha256,norm_sha,bytes,lines,"
+                "fixed_format,parse_status,scanned_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (path, name, kind, library, ext, sha_, norm, nbytes, nlines, fixed, "pending", now))
+            mem = Mem(cur.lastrowid, path, name, kind, library, norm)
+            if path not in existing:
+                ctx.bump("new")
+        ctx.members.append(mem)
+        ctx.by_name.setdefault(name, []).append(mem)
+        ctx.bump(f"kind:{kind}")
 
 
 def load_sched(ctx: Ctx, csv_path: str) -> None:
@@ -225,6 +282,7 @@ def apply_manifest(ctx: Ctx, manifest_path: str) -> None:
     with open(manifest_path, "r", encoding="utf-8") as fh:
         man = json.load(fh)
     prefixes = [p.replace("\\", "/").upper() for p in man.get("authoritative", [])]
+    ctx.conn.execute("UPDATE member SET authoritative=0")     # the manifest is the whole truth
     n = 0
     for m in ctx.members:
         p = m.path.replace("\\", "/").upper()
@@ -512,6 +570,12 @@ def index_jcl(ctx: Ctx, mem: Mem) -> None:
         else:
             ctx.bump("steps:pgm")
 
+    # A DFHCSDUP deck is usually the SYSIN of a JCL step: harvest it in place.
+    for s in facts.steps:
+        for d in s.dds:
+            if d.sysin_text and re.search(r"\b(?:DEFINE|ALTER)\s+TRANSACTION\(", d.sysin_text, re.I):
+                _insert_routing(ctx, mem, txn.parse_csd(d.sysin_text))
+
     conn.executemany("INSERT INTO unresolved(member_id,kind,detail,line) VALUES(?,?,?,?)",
                      [(mem.id, k, d, ln) for (k, d, ln) in facts.unresolved])
     ctx.bump("unresolved", len(facts.unresolved))
@@ -559,11 +623,11 @@ def index_doc(ctx: Ctx, mem: Mem) -> None:
     for i, (h, t) in enumerate(d.sections, 1):
         conn.execute("INSERT INTO doc_section(member_id,heading,text) VALUES(?,?,?)", (mem.id, h, t))
         if t:
-            conn.execute("INSERT INTO src_fts(member_name,kind,line_no,text) VALUES(?,?,?,?)",
-                         (mem.name, "doc", i, (h + "\n" + t)[:20000]))
+            conn.execute("INSERT INTO src_fts(member_name,kind,member_id,line_no,text) VALUES(?,?,?,?,?)",
+                         (mem.name, "doc", mem.id, i, (h + "\n" + t)[:20000]))
     for tbl in d.tables:
-        conn.execute("INSERT INTO src_fts(member_name,kind,line_no,text) VALUES(?,?,?,?)",
-                     (mem.name, "doc", 0, "\n".join("\t".join(r) for r in tbl)[:20000]))
+        conn.execute("INSERT INTO src_fts(member_name,kind,member_id,line_no,text) VALUES(?,?,?,?,?)",
+                     (mem.name, "doc", mem.id, 0, "\n".join("\t".join(r) for r in tbl)[:20000]))
     conn.executemany("INSERT INTO doc_image(member_id,name) VALUES(?,?)",
                      [(mem.id, n) for n in d.images])
     ctx.bump("doc_images", len(d.images))
@@ -574,12 +638,12 @@ def index_doc(ctx: Ctx, mem: Mem) -> None:
 def index_fts_code(ctx: Ctx, mem: Mem) -> None:
     conn = ctx.conn
     if mem.kind in ("cobol", "copybook"):
-        rows = [(mem.name, mem.kind, l.no, l.code) for l in ctx.lines_for(mem) if l.code.strip()]
+        rows = [(mem.name, mem.kind, mem.id, l.no, l.code) for l in ctx.lines_for(mem) if l.code.strip()]
     else:
         text, data, enc = reader.load(mem.path)
-        rows = [(mem.name, mem.kind, i, r.rstrip())
+        rows = [(mem.name, mem.kind, mem.id, i, r.rstrip())
                 for i, r in enumerate(reader._split_records(text, data, enc), 1) if r.strip()]
-    conn.executemany("INSERT INTO src_fts(member_name,kind,line_no,text) VALUES(?,?,?,?)", rows)
+    conn.executemany("INSERT INTO src_fts(member_name,kind,member_id,line_no,text) VALUES(?,?,?,?,?)", rows)
 
 
 def _insert_screens(ctx: Ctx, mem: Mem, scr: List[screens.Screen]) -> None:
@@ -620,10 +684,48 @@ def index_mfs(ctx: Ctx, mem: Mem) -> None:
     _insert_screens(ctx, mem, screens.parse_mfs(text))
 
 
+def _insert_routing(ctx: Ctx, mem: Mem, facts: txn.RoutingFacts) -> None:
+    conn = ctx.conn
+    conn.executemany(
+        "INSERT INTO transaction_def(member_id,tran_code,system,program,psb,group_name,detail,line) "
+        "VALUES(?,?,?,?,?,?,?,?)",
+        [(mem.id, t.tran_code, t.system, t.program, t.psb, t.group, t.detail, t.line) for t in facts.transactions])
+    conn.executemany(
+        "INSERT INTO cics_program(member_id,name,group_name,language,line) VALUES(?,?,?,?,?)",
+        [(mem.id, p.name, p.group, p.language, p.line) for p in facts.programs])
+    conn.executemany(
+        "INSERT INTO cics_file(member_id,name,dsname,group_name,line) VALUES(?,?,?,?,?)",
+        [(mem.id, f.name, f.dsname, f.group, f.line) for f in facts.files])
+    for dsn in {f.dsname for f in facts.files if f.dsname}:
+        # The JCL may have created the row already; the CSD is the authority
+        # that this dataset is VSAM, so update rather than ignore.
+        conn.execute("INSERT OR IGNORE INTO dataset(dsn,is_vsam) VALUES(?,1)", (dsn,))
+        conn.execute("UPDATE dataset SET is_vsam=1 WHERE dsn=?", (dsn,))
+    conn.executemany("INSERT INTO unresolved(member_id,kind,detail,line) VALUES(?,?,?,?)",
+                     [(mem.id, "routing", w, None) for w in facts.warnings])
+    ctx.bump("transactions", len(facts.transactions))
+
+
+def index_csd(ctx: Ctx, mem: Mem) -> None:
+    text, _d, _e = reader.load(mem.path)
+    facts = txn.parse_csd(text)
+    _insert_routing(ctx, mem, facts)
+    ctx.conn.execute("UPDATE member SET parse_status=? WHERE id=?",
+                     ("ok" if facts.transactions or facts.programs or facts.files else "partial", mem.id))
+
+
+def index_imsgen(ctx: Ctx, mem: Mem) -> None:
+    text, _d, _e = reader.load(mem.path)
+    facts = txn.parse_imsgen(text)
+    _insert_routing(ctx, mem, facts)
+    ctx.conn.execute("UPDATE member SET parse_status=? WHERE id=?",
+                     ("ok" if facts.transactions or facts.programs else "partial", mem.id))
+
+
 HANDLERS = {
     "cobol": index_cobol, "copybook": index_copybook, "jcl": index_jcl, "proc": index_jcl,
     "dbd": index_dbd, "psb": index_psb, "doc": index_doc,
-    "bms": index_bms, "mfs": index_mfs,
+    "bms": index_bms, "mfs": index_mfs, "csd": index_csd, "imsgen": index_imsgen,
 }
 
 
@@ -669,7 +771,11 @@ def summary(ctx: Ctx, db_path: str, root: str, t0: float) -> None:
     n_unres = conn.execute("SELECT kind, COUNT(*) FROM unresolved GROUP BY 1 ORDER BY 2 DESC").fetchall()
     n_amb = conn.execute("SELECT COUNT(*) FROM v_ambiguous_member WHERE distinct_content > 1").fetchone()[0]
     n_dup = conn.execute("SELECT COUNT(*) FROM v_ambiguous_member").fetchone()[0]
-    print(f"\n== programs {n_prog}   jobs {n_jobs}   steps {n_steps} ==")
+    st = ctx.stats
+    print(f"\n== this run: new {st.get('new', 0)}  changed {st.get('changed', 0)}  "
+          f"unchanged {st.get('unchanged', 0)}  pruned {st.get('pruned', 0)} ==")
+    n_tx = conn.execute("SELECT COUNT(*) FROM transaction_def").fetchone()[0]
+    print(f"\n== programs {n_prog}   jobs {n_jobs}   steps {n_steps}   transactions {n_tx} ==")
     print("  call edges: " + ", ".join(f"{r}={c}" for r, c in n_calls))
     print(f"\n== unresolved ({sum(c for _k, c in n_unres)}) - these are the known blind spots ==")
     for k, c in n_unres[:15]:
@@ -718,6 +824,8 @@ def _main(argv: Optional[List[str]] = None) -> int:
     order = {"copybook": 0, "cobol": 1, "proc": 2, "jcl": 3, "dbd": 4, "psb": 5, "doc": 9}
     ok = partial = failed = 0
     for i, mem in enumerate(sorted(ctx.members, key=lambda m: order.get(m.kind, 6)), 1):
+        if mem.skip:
+            continue                       # unchanged since last build; facts kept
         handler = HANDLERS.get(mem.kind)
         try:
             if handler:

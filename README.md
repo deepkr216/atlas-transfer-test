@@ -33,6 +33,48 @@ could **not** resolve, and gives the model a small **fact pack** to reason
 over. The model is demoted to a reader that cites; a mechanical gate rejects
 any answer whose citations do not check out.
 
+## Getting the code from the mainframe
+
+The index is built from a folder; something has to fill that folder correctly
+and repeatably. `sources.json` says where the automation looks: each source
+maps a mainframe dataset to a local folder (PDS) or file (sequential), a kind,
+a system, and whether it is the **production** copy. Zowe CLI does the
+download; the manifest `build.py` needs is generated from the same file, so
+the two cannot disagree.
+
+```bash
+python -m atlas.ui --config sources.json               # desktop UI (Tkinter, no installs)
+```
+
+or the same thing from the command line:
+
+```bash
+python -m atlas.fetch --config sources.json --init     # starter config, then edit it
+```
+
+```bash
+python -m atlas.fetch --config sources.json --check    # is zowe on PATH, does --version work
+```
+
+```bash
+python -m atlas.fetch --config sources.json --plan     # print every zowe command, run nothing
+```
+
+```bash
+python -m atlas.fetch --config sources.json --all --build   # download everything, then re-index incrementally
+```
+
+The UI is a table of sources with Add / Edit / Remove, Plan, Fetch selected /
+Fetch all, Build index / Rebuild from empty, Coverage, and a live log that
+shows every command exactly as run. Shop-specific Zowe flags (a profile, an
+encoding, `--preserve-original-letter-case`) go in `extra_args` — a config
+edit, not a code change. See `sources.example.json`.
+
+Re-indexing is **incremental**: unchanged members keep their facts, a changed
+copybook forces every program that expands it to be re-parsed, and members
+that disappeared are pruned. A full estate re-run after a small change takes
+seconds, not minutes.
+
 ## Quick start
 
 ```bash
@@ -52,6 +94,7 @@ python -m atlas.query --db atlas.db values   WS-GENDER-CD       # every value th
 python -m atlas.query --db atlas.db pair     WS-REL-CD WS-GENDER-CD   # cross-field rules (son must be male)
 python -m atlas.query --db atlas.db messages GENDER             # message texts naming a rule
 python -m atlas.query --db atlas.db screen   MEMMAP             # BMS map / MFS MID-MOD: fields, defaults, validating programs
+python -m atlas.query --db atlas.db transaction MEMB            # CICS CSD / IMS stage-1: which program a transaction runs
 python -m atlas.query --db atlas.db copybook PMASTREC           # impact
 python -m atlas.query --db atlas.db callers  RATECALC --depth 3
 python -m atlas.query --db atlas.db dataset  PROD.POLICY.EXTRACT
@@ -127,11 +170,12 @@ code-generation bundle, test conditions, abend triage).
 - **Not a scheduler.** Batch flow lives in CA-7/Control-M/TWS. Export it to CSV
   and load it with `--sched`; until then "dead job" and "what runs before"
   are unanswerable, and the reports say so.
-- **Screens are parsed; transaction routing is not.** BMS maps and MFS
-  MIDs/MODs are indexed (fields, offsets, defaults, validating programs), but
-  transaction→program comes from the CICS CSD / IMS SYSGEN (`APPLCTN`/
-  `TRANSACT`); `transaction_def` exists for that export and a loader is the
-  next step. Until then "which transaction runs this" is unknown.
+- **Transaction routing needs the exports.** BMS/MFS screens and the CICS
+  CSD (DFHCSDUP `DEFINE` deck or `LIST` report, also when embedded in a JCL
+  SYSIN) and IMS stage-1 (`APPLCTN`/`TRANSACT`) are parsed; if those exports
+  are not in the folder, "which transaction runs this" is unknown and
+  `coverage` says so. IMS program names are assumed equal to PSB names
+  unless `GPSB=` was used — recorded on every such row.
 - **Not modelling** SYNC alignment slack, GO TO in dead-paragraph analysis
   (never-PERFORMed paragraphs are *candidates* only), dynamic SQL targets, or
   targets read from control tables (these appear as `unresolved`).

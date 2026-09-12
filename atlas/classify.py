@@ -21,6 +21,7 @@ EXT_HINTS = {
     ".prc": "proc", ".proc": "proc",
     ".dbd": "dbd", ".psb": "psb",
     ".bms": "bms", ".mfs": "mfs",
+    ".csd": "csd", ".csdup": "csd", ".imsgen": "imsgen", ".stage1": "imsgen",
     ".sql": "sql", ".ddl": "sql", ".dcl": "copybook",
     ".ctl": "ctlcard", ".card": "ctlcard", ".parm": "ctlcard", ".sysin": "ctlcard",
     ".asm": "asm", ".mac": "asm",
@@ -64,6 +65,11 @@ _SIG_SEGM = re.compile(r"^(?:[A-Z0-9@#$]{1,8})?\s+SEGM\s+NAME=", re.I | re.M)
 _SIG_PSB = re.compile(r"^(?:[A-Z0-9@#$]{1,8})?\s+PSBGEN\b|^(?:[A-Z0-9@#$]{1,8})?\s+PCB\s+TYPE=",
                       re.I | re.M)
 _SIG_BMS = re.compile(r"\bDFHMSD\b|\bDFHMDI\b|\bDFHMDF\b", re.I)
+# CICS CSD extract/upload deck (DEFINE form) or DFHCSDUP LIST report form.
+_SIG_CSD = re.compile(r"^\s*(?:DEFINE|ALTER|USERDEFINE)\s+(?:TRANSACTION|PROGRAM|FILE|MAPSET|TDQUEUE)\("
+                      r"|^\s*(?:TRANSACTION|PROGRAM|FILE)\([A-Z0-9@#$]+\)\s+GROUP\(", re.I | re.M)
+# IMS stage-1 system definition: APPLCTN / TRANSACT macros (label optional in col 1).
+_SIG_IMSGEN = re.compile(r"^(?:[A-Z0-9@#$]{1,8})?\s+(?:APPLCTN|TRANSACT)\s+(?:PSB|GPSB|CODE)=", re.I | re.M)
 _SIG_MFS = re.compile(r"^\s*(MSG|FMT|DEV|DFLD|MFLD)\s", re.I | re.M)
 _SIG_SQL_DDL = re.compile(r"\bCREATE\s+(TABLE|VIEW|INDEX|TABLESPACE|DATABASE)\b", re.I)
 # Any level 01-49 plus 66/77/88. Level 49 is the DCLGEN VARCHAR structure and
@@ -89,6 +95,10 @@ def classify(path: str, head: str, ext_hint: Optional[str] = None) -> Tuple[str,
         return "proc", "instream PROC with PEND"
     if _SIG_PROC.search(head):
         return "proc", "PROC statement"
+    if _SIG_IMSGEN.search(head):
+        return "imsgen", "APPLCTN/TRANSACT macro (IMS stage-1)"
+    if _SIG_CSD.search(head):
+        return "csd", "CICS CSD DEFINE / LIST resource block"
     if _SIG_DBD.search(head) or _SIG_SEGM.search(head):
         return "dbd", "DBD/SEGM macro"
     if _SIG_PSB.search(head):

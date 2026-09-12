@@ -42,11 +42,17 @@ then the fix, then a row here. Nothing is "fixed" until the test exists.
 | 34 | MFS message with no `TYPE=` classified as unknown direction | Shop names MIDs/MODs `…FIP`/`…FOP`; inference from the label with a recorded warning | same test |
 | 35 | Screen labels (`'GENDER:'`) and defaults (`INITIAL='U'`) absent from message/value searches | Screen literals not indexed as literals | `test_values_on_a_screen_field_shows_default_and_validator` |
 
+| 36 | Online programs listed as dead; "which transaction runs this" unanswerable | No routing source loaded | `RoutingParsing.*`, `RoutingEndToEnd.test_online_programs_are_no_longer_dead_candidates` |
+| 37 | Re-running `build` without `--rebuild` duplicated every fact and every FTS row | `INSERT OR REPLACE` on member plus FTS rows with no member key | `IncrementalBuild.test_rerun_is_idempotent_and_changes_propagate` |
+| 38 | A changed copybook left programs with facts derived from its OLD text | Incremental skip did not follow COPY dependencies | same test (asserts `exp_lines` grows after the copybook changes) |
+| 39 | A dataset the CSD declares as VSAM stayed `is_vsam=0` | `INSERT OR IGNORE` after the JCL had created the row | `RoutingEndToEnd.test_cics_file_maps_to_dataset` |
+
 ## Known gaps (not yet guarded - contributions welcome)
 
 - SYNC alignment slack is flagged, not computed.
 - GO TO and fall-through are not evaluated for dead-paragraph candidates.
-- Screens are parsed; transaction→program routing (CICS CSD / IMS SYSGEN `APPLCTN`/`TRANSACT`) is not loaded yet.
+- IMS program name = PSB name is an assumption (recorded per row); `APPLCTN GPSB=` is handled, `PGMTYPE=BATCH` APPLCTNs without transactions are listed as programs only.
 - MFS `DO` repeats are expanded with the default 2-digit suffix only; `SUF=` and `BOUND=` are not modelled.
+- Zowe command syntax is built from the documented `zos-files download all-members / data-set` forms; a shop's profile type or flags go in `extra_args` — run `--check` and `--plan` before the first real fetch.
 - PDF text with CID fonts may be garbled; the extractor says so but cannot fix it.
 - Compiler listings are the authoritative expansion; a listing loader would supersede `expand.py`.

@@ -1,0 +1,28 @@
+{
+  "_comment": "Where the automation looks. Each source maps a mainframe dataset to a local folder (pds) or file (seq) under local_root. Copy to sources.json, edit, then: python -m atlas.fetch --config sources.json --check / --plan / --all --build.  Or open the UI: python -m atlas.ui --config sources.json",
+  "zowe": {
+    "executable": "zowe",
+    "profile": "",
+    "encoding": "",
+    "max_concurrent": 8,
+    "timeout_seconds": 3600,
+    "extra_args": []
+  },
+  "local_root": "C:/estate",
+  "db": "atlas.db",
+  "sources": [
+    { "dataset": "PROD.CLAIMS.SRC",      "type": "pds", "kind": "cobol",    "system": "CLAIMS", "local": "PROD.CLAIMS.SRC",      "ext": "cbl", "authoritative": true,  "enabled": true, "extra_args": [] },
+    { "dataset": "PROD.CLAIMS.COPYLIB",  "type": "pds", "kind": "copybook", "system": "CLAIMS", "local": "PROD.CLAIMS.COPYLIB",  "ext": "cpy", "authoritative": true,  "enabled": true, "extra_args": [] },
+    { "dataset": "PROD.CLAIMS.JCLLIB",   "type": "pds", "kind": "jcl",      "system": "CLAIMS", "local": "PROD.CLAIMS.JCLLIB",   "ext": "jcl", "authoritative": true,  "enabled": true, "extra_args": [] },
+    { "dataset": "PROD.CLAIMS.PROCLIB",  "type": "pds", "kind": "proc",     "system": "CLAIMS", "local": "PROD.CLAIMS.PROCLIB",  "ext": "prc", "authoritative": true,  "enabled": true, "extra_args": [] },
+    { "dataset": "PROD.CLAIMS.PARMLIB",  "type": "pds", "kind": "ctlcard",  "system": "CLAIMS", "local": "PROD.CLAIMS.PARMLIB",  "ext": "ctl", "authoritative": true,  "enabled": true, "extra_args": [] },
+    { "dataset": "PROD.IMS.DBDSRC",      "type": "pds", "kind": "dbd",      "system": "CLAIMS", "local": "PROD.IMS.DBDSRC",      "ext": "dbd", "authoritative": true,  "enabled": true, "extra_args": [] },
+    { "dataset": "PROD.IMS.PSBSRC",      "type": "pds", "kind": "psb",      "system": "CLAIMS", "local": "PROD.IMS.PSBSRC",      "ext": "psb", "authoritative": true,  "enabled": true, "extra_args": [] },
+    { "dataset": "PROD.IMS.MFSSRC",      "type": "pds", "kind": "mfs",      "system": "CLAIMS", "local": "PROD.IMS.MFSSRC",      "ext": "mfs", "authoritative": true,  "enabled": true, "extra_args": [] },
+    { "dataset": "PROD.CICS.BMSSRC",     "type": "pds", "kind": "bms",      "system": "CLAIMS", "local": "PROD.CICS.BMSSRC",     "ext": "bms", "authoritative": true,  "enabled": true, "extra_args": [] },
+    { "dataset": "PROD.IMS.STAGE1",      "type": "pds", "kind": "imsgen",   "system": "CLAIMS", "local": "routing/IMS.STAGE1",   "ext": "imsgen", "authoritative": true, "enabled": true, "extra_args": [] },
+    { "dataset": "PROD.CICS.CSD.EXTRACT","type": "seq", "kind": "csd",      "system": "CLAIMS", "local": "routing/cics-csd.txt", "ext": "csd", "authoritative": true,  "enabled": true, "extra_args": [] },
+    { "dataset": "PROD.CA7.JOBDEP.CSV",  "type": "seq", "kind": "sched",    "system": "",       "local": "routing/ca7-deps.csv", "ext": "csv", "authoritative": false, "enabled": true, "extra_args": [] },
+    { "dataset": "TEST.CLAIMS.SRC",      "type": "pds", "kind": "cobol",    "system": "CLAIMS", "local": "TEST.CLAIMS.SRC",      "ext": "cbl", "authoritative": false, "enabled": false, "extra_args": [] }
+  ]
+}
