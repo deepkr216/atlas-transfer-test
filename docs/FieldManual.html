@@ -1,0 +1,303 @@
+<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Mainframe Atlas Field Manual</title>
+<style>
+  :root {
+    --bg: #F2F4EE;        /* greenbar paper */
+    --card: #FAFBF8;
+    --ink: #1B1F1A;
+    --muted: #5B6357;
+    --rule: #D5DBCE;
+    --band: #E7EDE0;      /* the green bar */
+    --accent: #4E7C4D;
+    --accent-ink: #2F5A2E;
+    --warn: #A6731A;
+    --crit: #9C3A2C;
+    --codebg: #E9EDE3;
+    --serif: "IBM Plex Serif", Georgia, "Times New Roman", serif;
+    --sans: "IBM Plex Sans", "Segoe UI", Helvetica, Arial, sans-serif;
+    --mono: "IBM Plex Mono", Consolas, "Courier New", monospace;
+    color-scheme: light dark;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #151913; --card: #1A1F18; --ink: #E3E7DC; --muted: #98A192; --rule: #2A3127;
+      --band: #1C221A; --accent: #8FBC8B; --accent-ink: #B5D9B2; --warn: #D8A643; --crit: #E3806F;
+      --codebg: #1B211A;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #151913; --card: #1A1F18; --ink: #E3E7DC; --muted: #98A192; --rule: #2A3127;
+    --band: #1C221A; --accent: #8FBC8B; --accent-ink: #B5D9B2; --warn: #D8A643; --crit: #E3806F;
+    --codebg: #1B211A;
+  }
+
+  body { background: var(--bg); color: var(--ink); font-family: var(--sans); font-size: 16px; line-height: 1.55; }
+  .wrap { max-width: 1120px; margin: 0 auto; padding: 32px 20px 80px; }
+  @media (min-width: 1040px) {
+    .wrap { display: grid; grid-template-columns: 220px minmax(0, 1fr); gap: 48px; }
+    nav.toc { position: sticky; top: 24px; align-self: start; }
+  }
+  nav.toc { font-size: 13.5px; }
+  nav.toc .eyebrow { font-family: var(--mono); font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); margin: 0 0 10px; }
+  nav.toc ol { list-style: none; margin: 0; padding: 0; border-left: 2px solid var(--rule); }
+  nav.toc li a { display: block; padding: 5px 0 5px 12px; color: var(--ink); text-decoration: none; }
+  nav.toc li a:hover, nav.toc li a:focus-visible { color: var(--accent-ink); outline: none; box-shadow: inset 2px 0 0 var(--accent); }
+  @media (max-width: 1039px) { nav.toc { margin-bottom: 28px; } nav.toc ol { display: flex; flex-wrap: wrap; gap: 2px 14px; border: 0; } nav.toc li a { padding: 4px 0; } }
+
+  main { max-width: 76ch; }
+  header.title { margin-bottom: 36px; }
+  header.title .eyebrow { font-family: var(--mono); font-size: 12px; letter-spacing: .1em; text-transform: uppercase; color: var(--accent-ink); margin: 0 0 8px; }
+  h1 { font-family: var(--serif); font-weight: 600; font-size: 38px; line-height: 1.12; margin: 0 0 12px; text-wrap: balance; }
+  header.title p.lede { font-size: 18px; color: var(--muted); margin: 0; max-width: 60ch; }
+  h2 { font-family: var(--serif); font-weight: 600; font-size: 25px; line-height: 1.2; margin: 48px 0 12px; padding-top: 18px; border-top: 1px solid var(--rule); text-wrap: balance; }
+  h3 { font-family: var(--sans); font-weight: 600; font-size: 16px; margin: 26px 0 8px; }
+  p { margin: 0 0 12px; }
+  ul, ol { margin: 0 0 14px; padding-left: 22px; }
+  li { margin: 4px 0; }
+  a { color: var(--accent-ink); }
+  code, kbd { font-family: var(--mono); font-size: 0.92em; background: var(--codebg); padding: 1px 5px; border-radius: 3px; }
+  pre { font-family: var(--mono); font-size: 13.5px; line-height: 1.5; background: var(--codebg); border: 1px solid var(--rule); border-radius: 4px; padding: 12px 14px; overflow-x: auto; margin: 10px 0 16px; }
+  pre code { background: none; padding: 0; font-size: inherit; }
+  .callout { border-left: 3px solid var(--accent); background: var(--card); padding: 10px 14px; margin: 14px 0; border-radius: 0 4px 4px 0; }
+  .callout.warn { border-color: var(--warn); }
+  .callout.crit { border-color: var(--crit); }
+  .callout strong:first-child { font-family: var(--mono); font-size: 12px; letter-spacing: .06em; text-transform: uppercase; display: block; margin-bottom: 4px; color: var(--muted); }
+
+  .tablewrap { overflow-x: auto; margin: 10px 0 18px; border: 1px solid var(--rule); border-radius: 4px; }
+  table { border-collapse: collapse; width: 100%; font-size: 14px; }
+  th { text-align: left; font-family: var(--mono); font-size: 11.5px; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); padding: 8px 10px; border-bottom: 1px solid var(--rule); background: var(--card); }
+  td { padding: 8px 10px; vertical-align: top; border-bottom: 1px solid var(--rule); }
+  table.greenbar tbody tr:nth-child(odd) td { background: var(--band); }
+  td.mono, th.mono { font-family: var(--mono); font-size: 13px; white-space: nowrap; }
+  tr:last-child td { border-bottom: 0; }
+
+  .ruler { display: flex; gap: 2px; font-family: var(--mono); font-size: 12px; margin: 10px 0 6px; }
+  .ruler > div { background: var(--card); border: 1px solid var(--rule); padding: 8px 6px; border-radius: 3px; min-width: 0; }
+  .ruler .cols { display: block; color: var(--muted); font-size: 11px; letter-spacing: .04em; }
+  .ruler .live { background: var(--band); border-color: var(--accent); }
+  figcaption { font-size: 13px; color: var(--muted); margin: 0 0 14px; }
+  .cmd { display: grid; grid-template-columns: max-content 1fr; gap: 6px 16px; font-size: 14px; align-items: baseline; margin: 10px 0 16px; }
+  .cmd code { white-space: nowrap; }
+  .mermaid { background: var(--card); border: 1px solid var(--rule); border-radius: 4px; padding: 10px; overflow-x: auto; }
+  .fine { font-size: 13.5px; color: var(--muted); }
+  @media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; } }
+</style>
+
+<div class="wrap">
+<nav class="toc" aria-label="Sections">
+  <p class="eyebrow">Field manual</p>
+  <ol>
+    <li><a href="#why">Why a parser, not a model</a></li>
+    <li><a href="#transfer">Getting it onto the laptop</a></li>
+    <li><a href="#sources">Getting the code from the mainframe</a></li>
+    <li><a href="#build">Building the index</a></li>
+    <li><a href="#ask">Asking questions</a></li>
+    <li><a href="#loop">The loop with a model</a></li>
+    <li><a href="#rules">Rules the model follows</a></li>
+    <li><a href="#playbooks">Playbooks</a></li>
+    <li><a href="#breaks">When something breaks</a></li>
+    <li><a href="#limits">What it does not do</a></li>
+    <li><a href="#reference">Reference</a></li>
+  </ol>
+</nav>
+
+<main>
+<header class="title">
+  <p class="eyebrow">Mainframe Atlas · v0.1 · stdlib Python, no network · OFFLINE COPY</p>
+  <h1>Mainframe Atlas Field Manual</h1>
+  <p class="lede">A deterministic fact index over a COBOL / JCL / IMS / DB2 / VSAM estate, so a language model answers from rows it can cite instead of text it half-remembers.</p>
+</header>
+
+<h2 id="why">Why a parser, not a model</h2>
+<p>Indexing a large mainframe folder and chatting with it hallucinates, and not because the folder is big. Four things are going wrong at once:</p>
+<ul>
+  <li><strong>Training on the estate stores style, not facts.</strong> The model learns the shop's naming grammar and then emits perfectly plausible program names, field names and job flows that do not exist.</li>
+  <li><strong>Embeddings collapse on cryptic identifiers.</strong> <code>WS-PLCY-STAT-CD-01</code> and <code>WS-PLCY-STAT-CD-02</code> are the same point in vector space; thousands of near-identical CRUD paragraphs cluster together; the retriever returns the wrong-but-similar member and the model reasons fluently about it.</li>
+  <li><strong>Silent zero recall.</strong> When nothing relevant is retrieved, the model fills the gap from memory rather than saying "not found". That <em>is</em> the hallucination mechanism.</li>
+  <li><strong>The facts are not in the text.</strong> What a job does lives in control cards, PROC symbolics, <code>IKJEFT01</code>'s SYSTSIN, <code>DFSRRC00</code>'s PARM, GDG relative generations, PCB order, <code>COPY … REPLACING</code> and the scheduler. No chunk of COBOL contains them.</li>
+</ul>
+<p>So Atlas is a parser. It walks the folder, extracts hard facts into SQLite with a line citation on every row, records everything it could <em>not</em> resolve, and hands the model a small fact pack. The model is a reader that cites; a mechanical gate rejects any answer whose citations do not check out.</p>
+
+<pre>Estate folder (COBOL, JCL, copybooks, IMS, screens, CSD, documents)
+      |
+      v
+atlas.build  (no model calls)  --->  atlas.db  (facts + citations + unresolved)
+      |
+      v
+atlas.query  pack / program / job / field / literal / values / screen / transaction
+      |
+      v
+Model reads ONLY the pack  --->  answer.md with [[MEMBER line "token"]] citations
+      |
+      v
+verify_citations  --FAIL--> back to the model      --verified--> deliver</pre>
+
+<h2 id="transfer">Getting it onto the laptop</h2>
+<p>The toolkit is a folder of plain files. It contains no estate data and makes no network calls. The transfer set lives at <code>C:\User File\Claude\mainframe-atlas-transfer\</code> on the personal laptop:</p>
+<div class="tablewrap"><table class="greenbar">
+<thead><tr><th>File</th><th>What it is</th><th>Use it when</th></tr></thead>
+<tbody>
+<tr><td class="mono">mainframe-atlas.bundle</td><td>The whole git repository in one file (history included)</td><td>git is available on the laptop — best for round-tripping fixes</td></tr>
+<tr><td class="mono">mainframe-atlas.zip</td><td>The current files, no git metadata (34 files)</td><td>git is not available</td></tr>
+<tr><td class="mono">TRANSFER.txt</td><td>The same instructions as below, in plain text</td><td>Read it on the laptop</td></tr>
+</tbody></table></div>
+<h3>With git</h3>
+<pre><code>git clone mainframe-atlas.bundle mainframe-atlas
+cd mainframe-atlas
+python selfcheck.py            # must print SELFCHECK PASSED</code></pre>
+<p>Later updates arrive as a new bundle; apply with <code>git pull ..\mainframe-atlas.bundle main</code>.</p>
+<h3>Without git</h3>
+<pre><code>extract mainframe-atlas.zip into a folder named mainframe-atlas
+cd mainframe-atlas
+python selfcheck.py</code></pre>
+<div class="callout"><strong>Requirements</strong>Python 3.9 or newer. Standard library only — no <code>pip</code>, so a locked-down machine is fine. Transfer by whatever the company permits: USB, email to yourself, an approved share, or a private repository if policy allows.</div>
+<div class="callout warn"><strong>Direction of travel</strong>Toolkit goes <em>to</em> the laptop. Only three things ever come back: <code>atlas-crash.txt</code>, the output of <code>atlas.diag --redact</code>, and tiny fake fixtures. Never <code>atlas.db</code>, never <code>out/</code>, never a real member, dataset or job name.</div>
+
+<h2 id="sources">Getting the code from the mainframe</h2>
+<p>The index is built from a folder, so something has to fill that folder correctly and repeatably. <code>sources.json</code> answers "where does the automation look": each row maps a mainframe dataset to a local folder (PDS) or file (sequential), a kind, a system, and whether it is the <strong>production</strong> copy. Zowe CLI does the download; the manifest the build needs is generated from the same file, so the two cannot disagree.</p>
+<pre><code>python -m atlas.ui --config sources.json                  # desktop UI (Tkinter - nothing to install)
+
+python -m atlas.fetch --config sources.json --init        # or the command line: starter config
+python -m atlas.fetch --config sources.json --check       # zowe on PATH? profile works?
+python -m atlas.fetch --config sources.json --plan        # print every zowe command, run nothing
+python -m atlas.fetch --config sources.json --all --build # download everything, then re-index</code></pre>
+<div class="tablewrap"><table class="greenbar">
+<thead><tr><th>In the UI</th><th>What it does</th></tr></thead>
+<tbody>
+<tr><td>Add / Edit / Remove</td><td>One row per dataset: type (pds/seq), kind (cobol, copybook, jcl, proc, ctlcard, dbd, psb, bms, mfs, csd, imsgen, sched, doc…), system, local folder, extension, production flag, extra Zowe flags.</td></tr>
+<tr><td>Check Zowe</td><td>Confirms the CLI is on PATH and <code>zowe --version</code> runs with the chosen profile.</td></tr>
+<tr><td>Plan</td><td>Prints every command exactly as it will run — read this before the first real fetch.</td></tr>
+<tr><td>Fetch selected / Fetch all</td><td><code>zowe zos-files download all-members</code> per PDS (or <code>data-set</code> per sequential file) into the local folders, with a live log and a last-result column per row.</td></tr>
+<tr><td>Build index / Rebuild from empty</td><td>Writes the manifest from the table, runs the build. <strong>Incremental</strong>: unchanged members keep their facts, a changed copybook re-parses every program that expands it, vanished members are pruned.</td></tr>
+<tr><td>Coverage</td><td>The report to read before trusting anything.</td></tr>
+</tbody></table></div>
+<div class="callout"><strong>Shop-specific flags</strong>A different profile type, an encoding, <code>--preserve-original-letter-case</code>: put them in <code>extra_args</code> (global or per source). That is a config edit, not a code change, and the log shows the exact command so it can be corrected on the spot. Include the routing exports as sources too — the CSD extract (kind <code>csd</code>) and the IMS stage-1 source (kind <code>imsgen</code>) — or "which transaction runs this" stays unknown.</div>
+
+<h2 id="build">Building the index</h2>
+<p>Copy <code>manifest.example.json</code> to <code>manifest.json</code> and list the production libraries — the index cannot otherwise know which of several same-named copies is real. Then:</p>
+<pre><code>python -m atlas.build  C:\estate  --db atlas.db  --manifest manifest.json  --write-expanded out\expanded
+python -m atlas.query  --db atlas.db coverage        # read this FIRST
+python -m atlas.query  --db atlas.db ambiguous       # duplicate member names</code></pre>
+<p>Tens of thousands of members take minutes. Every member that fails to parse is recorded with its error; every reference that could not be resolved becomes a row in <code>unresolved</code>. The coverage report is the list of question classes the index will answer <em>wrong</em>, not merely incompletely — fix the inputs it names (missing copybook libraries, no scheduler export, ambiguous copies) before trusting answers.</p>
+<div class="tablewrap"><table class="greenbar">
+<thead><tr><th>Artifact</th><th>Facts extracted</th><th>Wrong answer it prevents</th></tr></thead>
+<tbody>
+<tr><td>COBOL</td><td>PROGRAM-ID, paragraphs, PERFORM/THRU, CALL literal <em>and</em> identifier (resolved via MOVE/VALUE, else unresolved), COPY / <code>EXEC SQL INCLUDE</code> / <code>++INCLUDE</code>, SELECT…ASSIGN→DD, OPEN mode, SQL tables and host variables, DL/I calls, CICS LINK/XCTL, MQ, every field reference with read/write/test/display mode, every literal with how it is used</td><td>Commented-out CALLs as live edges; <code>WS-CALL-FLAG</code> read as a CALL; multi-line statements split; period inside a PIC treated as a terminator</td></tr>
+<tr><td>Copybook</td><td>Field tree with byte offsets and lengths (COMP-3 packed, COMP 2/4/8, SIGN SEPARATE), REDEFINES held at the same offset, OCCURS DEPENDING ON flagged variable, 88-levels, VALUE literals</td><td>Test data of the wrong length; "change field X" without knowing what moves</td></tr>
+<tr><td>Expansion</td><td>Each program materialised with COPY/INCLUDE inline and REPLACING applied, with a line map back to the original member</td><td>Fields renamed by REPLACING invisible to grep; procedure copybooks attributed to the wrong member</td></tr>
+<tr><td>JCL / PROC</td><td>Continuations, inline control cards, symbolics (SET › EXEC override › PROC default), GDG base split from <code>(+1)</code>, <code>//STEP.DD</code> overrides, <strong>effective program</strong> unwrapped from IKJEFT01 / DFSRRC00 / SORT / IDCAMS / IEBGENER / IEFBR14 / FTP / NDM, sort-card byte positions</td><td>Steps attributed to TSO or the IMS region driver; producer→consumer linkage lost through GDG; DISP mistaken for direction</td></tr>
+<tr><td>IMS</td><td>DBD segments and fields; PSB PCBs in <strong>positional</strong> order with PROCOPT; <code>CMPAT=YES</code> / TP PCB → I/O PCB first</td><td>Off-by-one PCB naming the wrong database</td></tr>
+<tr><td>Screens</td><td>BMS maps: field, position, length, attributes, INITIAL, PICIN/PICOUT and the generated symbolic names programs reference (<code>GENDERI</code>/<code>GENDERO</code>). MFS: FMT/DFLD and MID/MOD with each MFLD's <strong>byte offset</strong> in the segment, <code>ATTR=YES</code> bytes, DO/ENDDO repeats; TYPE inferred from <code>…FIP</code>/<code>…FOP</code>/<code>…MID</code>/<code>…MOD</code> labels when missing, with the assumption recorded</td><td>Online validation invisible; screen defaults and labels missed by a message search</td></tr>
+<tr><td>Documents</td><td>.docx / .xlsx / .pptx / .vsdx text, headings, tables, image manifests; PDF best-effort; legacy .doc/.xls reported</td><td>Documentation indexed as if it were fact</td></tr>
+</tbody></table></div>
+
+<h2 id="ask">Asking questions</h2>
+<p>Every command prints Markdown with a <code>MEMBER:line</code> citation on each row and ends with the unresolved items in its scope.</p>
+<div class="cmd">
+  <code>program NAME</code><span>Dossier: where it runs, what it calls and is called by, copybooks (with REPLACING), files joined through JCL to datasets with direction, DB2 tables, DL/I calls, structure, literals it sets.</span>
+  <code>job NAME</code><span>Step by step: the effective program (not <code>PGM=</code>), control cards quoted, datasets in/out with the signal that decided direction, GDG generation, sort-card byte positions, PROC expansion.</span>
+  <code>field NAME</code><span>Every definition with offset and length, version skew across copies, programs including the copybooks, references by mode (<strong>write</strong> first), 88-level values, literals moved to it, sort cards overlapping its bytes.</span>
+  <code>literal VALUE</code><span>Where a code such as <code>E001</code> is defined (VALUE/88), set (MOVE), tested (IF/WHEN), displayed — and where the value goes afterwards: positionally through <code>CALL … USING</code> to the callee's LINKAGE, back to callers, and through file records to other programs at the same <em>bytes</em>.</span>
+  <code>values FIELD</code><span>The observed value domain: every value the code assumes for the field — documented by an 88, set, tested (including tests through 88 names that never mention the value), used in SQL predicates on the matching column, compared by sort INCLUDE cards. Flags <strong>used but not documented</strong> and documented but never used.</span>
+  <code>pair FIELD1 FIELD2</code><span>Every statement where two fields (or their 88s) are used together — the validation and derivation rules that bind one value to the other.</span>
+  <code>messages PATTERN</code><span>Message and text literals matching a pattern — including texts assembled from consecutive FILLER VALUEs and screen labels — with the field each is moved to, plus documents mentioning the term.</span>
+  <code>screen NAME</code><span>A BMS map/mapset or MFS FMT/MID/MOD: every field with position, length, attributes, default and (MFS) byte offset, and the programs that reference it — BMS through the generated <code>GENDERI</code>/<code>GENDERO</code> names, MFS by MFLD name.</span>
+  <code>transaction CODE</code><span>Routing from the CICS CSD and the IMS stage-1: which program (and PSB, group, remote system) a transaction runs, or which transactions run a program — with the IMS "program = PSB name" assumption recorded per row.</span>
+  <code>copybook NAME</code><span>Impact: including programs, jobs that run them, datasets they write and who reads those, callers, sort cards on consumer steps, unresolved CALLs inside.</span>
+  <code>callers / callees NAME --depth N</code><span>Call graph either way; dynamic targets included; names referenced but not in the index listed.</span>
+  <code>dataset DSN</code><span>Producers and consumers with the direction source.</span>
+  <code>search "TOKEN"</code><span>Full-text over source lines (exact identifiers beat similarity on this corpus).</span>
+  <code>cite MEMBER a-b</code><span>Numbered source lines, for building or checking a citation.</span>
+  <code>pack PROGRAM</code><span>The dossier plus the exact evidence lines behind every edge — what a model gets.</span>
+  <code>dead · ambiguous · coverage</code><span>Hygiene reports, each with its caveats printed.</span>
+</div>
+
+<h2 id="loop">The loop with a model</h2>
+<p>The budget is small, so the model never reads the repository. It reads packs.</p>
+<ol>
+  <li><code>python -m atlas.query --db atlas.db pack CLMPOST &gt; pack.md</code> — a few hundred lines of facts and evidence lines.</li>
+  <li>The model answers using only the pack, citing each claim as <code>[[MEMBER line "token"]]</code>. What it cannot cite it marks <code>UNVERIFIED</code> or <code>INSUFFICIENT EVIDENCE</code>.</li>
+  <li><code>python -m atlas.verify_citations answer.md --db atlas.db</code> — opens each cited member, checks the quoted token is on those lines, warns when the line is a comment, and rejects the answer on any failure.</li>
+  <li><code>cite MEMBER a-b</code> fetches more lines only when the pack was not enough.</li>
+</ol>
+<p>A typical analysis question is one model call over roughly 2–5k tokens of input. Indexing, impact sets, dossiers and test-condition inventories cost nothing. The model list at work is mixed-vendor; the design does not depend on which one is used — bulk work is free, the gate makes the model's choice matter less, and the strongest available model is reserved for design and verification.</p>
+
+<h2 id="rules">Rules the model follows</h2>
+<p>These live in <code>templates/CLAUDE.md</code>; copy that file to the estate root next to <code>atlas.db</code>.</p>
+<ul>
+  <li><strong>The index knows this estate; the model does not.</strong> Run the matching query before answering. A fact from neither the index nor an opened line is UNKNOWN.</li>
+  <li><strong>Cite or abstain.</strong> Every claim carries <code>[[MEMBER line "token"]]</code>; the token is quoted, never paraphrased. Run the gate before delivering.</li>
+  <li><strong>FACTS, then INFERENCE, then UNRESOLVED IN SCOPE, then NOT SEARCHED.</strong> Never mixed.</li>
+  <li><strong>A missing row is not "no link".</strong> No caller found ≠ no caller; dynamic CALLs, unindexed source, online transactions and the scheduler can all reach it.</li>
+  <li><strong>DISP is not direction. PGM= is not the program. PCB arguments are positional.</strong> Use <code>mode_source</code>, <code>effective_pgm</code>, and the PSB order.</li>
+  <li><strong>Same member name ≠ same program; same copybook ≠ same layout across systems.</strong> Check <code>ambiguous</code> and version skew.</li>
+  <li><strong>Group-level MOVEs, READ INTO, WRITE FROM, INITIALIZE and CALL BY REFERENCE touch fields without naming them.</strong> Follow parents and USING positions.</li>
+  <li><strong>Generated code takes field names from <code>field</code>, offsets from the parser, style from a real exemplar</strong>, and ends with a HUMAN MUST VERIFY list.</li>
+</ul>
+
+<h2 id="playbooks">Playbooks</h2>
+<p>Full procedures are in <code>templates/PLAYBOOKS.md</code>. The shape of each:</p>
+<div class="tablewrap"><table class="greenbar">
+<thead><tr><th>Task</th><th>Queries (free)</th><th>The model must produce</th></tr></thead>
+<tbody>
+<tr><td>A1 Field impact</td><td class="mono">field · copybook · literal</td><td>Copies and offsets (skew flagged); including programs with REPLACING; jobs; datasets written and their readers; sort cards over the bytes; callers. Then: does record length change, and RECOMPILE-ONLY vs SOURCE-CHANGE vs BIND vs DATA-CONVERSION.</td></tr>
+<tr><td>A2 What a job does</td><td class="mono">job</td><td>Step narrative from the effective program and quoted control cards; PROCs not in the index are UNKNOWN; without a scheduler, predecessors are UNKNOWN.</td></tr>
+<tr><td>A3 Trace an error code</td><td class="mono">literal</td><td>Defined → set → tested → displayed chain with citations, plus the routes it could not follow.</td></tr>
+<tr><td>A4 Where a field is populated</td><td class="mono">field · pack</td><td>Writers ranked: MOVE/COMPUTE targets, SELECT/FETCH INTO, READ INTO, CALL BY REFERENCE, group-level writes.</td></tr>
+<tr><td>A5 Abend triage</td><td class="mono">job · pack</td><td>At most three ranked hypotheses, each with a disconfirming check; S0C7 offset mapping needs the compile listing or says "cannot localise".</td></tr>
+<tr><td>A6 Dead code</td><td class="mono">dead</td><td>Candidates only, with the scheduler / online / dynamic-CALL caveats repeated.</td></tr>
+<tr><td>A7 Value-domain change<br><span class="fine">new code value, or codes merged</span></td><td class="mono">values · pair · messages · screen · field · copybook</td><td>Per system: the value table (with the undocumented special case), the cross-field rule list, the message list, the screen fields with their defaults and validating programs, the reader list. Then keep / rewrite / delete per rule, new text per message, a contract note per external reader. HUMAN MUST VERIFY: values in data but not in code, screens, DB2 CHECK constraints and lookup tables. Tests come from the value table.</td></tr>
+<tr><td>D1 Change design</td><td class="mono">A1 + A2 for everything touched</td><td>Pass 1 facts (no model); pass 2 narrative: components with change type, CRUD matrix from verbs, interface contracts in bytes, backout per change type, non-empty risks seeded from UNRESOLVED.</td></tr>
+<tr><td>V1 Code bundle</td><td class="mono">pack · cite · copybook · job</td><td>Source with real field names; copybook, compile/bind and run JCL modelled on real members; control cards; PSB/DBD/bind implications; HUMAN MUST VERIFY list.</td></tr>
+<tr><td>T1 Test conditions</td><td class="mono">field · pack · copybook</td><td>Every 88 value a positive class, THRU ranges low/high/mid, one value outside all 88s as the negative, every IF both ways, every EVALUATE each WHEN plus OTHER; records built to the byte layout; expected results from the spec, not the program.</td></tr>
+</tbody></table></div>
+
+<h2 id="breaks">When something breaks</h2>
+<div class="tablewrap"><table class="greenbar">
+<thead><tr><th>Symptom</th><th>Paste this</th><th>It contains</th></tr></thead>
+<tbody>
+<tr><td>It crashed</td><td class="mono">atlas-crash.txt</td><td>Toolkit version, Python/OS, the exception, the toolkit's own code frames. Paths and dataset names already stripped; written automatically by <code>build</code> and <code>query</code>.</td></tr>
+<tr><td>Coverage looks wrong</td><td class="mono">python -m atlas.diag --db atlas.db --redact</td><td>Failure signatures grouped (three signatures are usually three bugs), unresolved counts, format-detection stats. Member names hashed.</td></tr>
+<tr><td>Wrong answer</td><td>Five lines + a tiny fake fixture</td><td><code>command / expected / got / pattern / fixture</code>. The fixture is 10–30 lines with invented names that reproduce the <em>shape</em> (the continuation, the level numbers, the PARM layout). It becomes a regression test before the fix — see <code>LESSONS.md</code>, 28 entries so far.</td></tr>
+</tbody></table></div>
+<div class="callout crit"><strong>Never paste</strong>Real members, copybooks or JCL; dataset, library or job names that identify the company; anything from <code>out/expanded/</code> or <code>atlas.db</code>. The toolkit never sends anything anywhere; sharing is always your copy-paste.</div>
+
+<h2 id="limits">What it does not do</h2>
+<ul>
+  <li><strong>It is not a compiler.</strong> Grammar-aware, conservative extraction over properly tokenised source, reporting what it skipped. A compiler listing (LIST/MAP/XREF) is the authoritative expanded source — index listings when you have them.</li>
+  <li><strong>It is not a scheduler.</strong> Export CA-7 / Control-M / TWS to CSV and load with <code>--sched</code>; until then "dead job" and "what runs before" are unanswerable, and the reports say so.</li>
+  <li><strong>Transaction routing needs the exports.</strong> The CICS CSD (DFHCSDUP <code>DEFINE</code> deck or <code>LIST</code> report, also when embedded in a JCL SYSIN) and the IMS stage-1 (<code>APPLCTN</code>/<code>TRANSACT</code>) are parsed; if those exports are not in the folder, "which transaction runs this" is unknown and <code>coverage</code> says so. IMS program names are assumed equal to PSB names unless <code>GPSB=</code> was used — recorded on every such row.</li>
+  <li><strong>Not modelled:</strong> SYNC alignment slack, GO TO and fall-through in dead-paragraph analysis, dynamic SQL targets, CALL targets read from control tables. All appear as <code>unresolved</code>.</li>
+</ul>
+
+<h2 id="reference">Reference</h2>
+<h3>Fixed-format columns</h3>
+<figure>
+<div class="ruler" aria-label="COBOL fixed-format column map">
+  <div style="flex:6"><span class="cols">1–6</span>sequence · ignored</div>
+  <div style="flex:1.6"><span class="cols">7</span>* / − D</div>
+  <div class="live" style="flex:4"><span class="cols">8–11</span>Area A</div>
+  <div class="live" style="flex:20"><span class="cols">12–72</span>Area B</div>
+  <div style="flex:8"><span class="cols">73–80</span>ident · ignored</div>
+</div>
+<figcaption>The reader strips 1–6 and 73–80, treats <code>*</code>/<code>/</code> as comments, <code>−</code> as literal continuation and <code>D</code> as debug lines, and detects the right margin empirically because folder dumps are often 79 columns, not 80.</figcaption>
+</figure>
+<h3>How direction is decided</h3>
+<div class="tablewrap"><table class="greenbar">
+<thead><tr><th class="mono">mode_source</th><th>Signal</th><th>Trust</th></tr></thead>
+<tbody>
+<tr><td class="mono">open_verb</td><td>The program's own <code>OPEN INPUT / OUTPUT / I-O / EXTEND</code>, joined through SELECT…ASSIGN to the DD</td><td>Authoritative</td></tr>
+<tr><td class="mono">gdg_relative</td><td><code>(+1)</code> is created here; <code>(0)</code> / <code>(−n)</code> is read</td><td>Strong</td></tr>
+<tr><td class="mono">dd_convention</td><td>SORTIN / SYSUT1 read; SORTOUT / SYSUT2 write</td><td>Strong for utilities</td></tr>
+<tr><td class="mono">disp_new_weak · disp_mod_weak</td><td><code>DISP=NEW</code> / <code>MOD</code></td><td>Weak</td></tr>
+<tr><td class="mono">undetermined</td><td>Only <code>DISP=OLD/SHR</code> was available — serialisation, not direction</td><td>Unknown, and said so</td></tr>
+</tbody></table></div>
+<h3>The four names</h3>
+<p class="fine">PDS member name, <code>PROGRAM-ID</code>, CSECT and load module or alias routinely differ. Atlas keys members by path, stores <code>PROGRAM-ID</code> separately, hashes columns 8–72 (<code>norm_sha</code>) to find true duplicates, and never merges by name.</p>
+<h3>Citation syntax</h3>
+<pre><code>[[CLMPOST 412 "CALL 'RATECALC'"]]                 one line
+[[CLMNIGHT 17-19 "RUN PROGRAM(PREMCALC)"]]        a range
+[[libs/copy/PMASTREC.cpy 11 "COMP-3"]]            a path</code></pre>
+<p class="fine">The token must literally appear on the cited line(s). The gate checks case-insensitively with whitespace collapsed, warns when every cited line is a comment, and lists assertive lines that carry no citation.</p>
+</main>
+</div>
+</html>

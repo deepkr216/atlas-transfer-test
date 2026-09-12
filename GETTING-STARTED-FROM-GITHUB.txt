@@ -1,0 +1,49 @@
+MAINFRAME ATLAS - GETTING IT ONTO THE COMPANY LAPTOP VIA GITHUB
+================================================================
+This repository contains the toolkit only. No company data. Nothing here makes a
+network call. It is PRIVATE: only the repository owner and invited collaborators
+can see it.
+
+STEP 1 - THE TEST (browser only, 5 minutes)
+  1. Open this repository in the browser on the company laptop.
+  2. Click atlas_hello.py, then the "Raw" button, then save the page as atlas_hello.py
+     (or use the "Download raw file" icon).
+  3. PowerShell, in the folder you saved it:
+         Get-FileHash .\atlas_hello.py -Algorithm SHA256
+     The value must match the hash written in the README-HASHES section below.
+         python atlas_hello.py
+     It must end with:  ATLAS HELLO: ALL GOOD
+
+STEP 2 - THE TOOLKIT
+  Either  (git installed on the laptop)
+         git clone https://github.com/<owner>/mainframe-atlas.git
+     - a private repo asks for a username and a Personal Access Token (not your
+       password); create the token on github.com under Settings > Developer settings.
+  Or      (no git)  green "Code" button > "Download ZIP", extract.
+  Then:
+         cd mainframe-atlas
+         python selfcheck.py               -> must print SELFCHECK PASSED
+  Requirements: Python 3.9+, standard library only. No pip.
+
+STEP 3 - GET THE CODE FROM THE MAINFRAME (needs Zowe CLI on the laptop)
+  See README.md "Getting the code from the mainframe" and sources.example.json:
+         python -m atlas.ui --config sources.json
+
+STEP 4 - SEND RESULTS BACK (all safe: no source, no dataset names)
+  In the browser: this repository > Issues > New issue. Paste:
+    - the output of atlas_hello.py / selfcheck.py
+    - atlas-crash.txt (written automatically when something crashes)
+    - the output of:  python -m atlas.diag --db atlas.db --redact
+    - a 5-line wrong-answer note + a tiny FAKE fixture (see REPORTING.md)
+  Never paste real members, dataset or job names, or sources.json with real names.
+
+UPDATES
+  git pull            (Option git)      or download the ZIP again (Option ZIP)
+  then python selfcheck.py
+
+DOCUMENTATION ON THE LAPTOP
+  README.md, templates/PLAYBOOKS.md, templates/CLAUDE.md, REPORTING.md, LESSONS.md,
+  and docs/FieldManual.html (open in any browser).
+
+README-HASHES
+  atlas_hello.py  SHA-256  EC308A601A4FB13C625AE88F025E5A24E5CE6132917BBFF7530C353DEAADA93D
