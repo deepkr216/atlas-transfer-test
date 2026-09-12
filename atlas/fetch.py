@@ -126,7 +126,7 @@ _KIND_BY_SUFFIX = [
     (("CSD", "CSDUP", "CSDEXTR"), "csd"),
     (("STAGE1", "SYSGEN", "IMSGEN", "GEN"), "imsgen"),
     (("LIST", "LISTING", "LISTINGS", "LST", "SYSPRINT"), "listing"),
-    (("SCHED", "CA7", "CTM", "TWS", "OPC"), "sched"),
+    (("SCHED", "SCHEDULE", "CA7", "CTM", "TWS", "OPC", "ZEKE", "ZEKELIB", "ZEKEDEF", "EVENTS"), "sched"),
     (("DDL", "SQL", "DCL"), "sql"),
     (("DOC", "DOCS", "SPEC", "SPECS"), "doc"),
 ]

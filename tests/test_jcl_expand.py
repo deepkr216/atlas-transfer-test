@@ -143,6 +143,26 @@ class SchedulerSource(unittest.TestCase):
         self.assertIn("--sched", cmd)
         self.assertTrue(cmd[cmd.index("--sched") + 1].endswith(os.path.join("routing", "ca7.csv")))
 
+    def test_native_scheduler_export_is_reported_not_silently_empty(self):
+        self.assertEqual(fetch.infer_kind("PROD.ZEKE.EVENTS"), ("sched", False))
+        td = tempfile.mkdtemp()
+        try:
+            z = os.path.join(td, "zeke.txt")
+            with open(z, "w", encoding="utf-8") as fh:
+                fh.write("EVENT 001234  JOB NIGHTJOB   WHEN EVENT 001200 ENDED\n"
+                         "EVENT 001235  JOB DAYJOB     WHEN TIME 0600\n")
+            db = os.path.join(td, "t.db")
+            build._main([FIX, "--db", db, "--rebuild", "--quiet", "--sched", z])
+            c = query.connect(db)
+            self.assertEqual(c.execute("SELECT COUNT(*) FROM sched_dep").fetchone()[0], 0)
+            row = c.execute("SELECT detail FROM unresolved WHERE kind='scheduler_format'").fetchone()
+            self.assertIsNotNone(row)
+            self.assertIn("zeke.txt", row[0])
+            self.assertIn("scheduler_format", query.cmd_coverage(c))
+            c.close()
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
+
     def test_two_scheduler_files_load(self):
         td = tempfile.mkdtemp()
         try:

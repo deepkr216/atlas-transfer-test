@@ -260,7 +260,23 @@ def load_sched(ctx: Ctx, csv_path: str) -> None:
     """
     import csv
     n_dep = n_job = 0
-    with open(csv_path, "r", encoding="utf-8-sig", newline="") as fh:
+    with open(csv_path, "r", encoding="utf-8-sig", errors="replace", newline="") as fh:
+        head = fh.readline()
+        fh.seek(0)
+        cols = {c.strip().lower() for c in head.split(",")}
+        if not cols & {"job_name", "job", "jobname"}:
+            # Not the CSV form this loader understands (a Zeke / CA-7 / Control-M
+            # native export, most likely). Say so where it will be seen: the
+            # coverage report reads `unresolved`, and a silent "0 loaded" would
+            # look exactly like "no dependencies exist".
+            msg = (f"scheduler file {os.path.basename(csv_path)} is not a CSV with a job_name column "
+                   f"(first line: {head.strip()[:80]!r}). Its native format needs a loader - send its "
+                   f"SHAPE (20 lines, fake job names) per REPORTING.md, or export it as job_name,depends_on.")
+            ctx.conn.execute("INSERT INTO unresolved(member_id,kind,detail,line) VALUES(NULL,'scheduler_format',?,NULL)",
+                             (msg,))
+            ctx.conn.commit()
+            ctx.say("scheduler: " + msg)
+            return
         for row in csv.DictReader(fh):
             r = {(k or "").strip().lower(): (v or "").strip() for k, v in row.items()}
             job = r.get("job_name") or r.get("job") or r.get("jobname")
