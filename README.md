@@ -75,6 +75,39 @@ copybook forces every program that expands it to be re-parsed, and members
 that disappeared are pruned. A full estate re-run after a small change takes
 seconds, not minutes.
 
+### Several departments, each with its own libraries
+
+Every source row carries a `system` (the department). That one field drives
+everything else:
+
+- **Folders** — each department gets its own folder under `local_root`
+  (`C:\estate\CLAIMS\PROD.CLAIMS.SRC`), so same-named members in two
+  departments never collide on disk; the library folder name is still the
+  dataset name, so classification and the manifest keep working.
+- **Bulk add** — paste a department's dataset list (one per line); kinds are
+  inferred from the names (`SRC`, `COPYLIB`, `JCLLIB`, `PROCLIB`, `PARMLIB`,
+  `PSBSOURCE`, `DBDSRC`, `BMS`, `MFS`, `CSD`, `STAGE1`, `CA7`…), and
+  compiled libraries (`PSBLIB`, `DBDLIB`, `ACBLIB`, `LOADLIB`) are added
+  **disabled** with a warning — there is nothing to parse in them.
+- **System filter / Fetch system** — work on one department at a time; the
+  others stay untouched.
+- **Copybook resolution** — a CLAIMS program that says `COPY POLREC` gets the
+  CLAIMS copy, never POLICY's: candidates are ranked `COPY … OF lib` › same
+  department in its **declared order** › same department › authoritative ›
+  same folder › first found — and the choice is written into the
+  `ambiguous_copybook` note either way. The declared order is simply the
+  order of a department's copybook rows in the table (Move up / Move down):
+  that is the SYSLIB concatenation its programs compile against.
+- **Cross-department flow** — `dataset X` shows each writer's and reader's
+  department and says **Crosses departments** when they differ: a layout or
+  value change to that file is an interface change, not an internal one.
+- `program X` shows its department; `ambiguous` shows which departments hold
+  each duplicate name. Same name in two departments is normal; same name
+  with different content inside *one* department is the dangerous case.
+
+Shared exports — the IMS stage-1, the CSD extract, the scheduler CSV — go
+under a system of their own (`SHARED` in `sources.example.json`).
+
 ## Quick start
 
 ```bash

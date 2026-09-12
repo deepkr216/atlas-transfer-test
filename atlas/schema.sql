@@ -33,6 +33,8 @@ CREATE TABLE IF NOT EXISTS member (
     lines         INTEGER,
     fixed_format  INTEGER,                -- 1 = cols 7/72 rules applied
     authoritative INTEGER DEFAULT 0,      -- 1 = declared production copy (manifest)
+    system        TEXT,                   -- department / system (manifest: systems / system_of);
+                                          -- copybook resolution prefers the program's own system
     parse_status  TEXT DEFAULT 'pending', -- ok|partial|failed|skipped
     parse_error   TEXT,
     scanned_at    TEXT
@@ -46,6 +48,7 @@ CREATE INDEX IF NOT EXISTS ix_member_sha    ON member(sha256);
 -- when analysing a folder dump, so it gets a first-class view.
 CREATE VIEW IF NOT EXISTS v_ambiguous_member AS
 SELECT name, COUNT(*) AS copies, COUNT(DISTINCT norm_sha) AS distinct_content,
+       GROUP_CONCAT(DISTINCT system) AS systems,
        GROUP_CONCAT(path, ' | ') AS paths
 FROM member
 WHERE kind IN ('cobol','copybook','jcl','proc','dbd','psb')
@@ -399,7 +402,7 @@ CREATE TABLE IF NOT EXISTS dataset (
 -- refs are why this cannot be done by string-matching DSNs.
 CREATE VIEW IF NOT EXISTS v_dataset_flow AS
 SELECT d.dsn_resolved AS dsn, s.effective_pgm AS pgm, j.job_name, s.step_name,
-       d.mode, d.gdg_rel, m.path
+       d.mode, d.mode_source, d.gdg_rel, m.path, m.system, s.from_proc
 FROM dd d
 JOIN step s   ON s.id = d.step_id
 LEFT JOIN job j ON j.id = s.job_id

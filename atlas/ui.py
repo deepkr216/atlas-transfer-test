@@ -70,8 +70,13 @@ class SourceDialog(tk.Toplevel if tk else object):
         ttk.Checkbutton(f, text="Production (authoritative) copy", variable=self.vars["authoritative"]).grid(
             row=len(rows), column=1, sticky="w")
         ttk.Checkbutton(f, text="Enabled", variable=self.vars["enabled"]).grid(row=len(rows) + 1, column=1, sticky="w")
+        ttk.Label(f, wraplength=420, foreground="#555",
+                  text="dbd / psb = the SOURCE libraries (DBDGEN / PSBGEN macros). PSBLIB, DBDLIB, ACBLIB and "
+                       "LOADLIB are compiled output - nothing to parse, do not fetch them. csd = a DFHCSDUP "
+                       "extract; imsgen = IMS stage-1 source; sched = a scheduler CSV export.").grid(
+            row=len(rows) + 2, column=0, columnspan=2, sticky="w", pady=(8, 0))
         b = ttk.Frame(f)
-        b.grid(row=len(rows) + 2, column=0, columnspan=2, pady=(10, 0), sticky="e")
+        b.grid(row=len(rows) + 3, column=0, columnspan=2, pady=(10, 0), sticky="e")
         ttk.Button(b, text="Cancel", command=self.destroy).pack(side="right", padx=4)
         ttk.Button(b, text="OK", command=self._ok).pack(side="right")
         self.vars["kind"].trace_add("write", lambda *_: self.vars["ext"].set(
@@ -121,8 +126,15 @@ class App(tk.Tk if tk else object):
         ttk.Label(top, text="Database").grid(row=0, column=5, sticky="w")
         ttk.Entry(top, textvariable=self.v_db, width=22).grid(row=0, column=6, padx=4)
         ttk.Button(top, text="Check Zowe", command=self.check_zowe).grid(row=0, column=7, padx=(16, 0))
+        # One estate, many departments: filter the table to one system, fetch
+        # or inspect that system alone, keep the rest untouched.
+        ttk.Label(top, text="System").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        self.v_filter = tk.StringVar(value="All")
+        self.cb_filter = ttk.Combobox(top, textvariable=self.v_filter, state="readonly", width=16, values=("All",))
+        self.cb_filter.grid(row=1, column=1, padx=(4, 16), pady=(6, 0), sticky="w")
+        self.cb_filter.bind("<<ComboboxSelected>>", lambda e: self.refresh())
         self.v_status = tk.StringVar(value=f"config: {self.config_path}")
-        ttk.Label(top, textvariable=self.v_status, foreground="#555").grid(row=1, column=0, columnspan=8, sticky="w", pady=(6, 0))
+        ttk.Label(top, textvariable=self.v_status, foreground="#555").grid(row=1, column=2, columnspan=6, sticky="w", pady=(6, 0))
 
         mid = ttk.Frame(self, padding=(8, 0, 8, 0))
         mid.pack(fill="both", expand=True)
@@ -138,11 +150,14 @@ class App(tk.Tk if tk else object):
 
         btns = ttk.Frame(self, padding=8)
         btns.pack(fill="x")
-        for text, cmd in (("Add", self.add_source), ("Edit", self.edit_source), ("Remove", self.remove_source),
-                          ("Enable/Disable", self.toggle_source), ("Save", self.save)):
+        for text, cmd in (("Add", self.add_source), ("Bulk add", self.bulk_add), ("Edit", self.edit_source),
+                          ("Remove", self.remove_source), ("Enable/Disable", self.toggle_source),
+                          ("Move up", lambda: self.move(-1)), ("Move down", lambda: self.move(1)),
+                          ("Save", self.save)):
             ttk.Button(btns, text=text, command=cmd).pack(side="left", padx=2)
         ttk.Separator(btns, orient="vertical").pack(side="left", fill="y", padx=10)
-        for text, cmd in (("Plan", self.plan), ("Fetch selected", self.fetch_selected), ("Fetch all", self.fetch_all),
+        for text, cmd in (("Plan", self.plan), ("Fetch selected", self.fetch_selected),
+                          ("Fetch system", self.fetch_system), ("Fetch all", self.fetch_all),
                           ("Build index", lambda: self.build(False)), ("Rebuild from empty", lambda: self.build(True)),
                           ("Coverage", self.coverage)):
             ttk.Button(btns, text=text, command=cmd).pack(side="left", padx=2)
@@ -158,8 +173,13 @@ class App(tk.Tk if tk else object):
     # ---- table ---------------------------------------------------------
 
     def refresh(self) -> None:
+        systems = fetch.systems_in(self.cfg)
+        self.cb_filter["values"] = ("All", *systems)
+        if self.v_filter.get() not in ("All", *systems):
+            self.v_filter.set("All")
         self.tree.delete(*self.tree.get_children())
-        for i, s in enumerate(self.cfg["sources"]):
+        for i in fetch.filter_sources(self.cfg, self.v_filter.get()):
+            s = self.cfg["sources"][i]
             self.tree.insert("", "end", iid=str(i), values=(
                 s["dataset"], s.get("type", "pds"), s.get("kind", ""), s.get("system", ""),
                 fetch.local_path(self.cfg, s), "yes" if s.get("authoritative") else "",
@@ -313,6 +333,70 @@ class App(tk.Tk if tk else object):
         self._sync_cfg()
         db = self.cfg.get("db") or "atlas.db"
         self._run_bg(lambda: self._stream([sys.executable, "-m", "atlas.query", "--db", db, "coverage"]))
+
+    # ---- departments -----------------------------------------------------
+
+    def bulk_add(self) -> None:
+        """Paste a department's dataset list, one per line; kinds are inferred
+        from the names, load libraries are added disabled."""
+        dlg = tk.Toplevel(self)
+        dlg.title("Bulk add a department's libraries")
+        f = ttk.Frame(dlg, padding=12)
+        f.grid()
+        v_sys = tk.StringVar(value=self.v_filter.get() if self.v_filter.get() != "All" else "")
+        v_auth = tk.BooleanVar(value=True)
+        ttk.Label(f, text="System / department").grid(row=0, column=0, sticky="w")
+        ttk.Entry(f, textvariable=v_sys, width=20).grid(row=0, column=1, sticky="w", pady=3)
+        ttk.Checkbutton(f, text="These are the production (authoritative) libraries", variable=v_auth).grid(
+            row=1, column=0, columnspan=2, sticky="w")
+        ttk.Label(f, text="Datasets, one per line (SRC, COPYLIB, JCLLIB, PROCLIB, PARMLIB, PSBSOURCE, DBDSOURCE, "
+                          "BMS, MFS, CSD extract, STAGE1 ...). PSBLIB/DBDLIB/ACBLIB/LOADLIB are compiled - skip them.",
+                  wraplength=520, foreground="#555").grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 2))
+        txt = tk.Text(f, width=64, height=14, font=("Consolas", 10))
+        txt.grid(row=3, column=0, columnspan=2)
+        b = ttk.Frame(f)
+        b.grid(row=4, column=0, columnspan=2, sticky="e", pady=(10, 0))
+
+        def ok():
+            sysname = v_sys.get().strip().upper()
+            if not sysname:
+                messagebox.showerror("Bulk add", "System / department is required")
+                return
+            added, warnings = fetch.bulk_add(self.cfg, sysname, txt.get("1.0", "end"), v_auth.get())
+            for w in warnings:
+                self._log("bulk add: " + w)
+            self._log(f"bulk add: {len(added)} source(s) added to {sysname}")
+            dlg.destroy()
+            self.v_filter.set(sysname)
+            self.refresh()
+            self.save()
+        ttk.Button(b, text="Cancel", command=dlg.destroy).pack(side="right", padx=4)
+        ttk.Button(b, text="Add", command=ok).pack(side="right")
+        dlg.transient(self)
+        dlg.grab_set()
+
+    def move(self, delta: int) -> None:
+        """Order matters for copybook libraries: it is the SYSLIB concatenation
+        order the department's programs compile against."""
+        sel = self._selected()
+        if len(sel) != 1:
+            messagebox.showinfo("Move", "Select one source")
+            return
+        i, j = sel[0], sel[0] + delta
+        if 0 <= j < len(self.cfg["sources"]):
+            src = self.cfg["sources"]
+            src[i], src[j] = src[j], src[i]
+            self.refresh()
+            self.tree.selection_set(str(j))
+            self.save()
+
+    def fetch_system(self) -> None:
+        sysname = self.v_filter.get()
+        if sysname == "All":
+            messagebox.showinfo("Fetch system", "Pick a system in the filter first")
+            return
+        self._fetch([self.cfg["sources"][i]["dataset"] for i in fetch.filter_sources(self.cfg, sysname)
+                     if self.cfg["sources"][i].get("enabled", True)])
 
     def _close(self) -> None:
         try:

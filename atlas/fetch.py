@@ -89,11 +89,96 @@ def new_source(dataset: str, kind: str = "cobol", **kw) -> Dict:
         "last_result": None,
     }
     src.update({k: v for k, v in kw.items() if k in src})
+    src["system"] = (src.get("system") or "").strip().upper()
+    # Departments get their own folder: C:/estate/CLAIMS/PROD.CLAIMS.SRC. The
+    # library folder name is still the dataset name, so classification and the
+    # manifest keep working, and same-named members in two departments never
+    # collide on disk.
+    if src["system"] and "local" not in kw:
+        src["local"] = f"{src['system']}/{src['dataset']}"
     return src
 
 
 def local_path(cfg: Dict, src: Dict) -> str:
     return os.path.normpath(os.path.join(cfg["local_root"], src.get("local") or src["dataset"]))
+
+
+# --------------------------------------------------------------------------
+# many departments, many libraries
+# --------------------------------------------------------------------------
+
+# Compiled output: PSBLIB / DBDLIB / ACBLIB / LOADLIB hold binaries, not
+# source. Downloading them as text yields garbage, so they are recognised and
+# added DISABLED with a warning - fetch PSBSOURCE / DBDSOURCE / the COBOL
+# source library instead.
+LOAD_SUFFIXES = {"LOAD", "LOADLIB", "LINKLIB", "LNKLIB", "PSBLIB", "DBDLIB", "ACBLIB", "MAPLIB",
+                 "OBJ", "OBJLIB", "STEPLIB", "JOBLIB", "MODLIB"}
+_KIND_BY_SUFFIX = [
+    (("COPYLIB", "COPY", "CPY", "COPYBOOK", "COPYBOOKS", "INCLUDE", "INCLIB", "DCLGEN", "DCLLIB"), "copybook"),
+    (("SRC", "SOURCE", "COBOL", "COB", "SRCLIB", "COBSRC", "PGMSRC", "PGMLIB"), "cobol"),
+    (("JCL", "JCLLIB", "JOB", "JOBS"), "jcl"),
+    (("PROC", "PROCLIB", "PROCS"), "proc"),
+    (("PARM", "PARMLIB", "CNTL", "CONTROL", "CARDS", "CARDLIB", "CTL", "CTLCARD", "SYSIN"), "ctlcard"),
+    (("DBDSRC", "DBDSOURCE", "DBDGEN", "DBD"), "dbd"),
+    (("PSBSRC", "PSBSOURCE", "PSBGEN", "PSB"), "psb"),
+    (("BMS", "BMSSRC", "MAPSRC", "MAPS"), "bms"),
+    (("MFS", "MFSSRC"), "mfs"),
+    (("CSD", "CSDUP", "CSDEXTR"), "csd"),
+    (("STAGE1", "SYSGEN", "IMSGEN", "GEN"), "imsgen"),
+    (("LIST", "LISTING", "LISTINGS", "LST", "SYSPRINT"), "listing"),
+    (("SCHED", "CA7", "CTM", "TWS", "OPC"), "sched"),
+    (("DDL", "SQL", "DCL"), "sql"),
+    (("DOC", "DOCS", "SPEC", "SPECS"), "doc"),
+]
+
+
+def infer_kind(dataset: str) -> Tuple[str, bool]:
+    """(kind, is_load_library) from the dataset name's qualifiers, last first."""
+    toks = [t for t in re.split(r"[.()]", dataset.upper()) if t]
+    is_load = any(t in LOAD_SUFFIXES for t in toks)
+    for t in reversed(toks):
+        for names, kind in _KIND_BY_SUFFIX:
+            if t in names:
+                return kind, is_load
+    return "other", is_load
+
+
+def bulk_add(cfg: Dict, system: str, text: str, authoritative: bool = False) -> Tuple[List[Dict], List[str]]:
+    """One dataset per line -> sources for one department, kinds inferred.
+    Returns (added sources, warnings). Load libraries are added disabled."""
+    existing = {s["dataset"] for s in cfg["sources"]}
+    added: List[Dict] = []
+    warnings: List[str] = []
+    for line in text.splitlines():
+        s = line.strip()
+        if not s or s.startswith(("*", "#", "//")):
+            continue
+        ds = s.split()[0].upper()
+        if ds in existing:
+            warnings.append(f"{ds}: already listed")
+            continue
+        kind, is_load = infer_kind(ds)
+        src = new_source(ds, kind, system=system, authoritative=authoritative)
+        if is_load:
+            src["enabled"] = False
+            warnings.append(f"{ds}: looks like a LOAD library (compiled) - added disabled; fetch the SOURCE library instead")
+        elif kind == "other":
+            warnings.append(f"{ds}: kind not recognised from the name - set it in Edit")
+        cfg["sources"].append(src)
+        added.append(src)
+        existing.add(ds)
+    return added, warnings
+
+
+def systems_in(cfg: Dict) -> List[str]:
+    return sorted({(s.get("system") or "").upper() for s in cfg["sources"] if s.get("system")})
+
+
+def filter_sources(cfg: Dict, system: Optional[str] = None) -> List[int]:
+    """Indices into cfg['sources'] for one department (None / '' / 'All' = every source)."""
+    if not system or system.upper() == "ALL":
+        return list(range(len(cfg["sources"])))
+    return [i for i, s in enumerate(cfg["sources"]) if (s.get("system") or "").upper() == system.upper()]
 
 
 # --------------------------------------------------------------------------
@@ -259,15 +344,22 @@ def fetch_all(cfg: Dict, runner: Optional[Runner] = None, log: Callable[[str], N
 
 def write_manifest(cfg: Dict, path: str) -> Dict:
     """build.py's manifest, derived from the sources so they cannot disagree."""
-    man = {"authoritative": [], "system_of": {}}
+    man: Dict = {"authoritative": [], "system_of": {}, "systems": {}, "copylib_order": {}}
     for src in cfg["sources"]:
         if not src.get("enabled", True):
             continue
         lp = local_path(cfg, src).replace("\\", "/")
         if src.get("authoritative"):
             man["authoritative"].append(lp)
-        if src.get("system"):
-            man["system_of"][os.path.basename(lp)] = src["system"]
+        sysname = (src.get("system") or "").upper()
+        if sysname:
+            man["system_of"][os.path.basename(lp)] = sysname
+            man["systems"].setdefault(sysname, []).append(lp)
+            # The order copybook libraries are listed for a department is the
+            # SYSLIB concatenation order its programs compile against: first
+            # match wins when the same copybook name exists in several.
+            if src.get("kind") == "copybook":
+                man["copylib_order"].setdefault(sysname, []).append(lp)
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(man, fh, indent=2)
     return man

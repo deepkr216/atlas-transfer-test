@@ -92,7 +92,7 @@ def source_line(conn: sqlite3.Connection, member_name: str, line: int) -> str:
 
 def programs_named(conn: sqlite3.Connection, name: str) -> List[sqlite3.Row]:
     return conn.execute("""
-        SELECT p.*, m.name AS member_name, m.path, m.library, m.authoritative, m.parse_status
+        SELECT p.*, m.name AS member_name, m.path, m.library, m.authoritative, m.parse_status, m.system
         FROM program p JOIN member m ON m.id = p.member_id
         WHERE UPPER(p.program_id) = ? OR UPPER(m.name) = ?
         ORDER BY m.authoritative DESC, m.path""", (name.upper(), name.upper())).fetchall()
@@ -172,6 +172,7 @@ def cmd_program(conn: sqlite3.Connection, name: str) -> str:
                    + ("  **[authoritative]**" if p["authoritative"] else "") + "\n")
         out.append(f"- PROGRAM-ID `{p['program_id']}` - {p['src_lines']} source lines, "
                    f"{p['exp_lines']} after COPY expansion - parse: {p['parse_status']}\n")
+        out.append(f"- system: {p['system'] or 'not declared (add it to sources.json / manifest systems)'}\n")
         flags = [k for k in ("sql", "cics", "dli", "mq") if p[f"uses_{k}"]]
         out.append(f"- uses: {', '.join(flags) if flags else 'files only'}\n")
         lk = _jl(p["linkage_using"])
@@ -767,12 +768,20 @@ def cmd_dataset(conn: sqlite3.Connection, dsn: str) -> str:
     rows = conn.execute("""SELECT * FROM v_dataset_flow WHERE UPPER(dsn) LIKE ? ORDER BY dsn, mode, job_name""",
                         (f"%{dsn.upper()}%",)).fetchall()
     out = [f"# Dataset {dsn.upper()}\n"]
-    out.append(table(["dataset", "direction [source]", "program", "job", "step", "gdg", "member"],
-                     [(r["dsn"], f"{r['mode']} [{r['mode_source'] if 'mode_source' in r.keys() else ''}]".replace(" []", ""),
-                       r["pgm"], r["job_name"], r["step_name"], r["gdg_rel"] or "", os.path.basename(r["path"] or ""))
+    out.append(table(["dataset", "direction [source]", "system", "program", "job", "step", "gdg", "member"],
+                     [(r["dsn"], f"{r['mode']} [{r['mode_source'] or ''}]".replace(" []", ""),
+                       r["system"] or "?", r["pgm"], r["job_name"], r["step_name"], r["gdg_rel"] or "",
+                       os.path.basename(r["path"] or ""))
                       for r in rows]))
+    writers = {r["system"] for r in rows if r["mode"] in ("output", "mod", "both", "create") and r["system"]}
+    readers = {r["system"] for r in rows if r["mode"] in ("input", "both") and r["system"]}
+    if writers and readers and writers != readers:
+        out.append(f"\n**Crosses departments:** written by {', '.join(sorted(writers))}; read by "
+                   f"{', '.join(sorted(readers))}. A layout or value change here is an interface change "
+                   f"between systems, not an internal one.\n")
     out.append("\n> Direction marked `undetermined` means DISP alone was available; DISP is not direction. "
-               "`open_verb` is the program's own OPEN and is authoritative.\n")
+               "`open_verb` is the program's own OPEN and is authoritative. Rows from expanded PROC steps carry "
+               "the calling job's name.\n")
     return "".join(out)
 
 
@@ -871,8 +880,12 @@ def cmd_ambiguous(conn: sqlite3.Connection) -> str:
     out = [f"# Duplicate member names ({len(rows)})\n\n> Same name in more than one place. When contents differ, "
            "the index cannot know which is production; declare it in a manifest (`--manifest`) or every answer "
            "about these members is a coin toss.\n\n"]
-    out.append(table(["member", "copies", "distinct contents", "paths"],
-                     [(r["name"], r["copies"], r["distinct_content"], r["paths"][:160]) for r in rows[:300]]))
+    out.append(table(["member", "copies", "distinct contents", "systems", "paths"],
+                     [(r["name"], r["copies"], r["distinct_content"], r["systems"] or "?", r["paths"][:160])
+                      for r in rows[:300]]))
+    out.append("\n> Same name in two DEPARTMENTS is normal and safe once each department's programs resolve "
+               "to their own copy (sources.json `system` + copybook order). Same name with different content "
+               "inside ONE department is the dangerous case.\n")
     return "".join(out)
 
 
