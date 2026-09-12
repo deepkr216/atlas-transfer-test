@@ -44,6 +44,7 @@ DEFAULT_CONFIG: Dict = {
     "zowe": {"executable": "zowe", "profile": "", "encoding": "", "max_concurrent": 8,
              "timeout_seconds": 3600, "extra_args": []},
     "local_root": "C:/estate",
+    "extra_roots": [],       # folders indexed as well - the documentation folder, listings, exports
     "db": "atlas.db",
     "sources": [],
 }
@@ -62,6 +63,7 @@ def load_config(path: str) -> Dict:
         for k in ("local_root", "db"):
             if user.get(k):
                 cfg[k] = user[k]
+        cfg["extra_roots"] = [p for p in (user.get("extra_roots") or []) if str(p).strip()]
         cfg["sources"] = [dict(new_source(s.get("dataset", ""), s.get("kind", "other")), **s)
                           for s in user.get("sources", [])]
     return cfg
@@ -372,6 +374,9 @@ def build_cmd(cfg: Dict, manifest_path: str, rebuild: bool = False) -> List[str]
     for src in cfg["sources"]:
         if src.get("kind") == "sched" and src.get("enabled", True):
             cmd += ["--sched", local_path(cfg, src)]
+    # The documentation folder (and any other local-only folder) is indexed too.
+    for extra in cfg.get("extra_roots") or []:
+        cmd += ["--also", os.path.normpath(str(extra))]
     if rebuild:
         cmd.append("--rebuild")
     return cmd

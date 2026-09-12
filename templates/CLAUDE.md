@@ -25,6 +25,16 @@ python -m atlas.query --db atlas.db messages <PATTERN>        # message texts na
 python -m atlas.query --db atlas.db screen   <MAP|MID|MOD>    # screen fields, defaults, validating programs
 python -m atlas.query --db atlas.db transaction <CODE|PGM>    # CICS/IMS routing: transaction <-> program
 python -m atlas.query --db atlas.db column   <TABLE.COL>      # DB2 column: written from / read into which fields
+python -m atlas.query --db atlas.db docs     <TERM>           # documents (and OCR'd pictures) mentioning it
+python -m atlas.query --db atlas.db images   [DOC]            # pictures inside documents, read or not
+```
+
+Documents are PROSE, never facts: they say what was intended, the code says
+what runs. Cite a document as `[[DOCNAME 3 "token"]]` (section 3; OCR'd
+images are sections 1001+). When a document and the code disagree, quote both
+and say they disagree - do not pick one silently.
+
+```
 python -m atlas.query --db atlas.db copybook <NAME>
 python -m atlas.query --db atlas.db callers|callees <NAME> --depth N
 python -m atlas.query --db atlas.db dataset  <DSN>

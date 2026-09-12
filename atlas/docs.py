@@ -87,6 +87,13 @@ def extract(path: str) -> DocText:
             return _vsdx(path)
         if ext == ".pdf":
             return _pdf(path)
+        if ext in (".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tif", ".tiff"):
+            # A standalone picture (a screen shot, a photographed printout). No
+            # text until atlas.ocr has read it; listed so it is not forgotten.
+            d = DocText(path=path, kind="image", images=[os.path.basename(path)])
+            d.title = os.path.splitext(os.path.basename(path))[0]
+            d.notes.append("standalone image - run `python -m atlas.ocr` to read it")
+            return d
         if ext in (".htm", ".html"):
             return _html(path)
         if ext in (".txt", ".md", ".csv", ".tsv", ".log", ".rtf", ".xml", ".json"):

@@ -47,11 +47,14 @@ CREATE VIRTUAL TABLE IF NOT EXISTS src_fts USING fts5(
 CREATE TABLE IF NOT EXISTS doc_section(
     id INTEGER PRIMARY KEY,
     member_id INTEGER NOT NULL REFERENCES member(id) ON DELETE CASCADE,
-    heading TEXT, text TEXT);
+    heading TEXT, text TEXT,
+    ordinal INTEGER);                     -- 1.. = text sections; 1001.. = OCR'd images
 CREATE TABLE IF NOT EXISTS doc_image(
     id INTEGER PRIMARY KEY,
     member_id INTEGER NOT NULL REFERENCES member(id) ON DELETE CASCADE,
-    name TEXT);
+    name TEXT,
+    extracted_path TEXT,                  -- where atlas.ocr wrote the image
+    ocr_text TEXT);                       -- NULL = not read yet; '' = read, nothing found
 CREATE TABLE IF NOT EXISTS expand_run(
     id INTEGER PRIMARY KEY,
     program_id INTEGER NOT NULL REFERENCES program(id) ON DELETE CASCADE,
@@ -121,7 +124,21 @@ def open_db(path: str, rebuild: bool = False) -> sqlite3.Connection:
     with open(os.path.join(HERE, "schema.sql"), "r", encoding="utf-8") as fh:
         conn.executescript(fh.read())
     conn.executescript(EXTRA_SCHEMA)
+    # Columns added after a db was first built: add them in place rather than
+    # forcing a rebuild of a 40,000-member index.
+    for table, col, decl in (("doc_section", "ordinal", "INTEGER"), ("doc_image", "extracted_path", "TEXT"),
+                             ("doc_image", "ocr_text", "TEXT"), ("member", "system", "TEXT"),
+                             ("step", "from_proc", "TEXT"), ("step", "parent_step", "TEXT"),
+                             ("dd", "mode_source", "TEXT"), ("transaction_def", "group_name", "TEXT"),
+                             ("transaction_def", "detail", "TEXT")):
+        _ensure_column(conn, table, col, decl)
     return conn
+
+
+def _ensure_column(conn: sqlite3.Connection, table: str, col: str, decl: str) -> None:
+    cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+    if cols and col not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
 
 
 def _j(v) -> Optional[str]:
@@ -172,21 +189,26 @@ def _scan_files(root: str, limit: Optional[int] = None):
                 return
 
 
-def inventory(ctx: Ctx, root: str, limit: Optional[int] = None) -> None:
-    """Hash and classify every file; re-index only what changed.
+def inventory(ctx: Ctx, roots, limit: Optional[int] = None) -> None:
+    """Hash and classify every file under each root; re-index only what changed.
+
+    `roots` is the estate folder plus any extra folders (`--also`): the
+    documentation folder is usually NOT a mainframe dataset and lives elsewhere.
 
     Incremental by default: a member whose bytes are unchanged keeps its facts.
     A changed COPYBOOK forces every program that expands it to be re-parsed,
     because those programs' facts were derived from the old text. Members that
-    vanished from the folder are pruned. `--rebuild` starts from an empty db.
+    vanished from the folders are pruned. `--rebuild` starts from an empty db.
     """
     conn = ctx.conn
     now = time.strftime("%Y-%m-%dT%H:%M:%S")
     existing = {r[0]: (r[1], r[2], r[3]) for r in
                 conn.execute("SELECT path, id, sha256, parse_status FROM member")}
+    if isinstance(roots, str):
+        roots = [roots]
 
     found: List[tuple] = []
-    for dirpath, fn in _scan_files(root, limit):
+    for dirpath, fn in (pair for root in roots for pair in _scan_files(root, limit)):
         path = os.path.normpath(os.path.join(dirpath, fn))
         try:
             with open(path, "rb") as fh:
@@ -727,7 +749,7 @@ def index_doc(ctx: Ctx, mem: Mem) -> None:
     conn = ctx.conn
     d = docs.extract(mem.path)
     for i, (h, t) in enumerate(d.sections, 1):
-        conn.execute("INSERT INTO doc_section(member_id,heading,text) VALUES(?,?,?)", (mem.id, h, t))
+        conn.execute("INSERT INTO doc_section(member_id,heading,text,ordinal) VALUES(?,?,?,?)", (mem.id, h, t, i))
         if t:
             conn.execute("INSERT INTO src_fts(member_name,kind,member_id,line_no,text) VALUES(?,?,?,?,?)",
                          (mem.name, "doc", mem.id, i, (h + "\n" + t)[:20000]))
@@ -903,6 +925,8 @@ def _main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--manifest", help="JSON declaring authoritative (production) libraries")
     ap.add_argument("--sched", action="append",
                     help="scheduler export CSV (job_name,depends_on,kind | job_name,system,schedule); repeatable")
+    ap.add_argument("--also", action="append", metavar="DIR",
+                    help="extra folder to index (documents that are not mainframe datasets); repeatable")
     ap.add_argument("--rebuild", action="store_true", help="delete the db first")
     ap.add_argument("--write-expanded", help="directory to write expanded COBOL sources into")
     ap.add_argument("--limit", type=int, help="index only the first N files (smoke test)")
@@ -917,8 +941,9 @@ def _main(argv: Optional[List[str]] = None) -> int:
                        (time.strftime("%Y-%m-%dT%H:%M:%S"), args.root, VERSION))
     run_id = run.lastrowid
 
-    ctx.say(f"inventory: {args.root}")
-    inventory(ctx, args.root, args.limit)
+    roots = [args.root, *(args.also or [])]
+    ctx.say("inventory: " + ", ".join(roots))
+    inventory(ctx, roots, args.limit)
     conn.commit()
     ctx.say(f"  {len(ctx.members)} files: " + ", ".join(
         f"{k[5:]}={v}" for k, v in sorted(ctx.stats.items()) if k.startswith("kind:")))

@@ -315,6 +315,7 @@ def cmd_program(conn: sqlite3.Connection, name: str) -> str:
             out.append("- codes/literals set here: " + ", ".join(f"'{l['literal']}'->{l['field']}" for l in lits) + "\n")
 
         out.append(unresolved_for(conn, [p["member_id"]]))
+    out.append(_docs_section(conn, name.upper()))
     return "".join(out)
 
 
@@ -403,6 +404,7 @@ def cmd_job(conn: sqlite3.Connection, name: str) -> str:
         render_steps("proc_id=?", p["id"], p["member_name"])
         mids.append(p["member_id"])
     out.append(unresolved_for(conn, mids))
+    out.append(_docs_section(conn, name.upper()))
     return "".join(out)
 
 
@@ -684,6 +686,7 @@ def cmd_field(conn: sqlite3.Connection, name: str) -> str:
     if hits:
         out.append("\n### Sort/control cards addressing these bytes (any dataset - verify the record type matches)\n")
         out.append(table(["copybook", "field bytes", "job", "step", "card", "card bytes"], hits[:40]))
+    out.append(_docs_section(conn, name.upper()))
     return "".join(out)
 
 
@@ -1000,6 +1003,112 @@ def cmd_pack(conn: sqlite3.Connection, name: str, max_lines: int) -> str:
         if n >= max_lines:
             out.append(f"_...capped at {max_lines} evidence lines; use `cite {p['member_name']} a-b` for more_\n")
             break
+    return "".join(out)
+
+
+# --------------------------------------------------------------------------
+# documents (prose - never facts) and the pictures inside them
+# --------------------------------------------------------------------------
+
+def _section_label(n: Optional[int]) -> str:
+    if not n:
+        return "table"
+    return f"image {n - 1000}" if n >= 1000 else f"section {n}"
+
+
+def _doc_mentions(conn: sqlite3.Connection, term: str, limit: int = 8) -> List[sqlite3.Row]:
+    try:
+        rows = conn.execute("""SELECT member_name, member_id, line_no, substr(text,1,200) AS snip FROM src_fts
+                               WHERE src_fts MATCH ? AND kind='doc' LIMIT 80""", (f'"{term}"',)).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    seen, out = set(), []
+    for r in rows:
+        key = (r["member_name"], r["line_no"])
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(r)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _docs_section(conn: sqlite3.Connection, term: str) -> str:
+    hits = _doc_mentions(conn, term)
+    if not hits:
+        return ""
+    return ("\n### Documents mentioning it (prose: what was INTENDED, not what the code does)\n"
+            + table(["document", "where", "excerpt", "cite"],
+                    [(h["member_name"], _section_label(h["line_no"]), h["snip"].replace("\n", " ")[:120],
+                      f"{h['member_name']}:{h['line_no'] or 0}") for h in hits]))
+
+
+def cmd_docs(conn: sqlite3.Connection, term: str) -> str:
+    try:
+        rows = conn.execute("""SELECT f.member_name, f.member_id, f.line_no, substr(f.text,1,260) AS snip
+                               FROM src_fts f WHERE src_fts MATCH ? AND kind='doc' LIMIT 400""",
+                            (f'"{term}"',)).fetchall()
+    except sqlite3.OperationalError as e:
+        return f"search error: {e}\n"
+    out = [f"# Documents mentioning `{term}`\n"]
+    if not rows:
+        return out[0] + ("\n_none_ - no indexed document contains it. Documents are indexed from the folders in "
+                         "`extra_roots` (UI: Document folders); pictures only after `OCR images`.\n")
+    by_doc: Dict[str, List[sqlite3.Row]] = defaultdict(list)
+    for r in rows:
+        by_doc[r["member_name"]].append(r)
+    for doc, hits in by_doc.items():
+        mid = hits[0]["member_id"]
+        m = conn.execute("SELECT path FROM member WHERE id=?", (mid,)).fetchone()
+        n_img, n_ocr = conn.execute("SELECT COUNT(*), SUM(ocr_text IS NOT NULL) FROM doc_image WHERE member_id=?",
+                                    (mid,)).fetchone()
+        out.append(f"\n## {doc}  `{m['path'] if m else ''}`  - {n_img or 0} image(s), {n_ocr or 0} read by OCR\n")
+        seen = set()
+        trows = []
+        for h in hits:
+            if h["line_no"] in seen:
+                continue
+            seen.add(h["line_no"])
+            head = conn.execute("SELECT heading FROM doc_section WHERE member_id=? AND ordinal=?",
+                                (mid, h["line_no"])).fetchone()
+            trows.append((_section_label(h["line_no"]), (head["heading"] if head and head["heading"] else "")[:40],
+                          h["snip"].replace("\n", " ")[:160], f"{doc}:{h['line_no'] or 0}"))
+        out.append(table(["where", "heading", "excerpt", "cite"], trows[:15]))
+    out.append("\n> Cite a document as `[[DOCNAME <section> \"token\"]]`; the gate checks the token against that "
+               "section (images are sections 1001+). Where a document and the code disagree, say so - the "
+               "code is what runs.\n")
+    return "".join(out)
+
+
+def cmd_images(conn: sqlite3.Connection, name: Optional[str] = None) -> str:
+    q = """SELECT m.name, m.path, COUNT(i.id) AS n, SUM(i.extracted_path IS NOT NULL) AS extracted,
+                  SUM(i.ocr_text IS NOT NULL) AS read, SUM(i.ocr_text IS NOT NULL AND i.ocr_text<>'') AS with_text
+           FROM doc_image i JOIN member m ON m.id=i.member_id"""
+    args: tuple = ()
+    if name:
+        q += " WHERE UPPER(m.name)=?"
+        args = (name.upper(),)
+    q += " GROUP BY m.id ORDER BY n DESC"
+    rows = conn.execute(q, args).fetchall()
+    out = [f"# Pictures inside documents{' - ' + name.upper() if name else ''}\n"]
+    if not rows:
+        return out[0] + "\n_no images recorded_ (documents are indexed from `extra_roots`; legacy .doc/.xls must be saved as .docx/.xlsx first)\n"
+    out.append(table(["document", "images", "extracted", "OCR read", "with text", "path"],
+                     [(r["name"], r["n"], r["extracted"] or 0, r["read"] or 0, r["with_text"] or 0,
+                       os.path.basename(r["path"])) for r in rows[:200]]))
+    total = sum(r["n"] for r in rows)
+    unread = sum(r["n"] - (r["read"] or 0) for r in rows)
+    out.append(f"\n{total} image(s) in {len(rows)} document(s); {unread} not yet read. "
+               f"`python -m atlas.ocr --db atlas.db --out out/images` reads them with the Windows OCR engine "
+               f"(no tokens). Pictures that OCR cannot read (diagrams, handwriting) are the ones worth "
+               f"spending a vision-model call on - they are listed with their extracted path.\n")
+    if name:
+        rows2 = conn.execute("""SELECT i.name, i.extracted_path, i.ocr_text FROM doc_image i JOIN member m ON m.id=i.member_id
+                                WHERE UPPER(m.name)=? ORDER BY i.id""", (name.upper(),)).fetchall()
+        out.append(table(["image", "extracted to", "OCR text (first 80 chars)"],
+                         [(r["name"], r["extracted_path"] or "", (r["ocr_text"] or ("(not read)" if r["ocr_text"] is None else "(nothing recognised)"))[:80].replace("\n", " "))
+                          for r in rows2]))
     return "".join(out)
 
 
@@ -1437,6 +1546,8 @@ def _main(argv: Optional[List[str]] = None) -> int:
     s.add_argument("b")
     s.add_argument("--window", type=int, default=8)
     sub.add_parser("messages").add_argument("pattern")
+    sub.add_parser("docs").add_argument("term")
+    sub.add_parser("images").add_argument("name", nargs="?")
     for c in ("callers", "callees"):
         s = sub.add_parser(c)
         s.add_argument("name")
@@ -1481,6 +1592,10 @@ def _main(argv: Optional[List[str]] = None) -> int:
             print(cmd_transaction(conn, a.name))
         elif a.cmd == "column":
             print(cmd_column(conn, a.name))
+        elif a.cmd == "docs":
+            print(cmd_docs(conn, a.term))
+        elif a.cmd == "images":
+            print(cmd_images(conn, a.name))
         elif a.cmd == "dataset":
             print(cmd_dataset(conn, a.name))
         elif a.cmd == "copybook":

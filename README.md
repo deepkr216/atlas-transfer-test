@@ -202,6 +202,36 @@ falls back to the bare PROC only when no indexed job expands it.
   multi-line statements included), messages assembled by MOVEs into sibling
   fields of one group, screen labels and defaults.
 
+## Documents and the pictures inside them
+
+The documentation folder is usually not a mainframe dataset — it already sits
+somewhere on the laptop. Name it under **Document folders** in the UI (or
+`extra_roots` in `sources.json`, or `--also DIR` on the build) and the build
+indexes it alongside the code: `.docx / .xlsx / .pptx / .vsdx` text, headings,
+tables and slide notes; `.pdf` best-effort; `.txt/.md/.html`. Legacy `.doc /
+.xls / .ppt` cannot be read — save them as the modern format once.
+
+**Pictures are read, not just counted.** `OCR images` (UI) or
+`python -m atlas.ocr --db atlas.db --out out/images` pulls every image out of
+the documents and runs the OCR engine that ships with Windows 10/11
+(`Windows.Media.Ocr`, driven through PowerShell) — no install, no network,
+**no model tokens**. The recognised text becomes a section of the document
+(`image 1`, `image 2`…), searchable and citable. Pictures OCR cannot read
+(hand-drawn diagrams, photos of whiteboards) are listed with their extracted
+path; those are the few worth a vision-model call, chosen by hand.
+
+- `docs TERM` — every document mentioning a program, job, field, code or
+  phrase, with the section (or image) and an excerpt.
+- `images [DOC]` — documents with pictures, how many were extracted, read,
+  and had text.
+- `program`, `job` and `field` dossiers end with **Documents mentioning it**.
+
+Documents are indexed as **prose, never as facts**: they say what was
+*intended*; the code says what *runs*. A document is cited as
+`[[DOCNAME 3 "token"]]` (section 3; images are 1001+), and the gate checks the
+token against that section. Where a document and the code disagree, the
+answer must quote both and say so.
+
 ## The four-names problem
 
 PDS member name, `PROGRAM-ID`, CSECT and load-module/alias routinely differ.

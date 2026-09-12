@@ -125,6 +125,27 @@ def check_answer(text: str, root: Optional[str] = None,
             results.append(Result(m.group(0), ref, s, end, quote, "FAIL", how))
             continue
 
+        if kind == "doc" and db is not None:
+            # A document has sections, not lines: [[DOCNAME 3 "token"]] cites
+            # section 3 (1001+ = OCR'd images). The token must be in that
+            # section's heading or text.
+            secs = db.execute("""SELECT ordinal, heading, text FROM doc_section
+                                 WHERE member_id=(SELECT id FROM member WHERE path=?) ORDER BY ordinal""",
+                              (path,)).fetchall()
+            target = [x for x in secs if x[0] is not None and s <= x[0] <= end]
+            scoped = bool(target)
+            if not target:
+                target = secs
+            hay = " ".join(f"{h or ''} {t or ''}" for _o, h, t in target)
+            if _norm(quote) in _norm(hay):
+                results.append(Result(m.group(0), ref, s, end, quote, "PASS",
+                                      "document section" if scoped else "document (section number not found; matched elsewhere)",
+                                      path))
+            else:
+                results.append(Result(m.group(0), ref, s, end, quote, "FAIL",
+                                      f"quoted text not in document section(s) {s}-{end}", path))
+            continue
+
         if path not in cache:
             txt, data, enc = reader.load(path)
             recs = reader._split_records(txt, data, enc)

@@ -133,6 +133,14 @@ class App(tk.Tk if tk else object):
         self.cb_filter = ttk.Combobox(top, textvariable=self.v_filter, state="readonly", width=16, values=("All",))
         self.cb_filter.grid(row=1, column=1, padx=(4, 16), pady=(6, 0), sticky="w")
         self.cb_filter.bind("<<ComboboxSelected>>", lambda e: self.refresh())
+        # Documents are not mainframe datasets: they already sit in a folder on
+        # this laptop. Name those folders here and the build indexes them too.
+        ttk.Label(top, text="Document folders").grid(row=2, column=0, sticky="w", pady=(6, 0))
+        self.v_extra = tk.StringVar(value=";".join(self.cfg.get("extra_roots") or []))
+        ttk.Entry(top, textvariable=self.v_extra, width=70).grid(row=2, column=1, columnspan=3, sticky="w", padx=(4, 4), pady=(6, 0))
+        ttk.Button(top, text="Add folder", command=self._add_extra_root).grid(row=2, column=4, pady=(6, 0), sticky="w")
+        ttk.Label(top, text="(semicolon-separated; indexed as documentation, images read by OCR)",
+                  foreground="#555").grid(row=2, column=5, columnspan=3, sticky="w", pady=(6, 0))
         self.v_status = tk.StringVar(value=f"config: {self.config_path}")
         ttk.Label(top, textvariable=self.v_status, foreground="#555").grid(row=1, column=2, columnspan=6, sticky="w", pady=(6, 0))
 
@@ -159,7 +167,7 @@ class App(tk.Tk if tk else object):
         for text, cmd in (("Plan", self.plan), ("Fetch selected", self.fetch_selected),
                           ("Fetch system", self.fetch_system), ("Fetch all", self.fetch_all),
                           ("Build index", lambda: self.build(False)), ("Rebuild from empty", lambda: self.build(True)),
-                          ("Coverage", self.coverage)):
+                          ("OCR images", self.ocr_images), ("Coverage", self.coverage)):
             ttk.Button(btns, text=text, command=cmd).pack(side="left", padx=2)
 
         self.log = scrolledtext.ScrolledText(self, height=14, wrap="none", font=("Consolas", 9))
@@ -193,6 +201,16 @@ class App(tk.Tk if tk else object):
         self.cfg["zowe"]["profile"] = self.v_profile.get().strip()
         self.cfg["local_root"] = self.v_root.get().strip() or self.cfg["local_root"]
         self.cfg["db"] = self.v_db.get().strip() or "atlas.db"
+        self.cfg["extra_roots"] = [p.strip() for p in self.v_extra.get().split(";") if p.strip()]
+
+    def _add_extra_root(self) -> None:
+        d = filedialog.askdirectory(title="Folder of documents to index")
+        if d:
+            cur = [p.strip() for p in self.v_extra.get().split(";") if p.strip()]
+            if d not in cur:
+                cur.append(d)
+            self.v_extra.set(";".join(cur))
+            self.save()
 
     def add_source(self) -> None:
         d = SourceDialog(self)
@@ -397,6 +415,14 @@ class App(tk.Tk if tk else object):
             return
         self._fetch([self.cfg["sources"][i]["dataset"] for i in fetch.filter_sources(self.cfg, sysname)
                      if self.cfg["sources"][i].get("enabled", True)])
+
+    def ocr_images(self) -> None:
+        """Pull the pictures out of the indexed documents and read them with the
+        Windows OCR engine - no install, no network, no model tokens."""
+        self._sync_cfg()
+        db = self.cfg.get("db") or "atlas.db"
+        out = os.path.join(self.cfg["local_root"], "out", "images")
+        self._run_bg(lambda: self._stream([sys.executable, "-m", "atlas.ocr", "--db", db, "--out", out]))
 
     def _close(self) -> None:
         try:
