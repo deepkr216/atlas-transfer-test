@@ -480,7 +480,10 @@ class JclStatement:
     inline_data: List[str] = dc_field(default_factory=list)   # SYSIN control cards
 
 
-_JCL_STMT = re.compile(r"^//(?P<name>[A-Z0-9@#$]{0,8})\s+(?P<op>[A-Z]+)\s*(?P<rest>.*)$",
+# The name field may be qualified: //PROCSTEP.DDNAME DD ... overrides a DD
+# inside a called PROC. A pattern limited to 8 characters silently drops every
+# such override - and with it the datasets a job actually uses.
+_JCL_STMT = re.compile(r"^//(?P<name>[A-Z0-9@#$]{0,8}(?:\.[A-Z0-9@#$]{1,8})?)\s+(?P<op>[A-Z]+)\s*(?P<rest>.*)$",
                        re.IGNORECASE)
 _JCL_NAMELESS = re.compile(r"^//\s+(?P<op>[A-Z]+)\s*(?P<rest>.*)$", re.IGNORECASE)
 _JCL_CONT_ONLY = re.compile(r"^//\s+(?P<rest>\S.*)$")

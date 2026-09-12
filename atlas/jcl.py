@@ -29,10 +29,10 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass, field as dc_field
-from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass, field as dc_field, replace
+from typing import Callable, Dict, List, Optional, Tuple
 
-from .reader import JclStatement, keyword_operands, read_jcl, split_operands
+from .reader import JclStatement, _split_records, keyword_operands, read_jcl, split_operands
 
 # --------------------------------------------------------------------------
 # launcher table
@@ -65,7 +65,13 @@ _IMS_PARM = re.compile(
 
 _GDG_REL = re.compile(r"\(\s*([+-]?\d+)\s*\)\s*$")
 _MEMBER_REF = re.compile(r"\(\s*([A-Z0-9@#$]{1,8})\s*\)\s*$", re.IGNORECASE)
-_SYMBOL = re.compile(r"&([A-Z@#$][A-Z0-9@#$]{0,7})\.?", re.IGNORECASE)
+# `&&TEMP` is a temporary dataset, not a symbolic: the lookbehind keeps it intact.
+_SYMBOL = re.compile(r"(?<!&)&([A-Z@#$][A-Z0-9@#$]{0,7})\.?", re.IGNORECASE)
+_INCLUDE = re.compile(r"^//\S*\s+INCLUDE\s+MEMBER=([A-Z0-9@#$]{1,8})", re.IGNORECASE)
+
+# Operands on an EXEC that are NOT symbolic overrides.
+_EXEC_KEYWORDS = {"PROC", "PGM", "PARM", "COND", "REGION", "TIME", "ACCT", "ADDRSPC",
+                  "DYNAMNBR", "PERFORM", "RD", "MEMLIMIT", "CCSID", "TVSMSG", "TVSAMCOM"}
 
 
 # --------------------------------------------------------------------------
@@ -100,6 +106,9 @@ class StepFact:
     line: int
     dds: List[DdFact] = dc_field(default_factory=list)
     notes: List[str] = dc_field(default_factory=list)
+    from_proc: Optional[str] = None      # set on EFFECTIVE steps produced by expand_job
+    parent_step: Optional[str] = None    # the job step whose EXEC PROC= produced it
+    sym_overrides: Dict[str, str] = dc_field(default_factory=dict)   # EXEC PROC=X,SYM=value
 
 
 @dataclass
@@ -108,9 +117,11 @@ class JclFacts:
     job_line: int
     is_proc: bool
     proc_name: Optional[str]
-    symbolics: Dict[str, str]
+    symbolics: Dict[str, str]            # everything seen: PROC defaults, SET, EXEC overrides
     steps: List[StepFact] = dc_field(default_factory=list)
     unresolved: List[Tuple[str, str, int]] = dc_field(default_factory=list)  # kind, detail, line
+    set_symbols: Dict[str, str] = dc_field(default_factory=dict)     # instream SET only
+    includes: List[str] = dc_field(default_factory=list)             # INCLUDE members spliced in
 
 
 # --------------------------------------------------------------------------
@@ -118,10 +129,15 @@ class JclFacts:
 # --------------------------------------------------------------------------
 
 def parse_jcl(text: str, data: bytes = b"", enc: str = "utf-8",
-              extra_symbols: Optional[Dict[str, str]] = None) -> JclFacts:
+              extra_symbols: Optional[Dict[str, str]] = None,
+              include_lookup: Optional[Callable[[str], Optional[str]]] = None) -> JclFacts:
+    included: List[str] = []
+    if include_lookup is not None:
+        text, included = _splice_includes(text, data, enc, include_lookup)
     stmts = read_jcl(text, data, enc)
     facts = JclFacts(job_name=None, job_line=0, is_proc=False,
                      proc_name=None, symbolics=dict(extra_symbols or {}))
+    facts.includes = included
 
     cur: Optional[StepFact] = None
     ordinal = 0
@@ -144,6 +160,7 @@ def parse_jcl(text: str, data: bytes = b"", enc: str = "utf-8",
             # Instream SET wins over PROC defaults for everything after it.
             for k, v in keyword_operands(st.operands).items():
                 facts.symbolics[k] = _unquote(v)
+                facts.set_symbols[k] = _unquote(v)
 
         elif st.op == "EXEC":
             ordinal += 1
@@ -187,11 +204,12 @@ def _build_step(st: JclStatement, ordinal: int, facts: JclFacts) -> StepFact:
             proc_called = positional[0]
 
     # Any other KEY=VALUE on an EXEC PROC= is a symbolic override for that step.
+    overrides: Dict[str, str] = {}
     if proc_called:
         for k, v in kw.items():
-            if k not in ("PROC", "PGM", "PARM", "COND", "REGION", "TIME",
-                         "ACCT", "ADDRSPC", "DYNAMNBR", "PERFORM", "RD"):
-                facts.symbolics[k] = _unquote(v)
+            if k not in _EXEC_KEYWORDS:
+                overrides[k] = _unquote(v) or ""
+                facts.symbolics[k] = _unquote(v) or ""
 
     return StepFact(
         ordinal=ordinal,
@@ -203,6 +221,7 @@ def _build_step(st: JclStatement, ordinal: int, facts: JclFacts) -> StepFact:
         parm=_unquote(kw.get("PARM", "")) or None,
         cond=kw.get("COND"),
         line=st.start,
+        sym_overrides=overrides,
     )
 
 
@@ -532,4 +551,166 @@ def sort_card_fields(text: str) -> List[Tuple[str, int, int, str, str]]:
                 continue
             seen.add(key)
             out.append((kind, pos, ln, fmt or None, card[:120]))
+    return out
+
+
+# --------------------------------------------------------------------------
+# INCLUDE members
+# --------------------------------------------------------------------------
+
+def _splice_includes(text: str, data: bytes, enc: str,
+                     lookup: Callable[[str], Optional[str]], depth: int = 0) -> Tuple[str, List[str]]:
+    """Replace `// INCLUDE MEMBER=X` with the member's records, as the reader
+    does at submit time. Nested to depth 3."""
+    out: List[str] = []
+    names: List[str] = []
+    for rec in _split_records(text, data, enc):
+        m = _INCLUDE.match(rec[:71])
+        if m and depth < 3:
+            name = m.group(1).upper()
+            body = lookup(name)
+            if body is not None:
+                names.append(name)
+                out.append(f"//*      INCLUDE MEMBER={name} expanded by atlas")
+                sub, subnames = _splice_includes(body, b"", enc, lookup, depth + 1)
+                out.extend(sub.split("\n"))
+                names.extend(subnames)
+                continue
+        out.append(rec)
+    return "\n".join(out), names
+
+
+# --------------------------------------------------------------------------
+# PROC expansion: what a job ACTUALLY runs
+# --------------------------------------------------------------------------
+
+def expand_job(job: JclFacts, proc_lookup: Callable[[str], Optional["JclFacts"]],
+               depth: int = 0, max_depth: int = 5) -> List[StepFact]:
+    """Effective steps of a job: every EXEC PROC= replaced by the PROC's steps,
+    with symbolics resolved in JCL precedence (EXEC overrides > instream SET >
+    PROC defaults) and //PROCSTEP.DDNAME overrides and additions applied.
+
+    Without this, a DSN coded in a PROC as &HLQ..MASTER stays unresolved and
+    the job's real datasets are invisible - and in most shops the PROC is
+    where the datasets are. Unresolved symbolics are reported, not hidden.
+    """
+    out: List[StepFact] = []
+    for s in job.steps:
+        if not s.proc_called:
+            out.append(s)
+            continue
+        proc = proc_lookup(s.proc_called)
+        if proc is None or not proc.steps:
+            s.notes.append(f"PROC {s.proc_called} not in index - its steps are unknown")
+            job.unresolved.append(("missing_proc", f"{s.step_name}: PROC {s.proc_called} not found", s.line))
+            out.append(s)
+            continue
+
+        symbols: Dict[str, str] = dict(proc.symbolics)
+        symbols.update(job.set_symbols)
+        symbols.update(s.sym_overrides)
+
+        # //PROCSTEP.DDNAME overrides; an unqualified DD after EXEC PROC=
+        # applies to the FIRST step of the PROC (JCL rule).
+        first = proc.steps[0].step_name.upper()
+        ov: Dict[Tuple[str, str], DdFact] = {}
+        for d in s.dds:
+            if "." in d.dd_name:
+                ps_name, dn = d.dd_name.upper().split(".", 1)
+            else:
+                ps_name, dn = first, d.dd_name.upper()
+            ov[(ps_name, dn)] = d
+        used: set = set()
+
+        for ps in proc.steps:
+            eff = replace(ps,
+                          step_name=f"{s.step_name}.{ps.step_name}",
+                          from_proc=s.proc_called.upper(), parent_step=s.step_name,
+                          dds=[], notes=[],            # re-derived below by _resolve_effective_pgm
+                          parm=substitute_symbols(ps.parm, symbols) if ps.parm else ps.parm,
+                          pgm=substitute_symbols(ps.pgm, symbols) if ps.pgm else ps.pgm,
+                          sym_overrides=dict(ps.sym_overrides))
+            for d in ps.dds:
+                key = (ps.step_name.upper(), d.dd_name.upper())
+                o = ov.get(key)
+                if o is not None:
+                    used.add(key)
+                    nd = replace(d, dsn=o.dsn or d.dsn, disp=o.disp or d.disp,
+                                 sysin_text=o.sysin_text or d.sysin_text,
+                                 is_override=True, line=o.line)
+                else:
+                    nd = replace(d)
+                eff.dds.append(_resolve_dd(nd, symbols, job, eff))
+            for key, o in ov.items():
+                if key[0] == ps.step_name.upper() and key not in used:
+                    eff.dds.append(_resolve_dd(replace(o, dd_name=key[1], is_override=True), symbols, job, eff))
+            for key in ov:
+                if key[0] not in {p.step_name.upper() for p in proc.steps} and key not in used:
+                    job.unresolved.append(("override_target",
+                                           f"{s.step_name}: override //{key[0]}.{key[1]} names no step in PROC {s.proc_called}",
+                                           s.line))
+                    used.add(key)
+
+            if eff.proc_called and depth < max_depth:
+                sub = JclFacts(job_name=job.job_name, job_line=job.job_line, is_proc=False,
+                               proc_name=None, symbolics=dict(symbols), set_symbols=dict(symbols))
+                sub.steps = [eff]
+                out.extend(expand_job(sub, proc_lookup, depth + 1, max_depth))
+                job.unresolved.extend(sub.unresolved)
+                continue
+            _resolve_effective_pgm(eff, job)
+            out.append(eff)
+    return out
+
+
+def _resolve_dd(d: DdFact, symbols: Dict[str, str], job: JclFacts, step: StepFact) -> DdFact:
+    if not d.dsn:
+        return d
+    resolved, gdg = _strip_gdg(substitute_symbols(d.dsn, symbols))
+    if "&" in resolved.replace("&&", ""):
+        job.unresolved.append(("symbolic",
+                               f"{step.step_name} {d.dd_name}: symbolic still unresolved in {resolved}",
+                               d.line))
+    mode, src = _direction(d.dd_name, gdg, d.disp, f"DSN={resolved},DISP={d.disp or ''}")
+    return replace(d, dsn_resolved=resolved, gdg_rel=gdg, mode=mode, mode_source=src)
+
+
+# --------------------------------------------------------------------------
+# IDCAMS control cards: datasets created, deleted, copied
+# --------------------------------------------------------------------------
+
+_IDC_DEFINE = re.compile(r"\bDEFINE\s+(CLUSTER|AIX|ALTERNATEINDEX|GDG|PATH|NONVSAM)\b[^A-Z]*?\(?\s*NAME\s*\(\s*([^)\s]+)\s*\)",
+                         re.IGNORECASE | re.S)
+_IDC_DELETE = re.compile(r"\bDELETE\s+\(?\s*([A-Z0-9$#@.]+)", re.IGNORECASE)
+_IDC_REPRO = re.compile(r"\bREPRO\b(.*?)(?=\bREPRO\b|\bDEFINE\b|\bDELETE\b|\bPRINT\b|\bLISTCAT\b|$)",
+                        re.IGNORECASE | re.S)
+_IDC_KW = re.compile(r"\b(INFILE|OUTFILE|INDATASET|OUTDATASET|IDS|ODS|IFILE|OFILE)\s*\(\s*([^)\s]+)\s*\)",
+                     re.IGNORECASE)
+
+
+def idcams_ops(text: str) -> List[Tuple[str, str, str]]:
+    """(operation, name, mode). DEFINE -> (create, dsn); DELETE -> (delete, dsn);
+    REPRO INDATASET/OUTDATASET -> (input/output, dsn); REPRO INFILE/OUTFILE ->
+    ('REPRO DD', ddname, input/output) so the step's DD gets its direction.
+    An IDCAMS step is where a VSAM file is born or dies; without this the
+    dataset's lineage starts at its first reader."""
+    out: List[Tuple[str, str, str]] = []
+    if not text:
+        return out
+    t = " ".join(ln[:72] for ln in text.splitlines() if not ln.strip().startswith("/*"))
+    for m in _IDC_DEFINE.finditer(t):
+        out.append(("DEFINE " + m.group(1).upper(), m.group(2).upper(), "create"))
+    for m in _IDC_DELETE.finditer(t):
+        out.append(("DELETE", m.group(1).upper(), "delete"))
+    for m in _IDC_REPRO.finditer(t):
+        for k in _IDC_KW.finditer(m.group(1)):
+            kw, val = k.group(1).upper(), k.group(2).upper()
+            if kw in ("INDATASET", "IDS"):
+                out.append(("REPRO", val, "input"))
+            elif kw in ("OUTDATASET", "ODS"):
+                out.append(("REPRO", val, "output"))
+            elif kw in ("INFILE", "IFILE"):
+                out.append(("REPRO DD", val, "input"))
+            else:
+                out.append(("REPRO DD", val, "output"))
     return out

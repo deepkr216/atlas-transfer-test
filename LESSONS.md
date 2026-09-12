@@ -46,6 +46,13 @@ then the fix, then a row here. Nothing is "fixed" until the test exists.
 | 37 | Re-running `build` without `--rebuild` duplicated every fact and every FTS row | `INSERT OR REPLACE` on member plus FTS rows with no member key | `IncrementalBuild.test_rerun_is_idempotent_and_changes_propagate` |
 | 38 | A changed copybook left programs with facts derived from its OLD text | Incremental skip did not follow COPY dependencies | same test (asserts `exp_lines` grows after the copybook changes) |
 | 39 | A dataset the CSD declares as VSAM stayed `is_vsam=0` | `INSERT OR IGNORE` after the JCL had created the row | `RoutingEndToEnd.test_cics_file_maps_to_dataset` |
+| 40 | **Every `//PROCSTEP.DDNAME` override silently dropped** | JCL statement regex allowed an 8-character name only; qualified names never matched | `ProcExpansion.test_included_dd_overrides_proc_dd`, `test_qualified_override_and_added_dd`, `test_inline_sysin_override_replaces_dummy` |
+| 41 | DSNs in cataloged PROCs stayed `&HLQ..MASTER`; jobs showed no datasets | Members resolved in isolation; no PROC expansion with the calling job's symbolics | `ProcExpansion.test_exec_override_beats_proc_default`, `JobLevelLineage.*` |
+| 42 | `&&TEMP` treated as a symbolic and reported unresolved | Symbol regex matched the second `&` | `test_temporary_dataset_is_not_a_symbolic` |
+| 43 | VSAM files had no origin: lineage began at the first reader | IDCAMS `DEFINE`/`DELETE`/`REPRO` cards not read | `test_idcams_ops`, `test_job_dossier_shows_effective_steps` |
+| 44 | "Where is column X populated" unanswerable: only table names indexed | No column ↔ host-variable pairing | `ColumnLineage.*`, `ColumnQueries.test_column_report` |
+| 45 | A message built by `STRING` across four lines invisible to `messages` | Only the literal pieces were indexed, never the assembled text | `test_string_and_display_templates`, `test_messages_finds_runtime_templates` |
+| 46 | A program with no source (load module only) reported NOT FOUND although JCL runs it | Dossier required a program row | `test_program_runs_in_shows_the_job_not_the_bare_proc` |
 
 ## Known gaps (not yet guarded - contributions welcome)
 

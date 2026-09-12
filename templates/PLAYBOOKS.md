@@ -53,9 +53,14 @@ python -m atlas.query --db atlas.db job CLMNIGHT > j.md
 
 The model narrates step by step from `j.md` only: effective program (not
 `PGM=`), what the control cards make the step do (quote them), datasets in/out
-with direction source, GDG generation, COND/IF flow. If a step runs a PROC not
-in the index, the step's contents are UNKNOWN. If no scheduler is loaded,
-predecessors are UNKNOWN. Both are stated, not glossed.
+with direction source, GDG generation, COND/IF flow. `EXEC PROC=` steps are
+shown as their **effective steps** (`NIGHT.PS010 (from PROC NIGHTLY)`) with
+this job's symbolics and `//STEP.DD` overrides applied — those rows, not the
+PROC member, carry the real dataset names. IDCAMS steps show `create` /
+`delete` / `input` / `output` rows from their cards. If a step runs a PROC not
+in the index, the step's contents are UNKNOWN; a DSN still containing `&`
+is listed under `symbolic` in UNRESOLVED. If no scheduler is loaded,
+predecessors are UNKNOWN. All of it is stated, not glossed.
 
 ## A3. Trace an error / status code
 
@@ -87,6 +92,14 @@ Writers include MOVE/COMPUTE targets, `SELECT ... INTO`/`FETCH ... INTO`,
 `READ ... INTO`, `CALL ... USING` (by reference), group-level writes. For the
 end-to-end trace, walk dataset producers/consumers (`dataset`) and CALL
 positions; every hop is a FACT with a citation or it is a gap.
+
+For a DB2 column: `column TABLE.COL` gives every program that writes it
+(INSERT/UPDATE from a host variable — and where that host variable was set),
+reads it (SELECT INTO / FETCH INTO — and where the value goes next) or
+filters on it. `field <host-var>` shows the same from the COBOL side. For an
+IMS field: `field` lists the DL/I calls whose I/O area holds it (GU/GN read
+into the area, ISRT/REPL write from it) with the positional PCB; map the PCB
+through the PSB in the `program` dossier to name the database and segment.
 
 ## A5. Abend triage
 

@@ -133,7 +133,35 @@ def unresolved_for(conn: sqlite3.Connection, member_ids: Sequence[int], limit: i
 def cmd_program(conn: sqlite3.Connection, name: str) -> str:
     progs = programs_named(conn, name)
     if not progs:
-        return f"# {name}\n\n**NOT FOUND** - no program or member with this name is indexed.\n"
+        # No source - but the JCL, the CSD/stage-1 and other programs may still
+        # know it. A load-module-only program is normal in a 40-year estate.
+        n = name.upper()
+        steps = conn.execute("""
+            SELECT j.job_name, s.step_name, s.launcher, s.from_proc, m.name AS jm, s.line, pd.proc_name
+            FROM step s LEFT JOIN job j ON j.id=s.job_id LEFT JOIN member m ON m.id=j.member_id
+            LEFT JOIN proc_def pd ON pd.id=s.proc_id
+            WHERE UPPER(s.effective_pgm)=?
+              AND NOT (s.proc_id IS NOT NULL AND EXISTS (SELECT 1 FROM step x WHERE x.from_proc=pd.proc_name))
+            ORDER BY j.job_name, s.ordinal""", (n,)).fetchall()
+        callers = _callers_of(conn, n)
+        tx = conn.execute("SELECT tran_code, system FROM transaction_def WHERE UPPER(program)=?", (n,)).fetchall()
+        if not steps and not callers and not tx:
+            return f"# {name}\n\n**NOT FOUND** - no member with this name, and nothing indexed runs or calls it.\n"
+        out = [f"# Program {n}\n\n**Source not indexed** (no member with this PROGRAM-ID or name). "
+               f"What the estate knows about it:\n"]
+        if steps:
+            out.append("\n### Runs in\n")
+            out.append(table(["job", "step", "launcher", "cite"],
+                             [(s["job_name"] or f"(PROC {s['proc_name']})", s["step_name"], s["launcher"],
+                               f"{s['from_proc'] or s['jm'] or s['proc_name']}:{s['line']}") for s in steps]))
+        if tx:
+            out.append("Online: " + ", ".join(f"{t['tran_code']} ({t['system']})" for t in tx) + "\n")
+        if callers:
+            out.append("\n### Called by\n")
+            out.append(table(["caller", "kind"], callers))
+        out.append("\n> Obtain the source or the compile listing to go further; until then its datasets, "
+                   "tables and callees are unknown, not empty.\n")
+        return "".join(out)
     out = [f"# Program {name.upper()}\n"]
     if len(progs) > 1:
         out.append(f"> **{len(progs)} copies indexed.** Which one is production is not knowable from "
@@ -151,14 +179,21 @@ def cmd_program(conn: sqlite3.Connection, name: str) -> str:
             out.append(f"- called with (positional): {', '.join(f'{i+1}={a}' for i, a in enumerate(lk))}\n")
 
         # jobs / steps
+        # Effective (expanded) steps carry the job; a PROC's own row is shown only
+        # when no indexed job expands that PROC.
         steps = conn.execute("""
-            SELECT j.job_name, s.step_name, s.launcher, s.parm, m.name AS jm, s.line
+            SELECT j.job_name, s.step_name, s.launcher, s.parm, s.from_proc, m.name AS jm, s.line,
+                   pd.proc_name
             FROM step s LEFT JOIN job j ON j.id = s.job_id LEFT JOIN member m ON m.id = j.member_id
-            WHERE UPPER(s.effective_pgm) = ?""", (p["program_id"].upper(),)).fetchall()
+            LEFT JOIN proc_def pd ON pd.id = s.proc_id
+            WHERE UPPER(s.effective_pgm) = ?
+              AND NOT (s.proc_id IS NOT NULL AND EXISTS (SELECT 1 FROM step x WHERE x.from_proc = pd.proc_name))
+            ORDER BY j.job_name, s.ordinal""", (p["program_id"].upper(),)).fetchall()
         out.append("\n### Runs in\n")
         out.append(table(["job", "step", "launcher", "parm/notes", "cite"],
-                         [(s["job_name"], s["step_name"], s["launcher"], (s["parm"] or "")[:60],
-                           f"{s['jm']}:{s['line']}") for s in steps]))
+                         [(s["job_name"] or f"(PROC {s['proc_name']}: no indexed job expands it)",
+                           s["step_name"], s["launcher"], (s["parm"] or "")[:60],
+                           f"{s['from_proc'] or s['jm'] or s['proc_name']}:{s['line']}") for s in steps]))
         tx = conn.execute("SELECT tran_code, system FROM transaction_def WHERE UPPER(program)=?",
                           (p["program_id"].upper(),)).fetchall()
         if tx:
@@ -305,46 +340,62 @@ def cmd_job(conn: sqlite3.Connection, name: str) -> str:
         out.append("> No scheduler export loaded: predecessor/trigger relationships are **unknown**, "
                    "not absent.\n")
 
-    def render_steps(where: str, arg, member_name: str) -> None:
-        steps = conn.execute(f"SELECT * FROM step WHERE {where} ORDER BY ordinal", (arg,)).fetchall()
-        for s in steps:
-            out.append(f"\n### {s['step_name']}  `{member_name}:{s['line']}`\n")
-            what = s["effective_pgm"] or (f"PROC {s['proc_called']}" if s["proc_called"] else "?")
-            out.append(f"- runs **{what}**" + (f" (JCL says PGM={s['pgm']} - launcher)" if s["launcher"] else "")
-                       + (f"; COND={s['cond']}" if s["cond"] else "") + "\n")
-            if s["parm"]:
-                out.append(f"- PARM/notes: `{s['parm'][:200]}`\n")
-            dds = conn.execute("SELECT * FROM dd WHERE step_id=? ORDER BY line", (s["id"],)).fetchall()
-            drows = []
-            for d in dds:
-                if d["dsn_resolved"]:
-                    g = f"({d['gdg_rel']})" if d["gdg_rel"] else ""
-                    drows.append((d["dd_name"] or "  +concat", f"{d['dsn_resolved']}{g}", d["disp"] or "",
-                                  f"{d['mode']} [{d['mode_source']}]"))
-                elif d["sysin_text"]:
-                    first = d["sysin_text"].strip().splitlines()
-                    drows.append((d["dd_name"], f"inline cards ({len(first)} lines): "
-                                  + " / ".join(x.strip() for x in first[:3])[:90], "", "control"))
-            if drows:
-                out.append(table(["DD", "dataset / cards", "DISP", "direction [source]"], drows))
-            cards = conn.execute("SELECT card_kind, pos, length, fmt FROM card_field_ref WHERE step_id=? ORDER BY pos",
-                                 (s["id"],)).fetchall()
-            if cards:
-                out.append("- sort card byte positions: " + ", ".join(
-                    f"{c['card_kind']} {c['pos']}-{c['pos'] + c['length'] - 1} {c['fmt'] or ''}" for c in cards) + "\n")
-            if s["proc_called"]:
-                pd = conn.execute("SELECT p.id, m.name FROM proc_def p JOIN member m ON m.id=p.member_id WHERE UPPER(p.proc_name)=?",
-                                  (s["proc_called"].upper(),)).fetchone()
+    def render_step(s, member_name: str, job_for_children: Optional[int]) -> None:
+        cite_member = s["from_proc"] or member_name
+        tag = f"  (from PROC {s['from_proc']})" if s["from_proc"] else ""
+        out.append(f"\n### {s['step_name']}{tag}  `{cite_member}:{s['line']}`\n")
+        what = s["effective_pgm"] or (f"PROC {s['proc_called']}" if s["proc_called"] else "?")
+        out.append(f"- runs **{what}**" + (f" (JCL says PGM={s['pgm']} - launcher)" if s["launcher"] else "")
+                   + (f"; COND={s['cond']}" if s["cond"] else "") + "\n")
+        if s["parm"]:
+            out.append(f"- PARM/notes: `{s['parm'][:200]}`\n")
+        dds = conn.execute("SELECT * FROM dd WHERE step_id=? ORDER BY line, id", (s["id"],)).fetchall()
+        drows = []
+        for d in dds:
+            if d["dsn_resolved"]:
+                g = f"({d['gdg_rel']})" if d["gdg_rel"] else ""
+                ovr = " (override)" if d["is_override"] else ""
+                drows.append((d["dd_name"] or "  +concat", f"{d['dsn_resolved']}{g}{ovr}", d["disp"] or "",
+                              f"{d['mode']} [{d['mode_source']}]"))
+            elif d["sysin_text"]:
+                first = d["sysin_text"].strip().splitlines()
+                drows.append((d["dd_name"], f"inline cards ({len(first)} lines): "
+                              + " / ".join(x.strip() for x in first[:3])[:90], "", "control"))
+            elif d["dsn"]:
+                drows.append((d["dd_name"], f"{d['dsn']} (unresolved)", d["disp"] or "", "unknown"))
+        if drows:
+            out.append(table(["DD", "dataset / cards", "DISP", "direction [source]"], drows))
+        cards = conn.execute("SELECT card_kind, pos, length, fmt FROM card_field_ref WHERE step_id=? ORDER BY pos",
+                             (s["id"],)).fetchall()
+        if cards:
+            out.append("- sort card byte positions: " + ", ".join(
+                f"{c['card_kind']} {c['pos']}-{c['pos'] + c['length'] - 1} {c['fmt'] or ''}" for c in cards) + "\n")
+        if s["proc_called"]:
+            kids = conn.execute(
+                "SELECT * FROM step WHERE job_id=? AND parent_step=? AND from_proc IS NOT NULL ORDER BY ordinal",
+                (job_for_children, s["step_name"])).fetchall() if job_for_children else []
+            if kids:
+                out.append(f"- expands PROC {s['proc_called']}: effective steps below, with this job's "
+                           f"symbolics and //STEP.DD overrides applied\n")
+                for k in kids:
+                    render_step(k, member_name, job_for_children)
+            else:
+                pd = conn.execute("SELECT p.id, m.name FROM proc_def p JOIN member m ON m.id=p.member_id "
+                                  "WHERE UPPER(p.proc_name)=?", (s["proc_called"].upper(),)).fetchone()
                 if pd:
-                    out.append(f"- expands PROC {s['proc_called']} ({pd['name']}):\n")
-                    render_steps("proc_id=?", pd["id"], pd["name"])
+                    out.append(f"- PROC {s['proc_called']} ({pd['name']}) is indexed but could not be expanded "
+                               f"here; `job {s['proc_called']}` shows it with symbolics unresolved\n")
                 else:
                     out.append(f"- **PROC {s['proc_called']} NOT FOUND** in the index - its steps are unknown\n")
+
+    def render_steps(where: str, arg, member_name: str, job_for_children: Optional[int] = None) -> None:
+        for s in conn.execute(f"SELECT * FROM step WHERE {where} ORDER BY ordinal", (arg,)).fetchall():
+            render_step(s, member_name, job_for_children)
 
     mids = []
     for j in jobs:
         out.append(f"\n## {j['member_name']}  `{j['path']}`" + ("  **[authoritative]**" if j["authoritative"] else "") + "\n")
-        render_steps("job_id=?", j["id"], j["member_name"])
+        render_steps("job_id=? AND from_proc IS NULL", j["id"], j["member_name"], j["id"])
         mids.append(j["member_id"])
     for p in procs:
         out.append(f"\n## PROC {p['proc_name']}  `{p['path']}`  symbolics: `{p['symbolics'] or '{}'}`\n")
@@ -586,6 +637,35 @@ def cmd_field(conn: sqlite3.Connection, name: str) -> str:
         out.append(table(["literal", "how", "program", "cite"], rows[:60]))
     out.append("\n> Group-level MOVEs (MOVE REC-A TO REC-B) touch this field without naming it; check the "
                "parents listed under 'under' with `field <parent>`.\n")
+
+    # DB2 columns this field is loaded from / stored to (column-level lineage)
+    sc = conn.execute("""SELECT c.tbl, c.col, c.mode, c.stmt, c.line, p.program_id, p.id AS pid
+                         FROM sql_col_ref c JOIN program p ON p.id=c.program_id
+                         WHERE UPPER(c.host_var)=? ORDER BY c.mode, p.program_id, c.line""", (name.upper(),)).fetchall()
+    if sc:
+        out.append("\n### DB2 columns (read = column -> this field; write = this field -> column)\n")
+        out.append(table(["table", "column", "mode", "stmt", "program", "cite"],
+                         [(r["tbl"], r["col"], r["mode"], r["stmt"], r["program_id"], cite(conn, r["pid"], r["line"]))
+                          for r in sc]))
+
+    # IMS: DL/I calls whose I/O area (the 01 this field lives under) is read or written
+    roots = set()
+    for d in defs:
+        r = _root_of(conn, d["id"])
+        if r and r["name"] != "*COPYBOOK-FRAGMENT*":
+            roots.add(r["name"].upper())
+    if roots:
+        q = ",".join("?" * len(roots))
+        dl = conn.execute(f"""SELECT d.func, d.pcb_arg, d.io_area, d.line, p.program_id, p.id AS pid
+                              FROM dli_call d JOIN program p ON p.id=d.program_id
+                              WHERE UPPER(d.io_area) IN ({q}) ORDER BY p.program_id, d.line""", tuple(roots)).fetchall()
+        if dl:
+            out.append("\n### IMS DL/I calls whose I/O area holds this field\n")
+            out.append(table(["program", "func", "PCB (positional)", "I/O area", "cite"],
+                             [(r["program_id"], r["func"], r["pcb_arg"], r["io_area"], cite(conn, r["pid"], r["line"]))
+                              for r in dl]))
+            out.append("> GU/GN/GHU read the segment INTO the area; ISRT/REPL write it FROM the area. Map the PCB "
+                       "through the PSB (`program` dossier) to name the database and segment.\n")
 
     out.append(_screen_section(conn, name.upper()))
 
@@ -907,6 +987,56 @@ def cmd_pack(conn: sqlite3.Connection, name: str, max_lines: int) -> str:
         if n >= max_lines:
             out.append(f"_...capped at {max_lines} evidence lines; use `cite {p['member_name']} a-b` for more_\n")
             break
+    return "".join(out)
+
+
+# --------------------------------------------------------------------------
+# DB2 columns
+# --------------------------------------------------------------------------
+
+def cmd_column(conn: sqlite3.Connection, name: str) -> str:
+    """Where a DB2 column is written from, read into, and filtered by - and,
+    through the host variable, where that value came from or went next."""
+    n = name.upper()
+    tbl, _, col = n.rpartition(".")
+    q = "UPPER(c.col)=?" + (" AND UPPER(c.tbl)=?" if tbl else "")
+    args = (col, tbl) if tbl else (col,)
+    rows = conn.execute(f"""SELECT c.*, p.program_id AS pname FROM sql_col_ref c JOIN program p ON p.id=c.program_id
+                            WHERE {q} ORDER BY c.mode, p.program_id, c.line""", args).fetchall()
+    out = [f"# DB2 column {n}\n"]
+    if not rows:
+        return out[0] + ("\n**No static SQL references** to this column in indexed programs - dynamic SQL, "
+                         "a view, or a different column name. Check `search \"" + col + "\"`.\n")
+    for mode, title in (("write", "Written (INSERT / UPDATE from a host variable)"),
+                        ("read", "Read (SELECT INTO / FETCH INTO a host variable)"),
+                        ("predicate", "Used in predicates (WHERE)")):
+        rs = [r for r in rows if r["mode"] == mode]
+        if not rs:
+            continue
+        out.append(f"\n### {title}\n")
+        trows = []
+        for r in rs:
+            hv, pid = r["host_var"], r["program_id"]
+            extra = ""
+            if hv and mode == "write":
+                src = conn.execute("""SELECT stmt, line FROM field_ref WHERE program_id=? AND name=? AND mode='write'
+                                      AND stmt<>'EXEC-SQL' ORDER BY line""", (pid, hv)).fetchall()
+                lits = conn.execute("""SELECT literal, line FROM literal_ref WHERE program_id=? AND field=?
+                                       AND context='move_to' ORDER BY line""", (pid, hv)).fetchall()
+                extra = "; ".join([f"set by {x['stmt']} @{cite(conn, pid, x['line'])}" for x in src[:3]]
+                                  + [f"'{l['literal']}' @{cite(conn, pid, l['line'])}" for l in lits[:3]]) \
+                    or "host var never set by name here (group MOVE / CALL / file record?)"
+            elif hv and mode == "read":
+                dst = conn.execute("""SELECT mode, stmt, line FROM field_ref WHERE program_id=? AND name=?
+                                      AND mode IN ('display','write','test') AND stmt<>'EXEC-SQL' ORDER BY line""",
+                                   (pid, hv)).fetchall()
+                extra = "; ".join(f"{x['mode']} {x['stmt']} @{cite(conn, pid, x['line'])}" for x in dst[:4]) \
+                    or "value not used by name afterwards in this program"
+            trows.append((r["tbl"], r["col"], r["pname"], r["stmt"], hv or "", cite(conn, pid, r["line"]), extra))
+        out.append(table(["table", "column", "program", "stmt", "host variable", "cite",
+                          "value from / value to"], trows))
+    out.append("\n> Table `?` = the column was unqualified in a multi-table FROM. Views, dynamic SQL and "
+               "stored procedures are not resolved. For the field side of any host variable, run `field <name>`.\n")
     return "".join(out)
 
 
@@ -1233,7 +1363,8 @@ def cmd_messages(conn: sqlite3.Connection, pattern: str) -> str:
         SELECT l.literal, l.context, l.field, l.line, p.program_id AS pname, p.id AS pid, m.name AS mem
         FROM literal_ref l LEFT JOIN program p ON p.id=l.program_id JOIN member m ON m.id=l.member_id
         WHERE UPPER(l.literal) LIKE UPPER(?)
-          AND l.context IN ('display','move_to','value','string','value_group','screen_initial','screen_literal')
+          AND l.context IN ('display','move_to','value','string','value_group','string_group',
+                            'display_group','screen_initial','screen_literal')
         ORDER BY l.literal""", (pat,)).fetchall()
     groups: Dict[str, List[str]] = defaultdict(list)
     for r in rows:
@@ -1241,7 +1372,29 @@ def cmd_messages(conn: sqlite3.Connection, pattern: str) -> str:
         tgt = f" -> {r['field']}" if r["field"] else ""
         groups[r["literal"]].append(f"{r['context']}{tgt} @{r['pname'] or r['mem']} {ct}")
     out = [f"# Message / text literals matching `{pattern}` ({len(groups)})\n",
-           table(["text", "where"], [(t, "; ".join(w[:5])) for t, w in groups.items()])]
+           table(["text", "where"], [(t, "; ".join(w[:5])) for t, w in groups.items()]),
+           "\n`string_group` / `display_group` rows are messages assembled at run time: literals verbatim, "
+           "fields as `<NAME>`. `value_group` rows are texts assembled from consecutive FILLER VALUEs.\n"]
+
+    # Messages assembled by MOVEs into sibling fields of one group: show the whole set.
+    assembled: Dict[Tuple[str, str], List[Tuple[str, str]]] = {}
+    for r in rows:
+        if r["context"] != "move_to" or not r["field"] or not r["pid"]:
+            continue
+        par = conn.execute("""SELECT f2.name FROM field f JOIN field f2 ON f2.id=f.parent_id
+                              WHERE UPPER(f.name)=? LIMIT 1""", (r["field"].upper(),)).fetchone()
+        if not par:
+            continue
+        sibs = conn.execute("""SELECT l.literal, l.field FROM literal_ref l
+                               JOIN field f ON UPPER(f.name)=UPPER(l.field) JOIN field f2 ON f2.id=f.parent_id
+                               WHERE l.program_id=? AND l.context='move_to' AND UPPER(f2.name)=?
+                               ORDER BY l.line""", (r["pid"], par["name"].upper())).fetchall()
+        if len(sibs) > 1:
+            assembled[(r["pname"], par["name"])] = [(s["literal"], s["field"]) for s in sibs]
+    if assembled:
+        out.append("\n### Messages assembled by MOVEs into one group\n")
+        out.append(table(["program", "group", "pieces in source order"],
+                         [(p, g, " + ".join(f"'{l}'->{fld}" for l, fld in v)) for (p, g), v in assembled.items()]))
     docs = conn.execute("SELECT member_name, line_no, substr(text,1,120) FROM src_fts "
                         "WHERE kind='doc' AND UPPER(text) LIKE UPPER(?) LIMIT 10", (pat,)).fetchall()
     if docs:
@@ -1260,7 +1413,7 @@ def _main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Query atlas.db (markdown out, citations in).")
     ap.add_argument("--db", default="atlas.db")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for c in ("program", "job", "field", "dataset", "copybook", "values", "screen", "transaction"):
+    for c in ("program", "job", "field", "dataset", "copybook", "values", "screen", "transaction", "column"):
         sub.add_parser(c).add_argument("name")
     s = sub.add_parser("literal")
     s.add_argument("name")
@@ -1313,6 +1466,8 @@ def _main(argv: Optional[List[str]] = None) -> int:
             print(cmd_screen(conn, a.name))
         elif a.cmd == "transaction":
             print(cmd_transaction(conn, a.name))
+        elif a.cmd == "column":
+            print(cmd_column(conn, a.name))
         elif a.cmd == "dataset":
             print(cmd_dataset(conn, a.name))
         elif a.cmd == "copybook":

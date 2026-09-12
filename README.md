@@ -95,6 +95,7 @@ python -m atlas.query --db atlas.db pair     WS-REL-CD WS-GENDER-CD   # cross-fi
 python -m atlas.query --db atlas.db messages GENDER             # message texts naming a rule
 python -m atlas.query --db atlas.db screen   MEMMAP             # BMS map / MFS MID-MOD: fields, defaults, validating programs
 python -m atlas.query --db atlas.db transaction MEMB            # CICS CSD / IMS stage-1: which program a transaction runs
+python -m atlas.query --db atlas.db column   MEMBER_TBL.GENDER_CD   # DB2 column: written from / read into which fields, where
 python -m atlas.query --db atlas.db copybook PMASTREC           # impact
 python -m atlas.query --db atlas.db callers  RATECALC --depth 3
 python -m atlas.query --db atlas.db dataset  PROD.POLICY.EXTRACT
@@ -132,6 +133,41 @@ dataset. Direction is taken from, in order: the program's own `OPEN`
 verb (joined through `ASSIGN`), the GDG relative generation, utility DD-name
 conventions (SORTIN/SORTOUT, SYSUT1/SYSUT2), and only then `DISP=NEW/MOD` as a
 weak hint. Every DD row records which signal decided it (`mode_source`).
+
+## Symbolics, PROCs and where a file is created or used
+
+A job is indexed twice: its literal statements, and its **effective steps** —
+every `EXEC PROC=` replaced by the PROC's steps with symbolics resolved in JCL
+precedence (`EXEC PROC=X,SYM=value` › instream `SET` › PROC defaults) and
+`//PROCSTEP.DDNAME` overrides and additions applied, `INCLUDE MEMBER=`
+spliced in first, nested PROCs expanded, `&&TEMP` left alone. `&SYM` and
+`&SYM.` forms are substituted and `..` collapsed; anything still containing
+`&` afterwards is reported as `symbolic`, never guessed. GDG relative
+generations are split off so `(+1)` and `(0)` join as one dataset.
+
+Because of that, `dataset PROD.CLM.MASTER` lists the *jobs* that create and
+read it (`NIGHTJOB NIGHT.PS010`, direction with its source), not just a PROC
+with `&HLQ` in it. IDCAMS steps add `create` / `delete` / `input` / `output`
+rows from their `DEFINE`, `DELETE` and `REPRO` cards, so a VSAM file's
+lineage starts where it is defined. `program X` shows the job-level rows and
+falls back to the bare PROC only when no indexed job expands it.
+
+## Fields, columns and messages
+
+- `field NAME` — definitions with offsets, references by mode
+  (write/read/test/display), 88s, literals, screen fields, sort cards, the
+  **DB2 columns** it is loaded from or stored to, and the **IMS DL/I calls**
+  whose I/O area contains it (GU/GN read into it, ISRT/REPL write from it).
+- `column TABLE.COL` — every program that writes the column (INSERT/UPDATE
+  from a host variable, with where that host variable was set), reads it
+  (SELECT INTO / FETCH INTO, with where the value goes next) or filters on
+  it. Pairing is positional where SQL is positional (select list ↔ INTO,
+  INSERT columns ↔ VALUES, cursor select list ↔ FETCH INTO).
+- `messages PATTERN` — literals, texts assembled from consecutive FILLER
+  VALUEs, messages built at run time by `STRING`/`DISPLAY` (stored as
+  templates such as `INVALID GENDER <WS-GENDER-CD> FOR MEMBER <WS-MEMBER-ID>`,
+  multi-line statements included), messages assembled by MOVEs into sibling
+  fields of one group, screen labels and defaults.
 
 ## The four-names problem
 

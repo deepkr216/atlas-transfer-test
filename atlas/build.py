@@ -83,6 +83,7 @@ class Ctx:
         self._lines: Dict[int, List[Line]] = {}
         self.stats: Dict[str, int] = {}
         self.write_expanded: Optional[str] = None
+        self.proc_cache: Dict[str, Optional[jcl.JclFacts]] = {}
 
     def bump(self, key: str, n: int = 1) -> None:
         self.stats[key] = self.stats.get(key, 0) + n
@@ -297,6 +298,35 @@ def apply_manifest(ctx: Ctx, manifest_path: str) -> None:
 # copybook resolution
 # --------------------------------------------------------------------------
 
+def _member_text(ctx: Ctx, name: str, kinds: Tuple[str, ...]) -> Optional[str]:
+    for m in ctx.by_name.get(name.upper(), []):
+        if m.kind in kinds:
+            text, _d, _e = reader.load(m.path)
+            return text
+    return None
+
+
+def _include_text(ctx: Ctx, name: str) -> Optional[str]:
+    """`// INCLUDE MEMBER=X`: the member's records, spliced in by parse_jcl."""
+    return _member_text(ctx, name, ("jcl", "proc", "ctlcard", "unknown"))
+
+
+def _proc_facts(ctx: Ctx, name: str) -> Optional[jcl.JclFacts]:
+    """Parsed cataloged PROC by name (cached), for expand_job."""
+    key = name.upper()
+    if key not in ctx.proc_cache:
+        facts = None
+        for m in ctx.by_name.get(key, []):
+            if m.kind in ("proc", "jcl"):
+                text, data, enc = reader.load(m.path)
+                f = jcl.parse_jcl(text, data, enc, include_lookup=lambda n: _include_text(ctx, n))
+                if f.is_proc or m.kind == "proc":
+                    facts = f
+                    break
+        ctx.proc_cache[key] = facts
+    return ctx.proc_cache[key]
+
+
 def make_resolver(ctx: Ctx, prog: Mem, notes: List[Tuple[str, str, int]]):
     def resolve(name: str, lib: Optional[str]):
         cands = [c for c in ctx.by_name.get(name.upper(), [])
@@ -390,6 +420,9 @@ def index_cobol(ctx: Ctx, mem: Mem) -> None:
     conn.executemany(
         "INSERT INTO literal_ref(member_id,program_id,literal,context,field,line) VALUES(?,?,?,?,?,?)",
         [(mem.id, pid, lit, ctxt, fld, ln) for (lit, ctxt, fld, ln) in facts.literal_refs])
+    conn.executemany(
+        "INSERT INTO sql_col_ref(program_id,tbl,col,host_var,mode,stmt,line) VALUES(?,?,?,?,?,?,?)",
+        [(pid, t, c, h, m, s, ln) for (t, c, h, m, s, ln) in facts.sql_cols])
 
     # Fields: keep this program's own data items, plus any copybook brought in
     # with REPLACING (its names are program-specific). Plain copybook fields
@@ -520,7 +553,7 @@ def index_copybook(ctx: Ctx, mem: Mem) -> None:
 def index_jcl(ctx: Ctx, mem: Mem) -> None:
     conn = ctx.conn
     text, data, enc = reader.load(mem.path)
-    facts = jcl.parse_jcl(text, data, enc)
+    facts = jcl.parse_jcl(text, data, enc, include_lookup=lambda n: _include_text(ctx, n))
     job_id = proc_id = None
     if facts.is_proc or mem.kind == "proc":
         cur = conn.execute(
@@ -532,12 +565,12 @@ def index_jcl(ctx: Ctx, mem: Mem) -> None:
                            (mem.id, facts.job_name or mem.name, facts.job_line or 1))
         job_id = cur.lastrowid
 
-    for s in facts.steps:
+    def insert_step(s: jcl.StepFact, ordinal: int) -> int:
         cur = conn.execute(
             "INSERT INTO step(job_id,proc_id,ordinal,step_name,pgm,proc_called,effective_pgm,launcher,"
-            "parm,cond,line) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-            (job_id, proc_id, s.ordinal, s.step_name, s.pgm, s.proc_called, s.effective_pgm,
-             s.launcher, s.parm, s.cond, s.line))
+            "parm,cond,from_proc,parent_step,line) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (job_id, proc_id, ordinal, s.step_name, s.pgm, s.proc_called, s.effective_pgm,
+             s.launcher, s.parm, s.cond, s.from_proc, s.parent_step, s.line))
         sid = cur.lastrowid
         conn.executemany(
             "INSERT INTO dd(step_id,dd_name,concat_seq,dsn,dsn_resolved,gdg_rel,disp,mode,mode_source,"
@@ -551,24 +584,49 @@ def index_jcl(ctx: Ctx, mem: Mem) -> None:
                              (base, int(d.gdg_rel is not None)))
                 if d.gdg_rel is not None:
                     conn.execute("UPDATE dataset SET is_gdg=1 WHERE dsn=?", (base,))
-        if s.launcher and jcl.LAUNCHERS.get(s.launcher) == "sort":
-            ctl = "\n".join(d.sysin_text for d in s.dds if d.sysin_text)
+        kind = jcl.LAUNCHERS.get(s.launcher or "")
+        ctl = "\n".join(d.sysin_text for d in s.dds if d.sysin_text)
+        if kind == "sort":
             conn.executemany(
                 "INSERT INTO card_field_ref(step_id,card_kind,pos,length,fmt,raw) VALUES(?,?,?,?,?,?)",
                 [(sid, k, p, ln, fmt, raw) for (k, p, ln, fmt, raw) in jcl.sort_card_fields(ctl)])
-        if s.launcher and jcl.LAUNCHERS.get(s.launcher) in ("ftp", "ndm", "usssh"):
+        if kind == "idcams":
+            # A VSAM file is born (DEFINE) or dies (DELETE) here; REPRO copies it.
+            for op, name, mode in jcl.idcams_ops(ctl):
+                if op == "REPRO DD":
+                    conn.execute("UPDATE dd SET mode=?, mode_source='idcams_card' WHERE step_id=? AND UPPER(dd_name)=?",
+                                 (mode, sid, name))
+                else:
+                    conn.execute(
+                        "INSERT INTO dd(step_id,dd_name,concat_seq,dsn,dsn_resolved,mode,mode_source,is_override,line) "
+                        "VALUES(?,?,0,?,?,?,'idcams_card',0,?)", (sid, f"*{op}*", name, name, mode, s.line))
+                    conn.execute("INSERT OR IGNORE INTO dataset(dsn) VALUES(?)", (name,))
+                    if op.startswith(("DEFINE CLUSTER", "DEFINE AIX", "DEFINE ALTERNATEINDEX", "DEFINE PATH")):
+                        conn.execute("UPDATE dataset SET is_vsam=1 WHERE dsn=?", (name,))
+                    if op == "DEFINE GDG":
+                        conn.execute("UPDATE dataset SET is_gdg=1 WHERE dsn=?", (name,))
+        if kind in ("ftp", "ndm", "usssh"):
             conn.execute(
                 "INSERT INTO interface_edge(member_id,kind,detail,direction,line) VALUES(?,?,?,?,?)",
-                (mem.id, jcl.LAUNCHERS[s.launcher], "; ".join(s.notes)[:500], None, s.line))
+                (mem.id, kind, "; ".join(s.notes)[:500], None, s.line))
         if s.notes:
             conn.execute("UPDATE step SET parm=COALESCE(parm,'') || ' /* ' || ? || ' */' WHERE id=?",
                          ("; ".join(s.notes)[:300], sid))
-        if s.proc_called:
-            ctx.bump("steps:proc")
-        elif s.launcher:
-            ctx.bump("steps:launcher")
-        else:
-            ctx.bump("steps:pgm")
+        ctx.bump("steps:proc" if s.proc_called else "steps:launcher" if s.launcher else "steps:pgm")
+        return sid
+
+    for s in facts.steps:
+        insert_step(s, s.ordinal)
+
+    # Effective steps: every EXEC PROC= expanded with THIS job's symbolics and
+    # //STEP.DD overrides. These rows carry the datasets the job really uses.
+    if job_id is not None:
+        parent_ord = {s.step_name: s.ordinal for s in facts.steps}
+        for i, e in enumerate(jcl.expand_job(facts, lambda n: _proc_facts(ctx, n)), 1):
+            if e.from_proc:
+                top = (e.parent_step or "").split(".")[0]
+                insert_step(e, parent_ord.get(top, 0) * 100 + i)
+                ctx.bump("steps:expanded")
 
     # A DFHCSDUP deck is usually the SYSIN of a JCL step: harvest it in place.
     for s in facts.steps:
@@ -795,7 +853,8 @@ def _main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("root")
     ap.add_argument("--db", default="atlas.db")
     ap.add_argument("--manifest", help="JSON declaring authoritative (production) libraries")
-    ap.add_argument("--sched", help="scheduler export CSV (job_name,depends_on,kind | job_name,system,schedule)")
+    ap.add_argument("--sched", action="append",
+                    help="scheduler export CSV (job_name,depends_on,kind | job_name,system,schedule); repeatable")
     ap.add_argument("--rebuild", action="store_true", help="delete the db first")
     ap.add_argument("--write-expanded", help="directory to write expanded COBOL sources into")
     ap.add_argument("--limit", type=int, help="index only the first N files (smoke test)")
@@ -817,8 +876,8 @@ def _main(argv: Optional[List[str]] = None) -> int:
         f"{k[5:]}={v}" for k, v in sorted(ctx.stats.items()) if k.startswith("kind:")))
     if args.manifest:
         apply_manifest(ctx, args.manifest)
-    if args.sched:
-        load_sched(ctx, args.sched)
+    for sched_path in args.sched or []:
+        load_sched(ctx, sched_path)
 
     # Copybooks first so field rows exist; programs; then everything else.
     order = {"copybook": 0, "cobol": 1, "proc": 2, "jcl": 3, "dbd": 4, "psb": 5, "doc": 9}

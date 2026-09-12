@@ -213,6 +213,10 @@ class ProgramFacts:
     # 88-level that defines it, to the MOVE that sets it in one program, to the
     # DISPLAY in a different program that shows it.
     literal_refs: List[Tuple[str, str, Optional[str], int]] = dc_field(default_factory=list)
+    # (table, column, host_var, mode read|write|predicate, stmt, line) - column-level DB2 lineage
+    sql_cols: List[Tuple[str, str, Optional[str], str, str, int]] = dc_field(default_factory=list)
+    # cursor name -> (tables/aliases, select columns) so FETCH INTO can be paired positionally
+    cursors: Dict[str, Tuple[List[Tuple[str, Optional[str]]], List[str]]] = dc_field(default_factory=dict)
     unresolved: List[Tuple[str, str, int]] = dc_field(default_factory=list)
 
 
@@ -539,6 +543,164 @@ def _sql_literals(f: ProgramFacts, inner: str, verb: str, ln: int) -> None:
                 f.literal_refs.append((_norm_lit(val), "sql_insert", col, ln))
 
 
+# ---- column-level lineage --------------------------------------------------
+
+_SQL_CLAUSE_END = r"(?:\s+WHERE\b|\s+GROUP\s+BY\b|\s+ORDER\s+BY\b|\s+FOR\b|\s+WITH\b|\s+FETCH\s+FIRST\b|\s+OPTIMIZE\b|$)"
+_SQL_SELECT_INTO = re.compile(r"\bSELECT\s+(?:DISTINCT\s+)?(.*?)\s+INTO\s+(.*?)\s+FROM\s+(.*?)" + _SQL_CLAUSE_END,
+                              re.IGNORECASE | re.S)
+_SQL_DECLARE_CUR = re.compile(r"\bDECLARE\s+([A-Z0-9_\-]+)\s+(?:[A-Z]+\s+)*?CURSOR\b.*?\bFOR\s+SELECT\s+(?:DISTINCT\s+)?(.*?)\s+FROM\s+(.*?)"
+                              + _SQL_CLAUSE_END, re.IGNORECASE | re.S)
+_SQL_FETCH = re.compile(r"\bFETCH\s+(?:(?:NEXT|PRIOR|FIRST|LAST|FROM)\s+)*([A-Z0-9_\-]+)\s+INTO\s+(.*)$", re.IGNORECASE | re.S)
+_SQL_UPDATE = re.compile(r"\bUPDATE\s+([A-Z0-9_$#@.]+)(?:\s+(?:AS\s+)?(?!SET\b)([A-Z][A-Z0-9_]*))?\s+SET\s+(.*?)(?:\s+WHERE\s+(.*))?$",
+                         re.IGNORECASE | re.S)
+_SQL_WHERE = re.compile(r"\bWHERE\s+(.*?)" + _SQL_CLAUSE_END.replace(r"\s+WHERE\b|", ""), re.IGNORECASE | re.S)
+_SQL_PRED_HV = re.compile(r"\b([A-Z0-9_$#@]+(?:\.[A-Z0-9_$#@]+)?)\s*(?:=|<>|!=|>=|<=|>|<|\bLIKE\b|\bIN\s*\()\s*:([A-Z0-9\-_]+)",
+                          re.IGNORECASE)
+_SQL_DELETE_FROM = re.compile(r"\bDELETE\s+FROM\s+([A-Z0-9_$#@.]+)(?:\s+(?:AS\s+)?(?!WHERE\b)([A-Z][A-Z0-9_]*))?", re.IGNORECASE)
+_SQL_HV_FIRST = re.compile(r":([A-Z0-9\-_]+)", re.IGNORECASE)
+_SQL_IDENT = re.compile(r"^([A-Z0-9_$#@]+)(?:\.([A-Z0-9_$#@]+))?$", re.IGNORECASE)
+
+
+def _split_top(s: str) -> List[str]:
+    out, buf, depth = [], [], 0
+    for ch in s:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(0, depth - 1)
+        if ch == "," and depth == 0:
+            out.append("".join(buf).strip())
+            buf = []
+        else:
+            buf.append(ch)
+    if buf:
+        out.append("".join(buf).strip())
+    return [x for x in out if x]
+
+
+def _from_tables(from_clause: str) -> List[Tuple[str, Optional[str]]]:
+    """'POLICY_TBL P INNER JOIN MEMBER_TBL M ON ...' -> [(POLICY_TBL,P),(MEMBER_TBL,M)]"""
+    out: List[Tuple[str, Optional[str]]] = []
+    parts = re.split(r"\s*,\s*|\s+(?:INNER\s+|LEFT\s+(?:OUTER\s+)?|RIGHT\s+(?:OUTER\s+)?|FULL\s+(?:OUTER\s+)?)?JOIN\s+",
+                     from_clause, flags=re.IGNORECASE)
+    for p in parts:
+        p = re.split(r"\s+ON\s+", p, flags=re.IGNORECASE)[0].strip()
+        toks = p.split()
+        if not toks:
+            continue
+        tbl = toks[0].upper()
+        alias = None
+        if len(toks) >= 2:
+            a = toks[-1].upper()
+            if a not in ("AS",) and re.fullmatch(r"[A-Z][A-Z0-9_]*", a):
+                alias = a
+        out.append((tbl, alias))
+    return out
+
+
+def _col(expr: str, tables: List[Tuple[str, Optional[str]]]) -> Optional[Tuple[str, str]]:
+    """A plain column reference -> (table, column); functions/literals -> None."""
+    m = _SQL_IDENT.match(expr.strip())
+    if not m:
+        return None
+    a, b = m.group(1).upper(), (m.group(2) or "").upper()
+    if b:                                   # qualified: alias or table name
+        for tbl, alias in tables:
+            if a in (alias, tbl):
+                return tbl, b
+        return a, b
+    if a in ("NULL", "CURRENT", "USER", "DEFAULT"):
+        return None
+    if len(tables) == 1:
+        return tables[0][0], a
+    return ("?" if tables else "?"), a
+
+
+def _hv_list(s: str) -> List[Optional[str]]:
+    """':A :A-IND, :B' -> ['A', 'B'] - the first host var per comma-separated part."""
+    out: List[Optional[str]] = []
+    for part in _split_top(s):
+        m = _SQL_HV_FIRST.search(part)
+        out.append(m.group(1).upper() if m else None)
+    return out
+
+
+def _predicates(f: ProgramFacts, where: str, tables, stmt: str, ln: int) -> None:
+    for m in _SQL_PRED_HV.finditer(where or ""):
+        c = _col(m.group(1), tables)
+        if c:
+            f.sql_cols.append((c[0], c[1], m.group(2).upper(), "predicate", stmt, ln))
+
+
+def _sql_columns(f: ProgramFacts, inner: str, verb: str, ln: int) -> None:
+    """Pair DB2 columns with COBOL host variables, positionally where SQL is
+    positional (SELECT list <-> INTO list, INSERT columns <-> VALUES, cursor
+    select list <-> FETCH INTO) and by name for SET and predicates."""
+    v = verb.upper()
+    if v == "SELECT":
+        m = _SQL_SELECT_INTO.search(inner)
+        if m:
+            tables = _from_tables(m.group(3))
+            cols, hvs = _split_top(m.group(1)), _hv_list(m.group(2))
+            for c, h in zip(cols, hvs):
+                cc = _col(c, tables)
+                if cc and h:
+                    f.sql_cols.append((cc[0], cc[1], h, "read", "SELECT", ln))
+            mw = _SQL_WHERE.search(inner)
+            if mw:
+                _predicates(f, mw.group(1), tables, "SELECT", ln)
+    elif v == "DECLARE":
+        m = _SQL_DECLARE_CUR.search(inner)
+        if m:
+            tables = _from_tables(m.group(3))
+            f.cursors[m.group(1).upper()] = (tables, _split_top(m.group(2)))
+            mw = _SQL_WHERE.search(inner)
+            if mw:
+                _predicates(f, mw.group(1), tables, "DECLARE", ln)
+    elif v == "FETCH":
+        m = _SQL_FETCH.search(inner)
+        if m:
+            cur = m.group(1).upper()
+            if cur in f.cursors:
+                tables, cols = f.cursors[cur]
+                for c, h in zip(cols, _hv_list(m.group(2))):
+                    cc = _col(c, tables)
+                    if cc and h:
+                        f.sql_cols.append((cc[0], cc[1], h, "read", "FETCH", ln))
+            else:
+                f.unresolved.append(("sql_cursor", f"FETCH {cur}: cursor not declared in this program", ln))
+    elif v == "INSERT":
+        m = _SQL_INSERT.search(inner)
+        if m:
+            tbl = re.search(r"\bINSERT\s+INTO\s+([A-Z0-9_$#@.]+)", inner, re.IGNORECASE).group(1).upper()
+            cols = [c.strip().upper() for c in m.group(1).split(",")]
+            vals = _split_top(m.group(2))
+            for c, val in zip(cols, vals):
+                hv = _SQL_HV_FIRST.search(val)
+                if hv:
+                    f.sql_cols.append((tbl, c, hv.group(1).upper(), "write", "INSERT", ln))
+    elif v == "UPDATE":
+        m = _SQL_UPDATE.search(inner)
+        if m:
+            tables = [(m.group(1).upper(), (m.group(2) or "").upper() or None)]
+            for assign in _split_top(m.group(3)):
+                if "=" in assign:
+                    c, _, rhs = assign.partition("=")
+                    cc = _col(c, tables)
+                    hv = _SQL_HV_FIRST.search(rhs)
+                    if cc and hv:
+                        f.sql_cols.append((cc[0], cc[1], hv.group(1).upper(), "write", "UPDATE", ln))
+            if m.group(4):
+                _predicates(f, m.group(4), tables, "UPDATE", ln)
+    elif v == "DELETE":
+        m = _SQL_DELETE_FROM.search(inner)
+        if m:
+            tables = [(m.group(1).upper(), (m.group(2) or "").upper() or None)]
+            mw = _SQL_WHERE.search(inner)
+            if mw:
+                _predicates(f, mw.group(1), tables, "DELETE", ln)
+
+
 def _sql_host_modes(f: ProgramFacts, inner: str, ln: int) -> None:
     """Host variables after SELECT/FETCH ... INTO are WRITTEN by DB2; all
     others are read. This is how 'where does this field get populated' finds
@@ -565,6 +727,7 @@ def _extract_sql(f: ProgramFacts, st: LogicalLine) -> None:
         hvars = sorted({h.upper() for h in _SQL_HOSTVAR.findall(inner)})
         _sql_host_modes(f, inner, st.start)
         _sql_literals(f, inner, verb.upper(), st.start)
+        _sql_columns(f, inner, verb.upper(), st.start)
         dynamic = bool(re.search(r"\b(PREPARE|EXECUTE\s+IMMEDIATE)\b", inner, re.IGNORECASE))
         f.sql.append(SqlFact(stmt_type=verb.upper(),
                              cursor_name=cur.group(1).upper() if cur else None,
@@ -921,6 +1084,11 @@ def _extract_field_and_literal_refs(f: ProgramFacts, st: LogicalLine) -> None:
                     if lit.group(0)[0] in ("'", '"'):
                         for t in _idents(m.group(1)):
                             f.literal_refs.append((_norm_lit(lit.group(0)), "string", t, ln))
+                if verb == "STRING":
+                    tpl = _template(frag[:m.start()])
+                    if tpl:
+                        for t in _idents(m.group(1)):
+                            f.literal_refs.append((tpl, "string_group", t, ln))
             else:
                 _refs(f, _idents(frag), "read", verb, ln)
 
@@ -966,6 +1134,9 @@ def _extract_field_and_literal_refs(f: ProgramFacts, st: LogicalLine) -> None:
             for lit in _ALL_LITS.finditer(head):
                 if lit.group(0)[0] in ("'", '"'):
                     f.literal_refs.append((_norm_lit(lit.group(0)), "display", None, ln))
+            tpl = _template(head)
+            if tpl:
+                f.literal_refs.append((tpl, "display_group", None, ln))
 
         elif verb == "CALL":
             # BY REFERENCE is the default: the callee may write every argument.
@@ -1020,3 +1191,46 @@ def _extract_value_literals(f: ProgramFacts, st: LogicalLine) -> None:
     owner = name if level != "88" else f"{getattr(f, '_last_data_name', '')}/{name}"
     for lit in _ALL_LITS.finditer(mv.group(1)):
         f.literal_refs.append((_norm_lit(lit.group(0)), context, owner, st.start))
+
+
+_TEMPLATE_SKIP = {"DELIMITED", "BY", "SIZE", "INTO", "WITH", "POINTER", "UPON", "NO", "ADVANCING",
+                  "ON", "OVERFLOW", "NOT", "END-STRING", "END-DISPLAY", "OF", "IN", "CONSOLE",
+                  "SYSOUT", "SYSPRINT", "LINE", "ALL"}
+
+
+def _template(fragment: str) -> Optional[str]:
+    """The message a STRING or DISPLAY builds, as a template.
+
+        STRING 'INVALID GENDER ' DELIMITED BY SIZE WS-GENDER-CD DELIMITED BY SPACE
+               ' FOR MEMBER ' DELIMITED BY SIZE WS-MEMBER-ID ... INTO WS-ERR-MSG
+    -> 'INVALID GENDER <WS-GENDER-CD> FOR MEMBER <WS-MEMBER-ID>'
+
+    Searching for the message text 'GENDER' must find this even though no
+    single literal contains the whole sentence. Figurative constants (SPACE,
+    ZERO) used as delimiters are not part of the text.
+    """
+    parts: List[str] = []
+    has_literal = False
+    toks = list(_TOKEN.finditer(fragment or ""))
+    i = 0
+    while i < len(toks):
+        t = toks[i].group(0)
+        up = t.upper()
+        if t[0] in ("'", '"'):
+            parts.append(_norm_lit(t))
+            has_literal = True
+        elif up in ("DELIMITED",):
+            i += 1
+            if i < len(toks) and toks[i].group(0).upper() == "BY":
+                i += 1                              # skip the delimiter operand too
+            i += 1
+            continue
+        elif up in _TEMPLATE_SKIP or up in ("SPACE", "SPACES", "ZERO", "ZEROS", "ZEROES",
+                                             "LOW-VALUE", "LOW-VALUES", "HIGH-VALUE", "HIGH-VALUES"):
+            pass
+        elif re.fullmatch(ID, up.split("(")[0], re.I) and up.split("(")[0] not in _RESERVED:
+            parts.append(f"<{up.split('(')[0]}>")
+        i += 1
+    if has_literal and len(parts) >= 2:
+        return "".join(parts)
+    return None

@@ -232,6 +232,22 @@ CREATE TABLE IF NOT EXISTS sql_stmt (
 );
 CREATE INDEX IF NOT EXISTS ix_sql_prog ON sql_stmt(program_id);
 
+-- Column-level DB2 lineage: which COBOL field a column is read INTO, written
+-- FROM (INSERT/UPDATE), or compared with in a predicate. "Where is column X
+-- created and used" is unanswerable from table names alone.
+CREATE TABLE IF NOT EXISTS sql_col_ref (
+    id          INTEGER PRIMARY KEY,
+    program_id  INTEGER NOT NULL REFERENCES program(id) ON DELETE CASCADE,
+    tbl         TEXT,                     -- resolved table (alias expanded); '?' if ambiguous
+    col         TEXT NOT NULL,
+    host_var    TEXT,                     -- COBOL field (no colon)
+    mode        TEXT NOT NULL,            -- read (col -> host var) | write (host var -> col) | predicate
+    stmt        TEXT,                     -- SELECT|FETCH|INSERT|UPDATE|DELETE|DECLARE
+    line        INTEGER
+);
+CREATE INDEX IF NOT EXISTS ix_sqlcol_col ON sql_col_ref(col);
+CREATE INDEX IF NOT EXISTS ix_sqlcol_hv  ON sql_col_ref(host_var);
+
 CREATE TABLE IF NOT EXISTS db2_object (
     id          INTEGER PRIMARY KEY,
     kind        TEXT NOT NULL,            -- table|view|alias|proc
@@ -341,10 +357,15 @@ CREATE TABLE IF NOT EXISTS step (
     launcher      TEXT,                   -- IKJEFT01|DFSRRC00|SORT|IEBGENER|IDCAMS|...
     parm          TEXT,
     cond          TEXT,
+    from_proc     TEXT,                   -- EFFECTIVE step: the PROC it came from,
+    parent_step   TEXT,                   -- and the job step whose EXEC PROC= produced it.
+                                          -- Symbolics and //STEP.DD overrides are applied,
+                                          -- so THESE rows carry the datasets a job really uses.
     line          INTEGER
 );
 CREATE INDEX IF NOT EXISTS ix_step_pgm  ON step(effective_pgm);
 CREATE INDEX IF NOT EXISTS ix_step_job  ON step(job_id, ordinal);
+CREATE INDEX IF NOT EXISTS ix_step_parent ON step(job_id, parent_step);
 
 CREATE TABLE IF NOT EXISTS dd (
     id          INTEGER PRIMARY KEY,

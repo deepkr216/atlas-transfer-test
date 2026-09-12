@@ -276,6 +276,10 @@ def write_manifest(cfg: Dict, path: str) -> Dict:
 def build_cmd(cfg: Dict, manifest_path: str, rebuild: bool = False) -> List[str]:
     cmd = [sys.executable, "-m", "atlas.build", cfg["local_root"], "--db", cfg.get("db") or "atlas.db",
            "--manifest", manifest_path]
+    # Scheduler exports (kind "sched") are loaded into the index, not just downloaded.
+    for src in cfg["sources"]:
+        if src.get("kind") == "sched" and src.get("enabled", True):
+            cmd += ["--sched", local_path(cfg, src)]
     if rebuild:
         cmd.append("--rebuild")
     return cmd
