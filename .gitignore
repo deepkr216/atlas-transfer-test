@@ -1,8 +1,16 @@
 __pycache__/
 *.pyc
+# never commit work-side artefacts: the index, downloaded estate, configs with real dataset names, reports
 *.db
 *.db-wal
 *.db-shm
 /out/
 /atlas_out/
+/estate/
+sources.json
+manifest.json
+atlas-crash.txt
+diag*.txt
+answer*.md
+pack*.md
 /.claude/settings.local.json

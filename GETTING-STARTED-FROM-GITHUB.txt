@@ -17,8 +17,13 @@ STEP 1 - THE TEST (browser only, 5 minutes)
 STEP 2 - THE TOOLKIT
   Either  (git installed on the laptop)
          git clone https://github.com/<owner>/mainframe-atlas.git
-     - a private repo asks for a username and a Personal Access Token (not your
-       password); create the token on github.com under Settings > Developer settings.
+     - a PRIVATE repo asks you to sign in. If a browser window opens and it is
+       signed in as the company-managed account, cancel and choose the
+       "Personal access token" option instead (or sign in to the personal
+       account in a private window first). Create the token at home:
+       github.com > Settings > Developer settings > Personal access tokens,
+       scope "repo". It is a secret: keep it in your password manager only.
+     - a PUBLIC repo needs no sign-in at all.
   Or      (no git)  green "Code" button > "Download ZIP", extract.
   Then:
          cd mainframe-atlas
