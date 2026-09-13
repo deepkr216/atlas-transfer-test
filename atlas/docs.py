@@ -404,8 +404,20 @@ def _pdf_unescape(b: bytes) -> str:
     return out.decode("latin-1", errors="replace")
 
 
+PDF_TEXT_MAX_BYTES = 60 * 1024 * 1024     # bigger than this is a scan: the page renderer + OCR read it, not this
+
+
 def _pdf(path: str) -> DocText:
     d = DocText(path=path, kind="pdf")
+    size = os.path.getsize(path)
+    if size > PDF_TEXT_MAX_BYTES:
+        # a book-sized scan: the text extractor would chew on it for minutes
+        # and find nothing; `OCR images` renders and reads its pages instead
+        d.ok = False
+        d.notes.append(f"no extractable text - {size // 1024 // 1024} MB PDF, too large for the text extractor; "
+                       "likely a scan, its pages are read by `OCR images`")
+        d.title = os.path.splitext(os.path.basename(path))[0]
+        return d
     with open(path, "rb") as fh:
         data = fh.read()
     n_images = len(re.findall(rb"/Subtype\s*/Image", data))

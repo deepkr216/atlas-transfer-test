@@ -26,6 +26,7 @@ import os
 import re
 import sqlite3
 import sys
+import threading
 import time
 from dataclasses import dataclass, replace
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -35,6 +36,35 @@ from .reader import Line
 
 VERSION = "0.1.0"
 MAX_MEMBER_BYTES = 300 * 1024 * 1024      # a file bigger than this is not a document to index, it is a dump
+SLOW_MEMBER_SECONDS = 30                  # a member still parsing after this long is named on screen, and again every 30 s
+
+
+class Heartbeat:
+    """Names the member being parsed when it takes long, so a build that sits
+    on one huge PDF (or one pathological member) never looks stuck."""
+
+    def __init__(self, say, label: str, every: float = SLOW_MEMBER_SECONDS):
+        self.say, self.label, self.every = say, label, every
+        self.start = time.time()
+        self._stop = threading.Event()
+        self._t = threading.Thread(target=self._run, daemon=True)
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.every):
+            self.say(f"  ... still parsing {self.label} ({int(time.time() - self.start)} s) - a big document, "
+                     "or one being downloaded from OneDrive")
+
+    def __enter__(self):
+        self._t.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        return False
+
+    @property
+    def seconds(self) -> float:
+        return time.time() - self.start
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 CODE_KINDS = {"cobol", "copybook", "jcl", "proc", "ctlcard", "dbd", "psb", "bms", "mfs",
@@ -1532,6 +1562,7 @@ def _main(argv: Optional[List[str]] = None) -> int:
     # Copybooks first so field rows exist; programs; then everything else.
     order = {"copybook": 0, "cobol": 1, "proc": 2, "jcl": 3, "dbd": 4, "psb": 5, "doc": 9}
     ok = partial = failed = 0
+    slow: List[Tuple[float, str, str]] = []
     n_parse = sum(1 for m in ctx.members if not m.skip)
     ctx.say(f"parsing {n_parse} member(s) ({len(ctx.members) - n_parse} unchanged, kept) - a line every 10 s")
     t_tick = time.time()
@@ -1544,10 +1575,13 @@ def _main(argv: Optional[List[str]] = None) -> int:
             ctx.say(f"  ... {i}/{len(ctx.members)} - now {mem.kind}: {os.path.basename(mem.path)}")
         handler = HANDLERS.get(mem.kind)
         try:
-            if handler:
-                handler(ctx, mem)
-            if mem.kind in CODE_KINDS:
-                index_fts_code(ctx, mem)
+            with Heartbeat(ctx.say, f"{mem.kind} {os.path.basename(mem.path)}") as hb:
+                if handler:
+                    handler(ctx, mem)
+                if mem.kind in CODE_KINDS:
+                    index_fts_code(ctx, mem)
+            if hb.seconds >= SLOW_MEMBER_SECONDS:
+                slow.append((hb.seconds, mem.kind, os.path.basename(mem.path)))
             if not handler:
                 conn.execute("UPDATE member SET parse_status='skipped' WHERE id=?", (mem.id,))
             st = conn.execute("SELECT parse_status FROM member WHERE id=?", (mem.id,)).fetchone()[0]
@@ -1562,6 +1596,9 @@ def _main(argv: Optional[List[str]] = None) -> int:
             conn.commit()
             ctx.say(f"  {i}/{len(ctx.members)} ...")
     conn.commit()
+    if slow:
+        slow.sort(reverse=True)
+        ctx.say("  slowest members: " + "; ".join(f"{k} {n} {int(s)} s" for s, k, n in slow[:5]))
 
     n = post_open_modes(ctx)
     ctx.say(f"post: {n} DD direction(s) set from OPEN verbs")

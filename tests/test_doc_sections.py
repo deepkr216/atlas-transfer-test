@@ -93,6 +93,24 @@ class DocSections(unittest.TestCase):
         self.assertIn(f"RULES:{sec}", found)
         self.assertIn("doc DOCNAME --sections n", found)
 
+    def test_huge_pdf_goes_to_ocr_not_the_text_extractor(self):
+        from unittest import mock
+        p = os.path.join(self.td, "big.pdf")
+        with open(p, "wb") as fh:
+            fh.write(b"%PDF-1.4 tiny")
+        with mock.patch("atlas.docs.PDF_TEXT_MAX_BYTES", 5):
+            d = docs.extract(p)
+        self.assertFalse(d.ok)
+        self.assertIn("no extractable text", d.notes[0])
+        self.assertIn("too large for the text extractor", d.notes[0])
+
+    def test_heartbeat_names_a_slow_member(self):
+        import time
+        said = []
+        with build.Heartbeat(said.append, "doc BIG.pdf", every=0.2):
+            time.sleep(0.7)
+        self.assertTrue(any("still parsing doc BIG.pdf" in x for x in said), said)
+
     def test_budget_and_not_found(self):
         n = self.conn.execute("SELECT COUNT(*) FROM doc_section WHERE member_id=(SELECT id FROM member WHERE name='RULES')").fetchone()[0]
         t = query.cmd_doc(self.conn, "RULES", sections=f"1-{n}", budget=5000)
