@@ -579,11 +579,15 @@ def write_manifest(cfg: Dict, path: str) -> Dict:
             alt = os.path.join(os.path.dirname(path), "manifest.generated.json")
             print(f"manifest {path} was written by hand - kept; the generated manifest is {alt}")
             path = alt
-    man: Dict = {"_generated_by": MANIFEST_MARK, "authoritative": [], "system_of": {}, "systems": {}, "copylib_order": {}}
+    man: Dict = {"_generated_by": MANIFEST_MARK, "authoritative": [], "system_of": {}, "systems": {},
+                 "copylib_order": {}, "kinds": {}}
     for src in cfg["sources"]:
         if not src.get("enabled", True):
             continue
         lp = local_path(cfg, src).replace("\\", "/")
+        # the kind declared in the table decides when neither the content nor
+        # the folder name can (control cards in a library called ...UTL)
+        man["kinds"][os.path.basename(lp).upper()] = src.get("kind", "other")
         if src.get("authoritative"):
             man["authoritative"].append(lp)
         sysname = (src.get("system") or "").upper()

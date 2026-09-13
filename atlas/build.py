@@ -89,6 +89,7 @@ class Ctx:
         self.write_expanded: Optional[str] = None
         self.proc_cache: Dict[str, Optional[jcl.JclFacts]] = {}
         self.copylib_order: Dict[str, List[str]] = {}   # SYSTEM -> copybook library folder names, SYSLIB order
+        self.kind_of: Dict[str, str] = {}               # library folder name -> kind declared in sources.json
 
     def bump(self, key: str, n: int = 1) -> None:
         self.stats[key] = self.stats.get(key, 0) + n
@@ -314,6 +315,10 @@ def inventory(ctx: Ctx, roots, limit: Optional[int] = None, force_all: bool = Fa
         else:
             text, enc = reader.decode_bytes(data)
             kind, _why = classify.classify(path, text[:8192])
+            if kind == "unknown":
+                # neither the content nor the folder name said: the kind the
+                # user declared for that library in sources.json does
+                kind = ctx.kind_of.get(os.path.basename(dirpath).upper(), kind)
             norm, nlines, fixed = norm_hash(kind, text, data, enc)
             if kind in CODE_KINDS and code_line_count(kind, text, data, enc) == 0:
                 kind = "empty"           # a stub or a retired member: never a program row
@@ -422,6 +427,23 @@ def load_sched(ctx: Ctx, csv_path: str) -> None:
                 n_job += 1
     ctx.conn.commit()
     ctx.say(f"scheduler: {n_job} job definition(s), {n_dep} dependency edge(s) loaded")
+
+
+def load_declared_kinds(ctx: Ctx, manifest_path: Optional[str]) -> None:
+    """`kinds` from the manifest (written from the sources table): library
+    folder name -> kind. Read BEFORE the inventory, because that is where a
+    member without a content signature gets typed."""
+    ctx.kind_of = {}
+    if not manifest_path or not os.path.isfile(manifest_path):
+        return
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as fh:
+            man = json.load(fh)
+    except (OSError, ValueError):
+        return
+    ctx.kind_of = {str(k).upper(): str(v).lower() for k, v in (man.get("kinds") or {}).items()
+                   if str(v).lower() in ("cobol", "copybook", "jcl", "proc", "ctlcard", "dbd", "psb", "bms", "mfs",
+                                         "csd", "imsgen", "sql", "listing", "doc", "sched")}
 
 
 def apply_manifest(ctx: Ctx, manifest_path: str) -> None:
@@ -1474,6 +1496,7 @@ def _main(argv: Optional[List[str]] = None) -> int:
 
     roots = [args.root, *(args.also or [])]
     ctx.say("inventory: " + ", ".join(roots))
+    load_declared_kinds(ctx, args.manifest)
     inventory(ctx, roots, args.limit, force_all=force_all)
     conn.commit()
     ctx.say(f"  {len(ctx.members)} files: " + ", ".join(

@@ -40,7 +40,7 @@ DIR_HINTS = [
     (re.compile(r"JCL(LIB)?$|JOBS?$", re.I), "jcl"),
     # CNTL / CARDLIB hold control cards; a real job inside one is caught by
     # its JOB/EXEC statements before the folder hint is consulted.
-    (re.compile(r"CNTL(LIB)?$|CARD(LIB|S)?$", re.I), "ctlcard"),
+    (re.compile(r"CNTL(LIB)?$|CARD(LIB|S)?$|UTL$", re.I), "ctlcard"),
     (re.compile(r"SRC$|SOURCE$|COBOL$|PGM(LIB)?$", re.I), "cobol"),
     (re.compile(r"DBD(LIB|SRC)?$", re.I), "dbd"),
     (re.compile(r"PSB(LIB|SRC)?$", re.I), "psb"),
