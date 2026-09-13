@@ -70,6 +70,7 @@ class DocText:
     sections: List[Tuple[str, str]] = dc_field(default_factory=list)   # (heading, text)
     tables: List[List[List[str]]] = dc_field(default_factory=list)
     images: List[str] = dc_field(default_factory=list)                 # internal names
+    image_anchor: Dict[str, str] = dc_field(default_factory=dict)      # internal name -> the sheet / slide / heading it sits in
     notes: List[str] = dc_field(default_factory=list)                  # caveats
     ok: bool = True
 
@@ -150,6 +151,84 @@ def _clean(s: str) -> str:
     return re.sub(r"[ \t]+", " ", s).strip()
 
 
+def render_rows(rows: List[List[str]], numbers: Optional[List[int]] = None) -> str:
+    """A table as lines the model can read and cite: `row 12: a | b | c`.
+    Empty trailing cells are dropped, empty rows skipped; `numbers` are the
+    spreadsheet's own row numbers (a QA sheet's row 12 is row 12 to the
+    tester too), else 1-based."""
+    out = []
+    for i, cells in enumerate(rows):
+        n = numbers[i] if numbers and i < len(numbers) else i + 1
+        vals = [re.sub(r"[\r\n]+", " ", (c or "").replace("|", "/")).strip() for c in cells]
+        while vals and not vals[-1]:
+            vals.pop()
+        if not any(vals):
+            continue
+        out.append(f"row {n}: " + " | ".join(vals))
+    return "\n".join(out)
+
+
+def _anchor(d: "DocText", name: str, where: str) -> None:
+    """Record where a picture sits; a picture pasted on two tabs (Excel keeps
+    ONE media file for a copied screenshot) lists both: `sheet: A; sheet: B`."""
+    cur = d.image_anchor.get(name)
+    if not cur:
+        d.image_anchor[name] = where
+    elif where not in cur.split("; "):
+        d.image_anchor[name] = cur + "; " + where
+
+
+def _body_blocks(el):
+    """The paragraphs and tables of a Word body in order, looking inside
+    content controls (w:sdt / w:sdtContent - cover pages, tables of
+    contents, template blocks) which otherwise hide their text."""
+    for child in el:
+        tag = child.tag
+        if tag == _q("w", "p") or tag == _q("w", "tbl"):
+            yield child
+        elif tag == _q("w", "sdt"):
+            content = child.find(_q("w", "sdtContent"))
+            if content is not None:
+                yield from _body_blocks(content)
+        elif tag.endswith("}sdtContent"):
+            yield from _body_blocks(child)
+
+
+def _rels(z: zipfile.ZipFile, part: str) -> Dict[str, str]:
+    """Relationships of a package part, Id -> target part name (resolved
+    against the part's folder), e.g. xl/worksheets/sheet2.xml -> its drawing."""
+    d, base = part.rsplit("/", 1) if "/" in part else ("", part)
+    rel_part = f"{d}/_rels/{base}.rels" if d else f"_rels/{base}.rels"
+    if rel_part not in z.namelist():
+        return {}
+    try:
+        root = ET.fromstring(z.read(rel_part))
+    except ET.ParseError:
+        return {}
+    out: Dict[str, str] = {}
+    for r in root.iter(_q("rel", "Relationship")):
+        rid, target = r.get("Id"), r.get("Target") or ""
+        if not rid or not target or (r.get("TargetMode") or "").lower() == "external":
+            continue
+        if target.startswith("/"):
+            out[rid] = target.lstrip("/")
+        else:
+            segs = (d.split("/") if d else []) + target.split("/")
+            stack: List[str] = []
+            for sgm in segs:
+                if sgm == "..":
+                    if stack:
+                        stack.pop()
+                elif sgm and sgm != ".":
+                    stack.append(sgm)
+            out[rid] = "/".join(stack)
+    return out
+
+
+def _media_targets(z: zipfile.ZipFile, part: str) -> List[str]:
+    return [t for t in _rels(z, part).values() if t.lower().endswith(IMAGE_EXT)]
+
+
 # --------------------------------------------------------------------------
 # Word
 # --------------------------------------------------------------------------
@@ -166,26 +245,41 @@ def _docx(path: str) -> DocText:
 
         heading = ""
         buf: List[str] = []
+        rels = _rels(z, "word/document.xml")
+        r_embed, r_id = f"{{{NS['r']}}}embed", f"{{{NS['r']}}}id"
 
         def flush():
             if buf:
                 d.sections.append((heading, "\n".join(buf)))
                 buf.clear()
 
-        for el in body:
+        def anchor_pictures(el, where: str) -> List[str]:
+            names: List[str] = []
+            for x in el.iter():
+                if x.tag.endswith("}blip") or x.tag.endswith("}imagedata"):
+                    target = rels.get(x.get(r_embed) or x.get(r_id) or "")
+                    if target:
+                        _anchor(d, target, where)
+                        base = target.rsplit("/", 1)[-1]
+                        if base not in names:           # Word writes a picture twice (Choice + Fallback)
+                            names.append(base)
+            return names
+
+        for el in _body_blocks(body):
             if el.tag == _q("w", "p"):
                 style = el.find(f"./{_q('w','pPr')}/{_q('w','pStyle')}")
                 sval = (style.get(_q("w", "val")) if style is not None else "") or ""
                 txt = _clean("".join(t.text or "" for t in el.iter(_q("w", "t"))))
-                if el.find(f".//{_q('w','drawing')}") is not None or el.find(f".//{_q('w','pict')}") is not None:
-                    buf.append("[image]")
                 if re.match(r"(?i)heading\d*|title|caption", sval):
-                    flush()
+                    flush()                              # a picture in a heading / caption belongs to THAT heading
                     heading = txt
                     if d.title is None and re.match(r"(?i)title", sval):
                         d.title = txt
                 elif txt:
                     buf.append(txt)
+                if el.find(f".//{_q('w','drawing')}") is not None or el.find(f".//{_q('w','pict')}") is not None:
+                    pics = anchor_pictures(el, heading or "before the first heading")
+                    buf.append("[image" + (": " + ", ".join(pics) if pics else "") + "]")
             elif el.tag == _q("w", "tbl"):
                 rows: List[List[str]] = []
                 for tr in el.iter(_q("w", "tr")):
@@ -195,7 +289,8 @@ def _docx(path: str) -> DocText:
                     rows.append(cells)
                 if rows:
                     d.tables.append(rows)
-                    buf.append(f"[table {len(rows)}x{max(len(r) for r in rows)}]")
+                    buf.append(f"[table {len(rows)}x{max(len(r) for r in rows)}]\n" + render_rows(rows))
+                    anchor_pictures(el, heading or "before the first heading")
         flush()
 
     if d.title is None and d.sections:
@@ -257,11 +352,15 @@ def _xlsx(path: str) -> DocText:
                 continue
             root = ET.fromstring(z.read(target))
             rows: List[List[str]] = []
+            numbers: List[int] = []
             truncated = False
+            last_r = 0
             for i, row in enumerate(root.iter(_q("s", "row"))):
                 if i >= MAX_ROWS_PER_SHEET:
                     truncated = True
                     break
+                # a row without r sits right after the previous one (ECMA-376)
+                last_r = int(row.get("r")) if (row.get("r") or "").isdigit() else last_r + 1
                 cells: Dict[int, str] = {}
                 for c in row.findall(_q("s", "c")):
                     ref = c.get("r") or ""
@@ -284,9 +383,15 @@ def _xlsx(path: str) -> DocText:
                 if cells:
                     width = max(cells)
                     rows.append([cells.get(i, "") for i in range(1, width + 1)])
+                    numbers.append(last_r)
+            # the pictures pasted on this sheet (a tester's screenshots): sheet -> drawing -> media
+            for drawing in _rels(z, target).values():
+                if "/drawings/" in drawing:
+                    for media in _media_targets(z, drawing):
+                        _anchor(d, media, f"sheet: {sheet_name}")
             if rows:
                 d.tables.append(rows)
-                d.sections.append((f"sheet: {sheet_name}", f"[{len(rows)} rows]"))
+                d.sections.append((f"sheet: {sheet_name}", render_rows(rows, numbers)))
             if truncated:
                 d.notes.append(f"sheet {sheet_name!r} truncated at {MAX_ROWS_PER_SHEET} rows")
     d.title = os.path.splitext(os.path.basename(path))[0]
@@ -327,9 +432,12 @@ def _pptx(path: str) -> DocText:
                                  for tc in tr.findall(_q("a", "tc"))])
                 if rows:
                     d.tables.append(rows)
-                    paras.append(f"[table {len(rows)} rows]")
-            if root.find(f".//{_q('p','pic')}") is not None:
-                paras.append("[image]")
+                    paras.append(f"[table {len(rows)} rows]\n" + render_rows(rows))
+            media = list(dict.fromkeys(_media_targets(z, n)))
+            for m_name in media:
+                _anchor(d, m_name, f"slide {num}: {title}".rstrip(": "))
+            if root.find(f".//{_q('p','pic')}") is not None or media:
+                paras.append("[image" + (": " + ", ".join(x.rsplit("/", 1)[-1] for x in media) if media else "") + "]")
             notes_part = f"ppt/notesSlides/notesSlide{num}.xml"
             if notes_part in names:
                 nroot = ET.fromstring(z.read(notes_part))
@@ -519,9 +627,13 @@ def chunk_sections(sections: List[Tuple[str, str]], max_chars: int = 4000) -> Li
         parts: List[str] = []
         buf = ""
         for p in paras:
-            while len(p) > max_chars:                      # one huge paragraph: cut at sentence ends
-                cut = p.rfind(". ", 0, max_chars)
-                cut = cut + 1 if cut > max_chars // 2 else max_chars
+            while len(p) > max_chars:                      # one huge paragraph: cut between lines, else at sentence ends
+                cut = p.rfind("\n", 0, max_chars)
+                if cut > 0:                                # a short part beats a row cut in two
+                    cut = cut + 1
+                else:
+                    cut = p.rfind(". ", 0, max_chars)
+                    cut = cut + 1 if cut > max_chars // 2 else max_chars
                 head, p = p[:cut].rstrip(), p[cut:].lstrip()
                 if buf:
                     parts.append(buf)

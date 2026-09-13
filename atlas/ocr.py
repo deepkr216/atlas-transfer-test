@@ -346,6 +346,14 @@ def extract_images(conn: sqlite3.Connection, out_dir: str, member: Optional[str]
     return out
 
 
+def image_heading(img: str, anchor: Optional[str] = None) -> str:
+    """The section heading of an OCR'd picture: which image, and where it
+    sits (the sheet, slide or heading) - `image: image3.png (sheet: Gender Tests)`."""
+    if img.startswith("page-") and img[5:].isdigit():
+        return f"page {int(img[5:])} (OCR of the scanned page)"
+    return f"image: {os.path.basename(img)}" + (f" ({anchor})" if anchor else "")
+
+
 def run(conn: sqlite3.Connection, out_dir: str, do_ocr: bool = True, member: Optional[str] = None,
         log=print, pdf_pages: str = "scans") -> Dict[str, int]:
     images = extract_images(conn, out_dir, member, pdf_pages, log)
@@ -375,8 +383,8 @@ def run(conn: sqlite3.Connection, out_dir: str, do_ocr: bool = True, member: Opt
         n = conn.execute("SELECT COUNT(*) FROM doc_section WHERE member_id=? AND ordinal>=?",
                          (mid, OCR_ORDINAL_BASE)).fetchone()[0]
         ordinal = OCR_ORDINAL_BASE + n + 1
-        heading = (f"page {int(img[5:])} (OCR of the scanned page)" if img.startswith("page-") and img[5:].isdigit()
-                   else f"image: {os.path.basename(img)}")
+        anchor = conn.execute("SELECT anchor FROM doc_image WHERE member_id=? AND name=?", (mid, img)).fetchone()
+        heading = image_heading(img, anchor[0] if anchor else None)
         conn.execute("INSERT INTO doc_section(member_id,heading,text,ordinal) VALUES(?,?,?,?)",
                      (mid, heading, text, ordinal))
         conn.execute("INSERT INTO src_fts(member_name,kind,member_id,line_no,text) VALUES(?,?,?,?,?)",

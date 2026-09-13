@@ -23,7 +23,9 @@ How to work:
    identifier or text - use it when the question names a concept but not a field) ·
    `conditions PGM` · `paragraph PGM NAME` · `crud --job JOB` · `callers PGM` / `callees PGM` ·
    `dataset DSN` · `table T` · `column T.C` · `dbd D` · `segment S` · `transaction CODE` ·
-   `screen MAP` · `interfaces` · `docs TERM` (which documents mention it) · `doc NAME --grep TERM` /
+   `screen MAP` · `interfaces` · `doc --list [FOLDER]` (the indexed documents - a QA workbook is known by
+   its file name, its tabs are its sections, its rows the text, its screenshots anchored to their tab) ·
+   `docs TERM` (which documents mention it) · `doc NAME --grep TERM` /
    `doc NAME --sections 3-5` (the FULL text of a document's sections - what you read for a business
    rule or a flow; `doc NAME` alone is the outline) · `cite MEMBER a-b` · `coverage`.
    When the question is about a concept (gender, relationship, a status) rather than a named

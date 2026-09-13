@@ -85,7 +85,8 @@ CREATE TABLE IF NOT EXISTS doc_image(
     member_id INTEGER NOT NULL REFERENCES member(id) ON DELETE CASCADE,
     name TEXT,
     extracted_path TEXT,                  -- where atlas.ocr wrote the image
-    ocr_text TEXT);                       -- NULL = not read yet; '' = read, nothing found
+    ocr_text TEXT,                        -- NULL = not read yet; '' = read, nothing found
+    anchor TEXT);                         -- the sheet / slide / heading the picture sits in
 CREATE TABLE IF NOT EXISTS expand_run(
     id INTEGER PRIMARY KEY,
     program_id INTEGER NOT NULL REFERENCES program(id) ON DELETE CASCADE,
@@ -162,7 +163,8 @@ def open_db(path: str, rebuild: bool = False) -> sqlite3.Connection:
     # forcing a rebuild of a 40,000-member index. Done BEFORE the schema runs
     # so a view over a new column can be created on an old database.
     for table, col, decl in (("doc_section", "ordinal", "INTEGER"), ("doc_image", "extracted_path", "TEXT"),
-                             ("doc_image", "ocr_text", "TEXT"), ("member", "system", "TEXT"),
+                             ("doc_image", "ocr_text", "TEXT"), ("doc_image", "anchor", "TEXT"),
+                             ("member", "system", "TEXT"),
                              ("step", "from_proc", "TEXT"), ("step", "parent_step", "TEXT"),
                              ("dd", "mode_source", "TEXT"), ("transaction_def", "group_name", "TEXT"),
                              ("transaction_def", "detail", "TEXT"), ("dd", "card_member", "TEXT"),
@@ -1218,11 +1220,10 @@ def index_doc(ctx: Ctx, mem: Mem) -> None:
         if t:
             conn.execute("INSERT INTO src_fts(member_name,kind,member_id,line_no,text) VALUES(?,?,?,?,?)",
                          (mem.name, "doc", mem.id, i, (h + "\n" + t)[:20000]))
-    for tbl in d.tables:
-        conn.execute("INSERT INTO src_fts(member_name,kind,member_id,line_no,text) VALUES(?,?,?,?,?)",
-                     (mem.name, "doc", mem.id, 0, "\n".join("\t".join(r) for r in tbl)[:20000]))
-    conn.executemany("INSERT INTO doc_image(member_id,name) VALUES(?,?)",
-                     [(mem.id, n) for n in d.images])
+    # table rows are part of their section's text (a sheet IS its rows), so
+    # they are searched and cited section-precisely - no separate line-0 rows
+    conn.executemany("INSERT INTO doc_image(member_id,name,anchor) VALUES(?,?,?)",
+                     [(mem.id, n, d.image_anchor.get(n)) for n in d.images])
     ctx.bump("doc_images", len(d.images))
     # a converted copy whose legacy original (.doc/.xls/.ppt beside it) was
     # changed after the conversion: the index would describe the old text

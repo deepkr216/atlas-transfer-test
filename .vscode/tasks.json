@@ -14,6 +14,7 @@
     {"id": "copybook", "type": "promptString", "description": "Copybook name"},
     {"id": "member", "type": "promptString", "description": "Member name (a program, copybook, job, PROC, PSB, DBD, control card...)"},
     {"id": "document", "type": "promptString", "description": "Document name (the file name without extension, as `docs` shows it)"},
+    {"id": "docpattern", "type": "promptString", "description": "Part of a folder or file name to narrow the document list (e.g. QA); blank = all", "default": ""},
     {"id": "range", "type": "promptString", "description": "Line range, e.g. 1-9999 for the whole member or 120-180", "default": "1-9999"},
     {"id": "paragraph", "type": "promptString", "description": "Paragraph / section name, or a line number"},
     {"id": "old", "type": "promptString", "description": "The production copy: SYSTEM/NAME (GC/CLMPOST), NAME@LIBRARY, a path, or just NAME when the index holds two copies"},
@@ -148,6 +149,15 @@
         "env": {"PYTHONUTF8": "1"},
         "shell": {"executable": "powershell.exe", "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command"]}
       },
+      "presentation": {"reveal": "always", "panel": "shared", "showReuseMessage": false},
+      "problemMatcher": []
+    },
+    {
+      "label": "Atlas: documents in the index -> work/doclist.md",
+      "detail": "Every indexed document (workbooks, Word, PowerPoint, PDF) with its sections and pictures; give a folder or file-name fragment to narrow, or leave blank.",
+      "type": "shell",
+      "command": "python -m atlas.query --db atlas.db --out work/doclist.md doc --list \"${input:docpattern}\"",
+      "options": {"cwd": "${workspaceFolder}", "env": {"PYTHONUTF8": "1"}},
       "presentation": {"reveal": "always", "panel": "shared", "showReuseMessage": false},
       "problemMatcher": []
     },

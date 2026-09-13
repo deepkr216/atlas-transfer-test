@@ -41,6 +41,7 @@ python -m atlas.query --db atlas.db --out work/table.md      table <TABLE> | col
 python -m atlas.query --db atlas.db --out work/dbd.md        dbd <DBD> | segment <SEGMENT>
 python -m atlas.query --db atlas.db --out work/tran.md       transaction <CODE|PGM> | screen <MAP>
 python -m atlas.query --db atlas.db --out work/interfaces.md interfaces [--system S] [--dsn X]
+python -m atlas.query --db atlas.db --out work/doclist.md    doc --list [FOLDER]                       # the indexed documents (workbooks: tabs = sections, rows = text)
 python -m atlas.query --db atlas.db --out work/doc.md        doc <DOCUMENT> [--grep TERM | --sections 3-5] [--budget N]   # a document's sections in full
 python -m atlas.query --db atlas.db --out work/cite.md       cite <MEMBER> <a>-<b> [--kind K]
 python -m atlas.query --db atlas.db --out work/coverage.md   coverage

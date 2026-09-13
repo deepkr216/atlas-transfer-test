@@ -218,7 +218,7 @@ def check_answer(text: str, root: Optional[str] = None,
     for m in CITATION.finditer(text):
         ref, s, e, quote = m.group(1), int(m.group(2)), m.group(3), m.group(4)
         end = int(e) if e else s
-        quote = quote.replace('\\"', '"')
+        quote = quote.replace('\\"', '"').replace("\\|", "|")   # a token copied from a report table (| is escaped there)
         path, how, kind = _resolve(ref, root, db, quote)
         if not path:
             results.append(Result(m.group(0), ref, s, end, quote, "FAIL", how))

@@ -364,6 +364,17 @@ the documents and runs the OCR engine that ships with Windows 10/11
 (hand-drawn diagrams, photos of whiteboards) are listed with their extracted
 path; those are the few worth a vision-model call, chosen by hand.
 
+**Spreadsheets and tables are rows, not counts.** A workbook's tab is a
+section whose text is its rows — `row 12: TC-GEN-01 | Add gender N | PASS`,
+with the sheet's own row numbers — so a QA results workbook is searched
+(`docs TC-GEN-01`), read (`doc QAREL12 --sections 2`) and cited
+(`[[QAREL12 2 "TC-GEN-01"]]`) tab by tab; a tab of thousands of rows is
+cut into parts between rows. Word and PowerPoint tables are rendered the
+same way inside their section. Every picture is anchored to where it sits
+— the tab, the slide, or the Word heading above it — and the OCR section's
+heading says so (`image: image3.png (sheet: Gender Tests)`); `doc NAME`
+lists the pictures by place, `doc --list [FOLDER]` the indexed documents.
+
 - `docs TERM` — every document mentioning a program, job, field, code or
   phrase, with the section (or image) and an excerpt.
 - `doc DOC [--sections 3-5 | --grep TERM] [--budget N]` — one document: its

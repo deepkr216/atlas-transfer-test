@@ -39,9 +39,11 @@ From `crud`: which jobs run the changed programs, which datasets / tables / segm
 read, update or delete, and which of those cells the release alters.
 
 ## TEST EVIDENCE
-From `doc` on the QA workbook: the test cases, their results, and the screenshots (cited as
-`[[DOC n "token"]]` with the section that holds them). Say which changed paragraph each test covers
-and which changed paragraph no test covers.
+From `doc` on the QA workbooks (`doc --list QA` names them; a workbook's tabs are its sections and
+its rows the text - `row 12: TC-GEN-01 | ... | PASS`): the test cases, their results, and the
+screenshots (their OCR text is a section 1001+ whose heading names the tab; cite as
+`[[WORKBOOK n "token"]]`). Say which changed paragraph each test covers and which changed
+paragraph no test covers.
 
 ## SUPPORT NOTES
 Error messages and codes the changed paragraphs can produce (from `walk` / `diff` lines), restart and

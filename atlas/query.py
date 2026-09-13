@@ -1611,13 +1611,29 @@ def _doc_mentions(conn: sqlite3.Connection, term: str, limit: int = 8) -> List[s
     return out
 
 
+def _hit_line(conn: sqlite3.Connection, member_id: int, ordinal: Optional[int], term: str, fallback: str,
+              width: int = 160) -> str:
+    """The line of the section that holds the term - for a spreadsheet tab
+    that is the ROW (`row 12: TC-GEN-01 | ... | PASS`), not the tab's first
+    line; the section's start when the term is not on one line."""
+    if ordinal:
+        r = conn.execute("SELECT text FROM doc_section WHERE member_id=? AND ordinal=?", (member_id, ordinal)).fetchone()
+        if r and r["text"]:
+            t = term.strip('"').upper()
+            for ln in r["text"].split("\n"):
+                if t in ln.upper():
+                    return ln.strip()[:width]
+    return fallback.replace("\n", " ")[:width]
+
+
 def _docs_section(conn: sqlite3.Connection, term: str) -> str:
     hits = _doc_mentions(conn, term)
     if not hits:
         return ""
     return ("\n### Documents mentioning it (prose: what was INTENDED, not what the code does)\n"
             + table(["document", "where", "excerpt", "cite"],
-                    [(h["member_name"], _section_label(h["line_no"]), h["snip"].replace("\n", " ")[:120],
+                    [(h["member_name"], _section_label(h["line_no"]),
+                      _hit_line(conn, h["member_id"], h["line_no"], term, h["snip"], 120),
                       f"{h['member_name']}:{h['line_no'] or 0}") for h in hits]))
 
 
@@ -1650,7 +1666,7 @@ def cmd_docs(conn: sqlite3.Connection, term: str) -> str:
             head = conn.execute("SELECT heading FROM doc_section WHERE member_id=? AND ordinal=?",
                                 (mid, h["line_no"])).fetchone()
             trows.append((_section_label(h["line_no"]), (head["heading"] if head and head["heading"] else "")[:40],
-                          h["snip"].replace("\n", " ")[:160], f"{doc}:{h['line_no'] or 0}"))
+                          _hit_line(conn, mid, h["line_no"], term, h["snip"]), f"{doc}:{h['line_no'] or 0}"))
         out.append(table(["where", "heading", "excerpt", "cite"], trows[:15]))
     out.append("\n> Full text of a section: `doc DOCNAME --sections n` (or `n-m`); every section about a term: "
                "`doc DOCNAME --grep TERM`; the outline: `doc DOCNAME`.\n"
@@ -1685,6 +1701,62 @@ def _parse_sections(spec: str) -> set:
     return out
 
 
+def cmd_doc_list(conn: sqlite3.Connection, pattern: Optional[str] = None) -> str:
+    """The indexed documents - by name, folder or extension - with their
+    section and picture counts: what `doc NAME` can be asked for."""
+    pat = (pattern or "").strip().upper()
+    rows = conn.execute("""SELECT m.id, m.name, m.path, m.parse_status,
+                                  (SELECT COUNT(*) FROM doc_section s WHERE s.member_id=m.id AND s.ordinal<1000) AS secs,
+                                  (SELECT COUNT(*) FROM doc_image i WHERE i.member_id=m.id) AS imgs,
+                                  (SELECT COUNT(*) FROM doc_image i WHERE i.member_id=m.id AND i.ocr_text IS NOT NULL) AS read
+                           FROM member m WHERE m.kind='doc' ORDER BY m.path""").fetchall()
+    if pat:
+        rows = [r for r in rows if pat in r["path"].upper()]
+    out = [f"# Documents in the index" + (f" matching `{pattern}`" if pat else "") + "\n\n"]
+    if not rows:
+        return out[0] + ("_none_" + (f" match `{pattern}`" if pat else " - documents are indexed from the folders in "
+                         "`extra_roots` (UI: Document folders / `--also`)") + "\n")
+    out.append(table(["document", "file", "folder", "sections", "pictures", "read by OCR", "status"],
+                     [(r["name"], os.path.basename(r["path"]), os.path.basename(os.path.dirname(r["path"])),
+                       r["secs"], r["imgs"], r["read"], r["parse_status"] or "") for r in rows[:500]]))
+    if len(rows) > 500:
+        out.append(f"_... {len(rows) - 500} more_\n")
+    out.append(f"\n- {len(rows)} document(s). `doc NAME` for the outline (a workbook's tabs are its sections), "
+               f"`doc NAME --sections n` for the rows / text, `docs TERM` to find which one mentions a term\n")
+    return "".join(out)
+
+
+def _doc_pictures(conn: sqlite3.Connection, member_id: int, doc_name: str) -> str:
+    """The pictures of a document grouped by where they sit, with the OCR
+    section that holds each one's text once `OCR images` has run."""
+    try:
+        imgs = conn.execute("SELECT name, anchor, ocr_text FROM doc_image WHERE member_id=? ORDER BY id",
+                            (member_id,)).fetchall()
+    except sqlite3.OperationalError:
+        return "\n_pictures: the index was built by an older toolkit - run the build once (no --rebuild needed)_\n"
+    if not imgs:
+        return ""
+    groups: Dict[str, List[str]] = {}
+    for im in imgs:
+        base = os.path.basename(im["name"])
+        # the OCR section that holds this picture's text: `image: NAME (place)` / `page N (OCR ...)`
+        like = (f"page {int(base[5:])} (OCR%" if base.startswith("page-") and base[5:].isdigit()
+                else f"image: {base}%")
+        sec = conn.execute("SELECT ordinal FROM doc_section WHERE member_id=? AND ordinal>=1000 AND heading LIKE ?",
+                           (member_id, like)).fetchone()
+        tag = base + (f" = section {sec['ordinal']}" if sec else (" (nothing recognised)" if im["ocr_text"] == "" else ""))
+        groups.setdefault(im["anchor"] or "(place unknown)", []).append(tag)
+    out = ["\n## Pictures (screenshots) and where they sit\n"]
+    for where, names in list(groups.items())[:80]:
+        shown = ", ".join(names[:12]) + (f" ... +{len(names) - 12}" if len(names) > 12 else "")
+        out.append(f"- **{where}**: {shown}\n")
+    if len(groups) > 80:
+        out.append(f"- ... {len(groups) - 80} more places\n")
+    out.append(f"- a picture's text is its section (1001+): `doc {doc_name} --sections 1001`; "
+               f"cite it as `[[{doc_name} 1001 \"token\"]]`\n")
+    return "".join(out)
+
+
 def cmd_doc(conn: sqlite3.Connection, name: str, sections: Optional[str] = None, grep: Optional[str] = None,
             budget: Optional[int] = None) -> str:
     """A document the model can read a section at a time: the outline
@@ -1715,6 +1787,7 @@ def cmd_doc(conn: sqlite3.Connection, name: str, sections: Optional[str] = None,
         out.append(table(["section", "heading", "chars", "starts with"], trows[:400]))
         if len(secs) > 400:
             out.append(f"_... {len(secs) - 400} more sections_\n")
+        out.append(_doc_pictures(conn, m["id"], m["name"]))
         return "".join(out)
     if sections:
         want = _parse_sections(sections)
@@ -1768,10 +1841,14 @@ def cmd_images(conn: sqlite3.Connection, name: Optional[str] = None) -> str:
                f"(no tokens). Pictures that OCR cannot read (diagrams, handwriting) are the ones worth "
                f"spending a vision-model call on - they are listed with their extracted path.\n")
     if name:
-        rows2 = conn.execute("""SELECT i.name, i.extracted_path, i.ocr_text FROM doc_image i JOIN member m ON m.id=i.member_id
-                                WHERE UPPER(m.name)=? ORDER BY i.id""", (name.upper(),)).fetchall()
-        out.append(table(["image", "extracted to", "OCR text (first 80 chars)"],
-                         [(r["name"], r["extracted_path"] or "", (r["ocr_text"] or ("(not read)" if r["ocr_text"] is None else "(nothing recognised)"))[:80].replace("\n", " "))
+        try:
+            rows2 = conn.execute("""SELECT i.name, i.anchor, i.extracted_path, i.ocr_text FROM doc_image i JOIN member m ON m.id=i.member_id
+                                    WHERE UPPER(m.name)=? ORDER BY i.id""", (name.upper(),)).fetchall()
+        except sqlite3.OperationalError:
+            return "".join(out) + "\n_the index was built by an older toolkit - run the build once (no --rebuild needed) to see where each picture sits_\n"
+        out.append(table(["image", "where it sits", "extracted to", "OCR text (first 80 chars)"],
+                         [(r["name"], r["anchor"] or "", r["extracted_path"] or "",
+                           (r["ocr_text"] or ("(not read)" if r["ocr_text"] is None else "(nothing recognised)"))[:80].replace("\n", " "))
                           for r in rows2]))
     return "".join(out)
 
@@ -3791,8 +3868,11 @@ def _main(argv: Optional[List[str]] = None) -> int:
     s = sub.add_parser("paragraph")
     s.add_argument("name")
     s.add_argument("para", help="paragraph / section name, or a line number")
-    s = sub.add_parser("doc", help="a document's outline, or the full text of its sections by number / by content")
-    s.add_argument("name")
+    s = sub.add_parser("doc", help="a document's outline, or the full text of its sections by number / by content; "
+                                   "--list shows the indexed documents")
+    s.add_argument("name", nargs="?", help="document name (file name without extension)")
+    s.add_argument("--list", nargs="?", const="", metavar="PATTERN",
+                   help="list the indexed documents (optionally only paths containing PATTERN, e.g. a folder name)")
     s.add_argument("--sections", help="which sections to print in full: 3, 3-5, or 2,7,9-12")
     s.add_argument("--grep", help="print every section containing this text (case-insensitive)")
     s.add_argument("--budget", type=int, help="character budget for the printed sections")
@@ -3892,7 +3972,10 @@ def _run(a: argparse.Namespace) -> int:
         elif a.cmd == "walk":
             print(cmd_walk(conn, a.name, a.start, a.budget, a.depth, not a.no_source, not a.no_data, a.max_lines))
         elif a.cmd == "doc":
-            print(cmd_doc(conn, a.name, a.sections, a.grep, a.budget))
+            if a.list is not None or not a.name:
+                print(cmd_doc_list(conn, a.list if a.list is not None else a.name))
+            else:
+                print(cmd_doc(conn, a.name, a.sections, a.grep, a.budget))
         elif a.cmd == "diff":
             print(cmd_diff(conn, a.old, a.new, a.context, a.budget, a.system))
         elif a.cmd == "literal":

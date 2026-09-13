@@ -39,7 +39,7 @@ INPUTS = {"name": "SAMPPGM", "kind": "program", "budget": "12000", "field": "PM-
           "field2": "PM-POLICY-STATUS", "pattern": "ERROR", "literal": "E001", "job": "SAMPJOB",
           "program": "SAMPPGM", "copybook": "PMASTREC", "member": "SAMPPGM", "range": "1-9999",
           "paragraph": "100-MAIN", "document": "CLAIMSPEC",
-          "old": "SAMPPGM", "new": "", "system": ""}
+          "old": "SAMPPGM", "new": "", "system": "", "docpattern": ""}
 USER_WRITTEN = {"abend.txt", "answer.md"}
 
 

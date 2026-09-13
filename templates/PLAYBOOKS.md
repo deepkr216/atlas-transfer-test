@@ -365,7 +365,9 @@ python -m atlas.query --db atlas.db --out work/diff-<CPY>.md diff GC/<CPY> GC-TE
 python -m atlas.query --db atlas.db --out work/walk-<PGM>.md walk <PGM> --budget 12000        # what each changed program does now
 python -m atlas.query --db atlas.db --out work/pack-<CPY>.md pack <CPY> --kind copybook       # every other program that expands the copybook
 python -m atlas.query --db atlas.db --out work/crud.md crud --job <JOB> [--job ...]           # the jobs that run them: C/R/U/D per dataset / table / segment
-python -m atlas.query --db atlas.db --out work/doc.md doc <QA-WORKBOOK> --grep <TEST-CASE>    # the QA workbook's tabs and screenshots, as sections
+python -m atlas.query --db atlas.db --out work/doclist.md doc --list QA                       # the QA workbooks in the index (file name = document name)
+python -m atlas.query --db atlas.db --out work/doc.md doc <QA-WORKBOOK>                       # its tabs as sections, screenshots and where they sit
+python -m atlas.query --db atlas.db --out work/doc.md doc <QA-WORKBOOK> --grep <TEST-CASE>    # the rows of the tab(s) mentioning the test case
 ```
 
 The folder under `estate\` names the system: `GC` and `GC-TEST` are two
