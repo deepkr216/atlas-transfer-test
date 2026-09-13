@@ -338,6 +338,27 @@ estate folder for a coding agent; `templates/PLAYBOOKS.md` has the per-task
 procedures (impact analysis, job dossier, error-code trace, design doc,
 code-generation bundle, test conditions, abend triage).
 
+## Freshness and hygiene
+
+An answer is only as current as the index, so every pack and `coverage`
+start with **when the index was built**, warn when a build started and
+never finished, and warn when a fetched library is incomplete. The fetch
+reconciles each PDS folder with the host's member list (`zowe zos-files
+list all-members`): a download that stopped part-way is reported
+`INCOMPLETE n/m`, the listed-but-missing members are named, local members
+the host no longer lists are moved to `<folder>/.stale/`, and the record
+(`.atlas-library.json`) is loaded so `program X` answers **NOT FETCHED**
+instead of NOT FOUND. The build re-parses everything when the toolkit's own
+source changed (`git pull`) or the manifest changed, re-parses every job
+when a PROC / INCLUDE / card member changed, never indexes its own outputs
+(`.atlas-output` marker, `*.exp.cbl`), types empty and comment-only members
+as `empty`, refuses a program row to a member with no `PROGRAM-ID` or
+DIVISION header, re-types a card deck found in a JCL library as `ctlcard`,
+never files a compiler listing as a program or a mainframe member as a
+document, keeps a hand-written `manifest.json` (the generated one goes to
+`manifest.generated.json`), and never prints a `--password` / token from
+`extra_args` into a log.
+
 ## What Atlas is not
 
 - **Not a compiler.** Extraction is grammar-aware regex over properly

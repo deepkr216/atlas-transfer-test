@@ -291,8 +291,9 @@ class App(tk.Tk if tk else object):
         threading.Thread(target=target, daemon=True).start()
 
     def _stream(self, cmd: List[str]) -> int:
-        self._log("> " + " ".join(cmd))
-        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        self._log("> " + fetch.redact_cmd(cmd))
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                             encoding="utf-8", errors="replace")
         assert p.stdout is not None
         for line in p.stdout:
             self._log(line)

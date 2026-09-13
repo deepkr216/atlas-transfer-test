@@ -228,7 +228,9 @@ class FetchLayer(unittest.TestCase):
         self.assertEqual(res[0].files, 1)
         self.assertTrue(cfg["sources"][0]["last_result"].startswith("ok"))
         self.assertIn("not found", cfg["sources"][1]["last_result"])
-        self.assertEqual(len(seen), 2)
+        # one download per source, plus the member list used to reconcile the PDS
+        self.assertEqual(len([c for c in seen if "download" in c]), 2)
+        self.assertEqual(len([c for c in seen if "all-members" in c and "list" in c]), 1)
         self.assertTrue(any(l.startswith("> ") for l in logs))
 
         man = fetch.write_manifest(cfg, os.path.join(self.td, "manifest.json"))

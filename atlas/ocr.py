@@ -179,6 +179,13 @@ def extract_images(conn: sqlite3.Connection, out_dir: str, member: Optional[str]
     for mid, name, path, ext in conn.execute(q, args).fetchall():
         ext = (ext or "").lower().lstrip(".")
         dest_dir = os.path.join(out_dir, name)
+        marker = os.path.join(out_dir, ".atlas-output")
+        if not os.path.exists(marker):
+            # the build skips folders carrying this marker: extracted images
+            # must never be re-indexed as documents
+            os.makedirs(out_dir, exist_ok=True)
+            with open(marker, "w") as mh:
+                mh.write("written by atlas.ocr; never indexed\n")
         if ext in _MEDIA_PREFIX:
             try:
                 with zipfile.ZipFile(path) as z:

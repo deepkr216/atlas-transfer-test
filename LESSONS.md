@@ -110,6 +110,14 @@ then the fix, then a row here. Nothing is "fixed" until the test exists.
 | 101 | ICETOOL steps were "SORT with no inline SYSIN"; OUTFIL FNAMES= outputs, JOINKEYS inputs and ICETOOL FROM/TO had DISP-only direction; `OUTREC=(1:1,10,11:21,5)` yielded no byte positions; SYMNAMES symbols yielded nothing | Only SYSIN read; column-positioned items rejected by a lookbehind; symbols not substituted | `test_sort_cards_roles_symbols_positions` |
 | 102 | `LOAD ... INTO TABLE X` and DSNTIAUL's `SELECT ... FROM X` were invisible: `table X` listed COBOL programs only, the unload file had DISP-only direction | Utility cards not parsed | `test_db2_utility_lineage` |
 | 103 | IDCAMS `RECORDSIZE`, `KEYS`, `LIMIT`, `RELATE` were dropped, so a copybook length could not be checked against the cluster | Only the DEFINE verb and name were kept | `test_idcams_attributes` |
+| 104 | Every member of `PROD.CLAIMS.CNTL` became a job; a BIND deck in `PROD.CLAIMS.BIND/x.txt` became a specification; a compiler listing became a second copy of the program | Folder hint `CNTL` -> jcl; `.txt` -> doc regardless of folder; no listing signature | `Classification.test_cntl_listing_unknown_and_jcl_by_content` |
+| 105 | A 0-byte or comment-only `.cbl` got a program row and outranked the real program; a card deck filed in the source library got a program row too | Folder hint decided the kind; `index_cobol` inserted a program for any member | `BuildLevel.test_kinds_and_no_phantom_rows` |
+| 106 | `out/expanded/CLMPOST.exp.cbl` was re-indexed on the next build as a second CLMPOST | The toolkit's own outputs were not marked | `test_kinds_and_no_phantom_rows` |
+| 107 | After `git pull` the index kept facts made by the previous parser; after a PROC change every job that expands it kept the old steps | Incremental build compared member bytes only | `test_proc_change_forces_jobs_and_fingerprint_forces_all` |
+| 108 | A library whose download stopped at member 2,900 of 4,100 was indexed as complete; a program deleted on the host years ago stayed live; a listed-but-missing program was "NOT FOUND" | Nothing compared the folder with the host's member list | `FetchReconcile.test_reconcile_writes_marker_and_moves_stale`, `test_library_marker_incomplete_and_not_fetched` |
+| 109 | A hand-written `manifest.json` was silently overwritten by every UI build | The generated manifest used the same path | `test_hand_written_manifest_is_kept` |
+| 110 | `--password x` in extra_args was echoed into the live log and the plan | Command lines were logged verbatim | `Classification.test_redact_cmd` |
+| 111 | Every report read as current, even from a build that crashed halfway or a download three months old | No "as of" line anywhere | `test_library_marker_incomplete_and_not_fetched` (index header) |
 
 ## Known gaps (not yet guarded - contributions welcome)
 

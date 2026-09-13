@@ -705,6 +705,21 @@ CREATE TABLE IF NOT EXISTS derived_summary (
     verified_by TEXT                      -- human initials, NULL until reviewed
 );
 
+-- A fetched library as the fetcher saw it: which members the host lists,
+-- which arrived. "NOT FOUND" and "NOT FETCHED" are different answers.
+CREATE TABLE IF NOT EXISTS library (
+    id          INTEGER PRIMARY KEY,
+    dataset     TEXT NOT NULL,
+    folder      TEXT NOT NULL,
+    fetched_at  TEXT,
+    rc          INTEGER,
+    expected    INTEGER,                  -- members the host listed
+    present     INTEGER,                  -- files on disk
+    complete    INTEGER,                  -- 1 = every listed member is on disk and rc = 0
+    missing     TEXT,                     -- JSON list of listed-but-absent members
+    stale       TEXT                      -- JSON list of local files the host no longer lists
+);
+
 CREATE TABLE IF NOT EXISTS build_run (
     id          INTEGER PRIMARY KEY,
     started_at  TEXT,
@@ -714,5 +729,7 @@ CREATE TABLE IF NOT EXISTS build_run (
     ok          INTEGER,
     partial     INTEGER,
     failed      INTEGER,
-    tool_version TEXT
+    tool_version TEXT,
+    fingerprint TEXT,                     -- sha256 of the parser source: a change re-parses everything
+    manifest_sha TEXT                     -- sha256 of the manifest used
 );

@@ -26,6 +26,7 @@ EXT_HINTS = {
     ".ctl": "ctlcard", ".card": "ctlcard", ".parm": "ctlcard", ".sysin": "ctlcard",
     ".asm": "asm", ".mac": "asm",
     ".rex": "rexx", ".rexx": "rexx",
+    ".lst": "listing", ".listing": "listing", ".sysprint": "listing",
     ".txt": "doc", ".md": "doc", ".doc": "doc", ".docx": "doc", ".pdf": "doc",
     ".xls": "doc", ".xlsx": "doc", ".ppt": "doc", ".pptx": "doc", ".csv": "doc",
     ".htm": "doc", ".html": "doc", ".vsd": "doc", ".vsdx": "doc",
@@ -36,7 +37,10 @@ EXT_HINTS = {
 DIR_HINTS = [
     (re.compile(r"COPY(LIB|BOOK)?S?$", re.I), "copybook"),
     (re.compile(r"PROCLIB$|PROCS?$", re.I), "proc"),
-    (re.compile(r"JCL(LIB)?$|JOBS?$|CNTL$", re.I), "jcl"),
+    (re.compile(r"JCL(LIB)?$|JOBS?$", re.I), "jcl"),
+    # CNTL / CARDLIB hold control cards; a real job inside one is caught by
+    # its JOB/EXEC statements before the folder hint is consulted.
+    (re.compile(r"CNTL(LIB)?$|CARD(LIB|S)?$", re.I), "ctlcard"),
     (re.compile(r"SRC$|SOURCE$|COBOL$|PGM(LIB)?$", re.I), "cobol"),
     (re.compile(r"DBD(LIB|SRC)?$", re.I), "dbd"),
     (re.compile(r"PSB(LIB|SRC)?$", re.I), "psb"),
@@ -78,6 +82,13 @@ _SIG_DATA_LEVEL = re.compile(r"^.{0,6}.?\s*(0[1-9]|[1-4]\d|66|77|88)\s+[A-Z0-9][
                              re.I | re.M)
 _SIG_ASM = re.compile(r"^\s*\w*\s+(CSECT|DSECT|START|DFHEIENT)\b", re.I | re.M)
 _SIG_REXX = re.compile(r"^\s*/\*\s*REXX", re.I)
+# A compiler listing echoes the source: without this it is filed as a
+# second copy of the program, with line-number prefixes as fields.
+_SIG_LISTING = re.compile(r"^1?PP\s+5655-|IBM Enterprise COBOL for z\/OS|^\s+LineID\s+PL\s+SL\b|"
+                          r"CROSS REFERENCE TABLE|\bMODULE MAP\b|^1?\s*DATA DIVISION MAP\b", re.I | re.M)
+# A folder named like a dataset (PROD.CLAIMS.SRC) holds mainframe members:
+# an unrecognised member there is UNKNOWN, never a document.
+_DATASET_FOLDER = re.compile(r"^[A-Z0-9$#@]{1,8}(?:\.[A-Z0-9$#@]{1,8})+$")
 
 
 def classify(path: str, head: str, ext_hint: Optional[str] = None) -> Tuple[str, str]:
@@ -107,6 +118,8 @@ def classify(path: str, head: str, ext_hint: Optional[str] = None) -> Tuple[str,
         return "bms", "DFHMSD/DFHMDI macro"
     if _SIG_MFS.search(head):
         return "mfs", "MFS statement"
+    if _SIG_LISTING.search(head) or ext in (".lst", ".listing", ".sysprint"):
+        return "listing", "compiler listing (source echo, not the source)"
     if _SIG_COBOL.search(head) or _SIG_PROGRAM_ID.search(head):
         return "cobol", "IDENTIFICATION DIVISION / PROGRAM-ID"
     if _SIG_ASM.search(head):
@@ -127,6 +140,10 @@ def classify(path: str, head: str, ext_hint: Optional[str] = None) -> Tuple[str,
 
     # ---- last resort: the extension ---------------------------------------
     if ext in EXT_HINTS:
+        if EXT_HINTS[ext] == "doc" and _DATASET_FOLDER.match(parent.upper()):
+            # A .txt in PROD.CLAIMS.BIND is a mainframe member the toolkit
+            # cannot type (BIND cards, DBRM, PL/I ...) - not a specification.
+            return "unknown", f"unrecognised member of library {parent} (extension {ext} ignored)"
         return EXT_HINTS[ext], f"extension {ext}"
 
     return "unknown", "no signature, no library hint, no extension"

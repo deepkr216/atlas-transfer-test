@@ -177,6 +177,13 @@ def cmd_program(conn: sqlite3.Connection, name: str) -> str:
         other = conn.execute("SELECT kind, path FROM member WHERE UPPER(name)=? ORDER BY authoritative DESC",
                              (n,)).fetchall()
         if not steps and not callers and not tx and not cards and not other:
+            # Listed by the host but never downloaded is a different answer
+            # from "does not exist": the fetch record knows which.
+            for lib in conn.execute("SELECT dataset, fetched_at, missing FROM library WHERE complete=0"):
+                if n in [x.upper() for x in _jl(lib["missing"])]:
+                    return (f"# {name}\n\n**NOT FETCHED** - `{lib['dataset']}` lists a member {n} (host listing "
+                            f"{(lib['fetched_at'] or '?')[:10]}) but it was not downloaded. Fetch the library again "
+                            f"before concluding anything about it.\n")
             return f"# {name}\n\n**NOT FOUND** - no member with this name, and nothing indexed runs or calls it.\n"
         if other:
             out = [f"# {n}\n\n**Not a program**: indexed as a `{other[0]['kind']}` member (`{other[0]['path']}`). "
@@ -1276,8 +1283,36 @@ def cmd_ambiguous(conn: sqlite3.Connection) -> str:
     return "".join(out)
 
 
+def index_header(conn: sqlite3.Connection) -> str:
+    """When the index was built and from what - every answer is 'as of'
+    this, and a build that never finished is said so."""
+    last = conn.execute("SELECT started_at, finished_at, root, members FROM build_run WHERE finished_at IS NOT NULL "
+                        "ORDER BY id DESC LIMIT 1").fetchone()
+    hanging = conn.execute("SELECT started_at FROM build_run WHERE finished_at IS NULL ORDER BY id DESC LIMIT 1").fetchone()
+    parts = []
+    if last:
+        parts.append(f"index built {last['finished_at']} from {os.path.basename(last['root'] or '') or last['root']} "
+                     f"({last['members']} members)")
+    else:
+        parts.append("index never completed a build")
+    if hanging and (not last or hanging["started_at"] > (last["finished_at"] or "")):
+        parts.append(f"WARNING: a build started {hanging['started_at']} has not finished (running, or crashed) - "
+                     f"facts may be partial")
+    inc = conn.execute("SELECT COUNT(*) FROM library WHERE complete=0").fetchone()[0]
+    if inc:
+        parts.append(f"WARNING: {inc} fetched librar{'y is' if inc == 1 else 'ies are'} INCOMPLETE (see coverage)")
+    return "; ".join(parts)
+
+
 def cmd_coverage(conn: sqlite3.Connection) -> str:
-    out = ["# Coverage - what the index does and does not know\n"]
+    out = ["# Coverage - what the index does and does not know\n", f"\n_{index_header(conn)}_\n"]
+    libs = conn.execute("SELECT dataset, fetched_at, expected, present, complete, missing, stale FROM library ORDER BY dataset").fetchall()
+    if libs:
+        out.append("\n### Fetched libraries (what the host listed vs what arrived)\n")
+        out.append(table(["dataset", "fetched", "members", "present", "state", "missing (first few)"],
+                         [(l["dataset"], (l["fetched_at"] or "")[:10], l["expected"], l["present"],
+                           "complete" if l["complete"] else "**INCOMPLETE**",
+                           ", ".join(_jl(l["missing"])[:6]) + (" ..." if len(_jl(l["missing"])) > 6 else "")) for l in libs]))
     out.append("\n### Members\n")
     out.append(table(["kind", "status", "count"], conn.execute(
         "SELECT kind, parse_status, COUNT(*) FROM member GROUP BY 1,2 ORDER BY 1,2").fetchall()))
@@ -1516,7 +1551,7 @@ def cmd_pack(conn: sqlite3.Connection, name: str, max_lines: int = 120, kind: Op
         text = _strip_paths(text)
     est = len(text) // 4
     return (f"<!-- pack {kind} {name.upper()}: ~{est} tokens ({len(text)} chars)"
-            + (f", budget {budget}" if budget else "") + " -->\n") + text
+            + (f", budget {budget}" if budget else "") + f"; {index_header(conn)} -->\n") + text
 
 
 # --------------------------------------------------------------------------

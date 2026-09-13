@@ -145,7 +145,8 @@ def open_db(path: str, rebuild: bool = False) -> sqlite3.Connection:
                              ("ims_pcb", "procseq", "TEXT"), ("ims_dbd", "dd1", "TEXT"), ("ims_dbd", "dd2", "TEXT"),
                              ("dataset", "recordsize_max", "INTEGER"), ("dataset", "key_len", "INTEGER"),
                              ("dataset", "key_off", "INTEGER"), ("dataset", "gdg_limit", "INTEGER"),
-                             ("dataset", "relates_to", "TEXT")):
+                             ("dataset", "relates_to", "TEXT"), ("build_run", "fingerprint", "TEXT"),
+                             ("build_run", "manifest_sha", "TEXT")):
         _ensure_column(conn, table, col, decl)
     with open(os.path.join(HERE, "schema.sql"), "r", encoding="utf-8") as fh:
         conn.executescript(fh.read())
@@ -169,6 +170,32 @@ def _j(v) -> Optional[str]:
 
 def sha(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def tool_fingerprint() -> str:
+    """sha256 of the parser source. A `git pull` that changes a parser must
+    re-parse every member, or the index keeps facts an older parser made."""
+    h = hashlib.sha256()
+    for fn in sorted(os.listdir(HERE)):
+        if fn.endswith((".py", ".sql")):
+            with open(os.path.join(HERE, fn), "rb") as fh:
+                h.update(fn.encode() + fh.read())
+    return h.hexdigest()[:16]
+
+
+def code_line_count(kind: str, text: str, data: bytes, enc: str) -> int:
+    """Lines that carry code: comment-only and empty members become
+    programs with no facts otherwise, and outrank the real one."""
+    if kind in ("cobol", "copybook"):
+        lines, _ = reader.read_cobol_lines(text, data=data, enc=enc)
+        return sum(1 for l in lines if not l.is_comment and l.code.strip())
+    recs = reader._split_records(text, data, enc)
+    if kind in ("jcl", "proc"):
+        return sum(1 for r in recs if r.strip() and not r.startswith("//*") and r.strip() != "//")
+    return sum(1 for r in recs if r.strip() and not r.lstrip().startswith("*"))
+
+
+OUTPUT_MARKER = ".atlas-output"
 
 
 def norm_hash(kind: str, text: str, data: bytes, enc: str) -> Tuple[str, int, int]:
@@ -198,9 +225,15 @@ def _forget_member(conn: sqlite3.Connection, mid: int) -> None:
 def _scan_files(root: str, limit: Optional[int] = None):
     count = 0
     for dirpath, dirs, files in os.walk(root):
+        # Folders the toolkit itself wrote (expanded sources, extracted
+        # images) carry a marker: indexing them again would create a second
+        # copy of every program from its own expansion.
+        if OUTPUT_MARKER in files:
+            dirs[:] = []
+            continue
         dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.startswith(".")]
         for fn in sorted(files):
-            if fn.startswith("."):
+            if fn.startswith(".") or fn.lower().endswith(".exp.cbl"):
                 continue
             yield dirpath, fn
             count += 1
@@ -208,16 +241,43 @@ def _scan_files(root: str, limit: Optional[int] = None):
                 return
 
 
-def inventory(ctx: Ctx, roots, limit: Optional[int] = None) -> None:
+def _load_library_markers(ctx: Ctx, roots) -> None:
+    """`.atlas-library.json` written by the fetcher: what the host listed
+    versus what arrived. Loaded into `library` so coverage can say
+    'PROD.CLAIMS.SRC 3912/4100 INCOMPLETE' and `program X` can say NOT
+    FETCHED instead of NOT FOUND."""
+    conn = ctx.conn
+    conn.execute("DELETE FROM library")
+    for root in roots:
+        for dirpath, _dirs, files in os.walk(root):
+            if ".atlas-library.json" not in files:
+                continue
+            try:
+                with open(os.path.join(dirpath, ".atlas-library.json"), "r", encoding="utf-8") as fh:
+                    rec = json.load(fh)
+            except (OSError, ValueError):
+                continue
+            conn.execute("INSERT INTO library(dataset,folder,fetched_at,rc,expected,present,complete,missing,stale) "
+                         "VALUES(?,?,?,?,?,?,?,?,?)",
+                         (rec.get("dataset"), os.path.normpath(dirpath), rec.get("fetched_at"), rec.get("rc"),
+                          rec.get("expected"), rec.get("present"), int(bool(rec.get("complete"))),
+                          _j(rec.get("missing")), _j(rec.get("stale"))))
+            if not rec.get("complete"):
+                ctx.say(f"  INCOMPLETE library {rec.get('dataset')}: {rec.get('present')}/{rec.get('expected')} members")
+
+
+def inventory(ctx: Ctx, roots, limit: Optional[int] = None, force_all: bool = False) -> None:
     """Hash and classify every file under each root; re-index only what changed.
 
     `roots` is the estate folder plus any extra folders (`--also`): the
     documentation folder is usually NOT a mainframe dataset and lives elsewhere.
 
     Incremental by default: a member whose bytes are unchanged keeps its facts.
-    A changed COPYBOOK forces every program that expands it to be re-parsed,
-    because those programs' facts were derived from the old text. Members that
-    vanished from the folders are pruned. `--rebuild` starts from an empty db.
+    A changed COPYBOOK forces every program that expands it (and every
+    copybook that copies it) to be re-parsed; a changed PROC / INCLUDE /
+    control-card member forces every job. `force_all` (parser or manifest
+    changed) re-parses everything. Members that vanished are pruned.
+    `--rebuild` starts from an empty db.
     """
     conn = ctx.conn
     now = time.strftime("%Y-%m-%dT%H:%M:%S")
@@ -246,18 +306,36 @@ def inventory(ctx: Ctx, roots, limit: Optional[int] = None) -> None:
             text, enc = reader.decode_bytes(data)
             kind, _why = classify.classify(path, text[:8192])
             norm, nlines, fixed = norm_hash(kind, text, data, enc)
+            if kind in CODE_KINDS and code_line_count(kind, text, data, enc) == 0:
+                kind = "empty"           # a stub or a retired member: never a program row
         found.append((path, os.path.splitext(fn)[0].upper(), kind, os.path.basename(dirpath), ext,
                       sha(data), norm, len(data), nlines, fixed))
     found_by = {f[0]: f for f in found}
+    _load_library_markers(ctx, roots)
 
-    changed_names = {f[1] for f in found if f[2] in ("copybook", "cobol")
-                     and (f[0] not in existing or existing[f[0]][1] != f[5])}
+    changed = [f for f in found if f[0] not in existing or existing[f[0]][1] != f[5]]
+    changed_names = {f[1] for f in changed if f[2] in ("copybook", "cobol")}
     forced: set = set()
     if changed_names and existing:
-        q = ",".join("?" * len(changed_names))
-        forced = {r[0] for r in conn.execute(
-            f"SELECT DISTINCT m.path FROM copy_use c JOIN member m ON m.id=c.member_id "
-            f"WHERE UPPER(c.copybook) IN ({q})", tuple(changed_names))}
+        # programs and copybooks that expand a changed copybook, transitively
+        pending = set(changed_names)
+        seen_names: set = set()
+        while pending:
+            q = ",".join("?" * len(pending))
+            rows = conn.execute(f"SELECT DISTINCT m.path, m.name, m.kind FROM copy_use c JOIN member m ON m.id=c.member_id "
+                                f"WHERE UPPER(c.copybook) IN ({q})", tuple(pending)).fetchall()
+            seen_names |= pending
+            pending = set()
+            for r in rows:
+                forced.add(r[0])
+                if r[2] == "copybook" and r[1] not in seen_names:
+                    pending.add(r[1])
+    if any(f[2] in ("proc", "jcl", "ctlcard") for f in changed) and existing:
+        # a PROC, INCLUDE or card member changed: every job that expands it
+        # carries its facts - re-parse all JCL (cheap next to COBOL)
+        forced |= {r[0] for r in conn.execute("SELECT path FROM member WHERE kind IN ('jcl','proc')")}
+    if force_all:
+        forced |= set(existing)
 
     kept: Dict[str, int] = {}
     for path, (mid, ex_sha, ex_status) in existing.items():
@@ -492,6 +570,15 @@ def index_cobol(ctx: Ctx, mem: Mem) -> None:
     exp = expand.expand(lines, mem.id, make_resolver(ctx, mem, notes))
     exp_text = expand.expanded_text(exp)
     facts = cobol.parse_program(exp_text)
+
+    if facts.program_id is None and not re.search(r"\b(?:IDENTIFICATION|ID|DATA|PROCEDURE)\s+DIVISION\b",
+                                                   exp_text, re.IGNORECASE):
+        # Not a program at all (a copybook or a card deck filed in the source
+        # library): no program row, and the member says why.
+        conn.execute("UPDATE member SET parse_status='skipped', parse_error=? WHERE id=?",
+                     ("no PROGRAM-ID and no DIVISION header - not a program", mem.id))
+        ctx.bump("not_a_program")
+        return
 
     pid_name = facts.program_id or mem.name
     cur = conn.execute(
@@ -770,6 +857,14 @@ def index_jcl(ctx: Ctx, mem: Mem) -> None:
 def _index_jcl_facts(ctx: Ctx, mem: Mem, facts: jcl.JclFacts) -> None:
     conn = ctx.conn
     job_id = proc_id = None
+    if not facts.steps and not facts.job_name and not facts.is_proc and not facts.instream_procs and mem.kind != "proc":
+        # A member in a JCL-named folder with no JOB/EXEC/PROC statement is a
+        # control-card member, not a job: re-typed so it is looked up as cards
+        # and never gets a phantom job row.
+        conn.execute("UPDATE member SET kind='ctlcard' WHERE id=?", (mem.id,))
+        mem.kind = "ctlcard"
+        ctx.bump("retyped:ctlcard")
+        return
     if facts.is_proc or mem.kind == "proc":
         cur = conn.execute(
             "INSERT INTO proc_def(member_id,proc_name,symbolics,instream,line) VALUES(?,?,?,?,?)",
@@ -1300,13 +1395,33 @@ def _main(argv: Optional[List[str]] = None) -> int:
     conn = open_db(args.db, rebuild=args.rebuild)
     ctx = Ctx(conn, quiet=args.quiet)
     ctx.write_expanded = args.write_expanded
-    run = conn.execute("INSERT INTO build_run(started_at,root,tool_version) VALUES(?,?,?)",
-                       (time.strftime("%Y-%m-%dT%H:%M:%S"), args.root, VERSION))
+    if ctx.write_expanded:
+        os.makedirs(ctx.write_expanded, exist_ok=True)
+        with open(os.path.join(ctx.write_expanded, OUTPUT_MARKER), "w") as fh:
+            fh.write("written by atlas.build --write-expanded; never indexed\n")
+    fp = tool_fingerprint()
+    man_sha = None
+    if args.manifest and os.path.isfile(args.manifest):
+        with open(args.manifest, "rb") as fh:
+            man_sha = sha(fh.read())[:16]
+    last = conn.execute("SELECT fingerprint, manifest_sha FROM build_run WHERE finished_at IS NOT NULL "
+                        "ORDER BY id DESC LIMIT 1").fetchone()
+    force_all = False
+    if last is not None and not args.rebuild:
+        if last["fingerprint"] and last["fingerprint"] != fp:
+            force_all = True
+            ctx.say("toolkit changed since the last build: every member is re-parsed")
+        elif (last["manifest_sha"] or None) != man_sha:
+            force_all = True
+            ctx.say("manifest changed since the last build: every member is re-parsed")
+    run = conn.execute("INSERT INTO build_run(started_at,root,tool_version,fingerprint,manifest_sha) VALUES(?,?,?,?,?)",
+                       (time.strftime("%Y-%m-%dT%H:%M:%S"), args.root, VERSION, fp, man_sha))
     run_id = run.lastrowid
+    conn.commit()                              # a crash leaves a run with no finished_at: visible in `coverage`
 
     roots = [args.root, *(args.also or [])]
     ctx.say("inventory: " + ", ".join(roots))
-    inventory(ctx, roots, args.limit)
+    inventory(ctx, roots, args.limit, force_all=force_all)
     conn.commit()
     ctx.say(f"  {len(ctx.members)} files: " + ", ".join(
         f"{k[5:]}={v}" for k, v in sorted(ctx.stats.items()) if k.startswith("kind:")))

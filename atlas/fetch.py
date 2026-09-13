@@ -254,6 +254,30 @@ def parse_member_list(stdout: str) -> List[str]:
 # running
 # --------------------------------------------------------------------------
 
+_SECRET_FLAGS = {"--password", "--pass", "--pw", "--token-value", "--tv", "--cert-key-file", "--api-key"}
+
+
+def redact_cmd(cmd: List[str]) -> str:
+    """The command line as it may be logged: a password or token given in
+    extra_args never reaches the live log, a crash file or a pasted pack."""
+    out: List[str] = []
+    hide = False
+    for tok in cmd:
+        if hide:
+            out.append("<redacted>")
+            hide = False
+            continue
+        low = tok.lower()
+        if low in _SECRET_FLAGS:
+            out.append(tok)
+            hide = True
+        elif "=" in low and low.split("=", 1)[0] in _SECRET_FLAGS:
+            out.append(low.split("=", 1)[0] + "=<redacted>")
+        else:
+            out.append(tok)
+    return " ".join(out)
+
+
 class Runner:
     """subprocess wrapper; tests substitute a fake with the same run() shape."""
 
@@ -262,7 +286,10 @@ class Runner:
 
     def run(self, cmd: List[str]) -> Tuple[int, str, str]:
         try:
-            p = subprocess.run(cmd, capture_output=True, text=True, timeout=self.timeout)
+            # Zowe prints UTF-8; the Windows console codepage would otherwise
+            # abort the whole fetch on the first unmappable byte.
+            p = subprocess.run(cmd, capture_output=True, text=True, timeout=self.timeout,
+                               encoding="utf-8", errors="replace")
             return p.returncode, p.stdout or "", p.stderr or ""
         except FileNotFoundError:
             return 127, "", f"not found: {cmd[0]}"
@@ -307,8 +334,9 @@ def fetch_source(cfg: Dict, src: Dict, runner: Optional[Runner] = None,
     runner = runner or Runner(int(cfg["zowe"].get("timeout_seconds") or 3600))
     cmd = download_cmd(cfg, src)
     dest = local_path(cfg, src)
-    os.makedirs(dest if src.get("type", "pds") != "seq" else os.path.dirname(dest) or ".", exist_ok=True)
-    log(f"> {' '.join(cmd)}")
+    is_pds = src.get("type", "pds") != "seq"
+    os.makedirs(dest if is_pds else os.path.dirname(dest) or ".", exist_ok=True)
+    log(f"> {redact_cmd(cmd)}")
     t0 = time.time()
     if zowe_exe(cfg) is None:
         res = FetchResult(src["dataset"], False, 0, 0.0, "zowe not on PATH", cmd)
@@ -321,10 +349,67 @@ def fetch_source(cfg: Dict, src: Dict, runner: Optional[Runner] = None,
         else:
             tail = (err or out).strip().splitlines()[-3:]
             res = FetchResult(src["dataset"], False, n, secs, f"rc {rc}: " + " | ".join(tail)[:300], cmd)
+        if is_pds:
+            # Reconcile with what the host says the library holds. A download
+            # that stopped at member 2,900 of 4,100, or a member deleted on
+            # the host months ago, must not be indexed as if complete.
+            rec = reconcile_library(cfg, src, dest, rc, runner, log)
+            if rec and not rec["complete"]:
+                res = FetchResult(src["dataset"], False, n, secs,
+                                  f"INCOMPLETE {rec['present']}/{rec['expected']} members"
+                                  + (f" ({len(rec['missing'])} missing)" if rec["missing"] else "")
+                                  + (f"; rc {rc}" if rc else ""), cmd)
     src["last_fetched"] = time.strftime("%Y-%m-%dT%H:%M:%S")
     src["last_result"] = ("ok " if res.ok else "FAILED ") + res.message
     log(("  ok   " if res.ok else "  FAIL ") + f"{src['dataset']}: {res.message}")
     return res
+
+
+LIBRARY_MARKER = ".atlas-library.json"
+
+
+def reconcile_library(cfg: Dict, src: Dict, dest: str, rc: int, runner: Runner,
+                      log: Callable[[str], None] = print) -> Optional[Dict]:
+    """List the members on the host and compare with the folder.
+
+    Writes `<dest>/.atlas-library.json` (dataset, fetched_at, rc, expected,
+    present, missing, stale) for the build to load into `library`; local
+    files the host no longer lists are moved to `<dest>/.stale/` so a
+    retired program does not stay alive in the index. Returns the record,
+    or None when the member list could not be obtained (then nothing is
+    moved and the folder is trusted as it is)."""
+    rc_l, out, err = runner.run(list_members_cmd(cfg, src["dataset"]))
+    if rc_l != 0:
+        log(f"  (member list unavailable, rc {rc_l}: folder taken as is)")
+        return None
+    expected = sorted(set(parse_member_list(out)))
+    if not expected:
+        return None
+    present_files = {}
+    for fn in os.listdir(dest):
+        p = os.path.join(dest, fn)
+        if os.path.isfile(p) and not fn.startswith("."):
+            present_files[os.path.splitext(fn)[0].upper()] = fn
+    present = sorted(set(present_files))
+    missing = [m for m in expected if m not in present_files]
+    stale = [m for m in present if m not in set(expected)]
+    if stale:
+        stale_dir = os.path.join(dest, ".stale")
+        os.makedirs(stale_dir, exist_ok=True)
+        for m in stale:
+            try:
+                os.replace(os.path.join(dest, present_files[m]), os.path.join(stale_dir, present_files[m]))
+            except OSError:
+                pass
+        log(f"  {len(stale)} local member(s) no longer on the host moved to {stale_dir}")
+    rec = {"dataset": src["dataset"], "folder": dest.replace("\\", "/"), "fetched_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+           "rc": rc, "expected": len(expected), "present": len(expected) - len(missing),
+           "complete": rc == 0 and not missing, "missing": missing[:2000], "stale": stale[:2000]}
+    with open(os.path.join(dest, LIBRARY_MARKER), "w", encoding="utf-8") as fh:
+        json.dump(rec, fh, indent=1)
+    if missing:
+        log(f"  {len(missing)} listed member(s) NOT downloaded: {', '.join(missing[:8])}{' ...' if len(missing) > 8 else ''}")
+    return rec
 
 
 def fetch_all(cfg: Dict, runner: Optional[Runner] = None, log: Callable[[str], None] = print,
@@ -344,9 +429,27 @@ def fetch_all(cfg: Dict, runner: Optional[Runner] = None, log: Callable[[str], N
 # hand-off to the index
 # --------------------------------------------------------------------------
 
+MANIFEST_MARK = "atlas.fetch"
+
+
 def write_manifest(cfg: Dict, path: str) -> Dict:
-    """build.py's manifest, derived from the sources so they cannot disagree."""
-    man: Dict = {"authoritative": [], "system_of": {}, "systems": {}, "copylib_order": {}}
+    """build.py's manifest, derived from the sources so they cannot disagree.
+
+    A manifest.json written BY HAND (no `_generated_by` marker) is never
+    overwritten: the generated one goes to `manifest.generated.json` next to
+    it and the caller is told - the hand-kept declarations stay in force.
+    """
+    if os.path.isfile(path):
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                existing = json.load(fh)
+        except (OSError, ValueError):
+            existing = None
+        if isinstance(existing, dict) and existing.get("_generated_by") != MANIFEST_MARK:
+            alt = os.path.join(os.path.dirname(path), "manifest.generated.json")
+            print(f"manifest {path} was written by hand - kept; the generated manifest is {alt}")
+            path = alt
+    man: Dict = {"_generated_by": MANIFEST_MARK, "authoritative": [], "system_of": {}, "systems": {}, "copylib_order": {}}
     for src in cfg["sources"]:
         if not src.get("enabled", True):
             continue
@@ -413,7 +516,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if a.plan:
         for src in cfg["sources"]:
             flag = "" if src.get("enabled", True) else "  (disabled)"
-            print(" ".join(download_cmd(cfg, src)) + flag)
+            print(redact_cmd(download_cmd(cfg, src)) + flag)
         man = os.path.join(os.path.dirname(os.path.abspath(a.config)), "manifest.json")
         print(" ".join(build_cmd(cfg, man, a.rebuild)))
         return 0
