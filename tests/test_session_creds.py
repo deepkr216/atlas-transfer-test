@@ -89,5 +89,48 @@ class SessionCredentials(unittest.TestCase):
             self.assertNotIn(SECRET, fh.read())                      # never written to sources.json
 
 
+class StagedCheck(unittest.TestCase):
+    """Check Zowe says which of three stages fails: found, runs, host answers."""
+
+    def _cfg(self):
+        cfg = fetch.load_config(os.path.join(tempfile.mkdtemp(), "nope.json"))
+        cfg["sources"] = [fetch.new_source("PROD.X.SRC", "cobol")]
+        return cfg
+
+    class Fake:
+        def __init__(self, list_rc=0, list_err=""):
+            self.list_rc, self.list_err = list_rc, list_err
+
+        def run(self, cmd):
+            if "--version" in cmd:
+                return 0, "7.18.0\n", ""
+            if "list" in cmd:
+                return self.list_rc, ('{"success":true,"data":{"apiResponse":{"items":[{"member":"A"},{"member":"B"}]}}}'
+                                      if self.list_rc == 0 else ""), self.list_err
+            return 1, "", "unexpected"
+
+    def test_all_three_stages_pass(self):
+        with mock.patch("atlas.fetch.zowe_exe", return_value=r"C:\\npm\\zowe.cmd"):
+            ok, msg = fetch.check_zowe(self._cfg(), runner=self.Fake())
+        self.assertTrue(ok, msg)
+        self.assertIn("1. zowe found: C:\\\\npm\\\\zowe.cmd", msg)
+        self.assertIn("2. zowe --version: 7.18.0", msg)
+        self.assertIn("3. host answered: PROD.X.SRC has 2 member(s)", msg)
+
+    def test_host_refuses_with_password_prompt(self):
+        with mock.patch("atlas.fetch.zowe_exe", return_value="zowe"):
+            ok, msg = fetch.check_zowe(self._cfg(), runner=self.Fake(1, "Enter password: \nCommand Error: password required"))
+        self.assertFalse(ok)
+        self.assertIn("3. the host did NOT answer", msg)
+        self.assertIn("zowe wanted a password", msg)
+
+    def test_host_refuses_for_another_reason(self):
+        with mock.patch("atlas.fetch.zowe_exe", return_value="zowe"):
+            ok, msg = fetch.check_zowe(self._cfg(), runner=self.Fake(1, "Error: self signed certificate in certificate chain"))
+        self.assertFalse(ok)
+        self.assertIn("self signed certificate", msg)
+        self.assertIn("run it by hand in your window and compare", msg)
+
+
 if __name__ == "__main__":
     unittest.main()

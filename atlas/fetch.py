@@ -351,17 +351,41 @@ class FetchResult:
 
 
 def check_zowe(cfg: Dict, runner: Optional[Runner] = None) -> Tuple[bool, str]:
-    if zowe_exe(cfg) is None:
-        return False, (f"'{cfg['zowe'].get('executable') or 'zowe'}' is not on PATH. Install Zowe CLI "
-                       f"or set zowe.executable in the config to its full path.")
-    runner = runner or Runner(60)
+    """Three stages, each reported: is zowe found (and which file), does it
+    run, and - with the first enabled dataset - does the host answer a
+    member list through this profile. The stage that fails is the problem;
+    the message says what to do about it."""
+    exe = zowe_exe(cfg)
+    if exe is None:
+        return False, (f"1. '{cfg['zowe'].get('executable') or 'zowe'}' is not on PATH for this process. "
+                       "If it works in your own window, that window has a PATH this one lacks: start the UI from "
+                       "that same window, or set zowe.executable in sources.json to the full path "
+                       "(`where zowe` shows it).")
+    lines = [f"1. zowe found: {exe}"]
+    runner = runner or Runner(120)
     rc, out, err = runner.run(version_cmd(cfg))
     if rc != 0:
-        return False, f"zowe --version failed (rc {rc}): {err.strip()[:200]}"
-    msg = f"zowe {out.strip().splitlines()[0] if out.strip() else '?'}"
-    if cfg["zowe"].get("profile"):
-        msg += f", profile {cfg['zowe']['profile']}"
-    return True, msg
+        return False, "\n".join(lines + [f"2. zowe --version failed (rc {rc}): {(err or out).strip()[:300]}"])
+    lines.append(f"2. zowe --version: {out.strip().splitlines()[0] if out.strip() else '?'}"
+                 + (f", profile {cfg['zowe']['profile']}" if cfg["zowe"].get("profile") else "")
+                 + (", session password set" if has_session_credentials() else ", no session password"))
+    first = next((x for x in cfg.get("sources", []) if x.get("enabled", True) and x.get("type", "pds") != "seq"), None)
+    if first is None:
+        lines.append("3. no enabled PDS in the table yet - add one, then Check again to test the host connection")
+        return True, "\n".join(lines)
+    rc, out, err = runner.run(list_members_cmd(cfg, first["dataset"]))
+    if rc != 0:
+        tail = " | ".join((err or out).strip().splitlines()[-3:])[:400]
+        hint = password_hint(rc, out, err)
+        lines.append(f"3. the host did NOT answer `zowe zos-files list all-members {first['dataset']}` (rc {rc}): {tail}"
+                     + (f"\n   -> {hint}" if hint else
+                        "\n   -> the same command with your profile: run it by hand in your window and compare - "
+                        "a different profile, a certificate flag or a typo in the dataset name shows here"))
+        return False, "\n".join(lines)
+    members = parse_member_list(out)
+    lines.append(f"3. host answered: {first['dataset']} has {len(members)} member(s) - connection, profile and "
+                 "password are fine; Fetch will work")
+    return True, "\n".join(lines)
 
 
 def _count_files(path: str) -> int:
