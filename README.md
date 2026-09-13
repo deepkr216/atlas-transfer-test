@@ -96,7 +96,12 @@ everything else:
 - **Folders** — each department gets its own folder under `local_root`
   (`C:\estate\CLAIMS\PROD.CLAIMS.SRC`), so same-named members in two
   departments never collide on disk; the library folder name is still the
-  dataset name, so classification and the manifest keep working.
+  dataset name, so classification and the manifest keep working. The
+  folder between the estate root and the library folder **names the
+  system** even without a manifest (`estate\GC\PROD.GC.SRC` → system `GC`;
+  `estate\SHARED\...` → `SHARED`). A lower environment goes in its own
+  system folder (`estate\GC-TEST\TEST.GC.SRC`): its programs expand its
+  copybooks, and `diff GC/PGM GC-TEST/PGM` compares the two copies.
 - **Bulk add** — paste a department's dataset list (one per line); kinds are
   inferred from the names (`SRC`, `COPYLIB`, `JCLLIB`, `PROCLIB`, `PARMLIB`,
   `PSBSOURCE`, `DBDSRC`, `BMS`, `MFS`, `CSD`, `STAGE1`, `CA7`…), and
@@ -290,6 +295,16 @@ falls back to the bare PROC only when no indexed job expands it.
   DIVISION names, and only those, with offsets; the paragraphs nothing
   reaches. A budget keeps the order and the facts and drops source from the
   end. This is the program-by-program read, done for the model.
+- `diff OLD NEW [--budget N]` — two versions of a member, the production
+  copy and the changed one (`GC/CLMPOST GC-TEST/CLMPOST`, `NAME@LIBRARY`, or
+  the path of a file just downloaded): the paragraphs, calls, copybooks,
+  tables, files, DL/I and CICS facts that changed, the fields added or
+  redefined and the fields that only **shifted** (grouped: "2 fields shift
+  +1 byte from X to Y"), the paragraphs with changed lines, then the changed
+  lines of both sides with their own line numbers - citable on either side
+  through the system prefix. Columns 1-6 and 73-80 are ignored. `diff` with
+  no member (`diff --system GC-TEST`) lists every member whose copies differ:
+  the contents of a release.
 - `callers X --args` — every call site with its full USING list against the
   callee's LINKAGE; a count mismatch is flagged (the S0C4 check).
 - `interfaces [--system S] [--dsn X]` — what leaves and enters the
@@ -410,7 +425,7 @@ below do the same step by step, when you want to choose the report yourself:
   a report: PowerShell 5.1 writes UTF-16 and the model reads garbage.
 - In Copilot Chat type `/atlas-answer` (or `/atlas-program`, `/atlas-impact`,
   `/atlas-job`, `/atlas-trace`, `/atlas-populate`, `/atlas-abend`,
-  `/atlas-values`, `/atlas-tests`, `/atlas-design`): the prompt attaches
+  `/atlas-values`, `/atlas-tests`, `/atlas-design`, `/atlas-handover`): the prompt attaches
   the `work/` files and carries the rules. `.github/copilot-instructions.md`
   is the contract Copilot loads by itself; for another chat tool the same
   requests are in `templates/REQUESTS.md`.

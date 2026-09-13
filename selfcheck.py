@@ -63,6 +63,8 @@ def main() -> int:
             (["messages", "INVALID GENDER"], ["INVALID GENDER <WS-GENDER-CD> FOR MEMBER <WS-MEMBER-ID>"]),
             (["walk", "WALKPGM"], ["0000-MAIN  - entry", "<- PERFORM from 0000-MAIN", "| 1500-UNUSED | paragraph |",
                                    "WALKPROC:1-2 (via COPY WALKPROC)", "Entry point `WALKENT`"]),
+            (["diff", "WALKPGM"], ["a diff needs two"]),                 # one copy in the fixtures: says so, no crash
+            (["diff"], ["no member has two copies"]),
         ]
         for args, needles in checks:
             r = run(["-m", "atlas.query", "--db", db, *args])

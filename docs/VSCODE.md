@@ -68,6 +68,7 @@ answer is checked mechanically before you rely on it.
 | A new code value / codes merged | Atlas: value domain | `/atlas-values` |
 | Test conditions and test data | Atlas: conditions, layout, pack | `/atlas-tests` |
 | Change design document | the tasks for each field and job touched | `/atlas-design` |
+| Transition / handover document for a release | Atlas: release contents, diff per changed member, walk, layout, crud, document sections | `/atlas-handover` |
 | The gate said FAIL | Atlas: verify | `/atlas-fix` |
 
 `Atlas: coverage` before trusting anything; `Atlas: UI` for fetch and build;

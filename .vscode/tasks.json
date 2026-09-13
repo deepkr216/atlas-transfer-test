@@ -15,7 +15,10 @@
     {"id": "member", "type": "promptString", "description": "Member name (a program, copybook, job, PROC, PSB, DBD, control card...)"},
     {"id": "document", "type": "promptString", "description": "Document name (the file name without extension, as `docs` shows it)"},
     {"id": "range", "type": "promptString", "description": "Line range, e.g. 1-9999 for the whole member or 120-180", "default": "1-9999"},
-    {"id": "paragraph", "type": "promptString", "description": "Paragraph / section name, or a line number"}
+    {"id": "paragraph", "type": "promptString", "description": "Paragraph / section name, or a line number"},
+    {"id": "old", "type": "promptString", "description": "The production copy: SYSTEM/NAME (GC/CLMPOST), NAME@LIBRARY, a path, or just NAME when the index holds two copies"},
+    {"id": "new", "type": "promptString", "description": "The changed copy: SYSTEM/NAME (GC-TEST/CLMPOST), NAME@LIBRARY, or the path of the downloaded file; leave blank to take the other copy in the index", "default": ""},
+    {"id": "system", "type": "promptString", "description": "System folder holding the changed copies (e.g. GC-TEST); blank = every member whose copies differ", "default": ""}
   ],
   "tasks": [
     {
@@ -41,6 +44,24 @@
       "detail": "The program in reading order: entry first, each paragraph as control reaches it, resolved facts, source, the data it touches. For 'what does this program do'.",
       "type": "shell",
       "command": "python -m atlas.query --db atlas.db --out work/walk.md walk ${input:program} --budget ${input:budget}",
+      "options": {"cwd": "${workspaceFolder}", "env": {"PYTHONUTF8": "1"}},
+      "presentation": {"reveal": "always", "panel": "shared", "showReuseMessage": false},
+      "problemMatcher": []
+    },
+    {
+      "label": "Atlas: diff OLD NEW -> work/diff.md",
+      "detail": "Two versions of a member - the production copy and the changed one: the paragraphs, calls, copybooks, tables, files and fields that changed (fields that only shifted are grouped), then the changed lines of both sides with their own numbers, citable.",
+      "type": "shell",
+      "command": "python -m atlas.query --db atlas.db --out work/diff.md diff \"${input:old}\" \"${input:new}\" --budget ${input:budget}",
+      "options": {"cwd": "${workspaceFolder}", "env": {"PYTHONUTF8": "1"}},
+      "presentation": {"reveal": "always", "panel": "shared", "showReuseMessage": false},
+      "problemMatcher": []
+    },
+    {
+      "label": "Atlas: release contents -> work/release.md",
+      "detail": "Every member that exists in two libraries with different content (production vs the changed copies), with the diff command for each, and members new to the test system.",
+      "type": "shell",
+      "command": "python -m atlas.query --db atlas.db --out work/release.md diff --system \"${input:system}\"",
       "options": {"cwd": "${workspaceFolder}", "env": {"PYTHONUTF8": "1"}},
       "presentation": {"reveal": "always", "panel": "shared", "showReuseMessage": false},
       "problemMatcher": []

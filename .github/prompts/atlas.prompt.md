@@ -13,7 +13,9 @@ How to work:
 1. Decide which reports answer the question and run them in the terminal, each written to
    `work/` with `--out` (never the shell's `>`):
    `python -m atlas.query --db atlas.db --out work/<name>.md <query> <args>`
-   Queries: `walk PGM` (a program in reading order, with source) · `pack NAME` · `program NAME` ·
+   Queries: `walk PGM` (a program in reading order, with source) · `diff OLD NEW` (two versions of a
+   member - `GC/PGM GC-TEST/PGM`: the facts that changed, then the changed lines of both sides;
+   `diff --system GC-TEST` alone lists every member the release changed) · `pack NAME` · `program NAME` ·
    `job NAME` · `field NAME` · `layout COPYBOOK` · `literal CODE` (where an error / message code
    is defined, set, tested, shown, and where its value flows) · `values FIELD` (every value the
    code assumes for a field, documented or not) · `pair F1 F2` (rules binding two fields) ·

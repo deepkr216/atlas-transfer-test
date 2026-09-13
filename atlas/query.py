@@ -2748,6 +2748,386 @@ def cmd_paragraph(conn: sqlite3.Connection, name: str, para: str) -> str:
 
 
 # --------------------------------------------------------------------------
+# diff - two versions of a member: the production copy and the changed one
+# --------------------------------------------------------------------------
+
+_DIFF_KINDS = ("cobol", "copybook", "jcl", "proc", "ctlcard", "dbd", "psb", "bms", "mfs", "sql", "unknown")
+
+
+class _Loose(dict):
+    """A file on disk that is not in the index (a member just downloaded
+    into a scratch folder): its lines can be compared, its facts cannot."""
+
+    def __getitem__(self, k):
+        return dict.get(self, k)
+
+
+def _member_by_ref(conn: sqlite3.Connection, ref: str) -> list:
+    """The member(s) a reference names, production copy first:
+    SYSTEM/NAME, NAME@LIBRARY, NAME(kind), NAME, or a path on disk."""
+    import hashlib
+    r = ref.strip().strip('"').strip("'")
+    if not r:
+        return []
+    if os.path.isfile(r):
+        p = os.path.normpath(os.path.abspath(r))
+        rows = conn.execute("SELECT * FROM member WHERE UPPER(path)=UPPER(?)", (p,)).fetchall()
+        if rows:
+            return rows
+        with open(p, "rb") as fh:
+            data = fh.read()
+        return [_Loose(id=None, path=p, name=os.path.splitext(os.path.basename(p))[0].upper(), kind=None,
+                       library=os.path.basename(os.path.dirname(p)), system=None, authoritative=0,
+                       fixed_format=None, sha256=hashlib.sha256(data).hexdigest(), norm_sha=None, lines=None)]
+    m = re.match(r"^(?:([A-Za-z0-9_$#@.\-]+)/)?([A-Za-z0-9_$#@\-]+?)(?:\(([a-z]+)\))?(?:@([A-Za-z0-9_$#@.\-]+))?$", r)
+    if not m:
+        return []
+    system, name, kind, library = m.group(1), m.group(2), m.group(3), m.group(4)
+    rows = _members_named(conn, system, name, kind, library)
+    if not rows and library:                      # a member really named AB@CD
+        rows = _members_named(conn, system, f"{name}@{library}", kind, None)
+    return rows
+
+
+def _members_named(conn: sqlite3.Connection, system, name, kind, library) -> list:
+    q = "SELECT * FROM member WHERE UPPER(name)=?"
+    args: list = [name.upper()]
+    if system:
+        q += " AND UPPER(COALESCE(system,''))=?"
+        args.append(system.upper())
+    if library:
+        q += " AND UPPER(COALESCE(library,'')) LIKE ?"
+        args.append("%" + library.upper() + "%")
+    if kind:
+        q += " AND kind=?"
+        args.append(kind)
+    else:
+        q += " AND kind IN (%s)" % ",".join("?" * len(_DIFF_KINDS))
+        args.extend(_DIFF_KINDS)
+    return conn.execute(q + " ORDER BY authoritative DESC, system, path", args).fetchall()
+
+
+def _ident(m) -> str:
+    """How the gate names this copy: SYSTEM/NAME when the copy has a system
+    (the folder under estate\\), else NAME@LIBRARY."""
+    if m["system"]:
+        return f"{m['system']}/{m['name']}"
+    if m["library"]:
+        return f"{m['name']}@{m['library']}"
+    return m["name"]
+
+
+def _pick_versions(rows: list, system: Optional[str] = None) -> Tuple[object, object, str]:
+    """Among copies of one name: (old, new, why). Old is the declared
+    production copy, else the copy whose library or system says PROD, else
+    the first by path - and the report says which rule decided."""
+    if system:
+        news = [r for r in rows if (r["system"] or "").upper() == system.upper()]
+        olds = [r for r in rows if (r["system"] or "").upper() != system.upper()]
+        if news and olds:
+            olds.sort(key=lambda r: (0 if r["authoritative"] else 1,
+                                     0 if "PROD" in (r["library"] or "").upper() else 1, r["path"]))
+            return olds[0], news[0], f"new = the copy in {system.upper()}"
+    auth = [r for r in rows if r["authoritative"]]
+    prod = [r for r in rows if "PROD" in ((r["library"] or "") + "/" + (r["system"] or "")).upper()]
+    if len(auth) == 1:
+        old, why = auth[0], "old = the copy declared production in manifest.json"
+    elif not auth and len(prod) == 1:
+        old, why = prod[0], "old = the copy whose library name says PROD"
+    else:
+        old, why = rows[0], ("old = the first copy by path - NEITHER is declared production; give both sides "
+                             "(diff OLD NEW) to be sure")
+    others = [r for r in rows if r is not old]
+    new = next((r for r in others if r["norm_sha"] != old["norm_sha"]), others[0])
+    return old, new, why
+
+
+def _facts_of(conn: sqlite3.Connection, m) -> Optional[Dict[str, dict]]:
+    """Comparable facts of one copy, by kind: name -> detail (fields carry
+    (picture, offset, length) so a shifted field is told from a changed one).
+    None for a file that is not in the index."""
+    if m["id"] is None:
+        return None
+    out: Dict[str, dict] = {"paragraphs": {}, "calls": {}, "copybooks": {}, "tables": {}, "files": {},
+                            "dli": {}, "cics": {}, "fields": {}}
+    for c in conn.execute("SELECT copybook, replacing FROM copy_use WHERE member_id=?", (m["id"],)):
+        out["copybooks"][c["copybook"].upper()] = "with REPLACING" if c["replacing"] else ""
+    for f in conn.execute("SELECT name, pic, usage, offset, length, level, is_group FROM field WHERE member_id=? "
+                          "ORDER BY id", (m["id"],)):
+        pic = (f["pic"] or ("group" if f["is_group"] else "?")) + \
+              (f" {f['usage']}" if f["usage"] and f["usage"] != "DISPLAY" else "")
+        out["fields"][f"{f['level']:02d} {f['name']}"] = (pic, f["offset"], f["length"])
+    prog = conn.execute("SELECT id FROM program WHERE member_id=?", (m["id"],)).fetchone()
+    if prog:
+        pid = prog["id"]
+        for p in conn.execute("SELECT name, kind FROM paragraph WHERE program_id=?", (pid,)):
+            out["paragraphs"][p["name"]] = p["kind"]
+        for c in conn.execute("SELECT kind, target, via_var, resolved FROM call_edge WHERE program_id=?", (pid,)):
+            key = c["target"] or ", ".join(_jl(c["resolved"])) or f"{c['via_var']} (unresolved)"
+            out["calls"][f"{_CALL_LABEL.get(c['kind'], c['kind'])} {key}"] = ""
+        tabs: Dict[str, set] = {}
+        for s in conn.execute("SELECT stmt_type, tables FROM sql_stmt WHERE program_id=?", (pid,)):
+            for t in _jl(s["tables"]):
+                tabs.setdefault(str(t).upper(), set()).add(s["stmt_type"] or "?")
+        out["tables"] = {t: "/".join(sorted(v)) for t, v in tabs.items()}
+        for f in conn.execute("SELECT select_name, assign_dd FROM file_decl WHERE program_id=?", (pid,)):
+            out["files"][f["select_name"]] = f"DD {f['assign_dd'] or '?'}"
+        for d in conn.execute("SELECT func, dbd_name, procopt FROM dli_call WHERE program_id=?", (pid,)):
+            out["dli"][f"{d['func']} {d['dbd_name'] or '?'}"] = f"PROCOPT={d['procopt']}" if d["procopt"] else ""
+        for c in conn.execute("SELECT verb, resource_kind, resource FROM cics_cmd WHERE program_id=?", (pid,)):
+            out["cics"][f"{c['verb']} {c['resource_kind'] or ''} {c['resource'] or ''}".strip()] = ""
+    return out
+
+
+def _para_spans(conn: sqlite3.Connection, m) -> List[Tuple[int, int, str]]:
+    """(first source line, last source line, paragraph) for the paragraphs
+    written in this member itself (a copybook's paragraphs are its own)."""
+    if m["id"] is None:
+        return []
+    prog = conn.execute("SELECT id FROM program WHERE member_id=?", (m["id"],)).fetchone()
+    if not prog:
+        return []
+    spans = []
+    for p in conn.execute("SELECT name, start_line, end_line FROM paragraph WHERE program_id=? AND kind='paragraph'",
+                          (prog["id"],)):
+        m1, l1, d1, _v = origin(conn, prog["id"], p["start_line"])
+        m2, l2, _d2, _v2 = origin(conn, prog["id"], p["end_line"])
+        if m1 == m["name"] and l1 is not None and not d1:
+            spans.append((l1, l2 if (m2 == m["name"] and l2 is not None) else l1, p["name"]))
+    return spans
+
+
+def _load_lines(m) -> List[str]:
+    text, data, enc = reader.load(m["path"])
+    return [r.rstrip("\r\n") for r in reader._split_records(text, data, enc)]
+
+
+def _line_key(fixed: bool):
+    # sequence numbers (1-6) and change stamps (73-80) are not changes
+    return (lambda s: s[6:72].rstrip()) if fixed else (lambda s: s.rstrip())
+
+
+def _fmt_field(v: tuple) -> str:
+    pic, off, ln = v
+    return f"{pic} @{off} len {ln}"
+
+
+def cmd_diff(conn: sqlite3.Connection, old_ref: Optional[str] = None, new_ref: Optional[str] = None,
+             context: int = 3, budget: Optional[int] = None, system: Optional[str] = None) -> str:
+    """Two versions of a member: what changed in the facts the index tracks
+    (paragraphs, calls, copybooks, tables, files, DL/I, CICS; for data, the
+    fields whose picture or length changed and the fields that only shifted),
+    then the changed lines of both sides with their own line numbers, each
+    citable as [[SYSTEM/NAME line "token"]]. With no member: every member
+    that exists in two libraries with different content (the release)."""
+    import difflib
+    if not old_ref:
+        return cmd_diff_list(conn, system)
+    olds = _member_by_ref(conn, old_ref)
+    if not olds:
+        return (f"# Diff\n\n**NOT FOUND**: {old_ref} - give SYSTEM/NAME (as `ambiguous` and `program` show it), "
+                f"NAME@LIBRARY, or the path of the file\n")
+    why = ""
+    if new_ref:
+        news = _member_by_ref(conn, new_ref)
+        if not news:
+            return f"# Diff\n\n**NOT FOUND**: new side {new_ref} - SYSTEM/NAME, NAME@LIBRARY, or a path on disk\n"
+        old, new = olds[0], news[0]
+    else:
+        cands = [r for r in olds if r["id"] is not None]
+        if len(cands) < 2:
+            return (f"# Diff {old_ref}\n\n{len(olds)} copy of {old_ref} in the index - a diff needs two. Put the "
+                    f"changed copy under estate\\<SYSTEM-TEST>\\<its library>\\, build again (only new members are "
+                    f"parsed), then `diff {old_ref}`; or name the downloaded file: `diff {old_ref} C:\\path\\{old_ref}.cbl`\n")
+        old, new, why = _pick_versions(cands, system)
+    if old["id"] is not None and old["id"] == new["id"]:
+        return f"# Diff\n\nboth references name the same copy ({old['path']})\n"
+
+    a, b = _load_lines(old), _load_lines(new)
+    fixed = bool(old["fixed_format"] if old["fixed_format"] is not None else new["fixed_format"]) \
+        and bool(new["fixed_format"] if new["fixed_format"] is not None else old["fixed_format"])
+    key = _line_key(fixed)
+    sm = difflib.SequenceMatcher(None, [key(s) for s in a], [key(s) for s in b], autojunk=False)
+    ops = [op for op in sm.get_opcodes() if op[0] != "equal"]
+    added = sum(j2 - j1 for _t, _i1, _i2, j1, j2 in ops)
+    removed = sum(i2 - i1 for _t, i1, i2, _j1, _j2 in ops)
+    oi, ni = _ident(old), _ident(new)
+    loose = new["id"] is None or old["id"] is None
+
+    def side(tag: str, m, n: int) -> str:
+        return (f"- {tag}: `{os.path.basename(m['path'])}` in {m['library'] or '?'}"
+                + (f", system {m['system']}" if m["system"] else "")
+                + (" **[production]**" if m["authoritative"] else "")
+                + (" (not in the index: lines only)" if m["id"] is None else "")
+                + f", {n} lines, sha {(m['sha256'] or '')[:12]}\n")
+
+    out = [f"# Diff {oi} -> {ni}\n", side("old", old, len(a)), side("new", new, len(b))]
+    if why:
+        out.append(f"- {why}\n")
+    out.append(f"- {len(ops)} changed region(s): +{added} / -{removed} lines"
+               + (" (columns 1-6 and 73-80 ignored)" if fixed else "") + "\n")
+    if not ops:
+        out.append("\n**identical**" + (" apart from sequence numbers / change stamps" if fixed else "") + "\n")
+        return "".join(out)
+    if old["system"] and new["system"]:
+        out.append(f"- cite the old side as `[[{oi} line \"token\"]]`, the new side as `[[{ni} line \"token\"]]`\n")
+    elif loose:
+        out.append(f"- the copy that is not in the index cannot be cited; cite `[[{oi if old['id'] is not None else ni} "
+                   f"line \"token\"]]` on the other side, or put the folder under estate\\ and build\n")
+    else:
+        out.append(f"- cite as `[[{oi} line \"token\"]]` / `[[{ni} line \"token\"]]` (NAME@LIBRARY: without a system "
+                   f"per environment the plain [[NAME line]] form checks the production copy only)\n")
+
+    # ---- facts that changed
+    fo, fn = _facts_of(conn, old), _facts_of(conn, new)
+    out.append("\n## What changed (from the index)\n")
+    if fo is None or fn is None:
+        out.append("- the copy that is not in the index has no facts: lines only. Put it under estate\\ and build "
+                   "for the paragraph / call / copybook / field comparison\n")
+    else:
+        labels = [("paragraphs", "Paragraphs"), ("calls", "Calls"), ("copybooks", "Copybooks"), ("tables", "DB2 tables"),
+                  ("files", "Files"), ("dli", "DL/I"), ("cics", "CICS")]
+        any_fact = False
+        for k, label in labels:
+            o, n = fo[k], fn[k]
+            add = sorted(set(n) - set(o))
+            rem = sorted(set(o) - set(n))
+            chg = sorted(x for x in set(o) & set(n) if o[x] != n[x])
+            if not (add or rem or chg):
+                continue
+            any_fact = True
+            parts = []
+            if add:
+                parts.append("added " + ", ".join(f"`{x}`" + (f" ({n[x]})" if n[x] else "") for x in add))
+            if rem:
+                parts.append("removed " + ", ".join(f"`{x}`" + (f" ({o[x]})" if o[x] else "") for x in rem))
+            if chg:
+                parts.append("changed " + ", ".join(f"`{x}` {o[x] or '-'} -> {n[x] or '-'}" for x in chg))
+            out.append(f"- **{label}**: " + "; ".join(parts) + "\n")
+        o, n = fo["fields"], fn["fields"]
+        add = sorted(set(n) - set(o), key=lambda x: n[x][1] if n[x][1] is not None else 1 << 30)
+        rem = sorted(set(o) - set(n), key=lambda x: o[x][1] if o[x][1] is not None else 1 << 30)
+        chg = [x for x in o if x in n and o[x] != n[x]]
+        redef = [x for x in chg if o[x][0] != n[x][0] or o[x][2] != n[x][2]]    # picture or length
+        moved = [x for x in chg if x not in redef]                              # only the offset
+        if add or rem or redef or moved:
+            any_fact = True
+            parts = []
+            if add:
+                parts.append("added " + ", ".join(f"`{x}` {_fmt_field(n[x])}" for x in add))
+            if rem:
+                parts.append("removed " + ", ".join(f"`{x}` {_fmt_field(o[x])}" for x in rem))
+            if redef:
+                parts.append("changed " + ", ".join(f"`{x}` {_fmt_field(o[x])} -> {_fmt_field(n[x])}" for x in redef))
+            if parts:
+                out.append("- **Fields**: " + "; ".join(parts) + "\n")
+            if moved:
+                by_delta: Dict[int, List[str]] = {}
+                for x in moved:
+                    by_delta.setdefault((n[x][1] or 0) - (o[x][1] or 0), []).append(x)
+                for delta, names in sorted(by_delta.items()):
+                    names.sort(key=lambda x: o[x][1] or 0)
+                    out.append(f"- **Fields shifted** by {delta:+d} byte(s), same picture: {len(names)} field(s), "
+                               f"from `{names[0]}` to `{names[-1]}` - every program that reads this record by "
+                               f"position, and every file written with the OLD layout, sees them move\n")
+        # a pure insert marks no old line (the old line after the insertion point is not a change),
+        # a pure delete marks no new line
+        changed_old = {ln for _t, i1, i2, _j1, _j2 in ops for ln in range(i1 + 1, i2 + 1)}
+        changed_new = {ln for _t, _i1, _i2, j1, j2 in ops for ln in range(j1 + 1, j2 + 1)}
+        new_or_gone = set(fn["paragraphs"]) ^ set(fo["paragraphs"])          # already listed as added / removed
+        touched = sorted(({nm for s, e, nm in _para_spans(conn, new) if any(s <= ln <= e for ln in changed_new)}
+                          | {nm for s, e, nm in _para_spans(conn, old) if any(s <= ln <= e for ln in changed_old)})
+                         - new_or_gone)
+        if touched:
+            any_fact = True
+            out.append("- **Paragraphs with changed lines**: " + ", ".join(f"`{p}`" for p in touched)
+                       + f" - `walk {ni.split('/')[-1].split('@')[0]} --from PARA` / `paragraph` for what each does now\n")
+        if not any_fact:
+            out.append("- no fact the index tracks changed: the edit is inside statements (a condition, a MOVE, "
+                       "a literal, a comment) - see the lines\n")
+
+    # ---- the lines, both sides, their own numbers
+    out.append(f"\n## Lines (`-` old {oi}, `+` new {ni}, two spaces = unchanged context)\n```\n")
+    used = sum(len(x) for x in out) + 40
+    shown = 0
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            continue
+        hunk: List[str] = []
+        for x in range(max(0, i1 - context), i1):
+            hunk.append(f"  {x + 1:6d} | {a[x]}\n")
+        for x in range(i1, i2):
+            hunk.append(f"- {x + 1:6d} | {a[x]}\n")
+        for y in range(j1, j2):
+            hunk.append(f"+ {y + 1:6d} | {b[y]}\n")
+        for y in range(j2, min(len(b), j2 + context)):
+            hunk.append(f"  {y + 1:6d} | {b[y]}\n")
+        hunk.append("\n")
+        text = "".join(hunk)
+        if budget and used + len(text) > budget and shown:
+            out.append(f"... budget {budget}: {len(ops) - shown} more changed region(s) not shown - "
+                       f"`cite` the member for the rest\n")
+            break
+        out.append(text)
+        used += len(text)
+        shown += 1
+    out.append("```\n")
+    return "".join(out)
+
+
+def cmd_diff_list(conn: sqlite3.Connection, system: Optional[str] = None) -> str:
+    """Every member that exists in more than one library with different
+    content - the contents of a release when one folder per environment is
+    indexed (estate\\GC = production, estate\\GC-TEST = the changed copies)."""
+    import difflib
+    system = (system or "").strip() or None
+    names = conn.execute("SELECT name, kind FROM member WHERE kind IN (%s) GROUP BY name, kind "
+                         "HAVING COUNT(*) > 1 AND COUNT(DISTINCT COALESCE(norm_sha, sha256)) > 1 ORDER BY kind, name"
+                         % ",".join("?" * len(_DIFF_KINDS)), _DIFF_KINDS).fetchall()
+    title = "# Release contents - members whose copies differ" + (f" (changed copy in {system.upper()})" if system else "")
+    out = [title + "\n\n"]
+    rows_out = []
+    same = 0
+    for nm in names:
+        copies = conn.execute("SELECT * FROM member WHERE name=? AND kind=? ORDER BY authoritative DESC, path",
+                              (nm["name"], nm["kind"])).fetchall()
+        if system and not any((c["system"] or "").upper() == system.upper() for c in copies):
+            continue
+        old, new, _why = _pick_versions(copies, system)
+        if old["norm_sha"] == new["norm_sha"]:
+            same += 1
+            continue
+        a, b = _load_lines(old), _load_lines(new)
+        key = _line_key(bool(old["fixed_format"]) and bool(new["fixed_format"]))
+        sm = difflib.SequenceMatcher(None, [key(s) for s in a], [key(s) for s in b], autojunk=False)
+        ops = [op for op in sm.get_opcodes() if op[0] != "equal"]
+        added = sum(j2 - j1 for _t, _i1, _i2, j1, j2 in ops)
+        removed = sum(i2 - i1 for _t, i1, i2, _j1, _j2 in ops)
+        extra = len(copies) - 2
+        rows_out.append(f"| {nm['name']} | {nm['kind']} | {_ident(old)} | {_ident(new)} | +{added} / -{removed} | "
+                        f"`diff {_ident(old)} {_ident(new)}`" + (f" (+{extra} more copies)" if extra > 0 else "") + " |\n")
+    if rows_out:
+        out.append("| member | kind | old (production) | new (changed) | lines | command |\n|---|---|---|---|---|---|\n")
+        out.extend(rows_out)
+    else:
+        out.append("_no member has two copies with different content_" + (f" involving {system.upper()}" if system else "") + "\n")
+    if system:
+        fresh = conn.execute("SELECT m.name, m.kind, m.library FROM member m WHERE UPPER(COALESCE(m.system,''))=? "
+                             "AND m.kind IN (%s) AND NOT EXISTS (SELECT 1 FROM member o WHERE o.name=m.name AND o.kind=m.kind "
+                             "AND o.id<>m.id) ORDER BY m.kind, m.name" % ",".join("?" * len(_DIFF_KINDS)),
+                             (system.upper(), *_DIFF_KINDS)).fetchall()
+        if fresh:
+            out.append(f"\n## New in {system.upper()} (no copy anywhere else)\n")
+            out.extend(f"- {f['name']} ({f['kind']}) in {f['library']}\n" for f in fresh)
+    out.append(f"\n- {len(rows_out)} member(s) differ" + (f", {same} pair(s) identical apart from sequence numbers" if same else "")
+               + "; `diff OLD NEW` for each - the facts that changed, then the lines of both sides\n")
+    if not system:
+        out.append("- `diff --system GC-TEST` when the changed copies are in one system folder: pairs each with its "
+                   "production copy and lists members new to that system\n")
+    return "".join(out)
+
+
+# --------------------------------------------------------------------------
 # walk - a program in READING order: the entry paragraph first, then every
 # paragraph the first time control reaches it (PERFORM, GO TO, fall-through,
 # THRU range, performed SECTION), each with its resolved facts and its
@@ -3416,6 +3796,13 @@ def _main(argv: Optional[List[str]] = None) -> int:
     s.add_argument("--sections", help="which sections to print in full: 3, 3-5, or 2,7,9-12")
     s.add_argument("--grep", help="print every section containing this text (case-insensitive)")
     s.add_argument("--budget", type=int, help="character budget for the printed sections")
+    s = sub.add_parser("diff", help="two versions of a member (production vs changed): changed facts, then the lines "
+                                    "of both sides; with no member, every member whose copies differ (the release)")
+    s.add_argument("old", nargs="?", help="SYSTEM/NAME, NAME@LIBRARY, NAME(kind), NAME, or a path - the production copy")
+    s.add_argument("new", nargs="?", help="the changed copy; omitted = the other copy of the same name in the index")
+    s.add_argument("--system", help="the system folder holding the changed copies (e.g. GC-TEST)")
+    s.add_argument("--context", type=int, default=3, help="unchanged lines shown around each change")
+    s.add_argument("--budget", type=int, help="character budget for the lines")
     s = sub.add_parser("walk", help="the program in reading order: entry first, each paragraph as control reaches it")
     s.add_argument("name")
     s.add_argument("--from", dest="start", help="start at this paragraph / section instead of the entry")
@@ -3506,6 +3893,8 @@ def _run(a: argparse.Namespace) -> int:
             print(cmd_walk(conn, a.name, a.start, a.budget, a.depth, not a.no_source, not a.no_data, a.max_lines))
         elif a.cmd == "doc":
             print(cmd_doc(conn, a.name, a.sections, a.grep, a.budget))
+        elif a.cmd == "diff":
+            print(cmd_diff(conn, a.old, a.new, a.context, a.budget, a.system))
         elif a.cmd == "literal":
             print(cmd_literal(conn, a.name, a.field, a.like))
         elif a.cmd == "values":

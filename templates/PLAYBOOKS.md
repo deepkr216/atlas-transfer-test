@@ -345,3 +345,45 @@ Expected results come from the specification, not from reading the program:
 one call with spec + inputs (no source) produces expected outputs; a second
 with the program produces predicted outputs; the diff is the finding.
 Agreement is not proof - it is two readings that agree.
+
+
+## H1. Transition / handover document for a release
+
+Question shape: "3 programs and 4 copybooks changed, QA is done, write the
+transition document for the support team". The production copies are in the
+index (`estate\GC\...`); the changed copies live in a lower-environment PDS.
+
+**Pass 1 - facts (no model):**
+
+```
+zowe zos-files download all-members "TEST.GC.SRC" -d estate\GC-TEST\TEST.GC.SRC   # the changed copies (or only the changed members)
+zowe zos-files download all-members "TEST.GC.CPY" -d estate\GC-TEST\TEST.GC.CPY
+python -m atlas.build estate --db atlas.db                                        # incremental: only the new members are parsed
+python -m atlas.query --db atlas.db --out work/release.md diff --system GC-TEST    # every member whose copies differ + members new to GC-TEST
+python -m atlas.query --db atlas.db --out work/diff-<PGM>.md diff GC/<PGM> GC-TEST/<PGM>      # per changed program
+python -m atlas.query --db atlas.db --out work/diff-<CPY>.md diff GC/<CPY> GC-TEST/<CPY>      # per changed copybook: fields added / changed / shifted
+python -m atlas.query --db atlas.db --out work/walk-<PGM>.md walk <PGM> --budget 12000        # what each changed program does now
+python -m atlas.query --db atlas.db --out work/pack-<CPY>.md pack <CPY> --kind copybook       # every other program that expands the copybook
+python -m atlas.query --db atlas.db --out work/crud.md crud --job <JOB> [--job ...]           # the jobs that run them: C/R/U/D per dataset / table / segment
+python -m atlas.query --db atlas.db --out work/doc.md doc <QA-WORKBOOK> --grep <TEST-CASE>    # the QA workbook's tabs and screenshots, as sections
+```
+
+The folder under `estate\` names the system: `GC` and `GC-TEST` are two
+systems by layout alone (no manifest needed), so a GC-TEST program expands
+GC-TEST copybooks and `[[GC-TEST/PGM line "token"]]` cites the new copy,
+`[[GC/PGM line "token"]]` the old one. `diff` ignores columns 1-6 and 73-80
+(sequence numbers and change stamps are not changes); it names the paragraphs,
+calls, copybooks, tables, files and fields that changed, groups the fields
+that only shifted ("2 fields shift +1 byte from X to Y"), then prints the
+changed lines of both sides with their own numbers. A copy that is not in the
+index yet (a file just downloaded to a scratch folder) can be diffed by path:
+lines only, no facts.
+
+**Pass 2 - narrative (one model call, `/atlas-handover`):** summary; the
+changed-components table from `release` with "what changed" per member from the
+diffs; per program what it does now (cited NEW) and did before (cited OLD); per
+copybook the added, changed and shifted fields and every other program that
+expands it; jobs and CRUD; the QA evidence from the workbook's sections and
+screenshots, mapped to the changed paragraphs, naming the paragraphs no test
+covers; support notes (messages, restart); HUMAN MUST VERIFY seeded with the
+promote list and the files already written with the old layout.

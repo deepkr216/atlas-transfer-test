@@ -102,7 +102,9 @@ only; `no` = not handled.
    offsets to the I/O-area 01 of the program that GUs the I/O PCB.
 4. **RM-04 Lineage, batch order, restart, release diff** (P1, large).
    `lineage --upstream/--downstream`, `flow JOB --before/--after`,
-   `schedule`, `restart JOB STEP`, `diff --old`.
+   `schedule`, `restart JOB STEP`. Release diff: **delivered** as
+   `diff OLD NEW` / `diff --system SYS-TEST` (one folder per environment
+   under `estate\`, the folder names the system).
 5. **RM-05 Easytrieve / Assembler / PL/I / REXX / CLIST / SAS handlers**
    (P1, large). Program rows, call edges, DSECT layouts, ALLOC/SUBMIT edges.
 6. **RM-06 Link-edit cards, aliases, compile-PROC SYSLIB order, SCM stage**

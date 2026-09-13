@@ -148,12 +148,18 @@ class TwoDepartments(unittest.TestCase):
         finally:
             conn.close()
 
-    def test_without_manifest_the_choice_is_flagged_as_first_found(self):
+    def test_without_manifest_the_folder_names_the_department(self):
+        # estate\CLAIMS\PROD.CLAIMS.SRC: the folder between the root and the
+        # library is the department even with no manifest, so each program
+        # still gets its own department's copy - and the choice is still noted
         conn = self._build(None)
         try:
             notes = [r[0] for r in conn.execute("SELECT detail FROM unresolved WHERE kind='ambiguous_copybook'")]
             self.assertEqual(len(notes), 2)
-            self.assertTrue(all("FIRST FOUND" in n for n in notes))
+            self.assertTrue(all("same system" in n for n in notes), notes)
+            self.assertIn("PROD.CLAIMS.COPYLIB", self._copy_of(conn, "CLMPGM"))
+            self.assertIn("PROD.POLICY.COPYLIB", self._copy_of(conn, "POLPGM"))
+            self.assertEqual(conn.execute("SELECT system FROM member WHERE name='CLMPGM'").fetchone()[0], "CLAIMS")
         finally:
             conn.close()
 

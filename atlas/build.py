@@ -550,6 +550,32 @@ def apply_manifest(ctx: Ctx, manifest_path: str) -> None:
             f"copybook order declared for {len(ctx.copylib_order)} system(s), {n_ext} external interface(s)")
 
 
+def derive_systems(ctx: Ctx, root: str) -> int:
+    """`estate\\<SYSTEM>\\<LIBRARY>\\member`: the folder between the estate root
+    and the library folder names the system (GC, SHARED, GC-TEST) for every
+    member the manifest did not assign. Two environments of one system go in
+    two folders - `GC` for production, `GC-TEST` for the release under test:
+    copybook resolution then keeps each program with its own environment's
+    copybooks, and `diff GC/PGM GC-TEST/PGM` compares the two."""
+    root_n = os.path.normcase(os.path.abspath(root)).rstrip("\\/")
+    n = 0
+    for m in ctx.members:
+        if m.system:
+            continue
+        p = os.path.abspath(m.path)
+        if not os.path.normcase(p).startswith(root_n + os.sep):
+            continue
+        parts = p[len(root_n) + 1:].split(os.sep)
+        if len(parts) < 3:
+            continue
+        m.system = parts[0].upper()
+        ctx.conn.execute("UPDATE member SET system=? WHERE id=?", (m.system, m.id))
+        n += 1
+    if n:
+        ctx.say(f"  {n} member(s) assigned to a system from the folder layout (estate\\SYSTEM\\LIBRARY)")
+    return n
+
+
 # --------------------------------------------------------------------------
 # copybook resolution
 # --------------------------------------------------------------------------
@@ -1556,6 +1582,9 @@ def _main(argv: Optional[List[str]] = None) -> int:
         f"{k[5:]}={v}" for k, v in sorted(ctx.stats.items()) if k.startswith("kind:")))
     if args.manifest:
         apply_manifest(ctx, args.manifest)
+    else:
+        conn.execute("UPDATE member SET system=NULL, authoritative=0")     # nothing declared
+    derive_systems(ctx, args.root)
     for sched_path in args.sched or []:
         load_sched(ctx, sched_path)
 

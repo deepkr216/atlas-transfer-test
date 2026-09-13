@@ -49,8 +49,10 @@ from . import reader
 CITATION = re.compile(
     r"\[\[\s*([A-Za-z0-9_$#@.\\/:\-()]+?)(?:\s+|:)(\d+)(?:\s*-\s*(\d+))?\s*(?:\(via\s+COPY\s+[^)]*\)\s*)?"
     r"\"((?:[^\"\\]|\\.)*)\"\s*\]\]")
-_REF = re.compile(r"^(?:(?P<system>[A-Za-z0-9_$#@\-]+)/)?(?P<name>[A-Za-z0-9_$#@\-]+)"
+_REF = re.compile(r"^(?:(?P<system>[A-Za-z0-9_$#@\-]+)/)?(?P<name>[A-Za-z0-9_$#@\-]+?)"
                   r"(?:\((?P<kind>[a-z]+)\))?(?:@(?P<library>[A-Za-z0-9.$#@\-]+))?$", re.I)
+# the name is non-greedy: `@` is a legal character in a member name AND the
+# NAME@LIBRARY separator; greedy, the name swallowed the library every time
 # A quoted token this short matches almost anywhere; the gate says so.
 WEAK_TOKEN_CHARS = 6
 WIDE_RANGE_LINES = 20
@@ -113,6 +115,14 @@ def _resolve(ref: str, root: Optional[str], db: Optional[sqlite3.Connection],
         rows = db.execute(
             "SELECT path, kind, authoritative, system, library, norm_sha FROM member WHERE UPPER(name)=? "
             "ORDER BY authoritative DESC, path", (name,)).fetchall()
+        if not rows and want_lib:
+            # a member really named AB@CD: the split was wrong, not the cite
+            whole = f"{name}@{want_lib}"
+            rows = db.execute(
+                "SELECT path, kind, authoritative, system, library, norm_sha FROM member WHERE UPPER(name)=? "
+                "ORDER BY authoritative DESC, path", (whole,)).fetchall()
+            if rows:
+                name, want_lib = whole, None
         if not rows:
             return None, f"member {name} not in index", None
         cands = list(rows)

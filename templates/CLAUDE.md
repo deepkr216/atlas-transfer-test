@@ -51,6 +51,8 @@ python -m atlas.query --db atlas.db crud     <PGM...> | --job JOB | --copybook X
 python -m atlas.query --db atlas.db conditions <PGM>          # every IF/WHEN with its literal or 88 values
 python -m atlas.query --db atlas.db paragraph <PGM> <NAME|line>  # who reaches it, what it does, its source
 python -m atlas.query --db atlas.db walk <PGM> [--budget N] [--from PARA]  # the program in reading order: entry first, each paragraph as reached, facts + source
+python -m atlas.query --db atlas.db diff <OLD> <NEW> [--budget N]          # two versions of a member (GC/PGM GC-TEST/PGM): changed facts, then the lines of both sides
+python -m atlas.query --db atlas.db diff --system <SYS-TEST>               # every member the release changed, with the diff command for each
 python -m atlas.query --db atlas.db interfaces [--system S] [--dsn X]  # what leaves/enters the mainframe, and via whom
 python -m atlas.query --db atlas.db field    <NAME> [--all] [--program PGM]
 python -m atlas.query --db atlas.db search   '"<token>"'
