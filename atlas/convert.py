@@ -126,28 +126,40 @@ $script:word = $null
 $script:excel = $null
 $script:ppt = $null
 
+function Report-NewPid([string]$Name, $Before) {
+    # the process this script just started, so an interrupted run can close
+    # exactly that one and leave the user's own Word / Excel alone
+    $after = @(Get-Process -Name $Name -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
+    foreach ($id in $after) { if ($Before -notcontains $id) { Write-Output "PID`t$Name`t$id" } }
+}
 function Get-Word {
     if ($script:word -eq $null) {
+        $before = @(Get-Process -Name WINWORD -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
         $script:word = New-Object -ComObject Word.Application
         $script:word.Visible = $false
         $script:word.DisplayAlerts = 0
         try { $script:word.AutomationSecurity = 3 } catch {}
+        Report-NewPid "WINWORD" $before
     }
     return $script:word
 }
 function Get-Excel {
     if ($script:excel -eq $null) {
+        $before = @(Get-Process -Name EXCEL -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
         $script:excel = New-Object -ComObject Excel.Application
         $script:excel.Visible = $false
         $script:excel.DisplayAlerts = $false
         try { $script:excel.AutomationSecurity = 3 } catch {}
+        Report-NewPid "EXCEL" $before
     }
     return $script:excel
 }
 function Get-PPT {
     if ($script:ppt -eq $null) {
+        $before = @(Get-Process -Name POWERPNT -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
         $script:ppt = New-Object -ComObject PowerPoint.Application
         try { $script:ppt.AutomationSecurity = 3 } catch {}
+        Report-NewPid "POWERPNT" $before
     }
     return $script:ppt
 }
@@ -254,6 +266,8 @@ def _run_powershell(pairs: List[Tuple[str, str]], timeout: int,
     if log:
         log(f"  starting Office for {len(pairs)} file(s) - the first answer takes 20-40 s, then one line per file")
     lines: List[str] = []
+    office_pids: List[Tuple[str, int]] = []
+    p = None
     try:
         p = subprocess.Popen(["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
                               "-File", script, "-ListFile", listing],
@@ -262,6 +276,11 @@ def _run_powershell(pairs: List[Tuple[str, str]], timeout: int,
         assert p.stdout is not None
         for raw in p.stdout:
             line = raw.rstrip("\r\n")
+            if line.startswith("PID\t"):
+                parts = line.split("\t")
+                if len(parts) == 3 and parts[2].isdigit():
+                    office_pids.append((parts[1], int(parts[2])))
+                continue
             lines.append(line)
             rows = parse_output(line)
             if log and rows:
@@ -271,10 +290,31 @@ def _run_powershell(pairs: List[Tuple[str, str]], timeout: int,
             err = p.communicate(timeout=timeout)[1] or ""
         except subprocess.TimeoutExpired:
             p.kill()
+            _close_office(office_pids, log)
             return 124, "\n".join(lines), f"timed out after {timeout}s"
         return p.returncode, "\n".join(lines) + "\n", err
+    except KeyboardInterrupt:
+        if p is not None:
+            p.kill()
+        _close_office(office_pids, log)
+        done = sum(1 for l in lines if l.startswith("OK\t"))
+        if log:
+            log(f"  interrupted: {done} file(s) converted; Office closed; run the same command again to continue "
+                "(finished files are skipped, the one in progress is made again)")
+        raise
     finally:
         shutil.rmtree(td, ignore_errors=True)
+
+
+def _close_office(pids: List[Tuple[str, int]], log: Optional[Callable[[str], None]] = None) -> None:
+    """End the Office processes THIS run started (by PID) - never the user's own."""
+    for name, pid in pids:
+        try:
+            subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True, timeout=30)
+            if log:
+                log(f"  closed {name} (pid {pid}) started by this run")
+        except (OSError, subprocess.TimeoutExpired):
+            pass
 
 
 def _run_libreoffice(pairs: List[Tuple[str, str]], timeout: int, log: Callable[[str], None]) -> List[Tuple[str, str, str]]:
@@ -351,6 +391,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--timeout", type=int, default=3600)
     ap.add_argument("--no-unzip", action="store_true", help="do not extract .zip archives first")
     a = ap.parse_args(argv)
+    tot_ok = tot_have = tot_fail = 0
+    try:
+        return _run_folders(a)
+    except KeyboardInterrupt:
+        print("interrupted")
+        return 130
+
+
+def _run_folders(a) -> int:
     tot_ok = tot_have = tot_fail = 0
     for folder in a.folder:
         if not os.path.isdir(folder):

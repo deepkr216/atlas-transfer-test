@@ -209,6 +209,23 @@ class Convert(unittest.TestCase):
         os.utime(doc, (1_600_000_000, 1_600_000_000))
         self.assertEqual([st for s, _d, st in convert.plan(self.docs) if s == doc], ["exists"])
 
+    def test_interrupt_closes_only_the_office_this_run_started(self):
+        """PID lines from the script name the Office processes it started;
+        on Ctrl+C the runner ends exactly those (never the user's own Word)
+        and says how to continue."""
+        killed = []
+        with mock.patch("atlas.convert.subprocess.run", side_effect=lambda cmd, **kw: killed.append(cmd)):
+            convert._close_office([("WINWORD", 4321), ("EXCEL", 8765)], log=lambda l: None)
+        self.assertEqual(killed, [["taskkill", "/PID", "4321", "/F"], ["taskkill", "/PID", "8765", "/F"]])
+        # PID lines are consumed, not mistaken for results
+        self.assertEqual(convert.parse_output("PID\tWINWORD\t4321\nOK\tC:\\a\\b.doc\tC:\\a\\b.docx\n"),
+                         [("OK", "C:\\a\\b.doc", "C:\\a\\b.docx")])
+        # the CLI turns an interrupt into a clean exit
+        with mock.patch("atlas.convert._run_folders", side_effect=KeyboardInterrupt), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(convert.main([self.docs]), 130)
+        self.assertIn("interrupted", out.getvalue())
+
     def test_cli(self):
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
