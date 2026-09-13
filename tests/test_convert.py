@@ -121,23 +121,36 @@ class Convert(unittest.TestCase):
             ps.assert_not_called()
         self.assertIn("1 copies STALE", "\n".join(lines))
         self.assertIn("STALE " + doc, "\n".join(lines))
-        with mock.patch("atlas.convert._run_powershell") as ps:
-            ps.side_effect = lambda pairs, timeout, log=None, *rest: (0, "".join(f"OK\t{s}\t{d}\n" for s, d in pairs), "")
-            convert.convert_tree(self.docs, log=lines.append, refresh=True)
-            remade = [d for s, d in ps.call_args[0][0]]
-        self.assertIn(docx, remade)                          # --refresh remakes the stale copy
-        # the build indexes the copy, and says it is stale
+        # the build indexes the (stale) copy, and says so
         est = os.path.join(self.td, "estate", "SRC")
         os.makedirs(est)
         shutil.copy(os.path.join(HERE, "fixtures", "SAMPPGM.cbl"), est)
         db = os.path.join(self.td, "t.db")
-        with contextlib.redirect_stdout(io.StringIO()):
-            build._main([os.path.join(self.td, "estate"), "--db", db, "--rebuild", "--quiet", "--also", self.docs])
-        conn = query.connect(db)
-        row = conn.execute("SELECT parse_status, parse_error FROM member WHERE path LIKE '%rates.xlsx'").fetchone()
-        conn.close()
+
+        def status():
+            with contextlib.redirect_stdout(io.StringIO()):
+                build._main([os.path.join(self.td, "estate"), "--db", db, "--rebuild", "--quiet", "--also", self.docs])
+            conn = query.connect(db)
+            row = conn.execute("SELECT parse_status, parse_error FROM member WHERE path LIKE '%rates.xlsx'").fetchone()
+            conn.close()
+            return row
+        row = status()
         self.assertEqual(row[0], "partial")
         self.assertIn("STALE copy: rates.xls changed after this conversion", row[1])
+        # --refresh remakes the stale copy (a whole new file lands beside the original) - and it is stale no more
+        with mock.patch("atlas.convert._run_powershell") as ps:
+            def remake(pairs, timeout, log=None, *rest):
+                for s, d in pairs:
+                    import zipfile as zf
+                    with zf.ZipFile(d, "w") as z:
+                        z.writestr("xl/workbook.xml", "<workbook/>")
+                return 0, "".join(f"OK\t{s}\t{d}\n" for s, d in pairs), ""
+            ps.side_effect = remake
+            convert.convert_tree(self.docs, log=lines.append, refresh=True)
+            remade = [d for s, d in ps.call_args[0][0]]
+        self.assertIn(os.path.basename(docx), [os.path.basename(d) for d in remade])
+        self.assertEqual([st for s, _d, st in convert.plan(self.docs) if s == doc], ["exists"])
+        self.assertEqual(status()[0], "ok")
 
     def test_zip_archives_are_extracted_beside_them_nested_and_safely(self):
         import zipfile
@@ -304,6 +317,56 @@ class Convert(unittest.TestCase):
         self.assertIn("disconnected from its clients|RPC server is unavailable", script)
         self.assertIn("'.doc' { $script:word = $null }", script)
         self.assertIn("a new one is started for the next file", script)
+
+    def test_office_works_on_a_local_copy_and_the_result_lands_beside_the_original(self):
+        """OneDrive: Office must never open the file where it lives - it is
+        copied to a scratch folder, converted there, and the result moved
+        beside the original; the log names the original."""
+        seen = []
+        lines = []
+        with mock.patch("atlas.convert._run_powershell") as ps:
+            def fake(pairs, timeout, log=None, *rest):
+                for src, dst in pairs:
+                    seen.append(src)
+                    with open(dst, "w") as fh:
+                        fh.write("converted")
+                    if log:
+                        log(f"  OK   {src}")
+                return 0, "".join(f"OK\t{s}\t{d}\n" for s, d in pairs), ""
+            ps.side_effect = fake
+            ok, have, fail = convert.convert_tree(self.docs, log=lines.append)
+        self.assertEqual((ok, fail), (3, 0), "\n".join(lines))
+        self.assertTrue(all(self.docs not in s for s in seen), seen)               # Office saw scratch copies only
+        self.assertTrue(all("atlas-stage-" in s for s in seen), seen)
+        self.assertTrue(os.path.exists(os.path.join(self.docs, "Claims Manual.docx")))
+        self.assertTrue(os.path.exists(os.path.join(self.docs, "sub", "Flow.pptx")))
+        self.assertTrue(os.path.exists(os.path.join(self.docs, "sub", "deeper", "OLD.docx")))
+        # the scratch folders are gone afterwards
+        self.assertFalse(any("atlas-stage-" in d for d in os.listdir(tempfile.gettempdir())
+                             if os.path.isdir(os.path.join(tempfile.gettempdir(), d)) and d.startswith("atlas-stage-")))
+        # a file that cannot be read (a OneDrive placeholder that is not downloaded) is reported, the rest converted
+        with mock.patch("atlas.convert.shutil.copyfile", side_effect=lambda s, d: (_ for _ in ()).throw(OSError("cloud file not available")) if "Flow" in s else open(d, "w").close()), \
+                mock.patch("atlas.convert._run_powershell") as ps2:
+            ps2.side_effect = fake
+            for n in ("Claims Manual.docx", "sub/Flow.pptx", "sub/deeper/OLD.docx"):
+                os.remove(os.path.join(self.docs, *n.split("/")))
+            lines.clear()
+            ok, have, fail = convert.convert_tree(self.docs, log=lines.append)
+        self.assertEqual((ok, fail), (2, 1), "\n".join(lines))
+        self.assertIn("Flow.ppt: could not read the file (cloud file not available) - a OneDrive file not downloaded", "\n".join(lines))
+
+    def test_an_existing_copy_survives_a_failed_remake(self):
+        """--refresh must never delete the old copy before a whole new one exists."""
+        doc = os.path.join(self.docs, "rates.xls")
+        docx = os.path.join(self.docs, "rates.xlsx")
+        os.utime(doc, (1_800_000_000, 1_800_000_000))            # stale copy
+        before = open(docx, "rb").read()
+        with mock.patch("atlas.convert._run_powershell",
+                        side_effect=lambda pairs, timeout, log=None, *rest: (0, "".join(f"OK\t{s}\t{d}\n" for s, d in pairs), "")):
+            lines = []
+            ok, have, fail = convert.convert_tree(self.docs, log=lines.append, refresh=True)   # "OK" but no file written
+        self.assertEqual(open(docx, "rb").read(), before)
+        self.assertIn("Office reported success but wrote no file", "\n".join(lines))
 
     def test_cli(self):
         buf = io.StringIO()

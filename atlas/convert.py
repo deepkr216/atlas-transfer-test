@@ -30,7 +30,7 @@ import sys
 import tempfile
 import threading
 import zipfile
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from .docs import LEGACY_TO_MODERN
 
@@ -296,7 +296,8 @@ def _ps_command(script: str, listing: str, visible: bool) -> List[str]:
 
 def _run_powershell(pairs: List[Tuple[str, str]], timeout: int,
                     log: Optional[Callable[[str], None]] = None, visible: bool = False,
-                    stall_seconds: int = STALL_SECONDS) -> Tuple[int, str, str]:
+                    stall_seconds: int = STALL_SECONDS,
+                    names: Optional[Dict[str, Tuple[str, str]]] = None) -> Tuple[int, str, str]:
     """Run the conversion script and report every file THE MOMENT Office is
     done with it. A watchdog ends a run in which Office has gone silent on
     one file for `stall_seconds` (a dialog in an invisible window): that
@@ -343,7 +344,7 @@ def _run_powershell(pairs: List[Tuple[str, str]], timeout: int,
                        f"window (Document Recovery, a repair prompt); rerun with --visible to see and dismiss it")
                 lines.append(f"FAIL\t{stalled}\t{why}")
                 if log:
-                    log(f"  FAIL {stalled}: {why}")
+                    log(f"  FAIL {names.get(stalled, (stalled, ''))[0] if names else stalled}: {why}")
                 return 124, "\n".join(lines) + "\n", "stalled"
             if raw is None:
                 break
@@ -360,7 +361,8 @@ def _run_powershell(pairs: List[Tuple[str, str]], timeout: int,
             rows = parse_output(line)
             if log and rows:
                 st, src, detail = rows[0]
-                log(f"  {st:<4} {src}" + ("" if st == "OK" else f": {detail}"))
+                shown = names.get(src, (src, ""))[0] if names else src
+                log(f"  {st:<4} {shown}" + ("" if st == "OK" else f": {detail}"))
         try:
             err = p.communicate(timeout=timeout)[1] or ""
         except subprocess.TimeoutExpired:
@@ -412,6 +414,69 @@ def _run_libreoffice(pairs: List[Tuple[str, str]], timeout: int, log: Callable[[
     return rows
 
 
+
+
+# --------------------------------------------------------------------------
+# Office never works inside OneDrive / SharePoint / a network share: a file
+# there is a cloud document to Word (AutoSave, a web address behind the local
+# path, Protected View for synced files) and an automated Save As fails with
+# "Command failed". Every file is copied to a plain local scratch folder,
+# converted there, and the result put back beside the original.
+# --------------------------------------------------------------------------
+
+def _stage(pairs: List[Tuple[str, str]], log: Callable[[str], None]) -> Tuple[List[Tuple[str, str]], Dict[str, Tuple[str, str]], List[Tuple[str, str, str]]]:
+    """Copy each source to a scratch folder. Returns (staged pairs for
+    Office, staged source -> (original source, final destination), rows
+    for sources that could not even be read)."""
+    root = tempfile.mkdtemp(prefix="atlas-stage-")
+    staged: List[Tuple[str, str]] = []
+    back: Dict[str, Tuple[str, str]] = {}
+    failed: List[Tuple[str, str, str]] = []
+    for i, (src, dst) in enumerate(pairs):
+        d = os.path.join(root, str(i))
+        os.makedirs(d, exist_ok=True)
+        ssrc = os.path.join(d, os.path.basename(src))
+        sdst = os.path.join(d, os.path.basename(dst))
+        try:
+            shutil.copyfile(src, ssrc)          # data only: no Zone.Identifier "mark of the web" travels with it
+        except OSError as e:
+            failed.append(("FAIL", src, f"could not read the file ({e}) - a OneDrive file not downloaded to this "
+                                        "laptop? open the folder once so it syncs, or right-click > Always keep on this device"))
+            continue
+        staged.append((ssrc, sdst))
+        back[ssrc] = (src, dst)
+    return staged, back, failed
+
+
+def _unstage(rows: List[Tuple[str, str, str]], back: Dict[str, Tuple[str, str]],
+             log: Callable[[str], None]) -> List[Tuple[str, str, str]]:
+    """Move converted results beside their originals; rows re-keyed to the
+    original source paths."""
+    out: List[Tuple[str, str, str]] = []
+    for st, ssrc, detail in rows:
+        src, dst = back.get(ssrc, (ssrc, detail))
+        if st == "OK":
+            produced = detail if os.path.isabs(detail) and os.path.exists(detail) \
+                else os.path.join(os.path.dirname(ssrc), os.path.basename(dst))
+            if not os.path.exists(produced):
+                out.append(("FAIL", src, "Office reported success but wrote no file"))
+                continue
+            try:
+                os.replace(produced, dst)        # atomic where possible; an old copy is only replaced by a whole new one
+                out.append(("OK", src, dst))
+            except OSError as e:
+                out.append(("FAIL", src, f"converted, but the copy could not be written beside the original ({e})"))
+        else:
+            out.append((st, src, detail))
+    return out
+
+
+def _cleanup_stage(back: Dict[str, Tuple[str, str]]) -> None:
+    roots = {os.path.dirname(os.path.dirname(s)) for s in back}
+    for r in roots:
+        shutil.rmtree(r, ignore_errors=True)
+
+
 def convert_tree(root: str, dry_run: bool = False, log: Callable[[str], None] = print,
                  timeout: int = 3600, refresh: bool = False, visible: bool = False,
                  stall_seconds: int = STALL_SECONDS) -> Tuple[int, int, int]:
@@ -433,19 +498,24 @@ def convert_tree(root: str, dry_run: bool = False, log: Callable[[str], None] = 
             tag = {"exists": "have ", "stale": "stale", "convert": "todo "}[st]
             log(f"  {tag} {s} -> {os.path.basename(d)}")
         return 0, have, 0
-    rc, out, err = _run_powershell(todo, timeout, log, visible, stall_seconds)
-    rows = parse_output(out)
+    staged, back, unreadable = _stage(todo, log)
+    for _st, src, detail in unreadable:
+        log(f"  FAIL {src}: {detail}")
+    rc, out, err = _run_powershell(staged, timeout, log, visible, stall_seconds, back)
+    srows = parse_output(out)
     restarts = 0
     while rc == 124 and err == "stalled" and restarts < 5:
         # the watchdog stopped Office on one file: go on with the ones not yet attempted
-        reported = {src for _st, src, _d in rows}
-        rest = [(s, d) for s, d in todo if s not in reported]
+        reported = {src for _st, src, _d in srows}
+        rest = [(s, d) for s, d in staged if s not in reported]
         if not rest:
             break
         restarts += 1
         log(f"  restarting Office for the remaining {len(rest)} file(s)")
-        rc, out, err = _run_powershell(rest, timeout, log, visible, stall_seconds)
-        rows += parse_output(out)
+        rc, out, err = _run_powershell(rest, timeout, log, visible, stall_seconds, back)
+        srows += parse_output(out)
+    rows = _unstage(srows, back, log) + unreadable
+    _cleanup_stage(back)
     com_missing = rc != 0 and not rows or any("80040154" in d or "Cannot create" in d or "COM class factory" in d
                                               for _s, _src, d in rows if _s == "FAIL")
     if com_missing and (shutil.which("soffice") or shutil.which("soffice.exe")):
