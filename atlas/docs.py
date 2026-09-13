@@ -416,8 +416,16 @@ def _pdf(path: str) -> DocText:
     if texts:
         for i, t in enumerate(texts, 1):
             d.sections.append((f"page-block {i}", t))
-        d.notes.append("PDF text recovered from content streams without a font decoder: "
-                       "text using CID/Identity-H fonts may be garbled - verify before quoting")
+        # simple fonts come out readable; CID / Identity-H fonts (and text
+        # that comes out mostly non-letters) need the pages rendered and OCR'd
+        cid = bool(re.search(rb"/Identity-H|/Type0\b|/CIDFontType", data))
+        joined = " ".join(texts)
+        letters = sum(1 for c in joined if c.isalpha() or c.isspace())
+        if cid or letters < 0.6 * max(1, len(joined)):
+            d.notes.append("PDF text recovered without a font decoder and the file uses CID/Identity-H fonts "
+                           "(or the text looks scrambled): it may be garbled - `OCR images` renders the pages and reads them")
+        else:
+            d.notes.append("PDF text recovered from content streams (simple fonts) - verify before quoting")
     else:
         d.ok = False
         d.notes.append("no extractable text" + (f"; {n_images} embedded image(s) - likely a scan, needs OCR"

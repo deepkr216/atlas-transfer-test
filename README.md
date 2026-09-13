@@ -331,6 +331,15 @@ used if Office is absent). The build then indexes the copies and skips the
 archives and the originals; a copy older than its edited original is
 reported as STALE (`--refresh` remakes it).
 
+**PDFs.** A PDF with real text is read directly (simple fonts come out
+clean; the coverage report flags the ones that used CID/Identity-H fonts).
+A **scanned** PDF, or one whose fonts defeat the extractor, is handled by
+`OCR images`: its pages are rendered with the Windows PDF renderer
+(`Windows.Data.Pdf`, part of Windows 10/11 — nothing to install) and read by
+the same OCR engine as the pictures; each page becomes a citable section
+1001+ of that document (`--pdf-pages all` renders every PDF, `none` turns it
+off; 400 pages per document at most).
+
 **Pictures are read, not just counted.** `OCR images` (UI) or
 `python -m atlas.ocr --db atlas.db --out out/images` pulls every image out of
 the documents and runs the OCR engine that ships with Windows 10/11

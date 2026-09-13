@@ -121,6 +121,85 @@ def render_text_png(text: str, out_path: str) -> bool:
     return rc == 0 and os.path.exists(out_path)
 
 
+# PDF pages -> PNG with the Windows PDF renderer (Windows.Data.Pdf, part of
+# Windows 10/11), so a scanned PDF - or one whose fonts defeat the text
+# extractor - can be read by the same OCR engine as the pictures.
+_PS_PDF = r"""
+param([string]$Pdf, [string]$OutDir, [int]$MaxPages, [int]$Width)
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+try {
+  [Windows.Data.Pdf.PdfDocument, Windows.Data.Pdf, ContentType = WindowsRuntime] | Out-Null
+  [Windows.Data.Pdf.PdfPageRenderOptions, Windows.Data.Pdf, ContentType = WindowsRuntime] | Out-Null
+  [Windows.Storage.StorageFile, Windows.Storage, ContentType = WindowsRuntime] | Out-Null
+  [Windows.Storage.StorageFolder, Windows.Storage, ContentType = WindowsRuntime] | Out-Null
+  Add-Type -AssemblyName System.Runtime.WindowsRuntime
+} catch { Write-Output (@{error="pdf renderer unavailable: $_"} | ConvertTo-Json -Compress); exit 0 }
+$methods = [System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 }
+$asTaskGeneric = ($methods | Where-Object { $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]
+$asTaskAction = ($methods | Where-Object { $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncAction' })[0]
+function Await($WinRtTask, $ResultType) { $asTask = $asTaskGeneric.MakeGenericMethod($ResultType); $netTask = $asTask.Invoke($null, @($WinRtTask)); $netTask.Wait(-1) | Out-Null; $netTask.Result }
+function AwaitAction($WinRtAction) { $netTask = $asTaskAction.Invoke($null, @($WinRtAction)); $netTask.Wait(-1) | Out-Null }
+try {
+  $file = Await ([Windows.Storage.StorageFile]::GetFileFromPathAsync($Pdf)) ([Windows.Storage.StorageFile])
+  $doc = Await ([Windows.Data.Pdf.PdfDocument]::LoadFromFileAsync($file)) ([Windows.Data.Pdf.PdfDocument])
+  $folder = Await ([Windows.Storage.StorageFolder]::GetFolderFromPathAsync($OutDir)) ([Windows.Storage.StorageFolder])
+} catch { Write-Output (@{error="cannot open: $_"} | ConvertTo-Json -Compress); exit 0 }
+$total = [int]$doc.PageCount
+$n = [Math]::Min($total, $MaxPages)
+Write-Output (@{pages=$total; rendering=$n} | ConvertTo-Json -Compress)
+for ($i = 0; $i -lt $n; $i++) {
+  try {
+    $page = $doc.GetPage([uint32]$i)
+    $name = "page-{0:d4}.png" -f ($i + 1)
+    $out = Await ($folder.CreateFileAsync($name, [Windows.Storage.CreationCollisionOption]::ReplaceExisting)) ([Windows.Storage.StorageFile])
+    $stream = Await ($out.OpenAsync([Windows.Storage.FileAccessMode]::ReadWrite)) ([Windows.Storage.Streams.IRandomAccessStream])
+    $opts = New-Object Windows.Data.Pdf.PdfPageRenderOptions
+    $opts.DestinationWidth = [uint32]$Width
+    AwaitAction ($page.RenderToStreamAsync($stream, $opts))
+    $stream.Dispose(); $page.Dispose()
+    Write-Output (@{page=($i + 1); path=(Join-Path $OutDir $name)} | ConvertTo-Json -Compress)
+  } catch { Write-Output (@{page=($i + 1); error="$_"} | ConvertTo-Json -Compress) }
+}
+"""
+
+PDF_MAX_PAGES = 400        # per document; more is almost never a specification
+PDF_RENDER_WIDTH = 1700    # pixels across the page: enough for 9-point print
+
+
+def render_pdf_pages(pdf_path: str, out_dir: str, max_pages: int = PDF_MAX_PAGES,
+                     width: int = PDF_RENDER_WIDTH) -> Tuple[int, List[Tuple[int, str]], List[str]]:
+    """Render a PDF's pages to page-NNNN.png under out_dir with the Windows
+    PDF renderer. Returns (pages in the document, [(page, png path)], warnings)."""
+    ok, why = ocr_available()
+    if not ok:
+        return 0, [], [why]
+    os.makedirs(out_dir, exist_ok=True)
+    rc, out, err = _run_ps(_PS_PDF, ["-Pdf", os.path.abspath(pdf_path), "-OutDir", os.path.abspath(out_dir),
+                                     "-MaxPages", str(max_pages), "-Width", str(width)], timeout=3600)
+    pages: List[Tuple[int, str]] = []
+    warnings: List[str] = []
+    total = 0
+    for line in out.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        if "pages" in obj:
+            total = int(obj["pages"])
+        elif "path" in obj:
+            pages.append((int(obj["page"]), obj["path"]))
+        elif "error" in obj:
+            warnings.append(f"{os.path.basename(pdf_path)}" + (f" page {obj['page']}" if "page" in obj else "") + f": {obj['error']}")
+    if rc != 0 and not pages:
+        warnings.append(f"pdf render rc {rc}: {err.strip()[:200]}")
+    if total > max_pages:
+        warnings.append(f"{os.path.basename(pdf_path)}: {total} pages, only the first {max_pages} rendered")
+    return total, pages, warnings
+
+
 def ocr_images(paths: List[str]) -> Tuple[Dict[str, str], List[str]]:
     """{path: text} for every image Windows OCR could read, plus warnings."""
     ok, why = ocr_available()
@@ -166,17 +245,25 @@ def ocr_images(paths: List[str]) -> Tuple[Dict[str, str], List[str]]:
 # extraction
 # --------------------------------------------------------------------------
 
-def extract_images(conn: sqlite3.Connection, out_dir: str, member: Optional[str] = None
-                   ) -> List[Tuple[int, str, str, str]]:
+def _pdf_needs_pages(parse_error: Optional[str]) -> bool:
+    """The text extractor gave up (a scan) or warned (fonts it cannot decode)."""
+    note = parse_error or ""
+    return "no extractable text" in note or "may be garbled" in note
+
+
+def extract_images(conn: sqlite3.Connection, out_dir: str, member: Optional[str] = None,
+                   pdf_pages: str = "scans", log=print) -> List[Tuple[int, str, str, str]]:
     """Pull images out of the indexed Office documents (and pick up standalone
-    image files). Returns (member_id, member_name, image_name, extracted_path)."""
-    q = "SELECT id, name, path, ext FROM member WHERE kind='doc'"
+    image files); render the pages of PDFs the text extractor could not read
+    (`pdf_pages`: scans | all | none). Returns (member_id, member_name,
+    image_name, extracted_path)."""
+    q = "SELECT id, name, path, ext, parse_error FROM member WHERE kind='doc'"
     args: tuple = ()
     if member:
         q += " AND UPPER(name)=?"
         args = (member.upper(),)
     out: List[Tuple[int, str, str, str]] = []
-    for mid, name, path, ext in conn.execute(q, args).fetchall():
+    for mid, name, path, ext, perr in conn.execute(q, args).fetchall():
         ext = (ext or "").lower().lstrip(".")
         dest_dir = os.path.join(out_dir, name)
         marker = os.path.join(out_dir, ".atlas-output")
@@ -204,6 +291,17 @@ def extract_images(conn: sqlite3.Connection, out_dir: str, member: Optional[str]
         elif ext in [e.lstrip(".") for e in IMAGE_EXT]:
             if os.path.getsize(path) >= MIN_BYTES:
                 out.append((mid, name, os.path.basename(path), path))
+        elif ext == "pdf" and pdf_pages != "none" and (pdf_pages == "all" or _pdf_needs_pages(perr)):
+            done = conn.execute("SELECT COUNT(*) FROM doc_image WHERE member_id=? AND name LIKE 'page-%' AND ocr_text IS NOT NULL",
+                                (mid,)).fetchone()[0]
+            if done:
+                continue                                    # pages already read on an earlier run
+            total, pages, warns = render_pdf_pages(path, dest_dir)
+            for w in warns[:5]:
+                log("  " + w)
+            if pages:
+                log(f"  {name}: {len(pages)} of {total} page(s) rendered for OCR")
+            out += [(mid, name, f"page-{p:04d}", png) for p, png in pages]
     for mid, _n, img, dest in out:
         conn.execute("UPDATE doc_image SET extracted_path=? WHERE member_id=? AND name=?", (dest, mid, img))
         if conn.execute("SELECT 1 FROM doc_image WHERE member_id=? AND name=?", (mid, img)).fetchone() is None:
@@ -213,8 +311,8 @@ def extract_images(conn: sqlite3.Connection, out_dir: str, member: Optional[str]
 
 
 def run(conn: sqlite3.Connection, out_dir: str, do_ocr: bool = True, member: Optional[str] = None,
-        log=print) -> Dict[str, int]:
-    images = extract_images(conn, out_dir, member)
+        log=print, pdf_pages: str = "scans") -> Dict[str, int]:
+    images = extract_images(conn, out_dir, member, pdf_pages, log)
     stats = {"images": len(images), "ocr_text": 0, "ocr_empty": 0, "ocr_failed": 0}
     log(f"images extracted: {len(images)} -> {out_dir}")
     if not do_ocr or not images:
@@ -241,7 +339,8 @@ def run(conn: sqlite3.Connection, out_dir: str, do_ocr: bool = True, member: Opt
         n = conn.execute("SELECT COUNT(*) FROM doc_section WHERE member_id=? AND ordinal>=?",
                          (mid, OCR_ORDINAL_BASE)).fetchone()[0]
         ordinal = OCR_ORDINAL_BASE + n + 1
-        heading = f"image: {os.path.basename(img)}"
+        heading = (f"page {int(img[5:])} (OCR of the scanned page)" if img.startswith("page-") and img[5:].isdigit()
+                   else f"image: {os.path.basename(img)}")
         conn.execute("INSERT INTO doc_section(member_id,heading,text,ordinal) VALUES(?,?,?,?)",
                      (mid, heading, text, ordinal))
         conn.execute("INSERT INTO src_fts(member_name,kind,member_id,line_no,text) VALUES(?,?,?,?,?)",
@@ -258,13 +357,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--out", default=os.path.join("out", "images"))
     ap.add_argument("--member", help="only this document")
     ap.add_argument("--no-ocr", action="store_true", help="extract images only")
+    ap.add_argument("--pdf-pages", choices=("scans", "all", "none"), default="scans",
+                    help="render PDF pages for OCR: only PDFs whose text could not be extracted (default), all PDFs, or none")
     a = ap.parse_args(argv)
     if not os.path.exists(a.db):
         print(f"no such db: {a.db}")
         return 1
     conn = sqlite3.connect(a.db)
     try:
-        run(conn, a.out, do_ocr=not a.no_ocr, member=a.member)
+        run(conn, a.out, do_ocr=not a.no_ocr, member=a.member, pdf_pages=a.pdf_pages)
     finally:
         conn.close()
     return 0
