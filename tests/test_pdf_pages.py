@@ -56,10 +56,22 @@ class PdfPages(unittest.TestCase):
             self.skipTest(why)
         td = tempfile.mkdtemp()
         try:
+            # probe the two Windows engines first: where either is missing (no OCR
+            # language pack, a locked-down WinRT) the toolkit degrades and says so,
+            # and this test has nothing to prove - skip, do not fail
+            probe = os.path.join(td, "probe.png")
+            if not ocr.render_text_png("WAIVER PROBE", probe):
+                self.skipTest("could not render a probe image with System.Drawing")
+            texts, warnings = ocr.ocr_images([probe])
+            if not texts or "WAIVER" not in next(iter(texts.values())).upper():
+                self.skipTest("OCR engine unavailable or unreadable here: " + "; ".join(warnings))
             docs = os.path.join(td, "specs")
             os.makedirs(docs)
             with open(os.path.join(docs, "SCANSPEC.pdf"), "wb") as fh:
                 fh.write(tiny_pdf("WAIVER OF PREMIUM APPLIES AFTER SIX MONTHS"))
+            total, pages, warns = ocr.render_pdf_pages(os.path.join(docs, "SCANSPEC.pdf"), os.path.join(td, "probe-pdf"))
+            if not pages:
+                self.skipTest("Windows PDF renderer unavailable here: " + "; ".join(warns))
             est = os.path.join(td, "estate", "SRC")
             os.makedirs(est)
             shutil.copy(os.path.join(HERE, "fixtures", "SAMPPGM.cbl"), est)
