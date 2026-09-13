@@ -467,8 +467,38 @@ def _unstage(rows: List[Tuple[str, str, str]], back: Dict[str, Tuple[str, str]],
             except OSError as e:
                 out.append(("FAIL", src, f"converted, but the copy could not be written beside the original ({e})"))
         else:
-            out.append((st, src, detail))
+            out.append((st, src, f"{detail} [{circumstances(src)}]"))
     return out
+
+
+_APP = {".doc": "Word", ".xls": "Excel", ".ppt": "PowerPoint"}
+
+
+def circumstances(path: str) -> str:
+    """What the toolkit knows about a file that Office refused - Office's own
+    message ("Command failed") says nothing, the circumstances usually do:
+    where the file lives (OneDrive / SharePoint / a share), whether it is a
+    cloud placeholder not on the disk, its size, which application."""
+    bits: List[str] = []
+    low = path.lower()
+    if "onedrive" in low or "sharepoint" in low:
+        bits.append("path is under OneDrive/SharePoint")
+    elif low.startswith("\\\\") or low.startswith("//"):
+        bits.append("path is on a network share")
+    try:
+        st = os.stat(path)
+        attrs = getattr(st, "st_file_attributes", 0)
+        if attrs & 0x400000 or attrs & 0x1000:                  # RECALL_ON_DATA_ACCESS / OFFLINE
+            bits.append("cloud placeholder - not downloaded to this laptop")
+        if attrs & 0x1:
+            bits.append("read-only attribute")
+        bits.append(f"{st.st_size / 1024:.0f} KB")
+    except OSError:
+        bits.append("cannot stat the file")
+    app = _APP.get(os.path.splitext(path)[1].lower())
+    if app:
+        bits.append(app)
+    return "; ".join(bits)
 
 
 def _cleanup_stage(back: Dict[str, Tuple[str, str]]) -> None:

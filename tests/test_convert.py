@@ -368,6 +368,24 @@ class Convert(unittest.TestCase):
         self.assertEqual(open(docx, "rb").read(), before)
         self.assertIn("Office reported success but wrote no file", "\n".join(lines))
 
+    def test_a_failure_carries_the_circumstances(self):
+        """'Command failed' says nothing; the FAIL line adds where the file
+        lives, whether it is a cloud placeholder, its size and the app."""
+        od = os.path.join(self.td, "OneDrive - Company", "specs")
+        os.makedirs(od)
+        with open(os.path.join(od, "Rules.doc"), "w") as fh:
+            fh.write("x" * 3000)
+        c = convert.circumstances(os.path.join(od, "Rules.doc"))
+        self.assertIn("path is under OneDrive/SharePoint", c)
+        self.assertIn("3 KB", c)
+        self.assertIn("Word", c)
+        self.assertNotIn("cloud placeholder", c)
+        lines = []
+        with mock.patch("atlas.convert._run_powershell",
+                        side_effect=lambda pairs, timeout, log=None, *rest: (0, "".join(f"FAIL\t{s}\tCommand failed\n" for s, d in pairs), "")):
+            convert.convert_tree(od, log=lines.append)
+        self.assertIn("Rules.doc: Command failed [path is under OneDrive/SharePoint; 3 KB; Word]", "\n".join(lines))
+
     def test_cli(self):
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
