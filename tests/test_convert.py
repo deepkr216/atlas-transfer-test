@@ -296,6 +296,15 @@ class Convert(unittest.TestCase):
         self.assertIn("$true)\n", script)                                                            # NoEncodingDialog on Word
         self.assertIn("[System.Reflection.Missing]::Value", script)
 
+    def test_a_dead_office_is_replaced_for_the_next_file(self):
+        """'The object invoked has disconnected from its clients' means the
+        Word/Excel the script held was killed: the script must drop it and
+        start a fresh one for the next file, not fail the rest of the list."""
+        script = convert._PS_SCRIPT
+        self.assertIn("disconnected from its clients|RPC server is unavailable", script)
+        self.assertIn("'.doc' { $script:word = $null }", script)
+        self.assertIn("a new one is started for the next file", script)
+
     def test_cli(self):
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):

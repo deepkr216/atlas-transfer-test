@@ -205,6 +205,16 @@ foreach ($line in $pairs) {
         if (Test-Path -LiteralPath $dst) { Write-Output "OK`t$src`t$dst" } else { Write-Output "FAIL`t$src`tno output written" }
     } catch {
         $msg = $_.Exception.Message -replace "[`r`n]+", " "
+        # the Office instance died under us (killed, crashed): forget it, so
+        # the next file starts a fresh one instead of failing the same way
+        if ($msg -match "disconnected from its clients|RPC server is unavailable|0x80010108|0x800706BA") {
+            switch ($ext) {
+                '.doc' { $script:word = $null }
+                '.xls' { $script:excel = $null }
+                '.ppt' { $script:ppt = $null }
+            }
+            $msg = "$msg - Office had gone away; a new one is started for the next file, rerun for this one"
+        }
         Write-Output "FAIL`t$src`t$msg"
     }
 }
