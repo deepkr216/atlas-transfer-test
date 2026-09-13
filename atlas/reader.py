@@ -268,6 +268,7 @@ def read_cobol_lines(text: str, fixed: Optional[bool] = None,
 
     out: List[Line] = []
     in_id_comment = False        # inside AUTHOR. / REMARKS. ... (a comment-entry)
+    in_sql = False               # inside EXEC SQL ... END-EXEC
     division = None
     for i, rec in enumerate(records, start=1):
         rec = rec.replace("\t", "    ")  # tabs in a column-sensitive format
@@ -293,6 +294,20 @@ def read_cobol_lines(text: str, fixed: Optional[bool] = None,
         # header that follows them.
         if indicator == " " and (_DIRECTING.match(up) or _CBL_OPTS.match(rec.strip().upper())):
             indicator = "*"
+        # SQL `--` comments live inside EXEC SQL ... END-EXEC. Once the lines
+        # are joined into one statement their end-of-line is gone, so a
+        # comment ending in a period (`-- get the policy.`) would terminate
+        # the statement here and the SELECT would never be seen.
+        if indicator == " " and in_sql:
+            if code.lstrip().startswith("--"):
+                indicator = "*"
+            elif " --" in code:
+                code = code.split(" --", 1)[0].rstrip()
+        if indicator == " ":
+            if "EXEC SQL" in up and "END-EXEC" not in up:
+                in_sql = True
+            elif "END-EXEC" in up:
+                in_sql = False
         # IDENTIFICATION DIVISION comment-entries (AUTHOR. PAT O'BRIEN.) are
         # free text: an apostrophe there is not a literal, and left as code it
         # opens a string that never closes and silently eats the program.
@@ -453,10 +468,17 @@ def cobol_statements(logical: Sequence[LogicalLine]) -> Iterator[LogicalLine]:
         lmap.extend([ll.start] * len(ll.text))
         # `ll.text` is one logical line, so a trailing period really does end
         # the statement - there is no more text coming on this line.
+        scan_from = 0
         while True:
-            idx = find_terminator(buf, 0, at_line_end=True)
+            idx = find_terminator(buf, scan_from, at_line_end=True)
             if idx < 0:
                 break
+            if _inside_exec(buf, idx):
+                # `-- get the policy.` inside EXEC SQL ... END-EXEC is SQL
+                # text: the statement ends after END-EXEC, not here.
+                scan_from = idx + 1
+                continue
+            scan_from = 0
             raw_stmt = buf[:idx + 1]
             text = raw_stmt.strip()
             if text:
@@ -481,6 +503,19 @@ def cobol_statements(logical: Sequence[LogicalLine]) -> Iterator[LogicalLine]:
 
 
 _DECIMAL_DOT = re.compile(r"\d\.\d")
+_EXEC_OPEN = re.compile(r"\bEXEC\s+(?:SQL|CICS|DLI)\b", re.IGNORECASE)
+
+
+def _inside_exec(buf: str, idx: int) -> bool:
+    """True when position idx lies inside an EXEC SQL/CICS/DLI ... END-EXEC
+    block that has not been closed yet."""
+    head = buf[:idx + 1]
+    last = None
+    for m in _EXEC_OPEN.finditer(head):
+        last = m
+    if last is None:
+        return False
+    return "END-EXEC" not in head[last.end():].upper()
 
 
 def _terminates(text: str) -> bool:

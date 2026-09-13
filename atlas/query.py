@@ -419,9 +419,23 @@ def cmd_job(conn: sqlite3.Connection, name: str) -> str:
     procs = conn.execute("""
         SELECT p.*, m.name AS member_name, m.path FROM proc_def p JOIN member m ON m.id=p.member_id
         WHERE UPPER(p.proc_name)=? OR UPPER(m.name)=?""", (name.upper(), name.upper())).fetchall()
+    incl = conn.execute("""SELECT m.name, j.job_name FROM include_use i JOIN member m ON m.id=i.member_id
+                           LEFT JOIN job j ON j.member_id=m.id WHERE UPPER(i.include_member)=? ORDER BY m.name""",
+                        (name.upper(),)).fetchall()
     if not jobs and not procs:
+        if incl:
+            return (f"# {name.upper()}\n\nAn INCLUDE member, not a job: its statements are spliced into "
+                    + ", ".join(f"{r['job_name'] or r['name']}" for r in incl)
+                    + f". Run `job <JOB>` for the effective steps; `cite {name.upper()} a-b` for its text.\n")
         return f"# {name}\n\n**NOT FOUND** - no job or PROC with this name is indexed.\n"
     out = [f"# Job {name.upper()}\n"]
+    if incl:
+        out.append("Included by (INCLUDE MEMBER=): " + ", ".join(r["job_name"] or r["name"] for r in incl) + "\n")
+    for j in jobs:
+        spliced = [r[0] for r in conn.execute("SELECT include_member FROM include_use WHERE member_id=? ORDER BY 1",
+                                              (j["member_id"],))]
+        if spliced:
+            out.append(f"INCLUDE members spliced in: {', '.join(spliced)} (their DDs appear under the steps below)\n")
     sched = conn.execute("SELECT * FROM sched_dep WHERE UPPER(job_name)=? OR UPPER(depends_on)=?",
                          (name.upper(), name.upper())).fetchall()
     if sched:
@@ -1126,6 +1140,11 @@ def cmd_dataset(conn: sqlite3.Connection, dsn: str) -> str:
         out.append(f"\n**Crosses departments:** written by {', '.join(sorted(writers))}; read by "
                    f"{', '.join(sorted(readers))}. A layout or value change here is an interface change "
                    f"between systems, not an internal one.\n")
+    ext = _interface_rows(conn, dsn=dsn)
+    if ext:
+        out.append("\n**Crosses the mainframe boundary**: " + "; ".join(
+            f"{k} {d}" + (f" to/from {p}" if p else "") + f" ({w})" for (k, d, p, _what, w, _s, _c) in sorted(ext)[:6])
+            + " - see `interfaces --dsn`.\n")
     out.append("\n> Direction marked `undetermined` means DISP alone was available; DISP is not direction. "
                "`open_verb` is the program's own OPEN and is authoritative. Rows from expanded PROC steps carry "
                "the calling job's name.\n")
@@ -2704,6 +2723,70 @@ def _coverage_extras(conn: sqlite3.Connection) -> str:
 
 
 # --------------------------------------------------------------------------
+# interfaces - the mainframe / non-mainframe boundary
+# --------------------------------------------------------------------------
+
+def _interface_rows(conn: sqlite3.Connection, system: Optional[str] = None,
+                    dsn: Optional[str] = None) -> List[Tuple]:
+    """(kind, direction, peer, what, where, system, cite) from every source:
+    FTP/NDM/BPXBATCH steps, MQ calls, IMS message switches, CICS TD queues,
+    URIMAP web entry points, REMOTESYSTEM transactions, and the manifest's
+    declared external_interfaces."""
+    rows: List[Tuple] = []
+    q = """SELECT i.kind, i.detail, i.direction, i.line, m.name AS mem, m.kind AS mkind, m.system,
+                  (SELECT program_id FROM program p WHERE p.member_id=m.id LIMIT 1) AS pgm,
+                  (SELECT job_name FROM job j WHERE j.member_id=m.id LIMIT 1) AS job
+           FROM interface_edge i JOIN member m ON m.id=i.member_id"""
+    for r in conn.execute(q):
+        if system and (r["system"] or "").upper() != system.upper():
+            continue
+        where = r["pgm"] or r["job"] or r["mem"]
+        rows.append((r["kind"], r["direction"] or "?", "", r["detail"][:90], where, r["system"] or "?",
+                     f"{r['mem']}:{r['line']}"))
+    for r in conn.execute("""SELECT d.dd_name, d.dsn_resolved, d.mode, d.mode_source, d.line, s.step_name, s.from_proc,
+                                    j.job_name, m.name AS mem, m.system
+                             FROM dd d JOIN step s ON s.id=d.step_id JOIN job j ON j.id=s.job_id JOIN member m ON m.id=j.member_id
+                             WHERE d.dd_name IN ('*FTP*','*NDM*') OR d.mode_source IN ('pathopts')"""):
+        if system and (r["system"] or "").upper() != system.upper():
+            continue
+        if dsn and dsn.upper() not in (r["dsn_resolved"] or "").upper():
+            continue
+        kind = {"*FTP*": "ftp", "*NDM*": "ndm"}.get(r["dd_name"], "uss")
+        direction = "out" if r["mode"] == "input" and kind != "uss" else "in" if r["mode"] == "output" and kind != "uss" else r["mode"]
+        rows.append((kind, direction, "", r["dsn_resolved"], f"{r['job_name']} {r['step_name']}", r["system"] or "?",
+                     f"{r['from_proc'] or r['mem']}:{r['line']}"))
+    for r in conn.execute("SELECT tran_code, program, detail, member_id, line FROM transaction_def WHERE system='cics_web' "
+                          "OR detail LIKE 'REMOTESYSTEM%'"):
+        rows.append(("web" if r["detail"] and r["detail"].startswith("URIMAP") else "remote-region", "in", "",
+                     f"{r['tran_code']} -> {r['program'] or '?'} ({(r['detail'] or '')[:40]})", r["program"] or "", "?",
+                     f"CSD:{r['line']}"))
+    for r in conn.execute("SELECT kind, peer, direction, target_kind, target, note FROM external_interface"):
+        if dsn and r["target_kind"] == "dataset" and dsn.upper() not in r["target"].upper():
+            continue
+        rows.append((r["kind"], r["direction"] or "?", r["peer"] or "?", f"{r['target_kind']} {r['target']}",
+                     "(declared in the manifest)", "-", r["note"] or "manifest"))
+    if dsn:
+        rows = [x for x in rows if dsn.upper() in x[3].upper() or dsn.upper() in x[4].upper()]
+    return rows
+
+
+def cmd_interfaces(conn: sqlite3.Connection, system: Optional[str] = None, dsn: Optional[str] = None) -> str:
+    """What leaves and enters the mainframe: files sent by FTP / Connect:Direct,
+    MQ queues with their message layout, IMS message switches, CICS TD queues
+    and web entry points, plus the peers declared in the manifest."""
+    rows = _interface_rows(conn, system, dsn)
+    out = [f"# Interfaces" + (f" of {system.upper()}" if system else "") + (f" touching {dsn.upper()}" if dsn else "") + "\n"]
+    if not rows:
+        out.append("\n_none found_ - no FTP/NDM/MQ/TDQ/web facts in scope and no `external_interfaces` in the manifest.\n")
+    else:
+        out.append(table(["kind", "dir", "peer", "what", "where", "system", "cite"], sorted(rows)))
+    out.append("\n> A peer system that no source names (the reinsurer, the warehouse, the portal) comes only from the "
+               "manifest's `external_interfaces`; MQ queue names come from the MQOD literal; a `(queue not "
+               "resolvable)` row means the name is set at run time. Message layouts: `layout <01-NAME>`.\n")
+    return "".join(out)
+
+
+# --------------------------------------------------------------------------
 # main
 # --------------------------------------------------------------------------
 
@@ -2727,6 +2810,9 @@ def _main(argv: Optional[List[str]] = None) -> int:
     s.add_argument("--copybook", help="every program including the copybook")
     s.add_argument("--system", help="every program of a department")
     sub.add_parser("conditions").add_argument("name")
+    s = sub.add_parser("interfaces")
+    s.add_argument("--system", help="one department")
+    s.add_argument("--dsn", help="interfaces touching this dataset")
     s = sub.add_parser("paragraph")
     s.add_argument("name")
     s.add_argument("para", help="paragraph / section name, or a line number")
@@ -2781,6 +2867,8 @@ def _main(argv: Optional[List[str]] = None) -> int:
             print(cmd_crud(conn, a.programs, a.job, a.copybook, a.system))
         elif a.cmd == "conditions":
             print(cmd_conditions(conn, a.name))
+        elif a.cmd == "interfaces":
+            print(cmd_interfaces(conn, a.system, a.dsn))
         elif a.cmd == "paragraph":
             print(cmd_paragraph(conn, a.name, a.para))
         elif a.cmd == "literal":

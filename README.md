@@ -265,6 +265,13 @@ falls back to the bare PROC only when no indexed job expands it.
   fall-through, THRU range, section), what it performs/calls/does, its source.
 - `callers X --args` — every call site with its full USING list against the
   callee's LINKAGE; a count mismatch is flagged (the S0C4 check).
+- `interfaces [--system S] [--dsn X]` — what leaves and enters the
+  mainframe: FTP / Connect:Direct steps with the dataset, MQ queues with the
+  message layout, IMS message switches, CICS TD queues and web entry points,
+  and the peers you declare in the manifest (`"external_interfaces":
+  [{"kind":"ndm","peer":"REINSURER-X","direction":"out","dataset":"PROD.POLICY.EXTRACT"}]`)
+  - the one fact no source file states. `dataset X` says when X crosses the
+  boundary.
 - `field NAME` — definitions with offsets, references by mode
   (write/read/test/display), 88s, literals, screen fields, sort cards, the
   **DB2 columns** it is loaded from or stored to, and the **IMS DL/I calls**

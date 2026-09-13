@@ -418,6 +418,9 @@ def _build_step(st: JclStatement, ordinal: int, facts: JclFacts) -> StepFact:
 
 # Libraries whose (MEMBER) is a load module or macro, never control cards.
 _NOT_CARD_DDS = {"STEPLIB", "JOBLIB", "SYSLMOD", "SYSLIB", "DFSRESLB", "IMSACB"}
+# DDs that carry control cards: a sequential dataset here is a card file.
+_CARD_DDS = {"SYSIN", "SYSTSIN", "TOOLIN", "SYMNAMES", "DFSPARM", "$ORTPARM", "SORTCNTL", "INPUT", "SYSIN2", "PARMIN",
+             "CARDIN", "CTLCARDS", "DFSVSAMP"}
 
 
 def _build_dd(st: JclStatement, dd_name: str, concat_seq: int,
@@ -473,6 +476,18 @@ def _build_dd(st: JclStatement, dd_name: str, concat_seq: int,
                 body = member_lookup(card_member)
                 if body is not None:
                     sysin = body
+        elif (sysin is None and member_lookup is not None and not gdg
+              and dd_name.upper().split(".")[-1] in _CARD_DDS):
+            # Cards in a SEQUENTIAL dataset (//SYSIN DD DSN=PROD.CLAIMS.SORTCLM):
+            # fetched as a file named by the last qualifier - matched by that
+            # name, and said so, because it is an assumption.
+            last = resolved.rsplit(".", 1)[-1]
+            if 1 <= len(last) <= 8:
+                body = member_lookup(last)
+                if body is not None:
+                    sysin, card_member = body, last
+                    facts.unresolved.append(("card_seq_assumed", f"{dd_name}: cards taken from member {last} "
+                                                                 f"matching the last qualifier of {resolved}", st.start))
 
     # `//STEP1.DD1 DD ...` overrides a DD inside a called PROC.
     is_override = "." in dd_name

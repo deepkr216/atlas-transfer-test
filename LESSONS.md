@@ -118,6 +118,12 @@ then the fix, then a row here. Nothing is "fixed" until the test exists.
 | 109 | A hand-written `manifest.json` was silently overwritten by every UI build | The generated manifest used the same path | `test_hand_written_manifest_is_kept` |
 | 110 | `--password x` in extra_args was echoed into the live log and the plan | Command lines were logged verbatim | `Classification.test_redact_cmd` |
 | 111 | Every report read as current, even from a build that crashed halfway or a download three months old | No "as of" line anywhere | `test_library_marker_incomplete_and_not_fetched` (index header) |
+| 112 | `-- get the policy.` inside EXEC SQL ended the COBOL statement: the SELECT after it was never seen | Line ends vanish when a statement is assembled; the period in the SQL comment looked like a terminator | `test_sql_comment_with_period_does_not_end_the_statement` |
+| 113 | Every DCLGEN copybook was flagged "contains procedure code" because its `DECLARE TABLE` is EXEC SQL; its column list was thrown away | DECLARE counted as SQL to run | `test_dclgen_is_not_procedure_code_and_declares_columns` |
+| 114 | `job CLMINC` (an INCLUDE member) said NOT FOUND; nothing said which jobs splice it in | INCLUDE use not stored | `test_include_member_says_who_includes_it` |
+| 115 | `//SYSIN DD DSN=PROD.CLAIMS.SRTCLM` (cards in a SEQUENTIAL dataset) had no cards even when the file was fetched | Only `LIB(MEMBER)` was looked up | `test_sequential_card_dataset_matched_by_last_qualifier` (recorded as an assumption) |
+| 116 | "What leaves the mainframe" had no answer: FTP/NDM/MQ/TDQ/web facts were scattered across dossiers and the peer system was nowhere | No `interfaces` report; no place to declare peers | `test_interfaces_report_and_dataset_boundary_line` (manifest `external_interfaces`) |
+| 117 | A crash report still carried `PROD.MASTER` (two qualifiers) and job / copybook / program names | Redaction knew three-qualifier DSNs and member names only | `test_diag_redacts_two_qualifier_dsns` |
 
 ## Known gaps (not yet guarded - contributions welcome)
 

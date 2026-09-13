@@ -447,8 +447,23 @@ def apply_manifest(ctx: Ctx, manifest_path: str) -> None:
             m.system = sysname
             ctx.conn.execute("UPDATE member SET system=? WHERE id=?", (sysname, m.id))
             n_sys += 1
+    # What crosses the mainframe boundary is declared, not derivable:
+    #   "external_interfaces": [{"kind":"ndm","peer":"REINSURER-X","direction":"out","dataset":"PROD.POLICY.EXTRACT"},
+    #                           {"kind":"ddf","peer":"CLAIMS-WEB","direction":"in","table":"PRD.POLICY_TBL"}]
+    ctx.conn.execute("DELETE FROM external_interface")
+    n_ext = 0
+    for e in man.get("external_interfaces") or []:
+        if not isinstance(e, dict):
+            continue
+        tk = next((k for k in ("dataset", "queue", "table", "transaction", "program", "path") if e.get(k)), None)
+        if not tk:
+            continue
+        ctx.conn.execute("INSERT INTO external_interface(kind,peer,direction,target_kind,target,note) VALUES(?,?,?,?,?,?)",
+                         ((e.get("kind") or "other").lower(), e.get("peer"), (e.get("direction") or "").lower() or None,
+                          tk, str(e[tk]).upper() if tk != "path" else str(e[tk]), e.get("note")))
+        n_ext += 1
     ctx.say(f"manifest: {n_auth} authoritative, {n_sys} assigned to a system, "
-            f"copybook order declared for {len(ctx.copylib_order)} system(s)")
+            f"copybook order declared for {len(ctx.copylib_order)} system(s), {n_ext} external interface(s)")
 
 
 # --------------------------------------------------------------------------
@@ -831,11 +846,24 @@ def index_copybook(ctx: Ctx, mem: Mem) -> None:
     conn.executemany(
         "INSERT INTO copy_use(member_id,copybook,of_library,replacing,line) VALUES(?,?,?,?,?)",
         [(mem.id, n, lib, rep, ln) for (n, lib, rep, ln) in facts.copies])
-    if facts.calls or facts.performs or facts.sql:
+    # A DCLGEN's DECLARE TABLE is data, not procedure code: it is the
+    # table's column list (positional, behind SELECT *), recorded here so
+    # `table X` knows the columns even before any program includes it.
+    for tbl, cols in facts.declared_tables.items():
+        qual, _, name = tbl.rpartition(".")
+        conn.execute("INSERT OR IGNORE INTO db2_object(kind,qualifier,name,source,member_id) VALUES('table',?,?,'dclgen',?)",
+                     (qual or None, name, mem.id))
+        oid = conn.execute("SELECT id FROM db2_object WHERE kind='table' AND name=? AND COALESCE(qualifier,'')=?",
+                           (name, qual or "")).fetchone()[0]
+        if not conn.execute("SELECT 1 FROM db2_column WHERE object_id=? LIMIT 1", (oid,)).fetchone():
+            conn.executemany("INSERT INTO db2_column(object_id,ordinal,name,type) VALUES(?,?,?,?)",
+                             [(oid, i, c, t) for i, (c, t) in enumerate(cols, 1)])
+    proc_sql = [s for s in facts.sql if s.stmt_type not in ("DECLARE", "INCLUDE", "WHENEVER")]
+    if facts.calls or facts.performs or proc_sql:
         conn.execute("INSERT INTO unresolved(member_id,kind,detail,line) VALUES(?,?,?,?)",
                      (mem.id, "procedure_copybook",
                       f"copybook contains procedure code ({len(facts.calls)} CALL, "
-                      f"{len(facts.performs)} PERFORM, {len(facts.sql)} SQL); its facts are attributed "
+                      f"{len(facts.performs)} PERFORM, {len(proc_sql)} SQL); its facts are attributed "
                       f"to each including program via expansion", None))
     for w in warns:
         if "SYNC" in w or "not compile" in w or "mixed" in w:
@@ -877,6 +905,8 @@ def _index_jcl_facts(ctx: Ctx, mem: Mem, facts: jcl.JclFacts) -> None:
              _j([d.dsn_resolved or d.dsn for d in facts.job_dds if d.dd_name.upper() == "JOBLIB"]),
              facts.job_cond, _j(facts.jcllib)))
         job_id = cur.lastrowid
+    conn.executemany("INSERT INTO include_use(member_id,include_member) VALUES(?,?)",
+                     [(mem.id, inc) for inc in sorted(set(facts.includes))])
 
     def insert_step(s: jcl.StepFact, ordinal: int, owner: Optional[Tuple[Optional[int], Optional[int]]] = None) -> int:
         jid, pid = owner if owner else (job_id, proc_id)

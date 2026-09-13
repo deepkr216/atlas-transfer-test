@@ -11,5 +11,11 @@
     "PROD.CLAIMS.SRC": "CLAIMS",
     "PROD.POLICY.SRC": "POLICY",
     "PROD.BILLING.SRC": "BILLING"
-  }
+  },
+  "_external_interfaces_comment": "What crosses the mainframe boundary and with whom - no source file states the peer. kind: ndm|ftp|mq|ddf|webservice|zosconnect|file|other; direction: in|out|both; one of dataset|queue|table|transaction|program|path. Shown by `interfaces` and on `dataset X`.",
+  "external_interfaces": [
+    {"kind": "ndm", "peer": "REINSURER-X", "direction": "out", "dataset": "PROD.POLICY.EXTRACT", "note": "nightly bordereau"},
+    {"kind": "mq", "peer": "CLAIMS-PORTAL", "direction": "out", "queue": "CLAIMS.OUT.QUEUE"},
+    {"kind": "ddf", "peer": "CLAIMS-WEB", "direction": "in", "table": "PRD.POLICY_TBL"}
+  ]
 }

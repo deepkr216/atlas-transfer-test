@@ -45,6 +45,7 @@ python -m atlas.query --db atlas.db dataset  <DSN>
 python -m atlas.query --db atlas.db crud     <PGM...> | --job JOB | --copybook X   # C/R/U/D matrix with cites
 python -m atlas.query --db atlas.db conditions <PGM>          # every IF/WHEN with its literal or 88 values
 python -m atlas.query --db atlas.db paragraph <PGM> <NAME|line>  # who reaches it, what it does, its source
+python -m atlas.query --db atlas.db interfaces [--system S] [--dsn X]  # what leaves/enters the mainframe, and via whom
 python -m atlas.query --db atlas.db field    <NAME> [--all] [--program PGM]
 python -m atlas.query --db atlas.db search   '"<token>"'
 python -m atlas.query --db atlas.db cite     <MEMBER> <a>-<b> [--kind cobol|jcl|psb|...]

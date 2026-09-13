@@ -705,6 +705,26 @@ CREATE TABLE IF NOT EXISTS derived_summary (
     verified_by TEXT                      -- human initials, NULL until reviewed
 );
 
+-- // INCLUDE MEMBER=X in a job: X's DDs belong to the job.
+CREATE TABLE IF NOT EXISTS include_use (
+    id             INTEGER PRIMARY KEY,
+    member_id      INTEGER NOT NULL REFERENCES member(id) ON DELETE CASCADE,   -- the job/PROC member
+    include_member TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_include_use ON include_use(include_member);
+
+-- Declared in the manifest (`external_interfaces`): what leaves or enters
+-- the mainframe and through which peer - the part no source file states.
+CREATE TABLE IF NOT EXISTS external_interface (
+    id          INTEGER PRIMARY KEY,
+    kind        TEXT NOT NULL,            -- ndm|ftp|mq|ddf|webservice|zosconnect|file|other
+    peer        TEXT,                     -- the system on the other side
+    direction   TEXT,                     -- in|out|both
+    target_kind TEXT,                     -- dataset|queue|table|transaction|program|path
+    target      TEXT NOT NULL,
+    note        TEXT
+);
+
 -- A fetched library as the fetcher saw it: which members the host lists,
 -- which arrived. "NOT FOUND" and "NOT FETCHED" are different answers.
 CREATE TABLE IF NOT EXISTS library (

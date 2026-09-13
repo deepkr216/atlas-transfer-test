@@ -31,7 +31,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 _WIN_PATH = re.compile(r"[A-Za-z]:[\\/][^\s'\"<>|]+")
 _NIX_PATH = re.compile(r"(?<![\w.])/(?:[^\s'\"<>|/]+/)+[^\s'\"<>|/]*")
-_DSN = re.compile(r"\b[A-Z0-9$#@]{1,8}(?:\.[A-Z0-9$#@]{1,8}){2,}(?:\([+-]?\d+\))?\b")
+# two qualifiers (PROD.MASTER) are a dataset name too
+_DSN = re.compile(r"\b[A-Z0-9$#@]{1,8}(?:\.[A-Z0-9$#@]{1,8}){1,}(?:\([+-]?\d+\))?(?![A-Z0-9$#@.])")
 
 
 def redact(text: str, names: Iterable[str] = ()) -> str:
@@ -91,7 +92,16 @@ def report(db_path: str, redact_names: bool = False) -> str:
     conn = sqlite3.connect(db_path)
     names: List[str] = []
     if redact_names:
+        # member names, and every other estate name that can appear in an
+        # error text: job names, copybook names, call targets, PROGRAM-IDs
         names = [r[0] for r in conn.execute("SELECT DISTINCT name FROM member")]
+        for sql in ("SELECT DISTINCT job_name FROM job", "SELECT DISTINCT copybook FROM copy_use",
+                    "SELECT DISTINCT target FROM call_edge WHERE target IS NOT NULL",
+                    "SELECT DISTINCT program_id FROM program", "SELECT DISTINCT proc_name FROM proc_def"):
+            try:
+                names += [r[0] for r in conn.execute(sql) if r[0]]
+            except sqlite3.OperationalError:
+                pass
 
     run = conn.execute("SELECT * FROM build_run ORDER BY id DESC LIMIT 1").fetchone()
     if run:
