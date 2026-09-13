@@ -446,8 +446,25 @@ CREATE TABLE IF NOT EXISTS dataset (
     dsn         TEXT NOT NULL UNIQUE,     -- normalised, GDG base without (+1)
     is_gdg      INTEGER DEFAULT 0,
     is_vsam     INTEGER DEFAULT 0,
-    vsam_type   TEXT                      -- KSDS|ESDS|RRDS|AIX|PATH
+    vsam_type   TEXT,                     -- KSDS|ESDS|RRDS|LDS|AIX|PATH|GDG (from IDCAMS DEFINE)
+    recordsize_max INTEGER,               -- DEFINE CLUSTER RECORDSIZE(avg max): must equal the copybook length
+    key_len     INTEGER,                  -- KEYS(len off)
+    key_off     INTEGER,
+    gdg_limit   INTEGER,                  -- DEFINE GDG LIMIT(n)
+    relates_to  TEXT                      -- AIX RELATE(base) / PATH PATHENTRY(aix)
 );
+
+-- A batch utility step touching a DB2 table: LOAD/UNLOAD (DSNUTILB) and the
+-- SQL a DSNTIAUL/DSNTEP2 step runs. `table X` writers include the LOAD.
+CREATE TABLE IF NOT EXISTS step_table (
+    id          INTEGER PRIMARY KEY,
+    step_id     INTEGER NOT NULL REFERENCES step(id) ON DELETE CASCADE,
+    op          TEXT,                     -- LOAD|UNLOAD|REORG|RUNSTATS|COPY|SELECT|INSERT|UPDATE|DELETE
+    tbl         TEXT NOT NULL,
+    via_dd      TEXT,                     -- the DD carrying the rows (INDDN / UNLDDN / SYSREC00)
+    direction   TEXT                      -- read|write|reorg
+);
+CREATE INDEX IF NOT EXISTS ix_step_table ON step_table(tbl);
 
 -- The producer/consumer edge that reveals real batch data flow. GDG relative
 -- refs are why this cannot be done by string-matching DSNs.

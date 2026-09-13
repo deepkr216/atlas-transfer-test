@@ -42,8 +42,13 @@ class ProcExpansion(unittest.TestCase):
     def test_exec_override_beats_proc_default(self):
         self.assertEqual(self._dd("NIGHT.PS010", "MASTER").dsn_resolved, "PROD.CLM.MASTER")   # not TEST.CLM
 
-    def test_job_set_beats_proc_default_in_parm(self):
-        self.assertEqual(self.by["NIGHT.PS010"].parm, "20260912")
+    def test_proc_default_beats_job_set_in_parm(self):
+        # z/OS: inside a called procedure a PROC-statement default wins over
+        # a SET value; SET reaches the PROC only for symbols the PROC statement
+        # does not define (EXEC overrides beat both). NIGHTLY defaults
+        # RPTDT=00000000; the job's SET RPTDT=20260912 does not replace it.
+        self.assertEqual(self.by["NIGHT.PS010"].parm, "00000000")
+        self.assertTrue(jcl.PROC_DEFAULT_BEATS_SET)
 
     def test_included_dd_overrides_proc_dd(self):
         d = self._dd("NIGHT.PS010", "STEPLIB")

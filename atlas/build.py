@@ -142,7 +142,10 @@ def open_db(path: str, rebuild: bool = False) -> sqlite3.Connection:
                              ("dli_call", "dest", "TEXT"), ("dli_call", "psb_name", "TEXT"),
                              ("dli_call", "dbd_name", "TEXT"), ("dli_call", "procopt", "TEXT"),
                              ("dli_call", "pcb_source", "TEXT"), ("ims_pcb", "list_no", "INTEGER DEFAULT 0"),
-                             ("ims_pcb", "procseq", "TEXT"), ("ims_dbd", "dd1", "TEXT"), ("ims_dbd", "dd2", "TEXT")):
+                             ("ims_pcb", "procseq", "TEXT"), ("ims_dbd", "dd1", "TEXT"), ("ims_dbd", "dd2", "TEXT"),
+                             ("dataset", "recordsize_max", "INTEGER"), ("dataset", "key_len", "INTEGER"),
+                             ("dataset", "key_off", "INTEGER"), ("dataset", "gdg_limit", "INTEGER"),
+                             ("dataset", "relates_to", "TEXT")):
         _ensure_column(conn, table, col, decl)
     with open(os.path.join(HERE, "schema.sql"), "r", encoding="utf-8") as fh:
         conn.executescript(fh.read())
@@ -817,7 +820,37 @@ def _index_jcl_facts(ctx: Ctx, mem: Mem, facts: jcl.JclFacts) -> None:
             conn.executemany(
                 "INSERT INTO card_field_ref(step_id,card_kind,pos,length,fmt,raw) VALUES(?,?,?,?,?,?)",
                 [(sid, k, p, ln, fmt, raw) for (k, p, ln, fmt, raw) in jcl.easytrieve_fields(ctl)])
+        # SYSOUT=(x,INTRDR): a scheduling edge written in JCL.
+        for sub in s.submits:
+            conn.execute("INSERT INTO sched_dep(job_name,depends_on,kind) VALUES(?,?,?)",
+                         (sub, facts.job_name or mem.name, "intrdr"))
+        # DB2 utility / DSNTIAUL / DSNTEP2: the table <-> flat-file lineage.
+        eff = (s.effective_pgm or "").strip("*")
+        if kind == "db2util" or eff in ("DSNTIAUL", "DSNTEP2", "DSNTEP4") or s.launcher == "DSNUTILB":
+            is_sql = eff in ("DSNTIAUL", "DSNTEP2", "DSNTEP4")
+            sysin = "\n".join(d.sysin_text for d in s.dds if d.sysin_text and d.dd_name.upper().endswith("SYSIN"))
+            for op, tbl, via_dd, direction in jcl.db2util_ops(sysin, is_sql=is_sql):
+                conn.execute("INSERT INTO step_table(step_id,op,tbl,via_dd,direction) VALUES(?,?,?,?,?)",
+                             (sid, op, tbl, via_dd, direction))
+                if via_dd:
+                    # LOAD reads the DD (INDDN); UNLOAD writes it (UNLDDN).
+                    conn.execute("""UPDATE dd SET mode=?, mode_source='db2util_card' WHERE step_id=? AND UPPER(dd_name)=?
+                                    AND mode_source NOT IN ('open_verb')""",
+                                 ("input" if op == "LOAD" else "output", sid, via_dd.upper()))
+            if is_sql:
+                # DSNTIAUL writes SYSRECnn; DSNTEP2 prints. Every SYSREC DD is output.
+                conn.execute("""UPDATE dd SET mode='output', mode_source='db2util_card' WHERE step_id=?
+                                AND UPPER(dd_name) LIKE 'SYSREC%' AND mode_source NOT IN ('open_verb')""", (sid,))
         if kind == "idcams":
+            # DEFINE attributes: RECORDSIZE / KEYS / LIMIT / RELATE - the numbers
+            # a copybook or a rerun must agree with.
+            for name, a in jcl.idcams_attrs(ctl).items():
+                conn.execute("INSERT OR IGNORE INTO dataset(dsn) VALUES(?)", (name,))
+                conn.execute("""UPDATE dataset SET vsam_type=COALESCE(?, vsam_type), recordsize_max=COALESCE(?, recordsize_max),
+                                key_len=COALESCE(?, key_len), key_off=COALESCE(?, key_off), gdg_limit=COALESCE(?, gdg_limit),
+                                relates_to=COALESCE(?, relates_to) WHERE dsn=?""",
+                             (a.get("vsam_type"), a.get("recordsize_max"), a.get("key_len"), a.get("key_off"),
+                              a.get("gdg_limit"), a.get("relates_to"), name))
             # A VSAM file is born (DEFINE) or dies (DELETE) here; REPRO copies it.
             for op, name, mode in jcl.idcams_ops(ctl):
                 if op == "REPRO DD":

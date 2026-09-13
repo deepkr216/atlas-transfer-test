@@ -103,6 +103,13 @@ then the fix, then a row here. Nothing is "fixed" until the test exists.
 | 94 | The D1 CRUD matrix, the T1 test-condition inventory and "explain this paragraph" were assembled by the model from raw text | No `crud` / `conditions` / `paragraph` queries | `test_crud_conditions_paragraph` |
 | 95 | `coverage` said `ctlcard skipped 3100` without saying that class contributes no facts; `dead` covered programs only | No handler-vs-kind table, no optional-input checklist, no dataset/copybook/job decommissioning lists | `test_dead_and_coverage_extras` |
 | 96 | A section's paragraphs and GO TO / fall-through targets were counted "never PERFORMed" | The structure line used PERFORM edges only | `ControlFlow.test_sections_goto_times_fallthrough` |
+| 97 | A job's `// SET HLQ=PROD` was applied inside a PROC whose statement says `HLQ=TEST` - the production/test confusion the tool exists to prevent, in the tool's own answer | Precedence coded as SET > PROC default; z/OS applies EXEC override > PROC default > SET (`jcl.PROC_DEFAULT_BEATS_SET` explains how to confirm with one job) | `test_proc_default_beats_job_set_in_parm` |
+| 98 | `EXEC DLIBATCH,MBR=CLMPOST,PSB=CLMPSB` (the normal IMS batch form) gave "PROC not found", no effective program, CLMPOST a dead candidate | IMS.PROCLIB is not in the estate folder and nothing read the MBR=/PSB= overrides | `test_system_proc_synthesised` |
+| 99 | `SYSOUT=(A,INTRDR)` was a print class; the submitted job had no predecessor | INTRDR not recognised as a submit | `test_intrdr_submit_edge` |
+| 100 | `DD PATH='/u/feeds/in.txt'` had no dataset and no direction - the USS landing zone of every FTP/BPXBATCH feed was invisible | PATH= not read | `test_uss_path_dd` |
+| 101 | ICETOOL steps were "SORT with no inline SYSIN"; OUTFIL FNAMES= outputs, JOINKEYS inputs and ICETOOL FROM/TO had DISP-only direction; `OUTREC=(1:1,10,11:21,5)` yielded no byte positions; SYMNAMES symbols yielded nothing | Only SYSIN read; column-positioned items rejected by a lookbehind; symbols not substituted | `test_sort_cards_roles_symbols_positions` |
+| 102 | `LOAD ... INTO TABLE X` and DSNTIAUL's `SELECT ... FROM X` were invisible: `table X` listed COBOL programs only, the unload file had DISP-only direction | Utility cards not parsed | `test_db2_utility_lineage` |
+| 103 | IDCAMS `RECORDSIZE`, `KEYS`, `LIMIT`, `RELATE` were dropped, so a copybook length could not be checked against the cluster | Only the DEFINE verb and name were kept | `test_idcams_attributes` |
 
 ## Known gaps (not yet guarded - contributions welcome)
 

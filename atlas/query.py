@@ -1030,6 +1030,19 @@ def cmd_dataset(conn: sqlite3.Connection, dsn: str) -> str:
     rows = conn.execute("""SELECT * FROM v_dataset_flow WHERE UPPER(dsn) LIKE ? ORDER BY dsn, mode, job_name""",
                         (f"%{dsn.upper()}%",)).fetchall()
     out = [f"# Dataset {dsn.upper()}\n"]
+    for a in conn.execute("""SELECT dsn, vsam_type, recordsize_max, key_len, key_off, gdg_limit, relates_to FROM dataset
+                             WHERE UPPER(dsn) LIKE ? AND (vsam_type IS NOT NULL OR gdg_limit IS NOT NULL)""",
+                          (f"%{dsn.upper()}%",)):
+        bits = [a["vsam_type"] or ""]
+        if a["recordsize_max"]:
+            bits.append(f"RECORDSIZE max {a['recordsize_max']} (the copybook length must agree)")
+        if a["key_len"] is not None:
+            bits.append(f"KEYS len {a['key_len']} at offset {a['key_off']} (the RECORD KEY field must sit there)")
+        if a["gdg_limit"]:
+            bits.append(f"GDG LIMIT {a['gdg_limit']}")
+        if a["relates_to"]:
+            bits.append(f"relates to {a['relates_to']}")
+        out.append(f"- IDCAMS DEFINE `{a['dsn']}`: " + "; ".join(b for b in bits if b) + "\n")
     hidden = 0
     if not dsn.startswith("&&"):
         # &&TEMP names repeat across unrelated jobs; showing them here would
@@ -2130,6 +2143,18 @@ def cmd_table(conn: sqlite3.Connection, name: str) -> str:
     if cols:
         out.append("\n### Columns referenced (see `column TABLE.COL` for the field lineage)\n")
         out.append(table(["column", "mode", "refs", "programs"], [(c["col"], c["mode"], c["n"], c["pgms"]) for c in cols]))
+    util = conn.execute("""SELECT st.op, st.tbl, st.via_dd, st.direction, j.job_name, s.step_name, s.line, s.from_proc,
+                                  m.name AS mem, d.dsn_resolved
+                           FROM step_table st JOIN step s ON s.id=st.step_id LEFT JOIN job j ON j.id=s.job_id
+                           LEFT JOIN member m ON m.id=j.member_id
+                           LEFT JOIN dd d ON d.step_id=s.id AND UPPER(d.dd_name)=UPPER(st.via_dd)
+                           WHERE (UPPER(st.tbl)=? OR UPPER(st.tbl) LIKE ?) AND s.job_id IS NOT NULL
+                           ORDER BY j.job_name, s.ordinal""", (base, f"%.{base}")).fetchall()
+    if util:
+        out.append("\n### Batch utilities (LOAD writes the table from a file; UNLOAD / DSNTIAUL read it into one)\n")
+        out.append(table(["job", "step", "op", "direction", "via DD", "dataset", "cite"],
+                         [(u["job_name"], u["step_name"], u["op"], u["direction"], u["via_dd"] or "",
+                           u["dsn_resolved"] or "", f"{u['from_proc'] or u['mem']}:{u['line']}") for u in util]))
     plans = conn.execute("SELECT DISTINCT tran_code, detail FROM transaction_def WHERE detail LIKE '%DB2 plan%'").fetchall()
     if plans:
         out.append("\n- CICS transactions with a DB2 plan (from DB2ENTRY/DB2TRAN): "

@@ -153,7 +153,7 @@ change to the toolkit and before copying it to another machine.
 | Expansion | Every program materialised with COPY/INCLUDE inline and REPLACING applied (pseudo-text as a character string - `==PM-== BY ==LK-==` renames the prefix; `LEADING`/`TRAILING`; `==01== BY ==05==` renumbers levels only), with a line map back to (member, line) and a **field alias** table so `field PM-POLICY-STATUS` finds the program's `LK-POLICY-STATUS` references | Fields renamed by REPLACING are invisible to grep; procedure copybooks attributed to the wrong member; a COPY word inside a DISPLAY literal expanded |
 | DB2 | DCLGEN `DECLARE TABLE` columns (positional list behind `SELECT *`), qualified and unqualified names matched as one table, cursors, dynamic SQL flagged, stored-procedure calls, per-column lineage to host variables, CICS DB2ENTRY/DB2TRAN plans | `column X` saying "no references" for every program that reads the whole row; a cursor recorded as a table |
 | CICS | CSD `DEFINE`/`LIST` for TRANSACTION, PROGRAM, FILE→DSNAME, **TDQUEUE→dataset**, DB2ENTRY/DB2TRAN, URIMAP→program; every resource block kept; online readers/updaters of a VSAM file in `dataset`; program↔map and transaction chaining from `EXEC CICS` facts | The fifty CICS programs that update a master file missing from its lineage; a transaction reached only by `RETURN TRANSID` listed as dead |
-| JCL / PROC | JOB/EXEC/DD with continuations, inline control cards captured, symbolics resolved (SET > EXEC override > PROC default), GDG base split from `(+1)`, `//STEP.DD` overrides, **effective program** unwrapped from IKJEFT01/DFSRRC00/SORT/IDCAMS/IEBGENER/IEFBR14/DSNUTILB/FTP/NDM, sort-card **byte positions** | Steps attributed to TSO or the IMS region driver; producer/consumer linkage lost through GDG; `DISP` mistaken for direction |
+| JCL / PROC | JOB/EXEC/DD with continuations, inline control cards captured, symbolics resolved (EXEC override > PROC default > SET), GDG base split from `(+1)`, `//STEP.DD` overrides, **effective program** unwrapped from IKJEFT01/DFSRRC00/SORT/IDCAMS/IEBGENER/IEFBR14/DSNUTILB/FTP/NDM, sort-card **byte positions** | Steps attributed to TSO or the IMS region driver; producer/consumer linkage lost through GDG; `DISP` mistaken for direction |
 | IMS | DBD segments, **FIELDs (start/bytes/SEQ), XDFLD secondary indexes, DATASET DD1** (GSAM = the JCL DD), several DBDs per member; PSB PCBs in **positional** order with PROCOPT, `LIST=NO`, `PROCSEQ`, `CMPAT=YES` / TP PCB → I/O PCB first; **every DL/I call resolved to its database and PROCOPT** through the PSB named by the DFSRRC00 PARM / stage-1 / convention, with the reasoning stored; GSAM ISRT/GN sets the JCL DD's direction; stage-1 decks inside JCL SYSIN, SPA/INQUIRY, DATABASE access | Off-by-one PCB → wrong database named; an extract written through GSAM with no writer |
 | Screens | BMS maps (DFHMSD/DFHMDI/DFHMDF): field, position, length, attributes, INITIAL, PICIN/PICOUT, and the generated symbolic names (`GENDERI`/`GENDERO`) that programs actually reference; MFS (FMT/DFLD, MSG/SEG/MFLD): MID/MOD with each MFLD's **byte offset** in the segment, `ATTR=YES` bytes, DO/ENDDO repeats, TYPE inferred from `…FIP`/`…FOP`/`…MID`/`…MOD` labels when missing | Online validation invisible; screen defaults and labels missed by a message search |
 | Documents | .docx/.xlsx/.pptx/.vsdx text, headings, tables, image manifests; PDF best-effort; legacy .doc/.xls reported | Docs indexed as if they were facts |
@@ -173,7 +173,10 @@ weak hint. Every DD row records which signal decided it (`mode_source`).
 
 A job is indexed twice: its literal statements, and its **effective steps** —
 every `EXEC PROC=` replaced by the PROC's steps with symbolics resolved in JCL
-precedence (`EXEC PROC=X,SYM=value` › instream `SET` › PROC defaults) and
+precedence (`EXEC PROC=X,SYM=value` › PROC statement defaults › instream
+`SET` - a SET value reaches the PROC only for a symbol the PROC statement
+does not define; `jcl.PROC_DEFAULT_BEATS_SET` documents how to confirm this
+with one job on your system) and
 `//PROCSTEP.DDNAME` overrides and additions applied, `INCLUDE MEMBER=`
 spliced in first, nested PROCs expanded, instream PROCs (`// PROC … // PEND`
 inside the job) collected and used before cataloged ones. `&SYM` and
@@ -220,7 +223,17 @@ GDG, run-time symbols (`%%ODATE`, `&LYYMMDD`) become `<VAR>` and are
 reported. PROCs and INCLUDEs are resolved by the job's `JCLLIB ORDER`,
 then its department, then the manifest - two departments each owning a
 `NIGHTLY` PROC no longer cross - and an undecidable choice is reported as
-`ambiguous_proc`.
+`ambiguous_proc`. The IMS/DB2 system PROCs that are never in the estate
+folder (`EXEC DLIBATCH,MBR=CLMPOST,PSB=CLMPSB`, IMSBMP, DBBBATCH,
+DSNUPROC) are synthesised from their overrides and reported as
+`proc_synthesised`; `SYSOUT=(A,INTRDR)` becomes a scheduler edge to the
+submitted job; `DD PATH='/u/...'` files carry their PATHOPTS direction;
+ICETOOL `TOOLIN`/`xxxxCNTL`, `OUTFIL FNAMES=`, `JOINKEYS F1=/F2=` and
+`SYMNAMES` symbols give sort steps their DD roles and byte positions
+(`c:p,l` items included); `LOAD ... INTO TABLE` / `UNLOAD` / DSNTIAUL SQL
+join tables to the flat files they fill or drain (`table X` lists them);
+IDCAMS `RECORDSIZE`, `KEYS`, `LIMIT` and `RELATE` are kept on the dataset
+so a copybook length can be checked against the cluster.
 
 Because of that, `dataset PROD.CLM.MASTER` lists the *jobs* that create and
 read it (`NIGHTJOB NIGHT.PS010`, direction with its source), not just a PROC

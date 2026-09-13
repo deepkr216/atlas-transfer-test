@@ -70,6 +70,51 @@ _SCHED_VAR = re.compile(r"%%[A-Z0-9$#@_]+\.?|#J[IO][A-Z0-9]*", re.IGNORECASE)
 # EXEC PROC= operands that are STEP overrides, qualified (PARM.PS1=) or bare.
 _STEP_KEYWORDS = {"PARM", "COND", "TIME", "REGION", "ACCT", "MEMLIMIT"}
 
+# Symbol precedence inside a called procedure. z/OS: a value on the EXEC
+# statement, else the PROC statement default, else a SET value. Flip this
+# (and re-run the tests) only after checking one job on the real system:
+#   //X PROC HLQ=TEST / //D DD DSN=&HLQ..A   called by   // SET HLQ=PROD / EXEC X
+#   -> JESYSMSG allocates TEST.A (PROC default wins) or PROD.A (SET wins).
+PROC_DEFAULT_BEATS_SET = True
+
+# System PROCs that are rarely in the estate folder but whose EXEC says it
+# all: EXEC DLIBATCH,MBR=CLMPOST,PSB=CLMPSB. (proc -> (launcher, region))
+_SYSTEM_PROCS = {
+    "DLIBATCH": ("DFSRRC00", "DLI"), "IMSBATCH": ("DFSRRC00", "DLI"), "DBBBATCH": ("DFSRRC00", "DBB"),
+    "IMSBMP": ("DFSRRC00", "BMP"), "IMSBATCH2": ("DFSRRC00", "DLI"), "DFSMPR": ("DFSRRC00", "MPP"),
+    "DSNUPROC": ("DSNUTILB", None),
+}
+
+
+def _system_proc_step(s: "StepFact", job: "JclFacts") -> Optional["StepFact"]:
+    """An effective step for a well-known IMS/DB2 PROC that is not indexed,
+    built from the EXEC's symbolic overrides. Reported as `proc_synthesised`
+    so the reader knows the PROC's own DDs (IMS logs, RECON, STEPLIB) are
+    not in the index."""
+    name = (s.proc_called or "").upper()
+    if name not in _SYSTEM_PROCS:
+        return None
+    launcher, region = _SYSTEM_PROCS[name]
+    ov = {k.upper(): v for k, v in s.sym_overrides.items()}
+    if launcher == "DFSRRC00":
+        mbr, psb = ov.get("MBR") or ov.get("PGM") or "", ov.get("PSB") or ""
+        if not mbr:
+            return None
+        parm = f"{region},{mbr}{',' + psb if psb else ''}"
+    else:
+        parm = f"{ov.get('SYSTEM', '')},{ov.get('UID', '')}"
+    first = "G" if launcher == "DFSRRC00" else "DSNUPROC"
+    eff = replace(s, step_name=f"{s.step_name}.{first}", from_proc=name, parent_step=s.step_name,
+                  pgm=launcher, proc_called=None, parm=parm, dds=[], notes=[], sym_overrides={}, step_overrides={})
+    for d in s.dds:                               # the job's //S1.G.DD overrides become the step's DDs
+        dn = d.dd_name.upper().split(".")[-1]
+        eff.dds.append(replace(d, dd_name=dn, is_override=True))
+    _resolve_effective_pgm(eff, job)
+    eff.notes.append(f"PROC {name} synthesised from EXEC overrides (the PROC member is not indexed)")
+    job.unresolved.append(("proc_synthesised", f"{s.step_name}: system PROC {name} not indexed - step built from "
+                                               f"MBR=/PSB= overrides; the PROC's own DDs are unknown", s.line))
+    return eff
+
 # DFSRRC00 PARM=(DLI,pgm,psb,...)  /  (BMP,pgm,psb,...)  /  (MPP,...)
 _IMS_PARM = re.compile(
     r"^\(?\s*(DLI|BMP|MPP|IFP|ULU|DBB|IMS)\s*,\s*([A-Z0-9@#$]{1,8})\s*(?:,\s*([A-Z0-9@#$]{1,8}))?",
@@ -128,6 +173,7 @@ class StepFact:
     step_overrides: Dict[str, str] = dc_field(default_factory=dict)  # PARM.PS1=, COND.PS2=, bare PARM= on EXEC PROC
     guard: Optional[str] = None          # enclosing // IF (...) THEN / ELSE: the step runs only when true
     also_runs: List[str] = dc_field(default_factory=list)            # 2nd.. RUN PROGRAM() in one SYSTSIN
+    submits: List[str] = dc_field(default_factory=list)              # jobs written to SYSOUT=(x,INTRDR)
 
 
 @dataclass
@@ -386,6 +432,16 @@ def _build_dd(st: JclStatement, dd_name: str, concat_seq: int,
     resolved, gdg, referback, card_member, is_temp = None, None, None, None, False
     sysin = "\n".join(st.inline_data) if st.inline_data else None
 
+    if not dsn and kw.get("PATH"):
+        # A USS file (FTP landing zone, BPXBATCH input) is lineage too.
+        path = _unquote(kw["PATH"]) or ""
+        opts = (kw.get("PATHOPTS") or "").upper()
+        mode = ("both" if "ORDWR" in opts else "input" if "ORDONLY" in opts
+                else "output" if any(o in opts for o in ("OWRONLY", "OCREAT", "OAPPEND", "OTRUNC")) else "unknown")
+        return DdFact(dd_name=dd_name, concat_seq=concat_seq, dsn=path, dsn_resolved=path, gdg_rel=None,
+                      disp=disp, mode=mode, mode_source="pathopts" if mode != "unknown" else "undetermined",
+                      sysin_text=sysin, is_override="." in dd_name, line=st.start)
+
     if dsn and dsn.startswith("*."):
         # DSN=*.STEP.DD reuses what an earlier step allocated: resolved once
         # every step of the job is known (_resolve_referbacks).
@@ -469,6 +525,8 @@ def _direction(dd_name: str, gdg: Optional[str], disp: Optional[str],
     """
     up = (operands or "").upper()
     if "SYSOUT=" in up:
+        if "INTRDR" in up:
+            return "submit", "intrdr"        # SYSOUT=(A,INTRDR): the step SUBMITS a job
         return "sysout", "sysout"
     # DUMMY is the first positional operand, never a substring: a dataset
     # named PROD.CLM.DUMMY.FILE is real. DSN=NULLFILE is DUMMY's synonym.
@@ -553,6 +611,24 @@ def _resolve_effective_pgm(step: StepFact, facts: JclFacts,
         if step.proc_called:
             step.notes.append(f"runs PROC {step.proc_called}; steps come from the PROC member")
         return
+
+    # SYSOUT=(x,INTRDR): whatever this step writes there is SUBMITTED as a
+    # job - a scheduling edge written in JCL, not in the scheduler.
+    if any(d.mode == "submit" for d in step.dds):
+        for d in step.dds:
+            if d.mode == "submit":
+                continue
+            text = d.sysin_text or ""
+            for mj in re.finditer(r"^//([A-Z0-9@#$]{1,8})\s+JOB\b", text, re.IGNORECASE | re.MULTILINE):
+                if mj.group(1).upper() not in step.submits:
+                    step.submits.append(mj.group(1).upper())
+            if d.card_member and not text and d.card_member not in step.submits:
+                step.submits.append(d.card_member)          # the member name = the job name (assumption)
+        if step.submits:
+            step.notes.append("submits job(s) via INTRDR: " + ", ".join(step.submits))
+        else:
+            facts.unresolved.append(("intrdr", f"{step.step_name}: writes to INTRDR but the submitted JCL "
+                                               f"is not visible (built at run time?)", step.line))
 
     kind = LAUNCHERS.get(pgm)
     if kind is None:
@@ -644,13 +720,26 @@ def _resolve_effective_pgm(step: StepFact, facts: JclFacts,
 
     elif kind == "sort":
         step.effective_pgm = "*SORT*"
-        ctl = _dd_text(step, "SYSIN")
+        # ICETOOL reads TOOLIN and xxxxCNTL; DFSPARM / $ORTPARM override
+        # SYSIN; SYMNAMES defines symbols - all of them are the cards.
+        parts = [d.sysin_text for d in step.dds if d.sysin_text and
+                 (d.dd_name.upper().split(".")[-1] in ("SYSIN", "TOOLIN", "DFSPARM", "$ORTPARM", "SORTCNTL", "SYMNAMES")
+                  or d.dd_name.upper().endswith("CNTL"))]
+        ctl = "\n".join(parts) if parts else None
         if ctl:
-            step.notes.append("sort behaviour defined by SYSIN control cards")
+            step.notes.append("sort behaviour defined by control cards")
+            roles = sort_dd_roles(ctl)
+            for i, d in enumerate(step.dds):
+                r = roles.get(d.dd_name.upper().split(".")[-1])
+                if r and d.mode not in ("sysout", "dummy") and d.mode_source != "open_verb":
+                    step.dds[i] = replace(d, mode=r, mode_source="sort_card")
+            if re.search(r"\bSYMNAMES\b", " ".join(d.dd_name for d in step.dds), re.IGNORECASE) and not sort_symbols(ctl):
+                facts.unresolved.append(("sort_symbols", f"{step.step_name}: SYMNAMES DD present but its member is "
+                                                         f"not indexed - symbolic field positions unknown", step.line))
         else:
             facts.unresolved.append(
-                ("launcher_parm", f"{step.step_name}: SORT with no inline SYSIN "
-                                  f"(control cards are in a dataset)", step.line))
+                ("launcher_parm", f"{step.step_name}: SORT/ICETOOL with no cards in SYSIN/TOOLIN/xxxxCNTL "
+                                  f"(control cards are in a dataset that is not indexed)", step.line))
 
     elif kind == "idcams":
         step.effective_pgm = "*IDCAMS*"
@@ -907,9 +996,24 @@ _SORT_CARD = re.compile(
 # optional: INREC/OUTREC/OUTFIL BUILD lists are plain (pos,len) pairs, while
 # SORT FIELDS and INCLUDE/OMIT COND carry a format (or a FORMAT= default).
 _CARD_TRIPLE = re.compile(
-    r"(?<![\d:.])(\d{1,5}),(\d{1,5})(?:,([A-Z][A-Z0-9]{0,3}))?(?=[,)\s]|$)", re.IGNORECASE)
+    r"(?<![\d.])(\d{1,5}),(\d{1,5})(?:,([A-Z][A-Z0-9]{0,3}))?(?=[,)\s]|$)", re.IGNORECASE)
 _CARD_FORMAT = re.compile(r"\bFORMAT=([A-Z0-9]{1,4})\b", re.IGNORECASE)
 _NEEDS_FMT = {"SORT", "MERGE", "INCLUDE", "OMIT", "SUM"}
+# SYMNAMES: `POL-STATUS,45,1,CH` - a symbol used in the cards instead of the bytes.
+_SYMNAME = re.compile(r"^([A-Z@#$_][A-Z0-9@#$_\-]*),(\d{1,5}),(\d{1,5})(?:,([A-Z][A-Z0-9]{0,3}))?\s*$", re.IGNORECASE)
+
+
+def sort_symbols(text: str) -> Dict[str, str]:
+    """SYMNAMES definitions in a card deck: name -> 'pos,len[,fmt]'."""
+    out: Dict[str, str] = {}
+    for line in (text or "").splitlines():
+        s = line[:71].strip()
+        if not s or s.startswith("*"):
+            continue
+        m = _SYMNAME.match(s)
+        if m:
+            out[m.group(1).upper()] = ",".join(x for x in (m.group(2), m.group(3), (m.group(4) or "").upper()) if x)
+    return out
 
 
 def sort_card_fields(text: str) -> List[Tuple[str, int, int, str, str]]:
@@ -921,16 +1025,19 @@ def sort_card_fields(text: str) -> List[Tuple[str, int, int, str, str]]:
     A copybook change that moves bytes silently breaks every one of these,
     which is why the impact query joins these positions against computed
     field offsets instead of hoping somebody remembers the sort step.
+    SYMNAMES symbols (defined in the deck or a SYMNAMES DD/member joined into
+    `text`) are substituted first; `c:p,l` column-positioned items count.
     """
     out: List[Tuple[str, int, int, str, str]] = []
     if not text:
         return out
+    symbols = sort_symbols(text)
     # Join continued cards: a card continues when it ends with a comma.
     cards: List[str] = []
     buf = ""
     for line in text.splitlines():
         s = line[:71].rstrip()
-        if not s.strip() or s.lstrip().startswith("*"):
+        if not s.strip() or s.lstrip().startswith("*") or _SYMNAME.match(s.strip()):
             continue
         buf = (buf + " " + s.strip()) if buf else s.strip()
         if not buf.endswith(","):
@@ -939,7 +1046,13 @@ def sort_card_fields(text: str) -> List[Tuple[str, int, int, str, str]]:
     if buf:
         cards.append(buf)
 
-    for card in cards:
+    for raw_card in cards:
+        card = raw_card
+        if symbols:
+            def _sub(m: "re.Match[str]") -> str:
+                return symbols.get(m.group(0).upper(), m.group(0))
+            card = re.sub(r"(?<![A-Z0-9@#$_\-'])[A-Z@#$_][A-Z0-9@#$_\-]*(?![A-Z0-9@#$_\-'])", _sub, card, flags=re.IGNORECASE)
+        card = re.sub(r"(?<![A-Z0-9])\d{1,5}:", "", card)       # OUTREC=(1:1,10,11:21,5) -> (1,10,21,5)
         mk = _SORT_CARD.search(card)
         if not mk:
             continue
@@ -961,8 +1074,33 @@ def sort_card_fields(text: str) -> List[Tuple[str, int, int, str, str]]:
             if key in seen or pos == 0 or ln == 0:
                 continue
             seen.add(key)
-            out.append((kind, pos, ln, fmt or None, card[:120]))
+            out.append((kind, pos, ln, fmt or None, raw_card[:120]))
     return out
+
+
+_ICETOOL_OP = re.compile(r"\b(?:SORT|COPY|MERGE|SELECT|SPLICE|COUNT|STATS|UNIQUE|OCCUR|DISPLAY|RANGE|VERIFY|RESIZE)\s+"
+                         r"FROM\s*\(\s*([A-Z0-9@#$]+)\s*\)(?:.*?\bTO\s*\(\s*([A-Z0-9@#$ ,]+)\s*\))?", re.IGNORECASE)
+_OUTFIL_NAMES = re.compile(r"\bOUTFIL\b.*?\bFNAMES\s*=\s*\(?([A-Z0-9@#$ ,]+)\)?", re.IGNORECASE)
+_JOINKEYS_F = re.compile(r"\bJOINKEYS\b.*?\bF[12]\s*=\s*([A-Z0-9@#$]+)", re.IGNORECASE)
+
+
+def sort_dd_roles(text: str) -> Dict[str, str]:
+    """DD name -> input|output from the cards themselves: OUTFIL FNAMES= (the
+    split outputs of a one-pass extract), JOINKEYS F1=/F2= (the two inputs of
+    a join), ICETOOL FROM()/TO()."""
+    roles: Dict[str, str] = {}
+    t = " ".join(ln[:71] for ln in (text or "").splitlines() if not ln.strip().startswith("*"))
+    for m in _OUTFIL_NAMES.finditer(t):
+        for dd in re.findall(r"[A-Z0-9@#$]+", m.group(1), re.IGNORECASE):
+            roles[dd.upper()] = "output"
+    for m in _JOINKEYS_F.finditer(t):
+        roles[m.group(1).upper()] = "input"
+    for m in _ICETOOL_OP.finditer(t):
+        roles[m.group(1).upper()] = "input"
+        if m.group(2):
+            for dd in re.findall(r"[A-Z0-9@#$]+", m.group(2), re.IGNORECASE):
+                roles[dd.upper()] = "output"
+    return roles
 
 
 # --------------------------------------------------------------------------
@@ -1016,14 +1154,29 @@ def expand_job(job: JclFacts, proc_lookup: Callable[[str], Optional["JclFacts"]]
         # cataloged one of the same name - that is the JCL rule too.
         proc = job.instream_procs.get(s.proc_called.upper()) or proc_lookup(s.proc_called)
         if proc is None or not proc.steps:
+            synth = _system_proc_step(s, job)
+            if synth is not None:
+                # IMS.PROCLIB / DB2 PROCs are rarely in the estate folder, but
+                # `EXEC DLIBATCH,MBR=CLMPOST,PSB=CLMPSB` says everything that
+                # matters: synthesised, and reported as such.
+                out.append(synth)
+                continue
             s.notes.append(f"PROC {s.proc_called} not in index - its steps are unknown")
             job.unresolved.append(("missing_proc", f"{s.step_name}: PROC {s.proc_called} not found", s.line))
             out.append(s)
             continue
         proc_names_seen.add(s.proc_called.upper())
 
-        symbols: Dict[str, str] = dict(proc.symbolics)
-        symbols.update(job.set_symbols)
+        # JCL precedence inside a procedure: EXEC override > PROC statement
+        # default > SET. A SET value reaches the PROC only for a symbol the
+        # PROC statement does not define (z/OS MVS JCL Reference, SET
+        # statement). See LESSONS.md 97 - verify once on the real system.
+        symbols: Dict[str, str] = dict(job.set_symbols)
+        if PROC_DEFAULT_BEATS_SET:
+            symbols.update(proc.symbolics)
+        else:
+            symbols = dict(proc.symbolics)
+            symbols.update(job.set_symbols)
         # `EXEC INNER,HLQ=&HLQ` passes the enclosing value, not the text '&HLQ'.
         ov_syms = {k: substitute_symbols(v, symbols) for k, v in s.sym_overrides.items()}
         symbols.update(ov_syms)
@@ -1219,4 +1372,93 @@ def idcams_ops(text: str) -> List[Tuple[str, str, str]]:
                 out.append(("REPRO DD", val, "input"))
             else:
                 out.append(("REPRO DD", val, "output"))
+    return out
+
+
+_IDC_BODY = re.compile(r"\bDEFINE\s+(CLUSTER|AIX|ALTERNATEINDEX|GDG|PATH)\b(.*?)(?=\bDEFINE\b|\bDELETE\b|\bREPRO\b|\bLISTCAT\b|\bPRINT\b|$)",
+                       re.IGNORECASE | re.S)
+
+
+def idcams_attrs(text: str) -> Dict[str, Dict[str, str]]:
+    """DEFINE attributes per dataset name: vsam_type (KSDS/ESDS/RRDS/LDS/AIX/
+    PATH/GDG), recordsize_max, key_len, key_off, gdg_limit, relates_to.
+    The copybook's record length must agree with RECORDSIZE and the file's
+    RECORD KEY with KEYS - both are checkable only when they are indexed."""
+    out: Dict[str, Dict[str, str]] = {}
+    if not text:
+        return out
+    t = " ".join(ln[:72] for ln in text.splitlines() if not ln.strip().startswith("/*"))
+    for m in _IDC_BODY.finditer(t):
+        what, body = m.group(1).upper(), m.group(2)
+        mn = re.search(r"\bNAME\s*\(\s*([^)\s]+)\s*\)", body, re.IGNORECASE)
+        if not mn:
+            continue
+        name = mn.group(1).upper()
+        a: Dict[str, str] = {}
+        if what in ("AIX", "ALTERNATEINDEX"):
+            a["vsam_type"] = "AIX"
+        elif what == "PATH":
+            a["vsam_type"] = "PATH"
+        elif what == "GDG":
+            a["vsam_type"] = "GDG"
+        else:
+            a["vsam_type"] = ("ESDS" if re.search(r"\bNONINDEXED\b", body, re.I) else
+                              "RRDS" if re.search(r"\bNUMBERED\b", body, re.I) else
+                              "LDS" if re.search(r"\bLINEAR\b", body, re.I) else "KSDS")
+        mr = re.search(r"\bRECORDSIZE\s*\(\s*(\d+)\s+(\d+)\s*\)", body, re.IGNORECASE)
+        if mr:
+            a["recordsize_max"] = mr.group(2)
+        mk = re.search(r"\bKEYS\s*\(\s*(\d+)\s+(\d+)\s*\)", body, re.IGNORECASE)
+        if mk:
+            a["key_len"], a["key_off"] = mk.group(1), mk.group(2)
+        ml = re.search(r"\bLIMIT\s*\(\s*(\d+)\s*\)", body, re.IGNORECASE)
+        if ml:
+            a["gdg_limit"] = ml.group(1)
+        mrel = re.search(r"\b(?:RELATE|PATHENTRY)\s*\(\s*([^)\s]+)\s*\)", body, re.IGNORECASE)
+        if mrel:
+            a["relates_to"] = mrel.group(1).upper()
+        out[name] = a
+    return out
+
+
+_DB2U_TABLE = re.compile(r"\b(?:INTO|FROM)\s+TABLE\s+([A-Z0-9_$#@]+(?:\.[A-Z0-9_$#@]+)?)", re.IGNORECASE)
+_DB2U_OP = re.compile(r"\b(LOAD|UNLOAD|REORG|RUNSTATS|COPY|RECOVER|CHECK|REBUILD|MERGECOPY|QUIESCE)\b", re.IGNORECASE)
+_DB2U_DD = re.compile(r"\b(INDDN|UNLDDN|PUNCHDDN|COPYDDN|DISCARDDN|WORKDDN)\s+\(?\s*([A-Z0-9@#$]+)", re.IGNORECASE)
+_DB2U_TS = re.compile(r"\bTABLESPACE\s+([A-Z0-9_$#@]+(?:\.[A-Z0-9_$#@]+)?)", re.IGNORECASE)
+_SQL_VERB_TABLE = re.compile(r"\b(SELECT|INSERT|UPDATE|DELETE)\b.*?\b(?:FROM|INTO|UPDATE)\s+([A-Z0-9_$#@]+(?:\.[A-Z0-9_$#@]+)?)",
+                             re.IGNORECASE | re.S)
+
+
+def db2util_ops(text: str, is_sql: bool = False) -> List[Tuple[str, str, Optional[str], str]]:
+    """(op, table, dd, direction) for DSNUTILB cards (LOAD ... INTO TABLE x
+    INDDN dd; UNLOAD FROM TABLE x UNLDDN dd; REORG/RUNSTATS/COPY TABLESPACE)
+    and for the SQL a DSNTIAUL / DSNTEP2 step runs. This is the DB2 <-> flat
+    file lineage of every nightly feed: 'who writes CLAIM_TBL' includes the
+    LOAD, 'what reads it' includes the unload."""
+    out: List[Tuple[str, str, Optional[str], str]] = []
+    if not text:
+        return out
+    t = " ".join(ln[:72] for ln in text.splitlines() if not ln.strip().startswith(("*", "--")))
+    if is_sql:
+        for stmt in t.split(";"):
+            for m in _SQL_VERB_TABLE.finditer(stmt):
+                verb = m.group(1).upper()
+                out.append((verb, m.group(2).upper(), None, "write" if verb in ("INSERT", "UPDATE", "DELETE") else "read"))
+        return out
+    for chunk in re.split(r"(?=\b(?:LOAD|UNLOAD|REORG|RUNSTATS|COPY|RECOVER|CHECK|REBUILD|MERGECOPY|QUIESCE)\b)", t, flags=re.I):
+        mo = _DB2U_OP.match(chunk.strip())
+        if not mo:
+            continue
+        op = mo.group(1).upper()
+        dds = {k.upper(): v.upper() for k, v in _DB2U_DD.findall(chunk)}
+        tables = [x.upper() for x in _DB2U_TABLE.findall(chunk)] or [x.upper() for x in _DB2U_TS.findall(chunk)]
+        for tbl in tables or ["?"]:
+            if op == "LOAD":
+                out.append((op, tbl, dds.get("INDDN", "SYSREC"), "write"))
+            elif op == "UNLOAD":
+                out.append((op, tbl, dds.get("UNLDDN", "SYSREC00"), "read"))
+            elif op in ("REORG", "COPY", "MERGECOPY"):
+                out.append((op, tbl, dds.get("COPYDDN") or dds.get("UNLDDN"), "reorg" if op == "REORG" else "read"))
+            else:
+                out.append((op, tbl, None, "read"))
     return out
