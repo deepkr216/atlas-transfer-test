@@ -46,13 +46,15 @@ CREATE INDEX IF NOT EXISTS ix_member_sha    ON member(sha256);
 -- Same member name appearing in >1 library, or same content in >1 path.
 -- The "which copy is production?" question is the #1 source of wrong answers
 -- when analysing a folder dump, so it gets a first-class view.
+-- Same name AND same kind: SAMPPGM.cbl next to SAMPPGM.psb and SAMPPGM.jcl
+-- is a convention, not a duplicate.
 CREATE VIEW IF NOT EXISTS v_ambiguous_member AS
-SELECT name, COUNT(*) AS copies, COUNT(DISTINCT norm_sha) AS distinct_content,
+SELECT name, kind, COUNT(*) AS copies, COUNT(DISTINCT norm_sha) AS distinct_content,
        GROUP_CONCAT(DISTINCT system) AS systems,
        GROUP_CONCAT(path, ' | ') AS paths
 FROM member
-WHERE kind IN ('cobol','copybook','jcl','proc','dbd','psb')
-GROUP BY name
+WHERE kind IN ('cobol','copybook','jcl','proc','dbd','psb','ctlcard')
+GROUP BY name, kind
 HAVING COUNT(*) > 1;
 
 -- ------------------------------------------------------------------ program
@@ -79,7 +81,8 @@ CREATE TABLE IF NOT EXISTS paragraph (
     name        TEXT NOT NULL,
     start_line  INTEGER NOT NULL,
     end_line    INTEGER NOT NULL,
-    ordinal     INTEGER NOT NULL          -- needed for PERFORM..THRU and fall-through
+    ordinal     INTEGER NOT NULL,         -- needed for PERFORM..THRU and fall-through
+    kind        TEXT DEFAULT 'paragraph'  -- paragraph | section (a performed section runs its paragraphs)
 );
 CREATE INDEX IF NOT EXISTS ix_para_prog ON paragraph(program_id, ordinal);
 
@@ -451,7 +454,8 @@ CREATE TABLE IF NOT EXISTS dataset (
 CREATE VIEW IF NOT EXISTS v_dataset_flow AS
 SELECT d.dsn_resolved AS dsn, s.effective_pgm AS pgm, j.job_name, s.step_name,
        d.mode, d.mode_source, d.gdg_rel, m.path, m.system, s.from_proc,
-       s.proc_called, s.job_id, s.proc_id, pd.proc_name, d.is_temp, d.dd_name
+       s.proc_called, s.job_id, s.proc_id, pd.proc_name, d.is_temp, d.dd_name,
+       d.line AS dd_line, m.name AS member_name
 FROM dd d
 JOIN step s   ON s.id = d.step_id
 LEFT JOIN job j ON j.id = s.job_id

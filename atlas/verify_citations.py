@@ -29,6 +29,7 @@ Exit status 0 = every citation verified; 1 = at least one failed.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -39,8 +40,18 @@ from typing import Dict, List, Optional, Tuple
 
 from . import reader
 
+# [[MEMBER 27 "token"]]  [[MEMBER:27 "token"]]  [[MEMBER 27-31 (via COPY X) "token"]]
+# [[POLICY/DUPREC 1 "..."]] (department)  [[SAMPPGM(cobol) 27 "..."]] (kind)
+# [[DUPREC@PROD.POLICY.COPYLIB 1 "..."]] (library) - the forms the reports
+# print and the forms a model writes back; all of them must be checkable.
 CITATION = re.compile(
-    r"\[\[\s*([A-Za-z0-9_$#@.\\/:\-]+?)\s+(\d+)(?:\s*-\s*(\d+))?\s+\"((?:[^\"\\]|\\.)*)\"\s*\]\]")
+    r"\[\[\s*([A-Za-z0-9_$#@.\\/:\-()]+?)(?:\s+|:)(\d+)(?:\s*-\s*(\d+))?\s*(?:\(via\s+COPY\s+[^)]*\)\s*)?"
+    r"\"((?:[^\"\\]|\\.)*)\"\s*\]\]")
+_REF = re.compile(r"^(?:(?P<system>[A-Za-z0-9_$#@\-]+)/)?(?P<name>[A-Za-z0-9_$#@\-]+)"
+                  r"(?:\((?P<kind>[a-z]+)\))?(?:@(?P<library>[A-Za-z0-9.$#@\-]+))?$", re.I)
+# A quoted token this short matches almost anywhere; the gate says so.
+WEAK_TOKEN_CHARS = 6
+WIDE_RANGE_LINES = 20
 
 # Lines that assert something about the code but carry no citation.
 _ASSERTIVE = re.compile(
@@ -65,28 +76,92 @@ class Result:
 # member resolution
 # --------------------------------------------------------------------------
 
-def _resolve(ref: str, root: Optional[str], db: Optional[sqlite3.Connection]
-             ) -> Tuple[Optional[str], str, Optional[str]]:
-    """-> (path, detail, kind)"""
-    if "/" in ref or "\\" in ref:
+def _resolve(ref: str, root: Optional[str], db: Optional[sqlite3.Connection],
+             token: str = "") -> Tuple[Optional[str], str, Optional[str]]:
+    """-> (path, detail, kind)
+
+    A name is resolved by (name, kind): SAMPPGM.cbl, SAMPPGM.psb and
+    SAMPPGM.jcl are three members with one name (the IMS PSB=program and the
+    one-job-per-program conventions). The kind is taken from the citation
+    (`SAMPPGM(cobol)`), else chosen as the ONLY kind whose text contains the
+    quoted token. Two DIFFERENT copies of the same (name, kind) - one per
+    department - stay AMBIGUOUS unless the citation names the department
+    (`POLICY/DUPREC`) or the library (`DUPREC@PROD.POLICY.COPYLIB`); the
+    gate must not certify a claim about one copy against the other.
+    """
+    if ("/" in ref or "\\" in ref) and not _REF.match(ref):
         p = ref if os.path.isabs(ref) else os.path.join(root or ".", ref)
         if os.path.isfile(p):
             return p, "path", None
         return None, f"path not found: {p}", None
+    if "/" in ref:
+        p = ref if os.path.isabs(ref) else os.path.join(root or ".", ref)
+        if os.path.isfile(p):
+            return p, "path", None
 
-    name = ref.upper()
+    m = _REF.match(ref)
+    if not m:
+        return None, f"unreadable member reference {ref!r}", None
+    name = m.group("name").upper()
+    want_kind = (m.group("kind") or "").lower() or None
+    want_sys = (m.group("system") or "").upper() or None
+    want_lib = (m.group("library") or "").upper() or None
+
     if db is not None:
         rows = db.execute(
-            "SELECT path, kind, authoritative FROM member WHERE UPPER(name)=? ORDER BY authoritative DESC",
-            (name,)).fetchall()
+            "SELECT path, kind, authoritative, system, library, norm_sha FROM member WHERE UPPER(name)=? "
+            "ORDER BY authoritative DESC, path", (name,)).fetchall()
         if not rows:
             return None, f"member {name} not in index", None
-        if len(rows) > 1 and not rows[0][2]:
-            distinct = {r[0] for r in rows}
-            if len(distinct) > 1:
-                return None, (f"member {name} is AMBIGUOUS ({len(rows)} copies, none marked "
-                              f"authoritative): " + " | ".join(sorted(distinct)[:4])), None
-        return rows[0][0], "index", rows[0][1]
+        cands = list(rows)
+        if want_kind:
+            cands = [r for r in cands if (r[1] or "").lower() == want_kind]
+            if not cands:
+                return None, f"member {name} has no copy of kind {want_kind} (kinds: {sorted({r[1] for r in rows})})", None
+        if want_sys:
+            cands = [r for r in cands if (r[3] or "").upper() == want_sys]
+            if not cands:
+                return None, f"member {name}: no copy in department {want_sys}", None
+        if want_lib:
+            cands = [r for r in cands if (r[4] or "").upper() == want_lib]
+            if not cands:
+                return None, f"member {name}: no copy in library {want_lib}", None
+        kinds = sorted({r[1] for r in cands})
+        how = "index"
+        if len(kinds) > 1 and token:
+            # Several kinds share the name: the one whose text holds the token.
+            hits = []
+            for r in cands:
+                try:
+                    txt, data, enc = reader.load(r[0])
+                except OSError:
+                    continue
+                if _norm(token) in _norm(txt):
+                    hits.append(r)
+            hit_kinds = sorted({r[1] for r in hits})
+            if len(hit_kinds) == 1:
+                cands = [r for r in cands if r[1] == hit_kinds[0]]
+                how = f"index ({hit_kinds[0]} chosen: the only kind containing the token)"
+            elif not hits:
+                return None, (f"member {name} exists as {', '.join(kinds)} and none contains the token - "
+                              f"cite as {name}(kind)"), None
+            else:
+                return None, (f"member {name} is AMBIGUOUS across kinds {', '.join(hit_kinds)} - cite as "
+                              f"{name}({hit_kinds[0]})"), None
+        distinct = {r[0] for r in cands}
+        if len(distinct) > 1:
+            same = len({r[5] for r in cands}) == 1
+            auth = [r for r in cands if r[2]]
+            if same:
+                pass                                   # identical copies: any will do
+            elif len(auth) == 1:
+                cands = auth
+            else:
+                by_sys = sorted({(r[3] or "?") for r in cands})
+                return None, (f"member {name} is AMBIGUOUS ({len(cands)} different copies"
+                              + (f" in departments {', '.join(by_sys)}" if len(by_sys) > 1 else "")
+                              + f") - cite as SYSTEM/{name} or {name}@LIBRARY: " + " | ".join(sorted(distinct)[:4])), None
+        return cands[0][0], how, cands[0][1]
 
     if root:
         hits = []
@@ -110,6 +185,18 @@ def _norm(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip().upper()
 
 
+def _is_comment_record(rec: str, kind: Optional[str], path: str) -> bool:
+    """`//*` in JCL/PROC, `*` in column 1 of control cards / HLASM-style
+    members: a citation to those proves nothing about what runs."""
+    k = (kind or "").lower()
+    low = path.lower()
+    if k in ("jcl", "proc") or low.endswith((".jcl", ".prc", ".proc")):
+        return rec.startswith("//*")
+    if k in ("ctlcard", "dbd", "psb", "mfs", "imsgen", "csd") or low.endswith((".ctl", ".dbd", ".psb", ".mfs")):
+        return rec.startswith("*")
+    return False
+
+
 def check_answer(text: str, root: Optional[str] = None,
                  db_path: Optional[str] = None) -> Tuple[List[Result], List[str]]:
     db = sqlite3.connect(db_path) if db_path else None
@@ -120,10 +207,23 @@ def check_answer(text: str, root: Optional[str] = None,
         ref, s, e, quote = m.group(1), int(m.group(2)), m.group(3), m.group(4)
         end = int(e) if e else s
         quote = quote.replace('\\"', '"')
-        path, how, kind = _resolve(ref, root, db)
+        path, how, kind = _resolve(ref, root, db, quote)
         if not path:
             results.append(Result(m.group(0), ref, s, end, quote, "FAIL", how))
             continue
+        # The file checked must be the file that was indexed: a re-fetch after
+        # the pack was made shifts every line and every citation with it.
+        if db is not None and path not in cache:
+            row = db.execute("SELECT sha256 FROM member WHERE path=?", (path,)).fetchone()
+            try:
+                with open(path, "rb") as fh:
+                    now = hashlib.sha256(fh.read()).hexdigest()
+            except OSError:
+                now = None
+            if row and now and row[0] != now:
+                results.append(Result(m.group(0), ref, s, end, quote, "FAIL",
+                                      "member changed since the index was built (sha mismatch) - rebuild, then re-cite", path))
+                continue
 
         if kind == "doc" and db is not None:
             # A document has sections, not lines: [[DOCNAME 3 "token"]] cites
@@ -178,6 +278,19 @@ def check_answer(text: str, root: Optional[str] = None,
         if cob and all(cob[i - 1].is_comment for i in range(s, end + 1)):
             results.append(Result(m.group(0), ref, s, end, quote, "WARN",
                                   "every cited line is a COMMENT - not live code", path))
+            continue
+        if not cob and all(_is_comment_record(recs[i - 1], kind, path) for i in range(s, end + 1)):
+            results.append(Result(m.group(0), ref, s, end, quote, "WARN",
+                                  "every cited line is a COMMENT (//* or * card) - not live code", path))
+            continue
+        warn = []
+        if len(_norm(quote)) < WEAK_TOKEN_CHARS:
+            n_lines = sum(1 for r in recs if _norm(quote) in _norm(r))
+            warn.append(f"weak token ({len(_norm(quote))} chars, on {n_lines} lines of the member)")
+        if end - s + 1 > WIDE_RANGE_LINES:
+            warn.append(f"wide range ({end - s + 1} lines) - cite the line that holds the fact")
+        if warn:
+            results.append(Result(m.group(0), ref, s, end, quote, "WARN", "; ".join(warn), path))
             continue
         results.append(Result(m.group(0), ref, s, end, quote, "PASS", how, path))
 

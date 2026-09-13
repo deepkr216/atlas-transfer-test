@@ -243,6 +243,15 @@ falls back to the bare PROC only when no indexed job expands it.
   PIC, usage, OCCURS/ODO/REDEFINES, 88 values, record length) from the
   parser's numbers; with `--program` the 01 as that program sees it after
   REPLACING. This is what test data and interface contracts are built from.
+- `crud PGM… | --job JOB | --copybook X | --system S` — one matrix: programs ×
+  datasets / DB2 tables / IMS databases / CICS files with C/R/U/D and a cite
+  per cell (the design-document table).
+- `conditions PGM` — every IF/WHEN/UNTIL with the field and literal or 88 name
+  it tests (88s expanded), per paragraph, plus one negative case per field.
+- `paragraph PGM NAME|line` — who reaches a paragraph and how (PERFORM, GO TO,
+  fall-through, THRU range, section), what it performs/calls/does, its source.
+- `callers X --args` — every call site with its full USING list against the
+  callee's LINKAGE; a count mismatch is flagged (the S0C4 check).
 - `field NAME` — definitions with offsets, references by mode
   (write/read/test/display), 88s, literals, screen fields, sort cards, the
   **DB2 columns** it is loaded from or stored to, and the **IMS DL/I calls**

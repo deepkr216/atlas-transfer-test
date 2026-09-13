@@ -40,16 +40,22 @@ and say they disagree - do not pick one silently.
 
 ```
 python -m atlas.query --db atlas.db copybook <NAME>
-python -m atlas.query --db atlas.db callers|callees <NAME> --depth N
+python -m atlas.query --db atlas.db callers|callees <NAME> --depth N [--args]   # --args: USING vs LINKAGE per call site
 python -m atlas.query --db atlas.db dataset  <DSN>
+python -m atlas.query --db atlas.db crud     <PGM...> | --job JOB | --copybook X   # C/R/U/D matrix with cites
+python -m atlas.query --db atlas.db conditions <PGM>          # every IF/WHEN with its literal or 88 values
+python -m atlas.query --db atlas.db paragraph <PGM> <NAME|line>  # who reaches it, what it does, its source
+python -m atlas.query --db atlas.db field    <NAME> [--all] [--program PGM]
 python -m atlas.query --db atlas.db search   '"<token>"'
-python -m atlas.query --db atlas.db cite     <MEMBER> <a>-<b>
-python -m atlas.query --db atlas.db pack     <PROGRAM>
+python -m atlas.query --db atlas.db cite     <MEMBER> <a>-<b> [--kind cobol|jcl|psb|...]
+python -m atlas.query --db atlas.db pack     <PROGRAM|JOB|COPYBOOK|TRAN|FIELD> [--budget CHARS] [--sections a,b]
 ```
 
-Prefer `pack` for anything about a program: it is the dossier plus the exact
-evidence lines. Open a whole member only when the pack and `cite` are not
-enough, and say why.
+Prefer `pack` for anything about a program, a job (it carries the FULL
+control cards), a copybook (it carries the byte layout) or a transaction: it
+is the dossier plus the exact evidence lines, inside `--budget` characters
+(about 4 per token), with the token estimate on its first line. Open a whole
+member only when the pack and `cite` are not enough, and say why.
 
 ## 2. Cite or abstain
 
@@ -57,11 +63,20 @@ Every factual claim carries a citation in exactly this form:
 
 ```
 [[MEMBER line "token that appears on that line"]]      e.g. [[CLMPOST 412 "CALL 'RATECALC'"]]
+[[MEMBER:line "token"]]                                 the form the reports print - also accepted
 [[MEMBER first-last "token"]]                           e.g. [[CLMNIGHT 17-19 "RUN PROGRAM(PREMCALC)"]]
+[[MEMBER(kind) line "token"]]                           e.g. [[CLMPOST(jcl) 3 "PGM=CLMPOST"]] when a PSB or a
+                                                        job shares the program's name
+[[SYSTEM/MEMBER line "token"]]                          e.g. [[POLICY/DUPREC 1 "PIC X(9)"]] when two
+                                                        departments own different copies
 ```
 
 - The token must literally appear on the cited line(s). Quote it from the
-  pack or from `cite`; never paraphrase it.
+  pack or from `cite`; never paraphrase it. A token shorter than 6
+  characters or a range wider than 20 lines is a WARN: cite the line that
+  holds the fact. A `//*` or `*` comment line proves nothing.
+- The gate FAILS a citation when the member changed since the index was
+  built: rebuild, then cite again.
 - A claim you cannot cite is written as `UNVERIFIED:` and goes in its own
   section, or is not written at all.
 - When the index has no answer, the answer is `INSUFFICIENT EVIDENCE` plus

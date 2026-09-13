@@ -125,6 +125,7 @@ def open_db(path: str, rebuild: bool = False) -> sqlite3.Connection:
     # Views are re-created from the schema every time (their column lists
     # grow); tables are evolved in place below.
     conn.execute("DROP VIEW IF EXISTS v_dataset_flow")
+    conn.execute("DROP VIEW IF EXISTS v_ambiguous_member")
     # Columns added after a db was first built: add them in place rather than
     # forcing a rebuild of a 40,000-member index. Done BEFORE the schema runs
     # so a view over a new column can be created on an old database.
@@ -136,6 +137,7 @@ def open_db(path: str, rebuild: bool = False) -> sqlite3.Connection:
                              ("dd", "is_temp", "INTEGER DEFAULT 0"), ("step", "guard", "TEXT"),
                              ("job", "joblib", "TEXT"), ("job", "job_cond", "TEXT"), ("job", "jcllib", "TEXT"),
                              ("perform_edge", "kind", "TEXT DEFAULT 'perform'"),
+                             ("paragraph", "kind", "TEXT DEFAULT 'paragraph'"),
                              ("dli_call", "pcb_index", "INTEGER"), ("dli_call", "resolution", "TEXT"),
                              ("dli_call", "dest", "TEXT"), ("dli_call", "psb_name", "TEXT"),
                              ("dli_call", "dbd_name", "TEXT"), ("dli_call", "procopt", "TEXT"),
@@ -504,8 +506,8 @@ def index_cobol(ctx: Ctx, mem: Mem) -> None:
         [(pid, r.exp_start, r.exp_end, r.src_member, r.src_start, r.depth, r.via_copy) for r in exp.runs])
 
     conn.executemany(
-        "INSERT INTO paragraph(program_id,section,name,start_line,end_line,ordinal) VALUES(?,?,?,?,?,?)",
-        [(pid, p.section, p.name, p.start_line, p.end_line, p.ordinal) for p in facts.paragraphs])
+        "INSERT INTO paragraph(program_id,section,name,start_line,end_line,ordinal,kind) VALUES(?,?,?,?,?,?,?)",
+        [(pid, p.section, p.name, p.start_line, p.end_line, p.ordinal, p.kind) for p in facts.paragraphs])
     conn.executemany(
         "INSERT INTO perform_edge(program_id,from_para,to_para,thru_para,line,kind) VALUES(?,?,?,?,?,?)",
         [(pid, a, b, c, ln, kind) for (a, b, c, ln, kind) in facts.performs])
