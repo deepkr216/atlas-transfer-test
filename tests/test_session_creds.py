@@ -41,6 +41,25 @@ class SessionCredentials(unittest.TestCase):
         fetch.set_session_credentials(None, None)
         self.assertNotIn("ZOWE_OPT_PASSWORD", fetch.session_env())
 
+    def test_credentials_travel_as_options_too_and_the_daemon_is_off(self):
+        """Explicit --user/--password reach every Zowe version and mode; the
+        log never shows the value; the daemon is bypassed for our subprocess."""
+        fetch.set_session_credentials("DEEPAK", SECRET)
+        cfg = fetch.load_config(os.path.join(tempfile.mkdtemp(), "nope.json"))
+        with mock.patch("atlas.fetch.zowe_exe", return_value="zowe"):
+            cmd = fetch.list_members_cmd(cfg, "PROD.X.SRC")
+            dl = fetch.download_cmd(cfg, fetch.new_source("PROD.X.SRC", "cobol"))
+        for c in (cmd, dl):
+            self.assertEqual(c[c.index("--user") + 1], "DEEPAK")
+            self.assertEqual(c[c.index("--password") + 1], SECRET)
+            self.assertNotIn(SECRET, fetch.redact_cmd(c))
+            self.assertIn("--password <redacted>", fetch.redact_cmd(c))
+        self.assertEqual(fetch.session_env()["ZOWE_USE_DAEMON"], "no")
+        fetch.set_session_credentials(None, None)
+        with mock.patch("atlas.fetch.zowe_exe", return_value="zowe"):
+            self.assertNotIn("--password", fetch.list_members_cmd(cfg, "PROD.X.SRC"))
+        self.assertEqual(fetch.session_env()["ZOWE_USE_DAEMON"], "no")
+
     def test_runner_passes_the_env_and_closes_stdin(self):
         fetch.set_session_credentials("DEEPAK", SECRET)
         rc, out, _err = fetch.Runner(30).run([sys.executable, "-c",

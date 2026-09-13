@@ -204,6 +204,13 @@ def _flags(cfg: Dict, src: Optional[Dict] = None) -> List[str]:
     out += list(z.get("extra_args") or [])
     if src:
         out += list(src.get("extra_args") or [])
+    # the session password goes on the command line too, not only in the
+    # environment: an option is read by every Zowe version and mode, and
+    # redact_cmd hides it from every log
+    if _SESSION.get("ZOWE_OPT_USER"):
+        out += ["--user", _SESSION["ZOWE_OPT_USER"]]
+    if _SESSION.get("ZOWE_OPT_PASSWORD"):
+        out += ["--password", _SESSION["ZOWE_OPT_PASSWORD"]]
     return out
 
 
@@ -259,6 +266,12 @@ def parse_member_list(stdout: str) -> List[str]:
 _SECRET_FLAGS = {"--password", "--pass", "--pw", "--token-value", "--tv", "--cert-key-file", "--api-key"}
 
 
+def redact_list(cmd: List[str]) -> List[str]:
+    """The command with every secret value replaced - what may be kept in a
+    result object, a status column or a crash file."""
+    return redact_cmd(cmd).split(" ")
+
+
 def redact_cmd(cmd: List[str]) -> str:
     """The command line as it may be logged: a password or token given in
     extra_args never reaches the live log, a crash file or a pasted pack."""
@@ -304,7 +317,14 @@ def has_session_credentials() -> bool:
 
 
 def session_env() -> Dict[str, str]:
+    """The zowe subprocess environment: the session credentials, and the
+    Zowe daemon switched OFF. Zowe CLI v2/v3 normally hands the command to a
+    background daemon process; from a process with no console that hand-off
+    can wait forever, and the daemon does not see this process's
+    environment. ZOWE_USE_DAEMON=no runs the plain CLI instead - slower to
+    start, but it answers."""
     env = dict(os.environ)
+    env["ZOWE_USE_DAEMON"] = "no"
     env.update(_SESSION)
     return env
 
@@ -398,6 +418,7 @@ def check_zowe(cfg: Dict, runner: Optional[Runner] = None,
         return True, "\n".join(lines)
     say(f"   asking the host for the member list of {first['dataset']} (this is the first command that logs on; "
         f"if nothing comes back within {HANG_SECONDS} s, zowe is waiting for a password) ...")
+    say(f"   > {redact_cmd(list_members_cmd(cfg, first['dataset']))}   [ZOWE_USE_DAEMON=no]")
     lister = runner if runner is not None and not isinstance(runner, Runner) else Runner(HANG_SECONDS)
     rc, out, err = lister.run(list_members_cmd(cfg, first["dataset"]))
     if rc != 0:
@@ -426,24 +447,25 @@ def fetch_source(cfg: Dict, src: Dict, runner: Optional[Runner] = None,
                  log: Callable[[str], None] = print) -> FetchResult:
     runner = runner or Runner(int(cfg["zowe"].get("timeout_seconds") or 3600))
     cmd = download_cmd(cfg, src)
+    safe = redact_list(cmd)                       # never the password, wherever the result ends up
     dest = local_path(cfg, src)
     is_pds = src.get("type", "pds") != "seq"
     os.makedirs(dest if is_pds else os.path.dirname(dest) or ".", exist_ok=True)
     log(f"> {redact_cmd(cmd)}")
     t0 = time.time()
     if zowe_exe(cfg) is None:
-        res = FetchResult(src["dataset"], False, 0, 0.0, "zowe not on PATH", cmd)
+        res = FetchResult(src["dataset"], False, 0, 0.0, "zowe not on PATH", safe)
     else:
         rc, out, err = runner.run(cmd)
         secs = time.time() - t0
         n = _count_files(dest)
         if rc == 0:
-            res = FetchResult(src["dataset"], True, n, secs, f"{n} file(s) in {dest}", cmd)
+            res = FetchResult(src["dataset"], True, n, secs, f"{n} file(s) in {dest}", safe)
         else:
             tail = (err or out).strip().splitlines()[-3:]
             hint = password_hint(rc, out, err)
             res = FetchResult(src["dataset"], False, n, secs,
-                              f"rc {rc}: " + " | ".join(tail)[:300] + (f" - {hint}" if hint else ""), cmd)
+                              f"rc {rc}: " + " | ".join(tail)[:300] + (f" - {hint}" if hint else ""), safe)
         if is_pds:
             # Reconcile with what the host says the library holds. A download
             # that stopped at member 2,900 of 4,100, or a member deleted on
@@ -453,7 +475,7 @@ def fetch_source(cfg: Dict, src: Dict, runner: Optional[Runner] = None,
                 res = FetchResult(src["dataset"], False, n, secs,
                                   f"INCOMPLETE {rec['present']}/{rec['expected']} members"
                                   + (f" ({len(rec['missing'])} missing)" if rec["missing"] else "")
-                                  + (f"; rc {rc}" if rc else ""), cmd)
+                                  + (f"; rc {rc}" if rc else ""), safe)
     src["last_fetched"] = time.strftime("%Y-%m-%dT%H:%M:%S")
     src["last_result"] = ("ok " if res.ok else "FAILED ") + res.message
     log(("  ok   " if res.ok else "  FAIL ") + f"{src['dataset']}: {res.message}")
