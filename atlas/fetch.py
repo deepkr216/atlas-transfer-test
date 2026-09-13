@@ -280,6 +280,44 @@ def redact_cmd(cmd: List[str]) -> str:
     return " ".join(out)
 
 
+# --------------------------------------------------------------------------
+# credentials for THIS RUN ONLY. When the Zowe profile stores no password,
+# `zowe` asks for it on the terminal - and a background run cannot answer, so
+# Fetch all creates the folders and downloads nothing (LESSONS 128). Zowe
+# also reads ZOWE_OPT_USER / ZOWE_OPT_PASSWORD from the environment: the UI's
+# Sign in and the CLI's --ask-password put them there for the subprocess and
+# nowhere else - not in sources.json, not in the log, not in a crash file.
+# --------------------------------------------------------------------------
+_SESSION: Dict[str, str] = {}
+
+
+def set_session_credentials(user: Optional[str], password: Optional[str]) -> None:
+    _SESSION.clear()
+    if user:
+        _SESSION["ZOWE_OPT_USER"] = user
+    if password:
+        _SESSION["ZOWE_OPT_PASSWORD"] = password
+
+
+def has_session_credentials() -> bool:
+    return "ZOWE_OPT_PASSWORD" in _SESSION
+
+
+def session_env() -> Dict[str, str]:
+    env = dict(os.environ)
+    env.update(_SESSION)
+    return env
+
+
+def password_hint(rc: int, out: str, err: str) -> str:
+    """What to tell the user when zowe failed because it wanted a password."""
+    if rc != 0 and re.search(r"password", f"{out}\n{err}", re.IGNORECASE):
+        return ("zowe wanted a password and a background run cannot type one: store it in the "
+                "profile once (`zowe config secure`, kept in Windows Credential Manager) or use "
+                "Sign in (UI) / --ask-password (CLI) for this session")
+    return ""
+
+
 class Runner:
     """subprocess wrapper; tests substitute a fake with the same run() shape."""
 
@@ -289,9 +327,12 @@ class Runner:
     def run(self, cmd: List[str]) -> Tuple[int, str, str]:
         try:
             # Zowe prints UTF-8; the Windows console codepage would otherwise
-            # abort the whole fetch on the first unmappable byte.
+            # abort the whole fetch on the first unmappable byte. stdin is
+            # closed so an interactive prompt fails at once instead of
+            # waiting for the timeout; the session credentials ride in env.
             p = subprocess.run(cmd, capture_output=True, text=True, timeout=self.timeout,
-                               encoding="utf-8", errors="replace")
+                               encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL,
+                               env=session_env())
             return p.returncode, p.stdout or "", p.stderr or ""
         except FileNotFoundError:
             return 127, "", f"not found: {cmd[0]}"
@@ -350,7 +391,9 @@ def fetch_source(cfg: Dict, src: Dict, runner: Optional[Runner] = None,
             res = FetchResult(src["dataset"], True, n, secs, f"{n} file(s) in {dest}", cmd)
         else:
             tail = (err or out).strip().splitlines()[-3:]
-            res = FetchResult(src["dataset"], False, n, secs, f"rc {rc}: " + " | ".join(tail)[:300], cmd)
+            hint = password_hint(rc, out, err)
+            res = FetchResult(src["dataset"], False, n, secs,
+                              f"rc {rc}: " + " | ".join(tail)[:300] + (f" - {hint}" if hint else ""), cmd)
         if is_pds:
             # Reconcile with what the host says the library holds. A download
             # that stopped at member 2,900 of 4,100, or a member deleted on
@@ -497,6 +540,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--source", action="append", help="fetch this dataset (repeatable)")
     ap.add_argument("--build", action="store_true", help="rebuild atlas.db after fetching")
     ap.add_argument("--rebuild", action="store_true", help="with --build: start the db from empty")
+    ap.add_argument("--ask-password", action="store_true",
+                    help="ask for the mainframe password once, for this run only - never stored anywhere")
+    ap.add_argument("--user", help="mainframe user id for this run (with --ask-password)")
     a = ap.parse_args(argv)
 
     if a.init:
@@ -511,6 +557,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
 
     cfg = load_config(a.config)
+    if a.ask_password:
+        import getpass
+        user = a.user or input("Mainframe user id (Enter to use the profile's): ").strip() or None
+        set_session_credentials(user, getpass.getpass("Mainframe password (this run only, never stored): "))
     if a.check:
         ok, msg = check_zowe(cfg)
         print(("OK   " if ok else "FAIL ") + msg)

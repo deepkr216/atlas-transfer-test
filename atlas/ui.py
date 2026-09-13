@@ -126,6 +126,7 @@ class App(tk.Tk if tk else object):
         ttk.Label(top, text="Database").grid(row=0, column=5, sticky="w")
         ttk.Entry(top, textvariable=self.v_db, width=22).grid(row=0, column=6, padx=4)
         ttk.Button(top, text="Check Zowe", command=self.check_zowe).grid(row=0, column=7, padx=(16, 0))
+        ttk.Button(top, text="Sign in...", command=self.sign_in).grid(row=0, column=8, padx=(4, 0))
         # One estate, many departments: filter the table to one system, fetch
         # or inspect that system alone, keep the rest untouched.
         ttk.Label(top, text="System").grid(row=1, column=0, sticky="w", pady=(6, 0))
@@ -309,6 +310,49 @@ class App(tk.Tk if tk else object):
             self._log(("OK   " if ok else "FAIL ") + msg)
             self.after(0, lambda: self.v_status.set(msg))
         self._run_bg(go)
+
+    def sign_in(self) -> None:
+        """The mainframe password for THIS SESSION: zowe reads it from its own
+        environment variable in the fetch subprocess. Nothing is saved to
+        sources.json, the log or a crash file; closing the window forgets it."""
+        win = tk.Toplevel(self)
+        win.title("Sign in - this session only")
+        win.transient(self)
+        win.grab_set()
+        f = ttk.Frame(win, padding=12)
+        f.pack(fill="both", expand=True)
+        v_user = tk.StringVar(value=os.environ.get("ZOWE_OPT_USER") or "")
+        v_pw = tk.StringVar()
+        ttk.Label(f, text="Mainframe user id").grid(row=0, column=0, sticky="w")
+        e_user = ttk.Entry(f, textvariable=v_user, width=24)
+        e_user.grid(row=0, column=1, padx=6, pady=2)
+        ttk.Label(f, text="Password").grid(row=1, column=0, sticky="w")
+        e_pw = ttk.Entry(f, textvariable=v_pw, width=24, show="*")
+        e_pw.grid(row=1, column=1, padx=6, pady=2)
+        ttk.Label(f, text="Used only for the zowe commands of this session - never written to sources.json,\n"
+                          "the log or a crash file. Leave the user id empty to keep the profile's.",
+                  foreground="#555", justify="left").grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 8))
+
+        def use() -> None:
+            fetch.set_session_credentials(v_user.get().strip() or None, v_pw.get() or None)
+            v_pw.set("")
+            self.v_status.set("signed in for this session" + (f" as {v_user.get().strip()}" if v_user.get().strip() else "")
+                              if fetch.has_session_credentials() else "no session password")
+            self._log("session password " + ("set (not stored)" if fetch.has_session_credentials() else "cleared"))
+            win.destroy()
+
+        def forget() -> None:
+            fetch.set_session_credentials(None, None)
+            self.v_status.set("no session password")
+            win.destroy()
+
+        b = ttk.Frame(f)
+        b.grid(row=3, column=0, columnspan=2, sticky="e")
+        ttk.Button(b, text="Use for this session", command=use).pack(side="left", padx=2)
+        ttk.Button(b, text="Forget", command=forget).pack(side="left", padx=2)
+        ttk.Button(b, text="Cancel", command=win.destroy).pack(side="left", padx=2)
+        (e_pw if v_user.get() else e_user).focus_set()
+        win.bind("<Return>", lambda e: use())
 
     def plan(self) -> None:
         self._sync_cfg()

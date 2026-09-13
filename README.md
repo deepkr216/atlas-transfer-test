@@ -75,6 +75,19 @@ copybook forces every program that expands it to be re-parsed, and members
 that disappeared are pruned. A full estate re-run after a small change takes
 seconds, not minutes.
 
+### The mainframe password
+
+Run by hand, `zowe` asks for your password when the profile does not store
+it. Run by the toolkit it cannot ask, so a fetch would create the folders and
+download nothing - the log then says so and what to do. Two ways to give it:
+
+- once, in the profile: `zowe config secure` (Zowe v2/v3; the password goes
+  into Windows Credential Manager, never into a file), or
+- for one session: the UI's **Sign in** button, or `--ask-password` on the
+  command line. The password is passed to the `zowe` subprocess through its
+  own `ZOWE_OPT_PASSWORD` environment variable for that run and is never
+  written to `sources.json`, the log, or a crash file.
+
 ### Several departments, each with its own libraries
 
 Every source row carries a `system` (the department). That one field drives
