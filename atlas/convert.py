@@ -177,9 +177,29 @@ foreach ($line in $pairs) {
     [Console]::Out.WriteLine("START`t$src")
     try {
         $win = 0; if ($script:show) { $win = -1 }
+        # Open READ-ONLY with empty passwords given up front: a file with a
+        # "password to modify" or "read-only recommended" opens without the
+        # dialog the user would otherwise answer with Read Only; a file with a
+        # "password to open" fails at once with Office's own message instead
+        # of a prompt nobody can answer. No repair prompts, no encoding
+        # dialog, nothing added to the recent-files list.
+        $miss = [System.Reflection.Missing]::Value
         switch ($ext) {
-            '.doc' { $w = Get-Word; $d = $w.Documents.Open($src, $false, $true); $d.SaveAs2([ref]$dst, [ref]12); $d.Close(0) }
-            '.xls' { $x = Get-Excel; $b = $x.Workbooks.Open($src, 0, $true); $b.SaveAs($dst, 51); $b.Close($false) }
+            '.doc' {
+                $w = Get-Word
+                # FileName, ConfirmConversions, ReadOnly, AddToRecentFiles, PasswordDocument, PasswordTemplate,
+                # Revert, WritePasswordDocument, WritePasswordTemplate, Format, Encoding, Visible, OpenAndRepair,
+                # DocumentDirection, NoEncodingDialog
+                $d = $w.Documents.Open($src, $false, $true, $false, "", "", $false, "", "", $miss, $miss, $script:show, $false, $miss, $true)
+                $d.SaveAs2([ref]$dst, [ref]12); $d.Close(0)
+            }
+            '.xls' {
+                $x = Get-Excel
+                # Filename, UpdateLinks, ReadOnly, Format, Password, WriteResPassword, IgnoreReadOnlyRecommended,
+                # Origin, Delimiter, Editable, Notify, Converter, AddToMru
+                $b = $x.Workbooks.Open($src, 0, $true, $miss, "", "", $true, $miss, $miss, $false, $false, $miss, $false)
+                $b.SaveAs($dst, 51); $b.Close($false)
+            }
             '.ppt' { $p = Get-PPT; $r = $p.Presentations.Open($src, -1, 0, $win); $r.SaveAs($dst, 24); $r.Close() }
         }
         if (Test-Path -LiteralPath $dst) { Write-Output "OK`t$src`t$dst" } else { Write-Output "FAIL`t$src`tno output written" }

@@ -286,6 +286,16 @@ class Convert(unittest.TestCase):
         self.assertIn("restarting Office for the remaining 1 file(s)", text)
         closer.assert_called()
 
+    def test_office_is_told_read_only_and_no_passwords_up_front(self):
+        """A 'password to modify' / 'read-only recommended' file must open
+        without the dialog the user answers with Read Only; a 'password to
+        open' file must fail with Office's message, not prompt."""
+        script = convert._PS_SCRIPT
+        self.assertIn('$w.Documents.Open($src, $false, $true, $false, "", "", $false, "", ""', script)   # ReadOnly, empty passwords
+        self.assertIn('$x.Workbooks.Open($src, 0, $true, $miss, "", "", $true', script)                # ReadOnly, empty passwords, IgnoreReadOnlyRecommended
+        self.assertIn("$true)\n", script)                                                            # NoEncodingDialog on Word
+        self.assertIn("[System.Reflection.Missing]::Value", script)
+
     def test_cli(self):
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
