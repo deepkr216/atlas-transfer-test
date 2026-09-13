@@ -213,7 +213,11 @@ def parse_output(text: str) -> List[Tuple[str, str, str]]:
     return rows
 
 
-def _run_powershell(pairs: List[Tuple[str, str]], timeout: int) -> Tuple[int, str, str]:
+def _run_powershell(pairs: List[Tuple[str, str]], timeout: int,
+                    log: Optional[Callable[[str], None]] = None) -> Tuple[int, str, str]:
+    """Run the conversion script and report every file THE MOMENT Office is
+    done with it (a 40-file run is minutes of silence otherwise, and looks
+    stuck). Returns (rc, everything the script printed, stderr)."""
     if shutil.which("powershell") is None:
         return 127, "", "powershell.exe not found on PATH"
     td = tempfile.mkdtemp(prefix="atlas-convert-")
@@ -224,14 +228,28 @@ def _run_powershell(pairs: List[Tuple[str, str]], timeout: int) -> Tuple[int, st
     with open(listing, "w", encoding="utf-8") as fh:
         for src, dst in pairs:
             fh.write(f"{src}\t{dst}\n")
+    if log:
+        log(f"  starting Office for {len(pairs)} file(s) - the first answer takes 20-40 s, then one line per file")
+    lines: List[str] = []
     try:
-        p = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-                            "-File", script, "-ListFile", listing],
-                           capture_output=True, text=True, encoding="utf-8", errors="replace",
-                           timeout=timeout, stdin=subprocess.DEVNULL)
-        return p.returncode, p.stdout or "", p.stderr or ""
-    except subprocess.TimeoutExpired:
-        return 124, "", f"timed out after {timeout}s"
+        p = subprocess.Popen(["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                              "-File", script, "-ListFile", listing],
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8",
+                             errors="replace", stdin=subprocess.DEVNULL)
+        assert p.stdout is not None
+        for raw in p.stdout:
+            line = raw.rstrip("\r\n")
+            lines.append(line)
+            rows = parse_output(line)
+            if log and rows:
+                st, src, detail = rows[0]
+                log(f"  {st:<4} {src}" + ("" if st == "OK" else f": {detail}"))
+        try:
+            err = p.communicate(timeout=timeout)[1] or ""
+        except subprocess.TimeoutExpired:
+            p.kill()
+            return 124, "\n".join(lines), f"timed out after {timeout}s"
+        return p.returncode, "\n".join(lines) + "\n", err
     finally:
         shutil.rmtree(td, ignore_errors=True)
 
@@ -276,7 +294,7 @@ def convert_tree(root: str, dry_run: bool = False, log: Callable[[str], None] = 
             tag = {"exists": "have ", "stale": "stale", "convert": "todo "}[st]
             log(f"  {tag} {s} -> {os.path.basename(d)}")
         return 0, have, 0
-    rc, out, err = _run_powershell(todo, timeout)
+    rc, out, err = _run_powershell(todo, timeout, log)
     rows = parse_output(out)
     com_missing = rc != 0 and not rows or any("80040154" in d or "Cannot create" in d or "COM class factory" in d
                                               for _s, _src, d in rows if _s == "FAIL")
@@ -290,8 +308,11 @@ def convert_tree(root: str, dry_run: bool = False, log: Callable[[str], None] = 
             "open a .doc/.xls/.ppt - save them as .docx/.xlsx/.pptx from the application once.")
         return 0, have, len(todo)
     ok = sum(1 for st, _s, _d in rows if st == "OK")
-    for st, src, detail in rows:
-        log(f"  {st:<4} {src}" + ("" if st == "OK" else f": {detail}"))
+    failed_rows = [(src, detail) for st, src, detail in rows if st == "FAIL"]
+    if failed_rows:                                   # a recap of what needs a look, after the live lines
+        log(f"  {len(failed_rows)} file(s) not converted:")
+        for src, detail in failed_rows:
+            log(f"  FAIL {src}: {detail}")
     missing = [s for s, _d in todo if s not in {src for _st, src, _d in rows}]
     for s in missing:
         log(f"  FAIL {s}: no result reported")

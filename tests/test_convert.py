@@ -54,7 +54,7 @@ class Convert(unittest.TestCase):
     def test_convert_tree_reports_and_never_deletes(self):
         lines = []
         with mock.patch("atlas.convert._run_powershell") as ps:
-            def fake(pairs, timeout):
+            def fake(pairs, timeout, log=None):
                 out = []
                 for src, dst in pairs:
                     if src.endswith("OLD.DOC"):
@@ -121,7 +121,7 @@ class Convert(unittest.TestCase):
         self.assertIn("1 copies STALE", "\n".join(lines))
         self.assertIn("STALE " + doc, "\n".join(lines))
         with mock.patch("atlas.convert._run_powershell") as ps:
-            ps.side_effect = lambda pairs, timeout: (0, "".join(f"OK\t{s}\t{d}\n" for s, d in pairs), "")
+            ps.side_effect = lambda pairs, timeout, log=None: (0, "".join(f"OK\t{s}\t{d}\n" for s, d in pairs), "")
             convert.convert_tree(self.docs, log=lines.append, refresh=True)
             remade = [d for s, d in ps.call_args[0][0]]
         self.assertIn(docx, remade)                          # --refresh remakes the stale copy
