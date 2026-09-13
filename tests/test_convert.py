@@ -138,6 +138,59 @@ class Convert(unittest.TestCase):
         self.assertEqual(row[0], "partial")
         self.assertIn("STALE copy: rates.xls changed after this conversion", row[1])
 
+    def test_zip_archives_are_extracted_beside_them_nested_and_safely(self):
+        import zipfile
+        inner = os.path.join(self.td, "inner.zip")
+        with zipfile.ZipFile(inner, "w") as z:
+            z.writestr("deep/Policy Rules.md", "# Rules\n\nThe waiver applies.\n")
+            z.writestr("deep/old.doc", "x")
+        outer = os.path.join(self.docs, "sub", "Archive 2019.zip")
+        with zipfile.ZipFile(outer, "w") as z:
+            z.write(inner, "inner.zip")
+            z.writestr("readme.txt", "hello")
+            z.writestr("../escape.txt", "must not be written")          # zip-slip entry
+        lines = []
+        done, have, failed = convert.unzip_tree(self.docs, log=lines.append)
+        self.assertEqual((done, have, failed), (2, 0, 0))                # outer, then the zip inside it
+        top = os.path.join(self.docs, "sub", "Archive 2019.unzipped")
+        self.assertTrue(os.path.exists(os.path.join(top, "readme.txt")))
+        self.assertTrue(os.path.exists(os.path.join(top, "inner.unzipped", "deep", "Policy Rules.md")))
+        self.assertFalse(os.path.exists(os.path.join(self.docs, "sub", "escape.txt")))
+        self.assertFalse(os.path.exists(os.path.join(self.docs, "escape.txt")))
+        self.assertIn("entry outside the folder ignored", "\n".join(lines))
+        self.assertTrue(os.path.exists(outer))                             # nothing deleted
+        # second run: up to date, nothing re-extracted
+        done, have, failed = convert.unzip_tree(self.docs, log=lines.append)
+        self.assertEqual((done, have, failed), (0, 2, 0))
+        # the archive changed: extracted again
+        with zipfile.ZipFile(outer, "a") as z:
+            z.writestr("added.txt", "new")
+        done, have, failed = convert.unzip_tree(self.docs, log=lines.append)
+        self.assertEqual(done, 1)
+        self.assertTrue(os.path.exists(os.path.join(top, "added.txt")))
+        # the legacy file inside the archive is now on the conversion plan
+        self.assertIn("old.doc", {os.path.basename(s) for s, _d, _st in convert.plan(self.docs)})
+        # the build indexes the extracted documents and not the archives
+        est = os.path.join(self.td, "estate", "SRC")
+        os.makedirs(est)
+        shutil.copy(os.path.join(HERE, "fixtures", "SAMPPGM.cbl"), est)
+        db = os.path.join(self.td, "t.db")
+        with contextlib.redirect_stdout(io.StringIO()):
+            build._main([os.path.join(self.td, "estate"), "--db", db, "--rebuild", "--quiet", "--also", self.docs])
+        conn = query.connect(db)
+        names = {os.path.basename(r[0]).lower() for r in conn.execute("SELECT path FROM member")}
+        conn.close()
+        self.assertIn("policy rules.md", names)
+        self.assertIn("readme.txt", names)
+        self.assertNotIn("archive 2019.zip", names)
+        self.assertNotIn("inner.zip", names)
+        # dry run touches nothing
+        os.remove(os.path.join(top, "added.txt"))
+        with zipfile.ZipFile(outer, "a") as z:
+            z.writestr("again.txt", "x")
+        convert.unzip_tree(self.docs, log=lines.append, dry_run=True)
+        self.assertFalse(os.path.exists(os.path.join(top, "again.txt")))
+
     def test_cli(self):
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):

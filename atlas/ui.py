@@ -168,7 +168,7 @@ class App(tk.Tk if tk else object):
         for text, cmd in (("Plan", self.plan), ("Fetch selected", self.fetch_selected),
                           ("Fetch system", self.fetch_system), ("Fetch all", self.fetch_all),
                           ("Build index", lambda: self.build(False)), ("Rebuild from empty", lambda: self.build(True)),
-                          ("OCR images", self.ocr_images), ("Convert legacy Office", self.convert_legacy),
+                          ("OCR images", self.ocr_images), ("Prepare documents", self.convert_legacy),
                           ("Coverage", self.coverage)):
             ttk.Button(btns, text=text, command=cmd).pack(side="left", padx=2)
 
@@ -471,13 +471,14 @@ class App(tk.Tk if tk else object):
         self._run_bg(lambda: self._stream([sys.executable, "-m", "atlas.ocr", "--db", db, "--out", out]))
 
     def convert_legacy(self) -> None:
-        """Save .doc / .xls / .ppt under the document folders as .docx / .xlsx /
-        .pptx beside the originals, with the Office installed on this laptop
-        (nothing installed, nothing deleted). The build then reads the copies."""
+        """Extract .zip archives under the document folders (into <name>.unzipped
+        beside each), then save .doc / .xls / .ppt as .docx / .xlsx / .pptx beside
+        the originals with the Office installed on this laptop (nothing installed,
+        nothing deleted). The build then reads the copies."""
         self._sync_cfg()
         roots = [r for r in (self.cfg.get("extra_roots") or []) if os.path.isdir(r)]
         if not roots:
-            messagebox.showinfo("Convert legacy Office", "Name the document folder(s) under 'Document folders' first.")
+            messagebox.showinfo("Prepare documents", "Name the document folder(s) under 'Document folders' first.")
             return
         self._run_bg(lambda: self._stream([sys.executable, "-m", "atlas.convert", *roots]))
 

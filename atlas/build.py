@@ -241,6 +241,9 @@ def _scan_files(root: str, limit: Optional[int] = None):
             # (atlas.convert): the copy is readable, the original is not
             if ext.lower() in docs.LEGACY_TO_MODERN and (stem + docs.LEGACY_TO_MODERN[ext.lower()]).lower() in lower:
                 continue
+            # an archive atlas.convert already extracted into <name>.unzipped beside it
+            if ext.lower() == ".zip" and os.path.isdir(os.path.join(dirpath, stem + ".unzipped")):
+                continue
             yield dirpath, fn
             count += 1
             if limit and count >= limit:

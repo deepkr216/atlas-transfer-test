@@ -6,8 +6,13 @@ LibreOffice when Office is absent. The modern copy is written NEXT TO the
 original; nothing is deleted or modified. The build then indexes the modern
 copy and skips the legacy one.
 
-    python -m atlas.convert C:\\docs              # convert everything under the folder
-    python -m atlas.convert C:\\docs --dry-run    # list what would be converted, touch nothing
+    python -m atlas.convert C:\\docs              # unzip archives, then convert everything under the folder
+    python -m atlas.convert C:\\docs --dry-run    # list what would be done, touch nothing
+
+Archives: every .zip (zips inside zips too) is extracted first into a folder
+named <archive>.unzipped beside it, so the documents inside are converted and
+indexed like the rest; an archive already extracted from the same bytes is
+skipped.
 
 Files that are password-protected, corrupt, or locked by another user are
 reported as FAIL with Office's own message and left alone.
@@ -16,16 +21,99 @@ reported as FAIL with Office's own message and left alone.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import zipfile
 from typing import Callable, List, Optional, Tuple
 
 from .docs import LEGACY_TO_MODERN
 
 SKIP_DIRS = {"out", "atlas_out", ".git", "__pycache__", ".stale"}
+
+UNZIP_SUFFIX = ".unzipped"                 # specs.zip -> specs.unzipped\ beside it
+UNZIP_MARKER = ".atlas-unzipped.json"      # which zip (size, mtime) the folder came from
+MAX_UNZIP_BYTES = 4 * 1024 ** 3            # per archive
+
+
+def _safe_member(name: str) -> Optional[str]:
+    """A zip entry's relative path, or None when it would escape the folder."""
+    rel = name.replace("\\", "/").lstrip("/")
+    parts = [p for p in rel.split("/") if p not in ("", ".")]
+    if not parts or any(p == ".." for p in parts) or (len(rel) > 1 and rel[1] == ":"):
+        return None
+    return os.path.join(*parts)
+
+
+def unzip_tree(root: str, log: Callable[[str], None] = print, dry_run: bool = False,
+               max_depth: int = 5) -> Tuple[int, int, int]:
+    """Extract every .zip under `root` (subfolders included, zips inside zips
+    too) into `<name>.unzipped` beside the archive, so the documents in it
+    can be converted and indexed like any other. An archive already
+    extracted from the same bytes is skipped; nothing is deleted. Returns
+    (extracted, up to date, failed)."""
+    done = have = failed = 0
+    seen: set = set()
+    for _round in range(max_depth):
+        zips: List[str] = []
+        for dirpath, dirs, files in os.walk(root):
+            dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.startswith(".")]
+            zips += [os.path.join(dirpath, f) for f in sorted(files) if f.lower().endswith(".zip")]
+        fresh = [z for z in zips if z not in seen]
+        if not fresh:
+            break
+        for zpath in fresh:
+            seen.add(zpath)
+            dest = os.path.splitext(zpath)[0] + UNZIP_SUFFIX
+            try:
+                st = os.stat(zpath)
+                stamp = {"zip": os.path.basename(zpath), "size": st.st_size, "mtime": int(st.st_mtime)}
+            except OSError as e:
+                log(f"  FAIL  {zpath}: {e}")
+                failed += 1
+                continue
+            marker = os.path.join(dest, UNZIP_MARKER)
+            if os.path.isdir(dest) and os.path.exists(marker):
+                try:
+                    with open(marker, encoding="utf-8") as fh:
+                        if json.load(fh) == stamp:
+                            have += 1
+                            log(f"  have  {zpath} -> {os.path.basename(dest)} (up to date)")
+                            continue
+                except (OSError, ValueError):
+                    pass
+            if dry_run:
+                log(f"  todo  {zpath} -> {os.path.basename(dest)}")
+                continue
+            try:
+                total = 0
+                with zipfile.ZipFile(zpath) as z:
+                    for info in z.infolist():
+                        if info.is_dir():
+                            continue
+                        rel = _safe_member(info.filename)
+                        if rel is None:
+                            log(f"  skip  {zpath}: entry outside the folder ignored: {info.filename}")
+                            continue
+                        total += info.file_size
+                        if total > MAX_UNZIP_BYTES:
+                            raise ValueError(f"more than {MAX_UNZIP_BYTES // 1024 ** 3} GB - not extracted further")
+                        target = os.path.join(dest, rel)
+                        os.makedirs(os.path.dirname(target), exist_ok=True)
+                        with z.open(info) as src, open(target, "wb") as out:
+                            shutil.copyfileobj(src, out)
+                os.makedirs(dest, exist_ok=True)
+                with open(marker, "w", encoding="utf-8") as fh:
+                    json.dump(stamp, fh)
+                done += 1
+                log(f"  OK    {zpath} -> {os.path.basename(dest)}")
+            except (OSError, zipfile.BadZipFile, ValueError) as e:
+                failed += 1
+                log(f"  FAIL  {zpath}: {e}")
+    return done, have, failed
 
 # One PowerShell process for the whole tree: Word / Excel / PowerPoint are
 # started once each, on first use, and closed at the end. Files are opened
@@ -216,12 +304,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--refresh", action="store_true",
                     help="also remake a copy whose legacy original changed after the copy was made (overwrites the copy)")
     ap.add_argument("--timeout", type=int, default=3600)
+    ap.add_argument("--no-unzip", action="store_true", help="do not extract .zip archives first")
     a = ap.parse_args(argv)
     tot_ok = tot_have = tot_fail = 0
     for folder in a.folder:
         if not os.path.isdir(folder):
             print(f"not a folder: {folder}")
             return 2
+        if not a.no_unzip:
+            z_ok, z_have, z_fail = unzip_tree(folder, print, a.dry_run)
+            print(f"archives: {z_ok} extracted, {z_have} already extracted, {z_fail} failed")
+            tot_fail += z_fail
         ok, have, fail = convert_tree(folder, a.dry_run, print, a.timeout, a.refresh)
         tot_ok, tot_have, tot_fail = tot_ok + ok, tot_have + have, tot_fail + fail
     print(f"converted {tot_ok}, already present {tot_have}, failed {tot_fail}")

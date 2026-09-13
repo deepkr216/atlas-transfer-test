@@ -321,12 +321,15 @@ somewhere on the laptop. Name it under **Document folders** in the UI (or
 `extra_roots` in `sources.json`, or `--also DIR` on the build) and the build
 indexes it alongside the code: `.docx / .xlsx / .pptx / .vsdx` text, headings,
 tables and slide notes; `.pdf` best-effort; `.txt/.md/.html`. Legacy `.doc /
-.xls / .ppt` cannot be read directly: **Convert legacy Office** in the UI (or
-`python -m atlas.convert <folder>`) saves every one under the document
-folders — subfolders included — as `.docx / .xlsx / .pptx` beside the
-original, using the Office installed on the laptop (nothing installed,
-nothing deleted; LibreOffice is used if Office is absent). The build then
-indexes the copy and skips the original.
+.xls / .ppt` cannot be read directly: **Prepare documents** in the UI (or
+`python -m atlas.convert <folder>`) first extracts every `.zip` under the
+document folders — subfolders and zips inside zips included — into a
+`<name>.unzipped` folder beside the archive, then saves every `.doc / .xls /
+.ppt` as `.docx / .xlsx / .pptx` beside the original, using the Office
+installed on the laptop (nothing installed, nothing deleted; LibreOffice is
+used if Office is absent). The build then indexes the copies and skips the
+archives and the originals; a copy older than its edited original is
+reported as STALE (`--refresh` remakes it).
 
 **Pictures are read, not just counted.** `OCR images` (UI) or
 `python -m atlas.ocr --db atlas.db --out out/images` pulls every image out of
