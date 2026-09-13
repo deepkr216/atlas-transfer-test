@@ -94,7 +94,7 @@ class MultiLineCobol(unittest.TestCase):
         self.assertNotIn("WS-OLD-ARGUMENT-COMMENTED-OUT", calls[0].using_args)
 
     def test_perform_thru_split_over_two_lines(self):
-        self.assertIn(("0000-MAIN", "1000-PROCESS", "1000-EXIT", 40), self.facts.performs)
+        self.assertIn(("0000-MAIN", "1000-PROCESS", "1000-EXIT", 40, "perform"), self.facts.performs)
 
     def test_paragraph_header_and_statement_on_same_line(self):
         names = [p.name for p in self.facts.paragraphs]

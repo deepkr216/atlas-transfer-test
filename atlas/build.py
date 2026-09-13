@@ -118,6 +118,7 @@ def open_db(path: str, rebuild: bool = False) -> sqlite3.Connection:
             if os.path.exists(path + suffix):
                 os.remove(path + suffix)
     conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA foreign_keys=ON")
@@ -133,7 +134,13 @@ def open_db(path: str, rebuild: bool = False) -> sqlite3.Connection:
                              ("dd", "mode_source", "TEXT"), ("transaction_def", "group_name", "TEXT"),
                              ("transaction_def", "detail", "TEXT"), ("dd", "card_member", "TEXT"),
                              ("dd", "is_temp", "INTEGER DEFAULT 0"), ("step", "guard", "TEXT"),
-                             ("job", "joblib", "TEXT"), ("job", "job_cond", "TEXT"), ("job", "jcllib", "TEXT")):
+                             ("job", "joblib", "TEXT"), ("job", "job_cond", "TEXT"), ("job", "jcllib", "TEXT"),
+                             ("perform_edge", "kind", "TEXT DEFAULT 'perform'"),
+                             ("dli_call", "pcb_index", "INTEGER"), ("dli_call", "resolution", "TEXT"),
+                             ("dli_call", "dest", "TEXT"), ("dli_call", "psb_name", "TEXT"),
+                             ("dli_call", "dbd_name", "TEXT"), ("dli_call", "procopt", "TEXT"),
+                             ("dli_call", "pcb_source", "TEXT"), ("ims_pcb", "list_no", "INTEGER DEFAULT 0"),
+                             ("ims_pcb", "procseq", "TEXT"), ("ims_dbd", "dd1", "TEXT"), ("ims_dbd", "dd2", "TEXT")):
         _ensure_column(conn, table, col, decl)
     with open(os.path.join(HERE, "schema.sql"), "r", encoding="utf-8") as fh:
         conn.executescript(fh.read())
@@ -178,6 +185,7 @@ def _forget_member(conn: sqlite3.Connection, mid: int) -> None:
     OTHER members that only reference it, which a cascade cannot reach."""
     conn.execute("UPDATE copy_use SET resolved_member_id=NULL WHERE resolved_member_id=?", (mid,))
     conn.execute("DELETE FROM expand_run WHERE src_member=?", (mid,))
+    conn.execute("DELETE FROM db2_object WHERE member_id=?", (mid,))
     conn.execute("DELETE FROM src_fts WHERE member_id=?", (mid,))
     conn.execute("DELETE FROM member WHERE id=?", (mid,))
 
@@ -499,8 +507,28 @@ def index_cobol(ctx: Ctx, mem: Mem) -> None:
         "INSERT INTO paragraph(program_id,section,name,start_line,end_line,ordinal) VALUES(?,?,?,?,?,?)",
         [(pid, p.section, p.name, p.start_line, p.end_line, p.ordinal) for p in facts.paragraphs])
     conn.executemany(
-        "INSERT INTO perform_edge(program_id,from_para,to_para,thru_para,line) VALUES(?,?,?,?,?)",
-        [(pid, a, b, c, ln) for (a, b, c, ln) in facts.performs])
+        "INSERT INTO perform_edge(program_id,from_para,to_para,thru_para,line,kind) VALUES(?,?,?,?,?,?)",
+        [(pid, a, b, c, ln, kind) for (a, b, c, ln, kind) in facts.performs])
+    conn.executemany(
+        "INSERT INTO program_alias(program_id,alias,linkage_using,line) VALUES(?,?,?,?)",
+        [(pid, name, _j(using), ln) for (name, using, ln) in facts.entries])
+    conn.executemany(
+        "INSERT INTO cics_cmd(program_id,verb,resource_kind,resource,direction,line) VALUES(?,?,?,?,?,?)",
+        [(pid, v, k, r, d, ln) for (v, k, r, d, ln) in facts.cics_cmds])
+    # REPLACING renamed copybook fields: keep the link both ways.
+    conn.executemany(
+        "INSERT INTO field_alias(program_id,copybook,orig_name,new_name,line) VALUES(?,?,?,?,?)",
+        [(pid, cb, o, n, ln) for (cb, o, n, ln) in exp.aliases])
+    # DCLGEN DECLARE TABLE: the table's columns in declared order.
+    for tbl, cols in facts.declared_tables.items():
+        qual, _, name = tbl.rpartition(".")
+        conn.execute("INSERT OR IGNORE INTO db2_object(kind,qualifier,name,source,member_id) VALUES('table',?,?,'dclgen',?)",
+                     (qual or None, name, mem.id))
+        oid = conn.execute("SELECT id FROM db2_object WHERE kind='table' AND name=? AND COALESCE(qualifier,'')=?",
+                           (name, qual or "")).fetchone()[0]
+        if not conn.execute("SELECT 1 FROM db2_column WHERE object_id=? LIMIT 1", (oid,)).fetchone():
+            conn.executemany("INSERT INTO db2_column(object_id,ordinal,name,type) VALUES(?,?,?,?)",
+                             [(oid, i, c, t) for i, (c, t) in enumerate(cols, 1)])
     conn.executemany(
         "INSERT INTO call_edge(program_id,kind,target,via_var,resolved,resolution,using_args,line) "
         "VALUES(?,?,?,?,?,?,?,?)",
@@ -528,13 +556,22 @@ def index_cobol(ctx: Ctx, mem: Mem) -> None:
         [(mem.id, pid, s.stmt_type, s.cursor_name, _j(s.tables), None, _j(s.host_vars),
           int(s.is_dynamic), s.start_line, s.end_line, s.text[:4000]) for s in facts.sql])
     conn.executemany(
-        "INSERT INTO dli_call(program_id,interface,func,pcb_arg,pcb_ordinal,ssa_args,io_area,line) "
-        "VALUES(?,?,?,?,?,?,?,?)",
-        [(pid, d.interface, d.func, d.pcb_arg, None, _j(d.ssa_args), d.io_area, d.line) for d in facts.dli])
+        "INSERT INTO dli_call(program_id,interface,func,pcb_arg,pcb_ordinal,ssa_args,io_area,line,pcb_index,"
+        "resolution,dest) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        [(pid, d.interface, d.func, d.pcb_arg, None, _j(d.ssa_args), d.io_area, d.line, d.pcb_index,
+          d.resolution, d.dest) for d in facts.dli])
+    # MQ: the queue and the message layout are the interface contract.
     conn.executemany(
         "INSERT INTO interface_edge(member_id,kind,detail,direction,line) VALUES(?,?,?,?,?)",
-        [(mem.id, "mq", call, ("out" if call in ("MQPUT", "MQPUT1") else "in" if call == "MQGET" else None), ln)
-         for (call, ln) in facts.mq])
+        [(mem.id, "mq",
+          (f"{call} queue {queue}" if queue else f"{call} (queue not resolvable from this source)")
+          + (f" layout {layout}" if layout else ""),
+          direction, ln)
+         for (call, queue, direction, layout, ln) in facts.mq if call in ("MQPUT", "MQPUT1", "MQGET", "MQOPEN")])
+    # IMS message switch: CHNG to a destination = this program reaches that transaction.
+    conn.executemany(
+        "INSERT INTO interface_edge(member_id,kind,detail,direction,line) VALUES(?,?,?,?,?)",
+        [(mem.id, "ims_msw", f"CHNG destination {d.dest}", "out", d.line) for d in facts.dli if d.dest])
     conn.executemany(
         "INSERT INTO field_ref(program_id,name,mode,stmt,line) VALUES(?,?,?,?,?)",
         [(pid, n, mode, stmt, ln) for (n, mode, stmt, ln) in facts.field_refs])
@@ -564,6 +601,50 @@ def index_cobol(ctx: Ctx, mem: Mem) -> None:
         "INSERT INTO literal_ref(member_id,program_id,literal,context,field,line) VALUES(?,?,?,?,?,?)",
         [(mem.id, pid, lit, ctxt, fld, ln) for (lit, ctxt, fld, ln)
          in _group_value_literals(copybook.flatten(roots))])
+
+    # SELECT * INTO :DCLPOLICY / SELECT a,b,c INTO :GROUP: the columns land in
+    # the group's elementary children in order (the DCLGEN idiom). Without
+    # this, `column POLICY_TBL.STATUS_CD` says "no static SQL references" for
+    # every program that reads the whole row.
+    all_fields = copybook.flatten(roots)
+    by_name: Dict[str, copybook.Field] = {}
+    for fld in all_fields:
+        by_name.setdefault(fld.name.upper(), fld)
+    for hv, tables, cols, stmt, ln in facts.sql_group_intos:
+        grp = by_name.get(hv.upper())
+        if grp is None or not grp.children:
+            notes.append(("sql_group_into", f"{stmt} INTO :{hv} - group not found in this program's data division; "
+                                            f"column-to-field mapping skipped", ln))
+            continue
+        # Direct children only (a level-49 VARCHAR pair stays one column).
+        targets = [c.name.upper() for c in grp.children if c.name.upper() != "FILLER"]
+        if cols == ["*"]:
+            tbl_names = [t[0] for t in tables]
+            decl = None
+            for t in tbl_names:
+                decl = facts.declared_tables.get(t.upper()) or next(
+                    (v for k, v in facts.declared_tables.items() if k.upper().rpartition(".")[2] == t.upper().rpartition(".")[2]), None)
+                if decl:
+                    break
+            if not decl:
+                notes.append(("sql_group_into", f"{stmt} * INTO :{hv} - no DECLARE TABLE (DCLGEN) for "
+                                                f"{', '.join(tbl_names)} in this program; columns unknown", ln))
+                continue
+            col_names = [c for c, _t in decl]
+            tbl = (tbl_names[0] if tbl_names else "?").upper()
+            pairs = [((tbl, c), h) for c, h in zip(col_names, targets)]
+        else:
+            pairs = []
+            for c, h in zip(cols, targets):
+                cc = cobol._col(c, tables)
+                if cc:
+                    pairs.append((cc, h))
+        conn.executemany(
+            "INSERT INTO sql_col_ref(program_id,tbl,col,host_var,mode,stmt,line) VALUES(?,?,?,?,?,?,?)",
+            [(pid, t, c, h, "read", stmt + " (positional via group)", ln) for ((t, c), h) in pairs])
+        conn.executemany(
+            "INSERT INTO field_ref(program_id,name,mode,stmt,line) VALUES(?,?,?,?,?)",
+            [(pid, h, "write", "EXEC-SQL", ln) for (_tc, h) in pairs])
 
     for w in warns:
         if "SYNC" in w or "not compile" in w:
@@ -797,11 +878,16 @@ def _index_jcl_facts(ctx: Ctx, mem: Mem, facts: jcl.JclFacts) -> None:
             insert_step(e, parent_ord.get(top, 0) * 100 + i)
             ctx.bump("steps:expanded")
 
-    # A DFHCSDUP deck is usually the SYSIN of a JCL step: harvest it in place.
+    # A DFHCSDUP deck or an IMS stage-1 deck is usually the SYSIN of a JCL
+    # step: harvest it in place.
     for s in facts.steps:
         for d in s.dds:
-            if d.sysin_text and re.search(r"\b(?:DEFINE|ALTER)\s+TRANSACTION\(", d.sysin_text, re.I):
+            if not d.sysin_text:
+                continue
+            if re.search(r"\b(?:DEFINE|ALTER)\s+(?:TRANSACTION|TDQUEUE|DB2ENTRY|URIMAP|FILE)\s*\(", d.sysin_text, re.I):
                 _insert_routing(ctx, mem, txn.parse_csd(d.sysin_text))
+            elif re.search(r"^(?:[A-Z0-9@#$]{1,8})?\s+(?:APPLCTN|TRANSACT)\s+(?:PSB|GPSB|CODE)=", d.sysin_text, re.I | re.M):
+                _insert_routing(ctx, mem, txn.parse_imsgen(d.sysin_text))
 
     conn.executemany("INSERT INTO unresolved(member_id,kind,detail,line) VALUES(?,?,?,?)",
                      [(mem.id, k, d, ln) for (k, d, ln) in facts.unresolved])
@@ -812,15 +898,24 @@ def _index_jcl_facts(ctx: Ctx, mem: Mem, facts: jcl.JclFacts) -> None:
 def index_dbd(ctx: Ctx, mem: Mem) -> None:
     conn = ctx.conn
     text, _d, _e = reader.load(mem.path)
-    f = ims.parse_dbd(text)
-    cur = conn.execute("INSERT INTO ims_dbd(member_id,name,access,line) VALUES(?,?,?,?)",
-                       (mem.id, f.name or mem.name, f.access, 1))
-    did = cur.lastrowid
-    conn.executemany(
-        "INSERT INTO ims_segment(dbd_id,name,parent,bytes,seq_field,line) VALUES(?,?,?,?,?,?)",
-        [(did, s.name, s.parent, s.bytes_max, s.seq_field, s.line) for s in f.segments])
-    conn.executemany("INSERT INTO unresolved(member_id,kind,detail,line) VALUES(?,?,?,?)",
-                     [(mem.id, "ims_dbd", w, None) for w in f.warnings])
+    for f in ims.parse_dbd_all(text):
+        cur = conn.execute("INSERT INTO ims_dbd(member_id,name,access,line,dd1,dd2) VALUES(?,?,?,?,?,?)",
+                           (mem.id, f.name or mem.name, f.access, f.line or 1, f.dd1, f.dd2))
+        did = cur.lastrowid
+        for s in f.segments:
+            sc = conn.execute(
+                "INSERT INTO ims_segment(dbd_id,name,parent,bytes,seq_field,line) VALUES(?,?,?,?,?,?)",
+                (did, s.name, s.parent, s.bytes_max, s.seq_field, s.line))
+            # FIELDs are what an SSA can qualify on and where a copybook
+            # field maps into the segment.
+            conn.executemany(
+                "INSERT INTO ims_field(segment_id,name,start,bytes,is_seq,line) VALUES(?,?,?,?,?,?)",
+                [(sc.lastrowid, n, st, by, int(seq), s.line) for (n, st, by, seq) in s.fields])
+        conn.executemany(
+            "INSERT INTO ims_xdfld(dbd_id,name,segment,srch,line) VALUES(?,?,?,?,?)",
+            [(did, n, seg, _j(srch), ln) for (n, seg, srch, ln) in f.xdfld])
+        conn.executemany("INSERT INTO unresolved(member_id,kind,detail,line) VALUES(?,?,?,?)",
+                         [(mem.id, "ims_dbd", w, None) for w in f.warnings])
     conn.execute("UPDATE member SET parse_status='ok' WHERE id=?", (mem.id,))
 
 
@@ -835,10 +930,10 @@ def index_psb(ctx: Ctx, mem: Mem) -> None:
          None if f.io_pcb_first is None else int(f.io_pcb_first), 1))
     psid = cur.lastrowid
     conn.executemany(
-        "INSERT INTO ims_pcb(psb_id,ordinal,pcb_type,dbd_name,procopt,keylen,sensegs,line) "
-        "VALUES(?,?,?,?,?,?,?,?)",
+        "INSERT INTO ims_pcb(psb_id,ordinal,pcb_type,dbd_name,procopt,keylen,sensegs,line,list_no,procseq) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?)",
         [(psid, p.ordinal, p.pcb_type, p.dbd_name, p.procopt, p.keylen,
-          _j([s[0] for s in p.sensegs]), p.line) for p in f.pcbs])
+          _j([s[0] for s in p.sensegs]), p.line, int(p.list_no), p.procseq) for p in f.pcbs])
     conn.executemany("INSERT INTO unresolved(member_id,kind,detail,line) VALUES(?,?,?,?)",
                      [(mem.id, "ims_psb", w, None) for w in f.warnings])
     conn.execute("UPDATE member SET parse_status='ok' WHERE id=?", (mem.id,))
@@ -928,6 +1023,43 @@ def _insert_routing(ctx: Ctx, mem: Mem, facts: txn.RoutingFacts) -> None:
         # that this dataset is VSAM, so update rather than ignore.
         conn.execute("INSERT OR IGNORE INTO dataset(dsn,is_vsam) VALUES(?,1)", (dsn,))
         conn.execute("UPDATE dataset SET is_vsam=1 WHERE dsn=?", (dsn,))
+    conn.executemany(
+        "INSERT INTO cics_resource(member_id,type,name,group_name,attrs,line) VALUES(?,?,?,?,?,?)",
+        [(mem.id, t, n, (a.get("GROUP") or "").upper() or None, _j(a), ln) for (t, n, a, ln) in facts.resources])
+    entries: Dict[str, str] = {}
+    for t, n, a, ln in facts.resources:
+        if t == "TDQUEUE" and (a.get("DSNAME") or "").strip():
+            # An extrapartition TD queue IS a dataset: the classic online ->
+            # batch hand-off.
+            dsn = a["DSNAME"].strip().upper()
+            conn.execute("INSERT OR IGNORE INTO dataset(dsn) VALUES(?)", (dsn,))
+            direction = "out" if (a.get("TYPEFILE") or "").upper().startswith("OUT") else \
+                        "in" if (a.get("TYPEFILE") or "").upper().startswith("IN") else None
+            conn.execute("INSERT INTO interface_edge(member_id,kind,detail,direction,line) VALUES(?,?,?,?,?)",
+                         (mem.id, "cics_tdq", f"TD queue {n} -> {dsn}", direction, ln))
+        elif t == "DB2ENTRY":
+            entries[n] = (a.get("PLAN") or "").upper()
+        elif t == "URIMAP" and (a.get("PROGRAM") or "").strip():
+            # An inbound web request routed straight to a program: routing
+            # without a transaction code.
+            conn.execute(
+                "INSERT INTO transaction_def(member_id,tran_code,system,program,psb,group_name,detail,line) "
+                "VALUES(?,?,?,?,?,?,?,?)",
+                (mem.id, n, "cics_web", a["PROGRAM"].strip().upper(), None,
+                 (a.get("GROUP") or "").upper() or None,
+                 f"URIMAP PATH({a.get('PATH', '?')}) USAGE({a.get('USAGE', '?')})", ln))
+    for t, n, a, ln in facts.resources:
+        if t == "DB2TRAN" and a.get("TRANSID") and a.get("ENTRY"):
+            # DB2TRAN -> DB2ENTRY PLAN(): the plan a CICS transaction runs under
+            plan = entries.get(a["ENTRY"].strip().upper())
+            if plan:
+                conn.execute("UPDATE transaction_def SET detail=COALESCE(detail,'') || ? WHERE UPPER(tran_code)=? AND system='cics'",
+                             (f"; DB2 plan {plan} (DB2ENTRY {a['ENTRY'].strip().upper()})", a["TRANSID"].strip().upper()))
+        elif t == "DB2ENTRY" and a.get("TRANSID") and a.get("PLAN"):
+            conn.execute("UPDATE transaction_def SET detail=COALESCE(detail,'') || ? WHERE UPPER(tran_code)=? AND system='cics'",
+                         (f"; DB2 plan {a['PLAN'].strip().upper()} (DB2ENTRY {n})", a["TRANSID"].strip().upper()))
+    conn.executemany("INSERT INTO ims_online_db(member_id,dbd,access,line) VALUES(?,?,?,?)",
+                     [(mem.id, d, acc or None, ln) for (d, acc, ln) in facts.databases])
     conn.executemany("INSERT INTO unresolved(member_id,kind,detail,line) VALUES(?,?,?,?)",
                      [(mem.id, "routing", w, None) for w in facts.warnings])
     ctx.bump("transactions", len(facts.transactions))
@@ -982,6 +1114,103 @@ def post_open_modes(ctx: Ctx) -> int:
             WHERE UPPER(dd_name) = ? AND step_id IN (SELECT id FROM step WHERE effective_pgm=?)""",
             (mode, dd_name.upper(), pname))
         n += cur.rowcount
+    return n
+
+
+def post_pcb_positions(ctx: Ctx) -> int:
+    """Turn every DL/I call's PCB argument into a database name.
+
+    The PSB is found from the DFSRRC00 PARM of a step running the program,
+    else the stage-1 APPLCTN, else a PSB named like the program. The
+    program's USING list gives the argument's position; the PSB's PCB order
+    (I/O PCB first when CMPAT=YES / a TP PCB / BMP-MPP region; LIST=NO PCBs
+    skipped) gives the PCB at that position. This is the off-by-one that
+    names the wrong database when done by hand (LESSONS 23), so it is done
+    here, once, and the reasoning is stored on the row (`pcb_source`).
+    """
+    conn = ctx.conn
+    n = 0
+    progs = conn.execute("""SELECT DISTINCT p.id, p.program_id, p.linkage_using FROM program p
+                            JOIN dli_call d ON d.program_id=p.id""").fetchall()
+    for p in progs:
+        pid, pname = p[0], p[1].upper()
+        using = [u.upper() for u in json.loads(p[2] or "[]")]
+        cands: List[Tuple[str, Optional[str], str]] = []
+        for (parm,) in conn.execute("SELECT parm FROM step WHERE UPPER(effective_pgm)=? AND parm LIKE '%PSB %'", (pname,)):
+            m = re.search(r"\bPSB ([A-Z0-9@#$]+)", parm or "")
+            r = re.search(r"IMS region type ([A-Z]+)", parm or "")
+            if m:
+                cands.append((m.group(1).upper(), r.group(1).upper() if r else None, "DFSRRC00 PARM in JCL"))
+        for (psb,) in conn.execute("SELECT DISTINCT psb FROM transaction_def WHERE UPPER(program)=? AND psb IS NOT NULL", (pname,)):
+            cands.append((psb.upper(), "MPP", "IMS stage-1 APPLCTN"))
+        if conn.execute("SELECT 1 FROM ims_psb WHERE UPPER(name)=?", (pname,)).fetchone():
+            cands.append((pname, None, "PSB named as the program (convention)"))
+        chosen = None
+        for psb_name, region, how in cands:
+            row = conn.execute("SELECT id, io_pcb_first FROM ims_psb WHERE UPPER(name)=? ORDER BY id", (psb_name,)).fetchone()
+            if row:
+                chosen = (psb_name, region, how, row)
+                break
+        if not chosen:
+            why = ("no PSB found: no DFSRRC00 step runs it, no stage-1 APPLCTN names it, no PSB member named like it"
+                   if not cands else f"PSB {cands[0][0]} ({cands[0][2]}) is not indexed")
+            conn.execute("UPDATE dli_call SET pcb_source=? WHERE program_id=?", (why, pid))
+            continue
+        psb_name, region, how, row = chosen
+        others = sorted({c[0] for c in cands if c[0] != psb_name})
+        pcbs = conn.execute("SELECT ordinal, pcb_type, dbd_name, procopt, list_no FROM ims_pcb WHERE psb_id=? ORDER BY ordinal",
+                            (row[0],)).fetchall()
+        io_first = row[1]
+        if io_first is None and region:
+            io_first = region in ("BMP", "MPP", "IFP", "JBP", "JMP")
+        positions: Dict[int, Optional[sqlite3.Row]] = {}
+        pos = 1
+        if io_first:
+            positions[1] = None
+            pos = 2
+        for pcb in pcbs:
+            if pcb["list_no"]:
+                continue
+            positions[pos] = pcb
+            pos += 1
+        by_ordinal = {pcb["ordinal"]: pcb for pcb in pcbs}
+        tail = f" ({how}{', I/O PCB first' if io_first else ''}{'; other PSBs seen: ' + ', '.join(others) if others else ''})"
+        for d in conn.execute("SELECT id, pcb_arg, pcb_index, func FROM dli_call WHERE program_id=?", (pid,)).fetchall():
+            pcb = None
+            src = None
+            if d["pcb_index"]:
+                pcb = by_ordinal.get(d["pcb_index"])
+                src = f"EXEC DLI PCB({d['pcb_index']}) = PSB {psb_name} PCB #{d['pcb_index']}" + tail
+            elif d["pcb_arg"] and d["pcb_arg"] in using:
+                p_pos = using.index(d["pcb_arg"]) + 1
+                if p_pos in positions:
+                    pcb = positions[p_pos]
+                    src = (f"USING position {p_pos} = " + ("the I/O PCB" if pcb is None else f"PSB {psb_name} PCB #{pcb['ordinal']}")
+                           + tail)
+                else:
+                    src = f"USING position {p_pos} is beyond the {len(positions)} PCB(s) of PSB {psb_name}" + tail
+            elif d["pcb_arg"]:
+                src = f"{d['pcb_arg']} is not in PROCEDURE DIVISION / ENTRY USING - position unknown (AIB by name?)" + tail
+            else:
+                src = f"no PCB argument" + tail
+            if pcb is not None:
+                conn.execute("UPDATE dli_call SET pcb_ordinal=?, psb_name=?, dbd_name=?, procopt=?, pcb_source=? WHERE id=?",
+                             (pcb["ordinal"], psb_name, pcb["dbd_name"], pcb["procopt"], src, d["id"]))
+                n += 1
+                if pcb["pcb_type"] == "GSAM" and pcb["dbd_name"] and d["func"] in ("ISRT", "GN", "GHN", "GU"):
+                    # A GSAM PCB is a sequential file: the DBD's DD1 (or the
+                    # DBD name) is the JCL DD the program writes / reads.
+                    dd = conn.execute("SELECT dd1 FROM ims_dbd WHERE UPPER(name)=?", (pcb["dbd_name"],)).fetchone()
+                    ddname = (dd[0] if dd and dd[0] else pcb["dbd_name"]).upper()
+                    mode = "output" if d["func"] == "ISRT" else "input"
+                    conn.execute("""UPDATE dd SET mode=?, mode_source=? WHERE UPPER(dd_name)=? AND mode_source<>'open_verb'
+                                    AND step_id IN (SELECT id FROM step WHERE UPPER(effective_pgm)=?)""",
+                                 (mode, "gsam_isrt" if mode == "output" else "gsam_gn", ddname, pname))
+            elif src and "I/O PCB" in src and pcb is None and d["pcb_arg"] and d["pcb_arg"] in using:
+                conn.execute("UPDATE dli_call SET psb_name=?, dbd_name='*IO-PCB*', pcb_source=? WHERE id=?",
+                             (psb_name, src, d["id"]))
+            else:
+                conn.execute("UPDATE dli_call SET psb_name=?, pcb_source=? WHERE id=?", (psb_name, src, d["id"]))
     return n
 
 
@@ -1080,6 +1309,8 @@ def _main(argv: Optional[List[str]] = None) -> int:
 
     n = post_open_modes(ctx)
     ctx.say(f"post: {n} DD direction(s) set from OPEN verbs")
+    n = post_pcb_positions(ctx)
+    ctx.say(f"post: {n} DL/I call(s) mapped to a database through the PSB")
     conn.execute("UPDATE build_run SET finished_at=?, members=?, ok=?, partial=?, failed=? WHERE id=?",
                  (time.strftime("%Y-%m-%dT%H:%M:%S"), len(ctx.members), ok, partial, failed, run_id))
     conn.commit()

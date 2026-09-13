@@ -163,15 +163,26 @@ def parse_mfs(text: str) -> List[Screen]:
     ordinal = offset = seg = 0
     do_count: Optional[int] = None
     do_buf: List[ScreenField] = []
+    # DFLD lengths per FMT: an MFLD without LTH= takes the length of the DFLD
+    # it names - the normal way to write it. Left unknown, every following
+    # offset in the message would be wrong.
+    dfld_len: Dict[str, Dict[str, int]] = {}
+    fmt_lens: Dict[str, int] = {}
+    offset_known = True
 
     def add_field(f: ScreenField) -> None:
-        nonlocal offset, ordinal
+        nonlocal offset, ordinal, offset_known
         ordinal += 1
         f.ordinal = ordinal
         if cur.kind == "mfs_msg":
-            f.offset = offset
+            f.offset = offset if offset_known else None
             f.seg = seg
-            offset += (f.length or 0)
+            if f.length is None and f.name:
+                offset_known = False
+                cur.warnings.append(f"MFLD {f.name}: no LTH= and no DFLD of that name in this member - "
+                                    f"offsets after it are UNKNOWN")
+            elif offset_known:
+                offset += (f.length or 0)
         cur.fields.append(f)
 
     for st in parse_macros(text):
@@ -193,6 +204,8 @@ def parse_mfs(text: str) -> List[Screen]:
             toks = [t for t in split_operands(st.operands) if "=" not in t]
             if toks and toks[0].startswith(("'", '"')):
                 f.literal = _unq(toks[0])          # DFLD 'GENDER:',POS=... is a screen label
+            if f.name and f.length is not None:
+                dfld_len.setdefault(cur.name.upper(), {})[f.name.upper()] = f.length
             add_field(f)
         elif op == "MSG":
             mtype = (kw.get("TYPE") or "").upper() or None
@@ -206,9 +219,12 @@ def parse_mfs(text: str) -> List[Screen]:
                 cur.warnings.append(f"MSG {cur.name}: no TYPE=; {'inferred ' + inferred + ' from the label' if inferred else 'type UNKNOWN'}")
             screens.append(cur)
             ordinal = offset = seg = 0
+            offset_known = True
+            fmt_lens = dfld_len.get((sor[0] if sor else "").upper(), {})
         elif op == "SEG" and cur is not None:
             seg += 1
             offset = 0
+            offset_known = True
         elif op == "DO" and cur is not None:
             toks = [t for t in split_operands(st.operands) if "=" not in t]
             do_count = _int(toks[0]) if toks else 1
@@ -232,9 +248,13 @@ def parse_mfs(text: str) -> List[Screen]:
         elif op == "MFLD" and cur is not None:
             name, lit, mk = _mfld_operands(st.operands)
             length = _int(mk.get("LTH")) or (len(lit) if lit else None)
+            if length is None and name:
+                length = fmt_lens.get(name.upper())      # inherited from the DFLD (SOR= FMT)
             attr = mk.get("ATTR")
-            if attr and attr.upper().startswith("YES"):
-                length = (length or 0) + 2       # attribute bytes precede the data
+            ma = re.match(r"\(?\s*YES\s*(?:,\s*(\d+))?", attr or "", re.IGNORECASE)
+            if ma and length is not None:
+                # 2 attribute bytes, plus 2 per extended attribute: ATTR=(YES,2) = 6
+                length = length + 2 + 2 * int(ma.group(1) or 0)
             f = ScreenField(name=name, ordinal=0, length=length, attrb=attr,
                             initial=lit if name else None, literal=lit if not name else None,
                             line=st.start)

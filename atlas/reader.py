@@ -252,6 +252,12 @@ def detect_code_end(records: Sequence[str]) -> int:
     return 72
 
 
+_DIRECTING = re.compile(r"^(?:EJECT|SKIP[123])\s*\.?\s*$|^TITLE\b")
+_CBL_OPTS = re.compile(r"^(?:CBL|PROCESS)\s+\S")
+_DIVISION_HDR = re.compile(r"^(IDENTIFICATION|ID|ENVIRONMENT|DATA|PROCEDURE)\s+DIVISION\b")
+_ID_COMMENT_ENTRY = re.compile(r"^(?:AUTHOR|INSTALLATION|DATE-WRITTEN|DATE-COMPILED|SECURITY|REMARKS)\b")
+
+
 def read_cobol_lines(text: str, fixed: Optional[bool] = None,
                      data: bytes = b"", enc: str = "utf-8") -> Tuple[List[Line], bool]:
     """Return (lines, fixed_format_used) for a COBOL / copybook member."""
@@ -261,6 +267,8 @@ def read_cobol_lines(text: str, fixed: Optional[bool] = None,
     code_end = detect_code_end(records) if fixed else None
 
     out: List[Line] = []
+    in_id_comment = False        # inside AUTHOR. / REMARKS. ... (a comment-entry)
+    division = None
     for i, rec in enumerate(records, start=1):
         rec = rec.replace("\t", "    ")  # tabs in a column-sensitive format
         if fixed:
@@ -279,6 +287,26 @@ def read_cobol_lines(text: str, fixed: Optional[bool] = None,
                 body = stripped[1:]
 
         code = body.rstrip()
+        up = code.strip().upper()
+        # Compiler-directing lines are not statements: EJECT / SKIPn / TITLE
+        # (and CBL / PROCESS options) would otherwise swallow the paragraph
+        # header that follows them.
+        if indicator == " " and (_DIRECTING.match(up) or _CBL_OPTS.match(rec.strip().upper())):
+            indicator = "*"
+        # IDENTIFICATION DIVISION comment-entries (AUTHOR. PAT O'BRIEN.) are
+        # free text: an apostrophe there is not a literal, and left as code it
+        # opens a string that never closes and silently eats the program.
+        md = _DIVISION_HDR.match(up)
+        if md:
+            division = md.group(1)
+            in_id_comment = False
+        elif division in ("IDENTIFICATION", "ID") and indicator == " ":
+            if _ID_COMMENT_ENTRY.match(up):
+                in_id_comment = True
+            elif code[:4].strip():           # a new Area-A entry ends the comment-entry
+                in_id_comment = False
+            if in_id_comment:
+                indicator = "*"
         out.append(Line(
             no=i,
             raw=rec,

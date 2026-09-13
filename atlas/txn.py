@@ -68,6 +68,9 @@ class RoutingFacts:
     files: List[CicsFile] = dc_field(default_factory=list)
     databases: List[Tuple[str, str, int]] = dc_field(default_factory=list)   # (dbd, access, line)
     warnings: List[str] = dc_field(default_factory=list)
+    # every CSD block: (type, name, attrs without the _ keys, line) - TDQUEUE,
+    # DB2ENTRY/DB2TRAN, URIMAP, WEBSERVICE... are facts too
+    resources: List[Tuple[str, str, Dict[str, str], int]] = dc_field(default_factory=list)
 
 
 # --------------------------------------------------------------------------
@@ -80,7 +83,8 @@ _RES_TYPES = ("TRANSACTION", "PROGRAM", "FILE", "MAPSET", "TDQUEUE", "TSMODEL", 
               "DB2TRAN", "URIMAP", "PIPELINE", "WEBSERVICE", "CONNECTION", "SESSIONS",
               "TERMINAL", "TYPETERM", "PROFILE", "PARTITIONSET", "JOURNALMODEL", "ENQMODEL",
               "DOCTEMPLATE", "TCPIPSERVICE", "LIBRARY", "BUNDLE", "ATOMSERVICE")
-_ATTR = re.compile(r"\b([A-Z][A-Z0-9]*)\(([^()]*(?:\([^()]*\)[^()]*)*)\)", re.I)
+# `DEFINE TRANSACTION (MEMX)` with a blank before the parenthesis is accepted too.
+_ATTR = re.compile(r"\b([A-Z][A-Z0-9]*)\s*\(([^()]*(?:\([^()]*\)[^()]*)*)\)", re.I)
 _REPORT_HEAD = re.compile(r"^\s*(" + "|".join(_RES_TYPES) + r")\(([^)]+)\)", re.I)
 _REPORT_ATTR = re.compile(r"^\s*([A-Z][A-Z0-9]*)\s*:\s*(.*?)\s*$", re.I)
 
@@ -149,6 +153,7 @@ def parse_csd(text: str) -> RoutingFacts:
 
     for line, a in blocks:
         t, name, grp = a["_TYPE"], a["_NAME"], (a.get("GROUP") or "").upper() or None
+        f.resources.append((t, name, {k: v for k, v in a.items() if not k.startswith("_")}, line))
         if t == "TRANSACTION":
             prog = (a.get("PROGRAM") or "").upper() or None
             if not prog:
@@ -194,11 +199,21 @@ def parse_imsgen(text: str) -> RoutingFacts:
             if not codes:
                 f.warnings.append(f"L{st.start}: {st.op} without CODE=")
                 continue
+            extra = []
+            spa = _list(kw.get("SPA"))
+            if spa:
+                extra.append(f"conversational SPA {spa[0]}")
+            if (kw.get("INQUIRY") or "").upper().startswith("YES"):
+                extra.append("inquiry-only")
+            mt = _list(kw.get("MSGTYPE"))
+            if mt:
+                extra.append("MSGTYPE " + "/".join(mt))
             for code in codes:
                 f.transactions.append(TxnDef(
                     tran_code=code, system="ims_dc", program=cur_prog, psb=cur_psb,
                     detail=(f"{st.op} under APPLCTN {cur_psb or cur_prog or '?'}; PGMTYPE={cur_type or '?'}; "
-                            f"program name assumed = PSB name" if cur_psb else f"{st.op} under APPLCTN GPSB {cur_prog}"),
+                            f"program name assumed = PSB name" if cur_psb else f"{st.op} under APPLCTN GPSB {cur_prog}")
+                           + ("; " + "; ".join(extra) if extra else ""),
                     line=st.start))
             if cur_prog is None:
                 f.warnings.append(f"L{st.start}: {st.op} {codes[0]} before any APPLCTN")

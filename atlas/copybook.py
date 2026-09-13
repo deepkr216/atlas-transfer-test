@@ -54,7 +54,17 @@ _USAGE_ALIASES = {
     "NATIONAL": "NATIONAL",
 }
 
-_PIC_TOKEN = re.compile(r"([9AXZSVPBE0/,.\-+*$CRDB])(?:\((\d+)\))?", re.IGNORECASE)
+# CR / DB are two-character editing symbols (two bytes each), not C+R.
+_PIC_TOKEN = re.compile(r"(CR|DB|[9AXZSVPBE0/,.\-+*$])(?:\((\d+)\))?", re.IGNORECASE)
+# `05 PIC X(3).` / `05 COMP-3 ...` : an entry with no name is an anonymous FILLER.
+_CLAUSE_WORDS = {"PIC", "PICTURE", "REDEFINES", "OCCURS", "VALUE", "VALUES", "USAGE", "COMP", "COMP-1", "COMP-2",
+                 "COMP-3", "COMP-4", "COMP-5", "COMPUTATIONAL", "COMPUTATIONAL-1", "COMPUTATIONAL-2",
+                 "COMPUTATIONAL-3", "COMPUTATIONAL-4", "COMPUTATIONAL-5", "BINARY", "PACKED-DECIMAL", "DISPLAY",
+                 "DISPLAY-1", "POINTER", "INDEX", "NATIONAL", "SIGN", "SYNC", "SYNCHRONIZED", "JUST", "JUSTIFIED",
+                 "BLANK", "EXTERNAL", "GLOBAL", "LEADING", "TRAILING"}
+# Words whose OPERAND is a data-name, never a usage: `DEPENDING ON WS-COMP-CNT`.
+_OPERAND_WORDS = {"REDEFINES", "DEPENDING", "ON", "INDEXED", "BY", "KEY", "IS", "ASCENDING", "DESCENDING"}
+_LITERAL = re.compile(r"'(?:[^']|'')*'|\"(?:[^\"]|\"\")*\"")
 
 
 @dataclass
@@ -109,9 +119,9 @@ def parse_pic(pic: str) -> PicInfo:
             info.chars += n
             if sym == "Z" or sym == "*":
                 info.digits += n
-        elif sym in ("C", "D"):     # CR / DB
+        elif sym in ("CR", "DB"):   # credit / debit symbols: two bytes each
             info.is_edited = True
-            info.chars += 2
+            info.chars += 2 * n
     return info
 
 
@@ -189,7 +199,7 @@ _OCCURS = re.compile(
     r"\bOCCURS\s+(?:(\d+)\s+TO\s+)?(\d+)\s*(?:TIMES)?"
     r"(?:\s+DEPENDING\s+(?:ON\s+)?([A-Z0-9][A-Z0-9\-_]*))?", re.IGNORECASE)
 _REDEFINES = re.compile(r"\bREDEFINES\s+([A-Z0-9][A-Z0-9\-_]*)", re.IGNORECASE)
-_VALUE = re.compile(r"\bVALUE\s+(?:IS\s+)?(.+?)(?:\s*\.\s*$|$)", re.IGNORECASE)
+_VALUE = re.compile(r"\bVALUES?\s+(?:IS\s+|ARE\s+)?(.+?)(?:\s*\.\s*$|$)", re.IGNORECASE)
 _SIGN = re.compile(r"\bSIGN\s+(?:IS\s+)?(LEADING|TRAILING)(\s+SEPARATE(\s+CHARACTER)?)?",
                    re.IGNORECASE)
 _SYNC = re.compile(r"\bSYNC(HRONIZED)?\b", re.IGNORECASE)
@@ -222,10 +232,19 @@ def parse_data_division(logical: Sequence[LogicalLine]) -> Tuple[List[Field], Li
 
         m = _LEVEL.match(txt)
         if not m:
-            continue
-        level = int(m.group(1))
-        name = m.group(2).upper()
-        rest = m.group(3) or ""
+            ma = _LEVEL_ANON.match(txt)
+            if not ma:
+                continue
+            level, name, rest = int(ma.group(1)), "FILLER", ""      # `05.` - a bare group level
+        else:
+            level = int(m.group(1))
+            name = m.group(2).upper()
+            rest = m.group(3) or ""
+            if name in _CLAUSE_WORDS:
+                # `05  PIC X(3).` - no data-name at all: an anonymous FILLER,
+                # NOT a field called PIC with no picture (and length 0).
+                rest = txt[m.start(2):]
+                name = "FILLER"
 
         # ---- 88 condition names attach to the field above them ------------
         if level == 88:
@@ -243,6 +262,8 @@ def parse_data_division(logical: Sequence[LogicalLine]) -> Tuple[List[Field], Li
         _apply_clauses(fld, rest, warnings, ll.start)
 
         # ---- place in tree -----------------------------------------------
+        if level in (1, 77):
+            stack.clear()                 # 01 and 77 always start a new root
         while stack and stack[-1].level >= level:
             stack.pop()
         if stack:
@@ -311,14 +332,35 @@ def _check_redefines(f: Field, warnings: List[str]) -> None:
         _check_redefines(c, warnings)
 
 
+def _usage_in(rest: str) -> Optional[str]:
+    """The USAGE keyword as a WORD of the clause text - not `COMP` inside
+    WS-COMP-CNT, not inside a VALUE literal, and not the operand of
+    REDEFINES / DEPENDING ON / INDEXED BY (those are data-names)."""
+    text = _LITERAL.sub(" ", rest)
+    skip_next = False
+    for tok in re.findall(r"[A-Z0-9][A-Z0-9\-]*", text, re.IGNORECASE):
+        up = tok.upper()
+        if skip_next:
+            skip_next = up in ("ON", "BY", "IS")      # DEPENDING ON x / INDEXED BY x / KEY IS x
+            continue
+        if up in _OPERAND_WORDS:
+            skip_next = True
+            continue
+        if up in _USAGE_ALIASES:
+            return _USAGE_ALIASES[up]
+        if up in ("DISPLAY", "DISPLAY-1", "INDEX", "POINTER", "NATIONAL"):
+            return up
+    return None
+
+
 def _apply_clauses(fld: Field, rest: str, warnings: List[str], line: int) -> None:
     m = _PIC_CLAUSE.search(rest)
     if m:
         fld.pic = m.group(1).rstrip(".")
 
-    m = _USAGE_CLAUSE.search(rest)
-    if m:
-        fld.usage = _USAGE_ALIASES.get(m.group(1).upper(), m.group(1).upper())
+    u = _usage_in(rest)
+    if u:
+        fld.usage = u
 
     m = _OCCURS.search(rest)
     if m:
@@ -352,9 +394,16 @@ def _mark_groups(f: Field) -> None:
         _mark_groups(c)
 
 
-def _compute_offsets(f: Field, start: int, warnings: List[str]) -> int:
-    """Set f.offset/f.length. Returns bytes consumed by f (one occurrence * occurs)."""
+def _compute_offsets(f: Field, start: int, warnings: List[str],
+                     usage: Optional[str] = None, sign: Optional[str] = None) -> int:
+    """Set f.offset/f.length. Returns bytes consumed by f (one occurrence * occurs).
+
+    `usage` / `sign` are inherited from the group: `01 WS-AMOUNTS COMP-3.`
+    makes every child packed - an explicit clause on the child wins.
+    """
     f.offset = start
+    eff_usage = f.usage or usage
+    eff_sign = f.sign_clause or sign
 
     if f.is_group:
         cursor = start
@@ -368,14 +417,16 @@ def _compute_offsets(f: Field, start: int, warnings: List[str]) -> int:
                     sib = next((s for s in f.children
                                 if s.name == c.redefines.upper()), None)
                     base = sib.offset if sib else cursor
-                _compute_offsets(c, base, warnings)
+                _compute_offsets(c, base, warnings, eff_usage, eff_sign)
                 continue
-            used = _compute_offsets(c, cursor, warnings)
+            used = _compute_offsets(c, cursor, warnings, eff_usage, eff_sign)
             redefine_base[c.name] = cursor
             cursor += used
         f.length = cursor - start
     else:
-        sign_sep = bool(f.sign_clause and "SEPARATE" in f.sign_clause)
+        if usage and not f.usage:
+            f.usage = usage                  # record the usage that applies
+        sign_sep = bool(eff_sign and "SEPARATE" in eff_sign)
         f.length = storage_bytes(f.pic or "", f.usage or "DISPLAY", sign_sep)
         info = parse_pic(f.pic or "")
         f.digits, f.scale = info.digits, info.scale

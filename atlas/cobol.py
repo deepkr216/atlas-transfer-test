@@ -74,11 +74,16 @@ _ORGANIZATION = re.compile(r"\bORGANIZATION\s+(?:IS\s+)?(\w+)", re.IGNORECASE)
 _ACCESS = re.compile(r"\bACCESS\s+(?:MODE\s+)?(?:IS\s+)?(\w+)", re.IGNORECASE)
 _RECORD_KEY = re.compile(rf"\bRECORD\s+KEY\s+(?:IS\s+)?({ID})", re.IGNORECASE)
 _ALT_KEY = re.compile(rf"\bALTERNATE\s+RECORD\s+KEY\s+(?:IS\s+)?({ID})", re.IGNORECASE)
-_FD = re.compile(rf"^FD\s+({ID})", re.IGNORECASE)
+_FD = re.compile(rf"^(FD|SD)\s+({ID})", re.IGNORECASE)
 
+# READ/WRITE/... name ONE file (or record); OPEN/CLOSE take a LIST per mode:
+#   OPEN INPUT POLICY-IN CLAIM-IN OUTPUT REPORT-OUT
 _FILE_OP = re.compile(
-    B + rf"(OPEN\s+(?:INPUT|OUTPUT|I-O|EXTEND)|READ|WRITE|REWRITE|DELETE|START|CLOSE)\s+({ID})",
-    re.IGNORECASE)
+    B + rf"(READ|WRITE|REWRITE|DELETE|START|RELEASE|RETURN)\s+({ID})", re.IGNORECASE)
+_OPEN_CLOSE = re.compile(B + r"(OPEN|CLOSE)\s+(.*?)(?=\s*(?:$|\.|" + B + r"(?:END-|ELSE|WHEN|IF|MOVE|PERFORM|"
+                         r"READ|WRITE|OPEN|CLOSE|CALL|DISPLAY|GO|GOBACK|STOP)" + E + "))",
+                         re.IGNORECASE | re.DOTALL)
+_OPEN_MODE = re.compile(r"\b(INPUT|OUTPUT|I-O|EXTEND)\b", re.IGNORECASE)
 
 _EXEC_SQL = re.compile(r"\bEXEC\s+SQL\b(.*?)\bEND-EXEC\b", re.IGNORECASE | re.DOTALL)
 _EXEC_CICS = re.compile(r"\bEXEC\s+CICS\b(.*?)\bEND-EXEC\b", re.IGNORECASE | re.DOTALL)
@@ -98,6 +103,16 @@ _MOVE_LIT = re.compile(B + rf"MOVE\s+(['\"])([^'\"]*)\1\s+TO\s+([A-Z0-9\-_,\s]+)
                        re.IGNORECASE)
 _SET_VALUE = re.compile(rf"^\s*\d{{1,2}}\s+({ID})\b.*\bVALUE\s+(?:IS\s+)?(['\"])([^'\"]*)\2",
                         re.IGNORECASE)
+_LEVEL_ENTRY = re.compile(rf"^\s*(\d{{1,2}})\s+({ID})\b(.*)$", re.IGNORECASE | re.DOTALL)
+_SET_TRUE = re.compile(B + rf"SET\s+({ID})\s+TO\s+TRUE" + E, re.IGNORECASE)
+_GO_TO = re.compile(B + r"GO\s+TO\s+((?:" + ID + r"\s*)+?)(?:\s*DEPENDING\s+(?:ON\s+)?(" + ID + r"))?(?=\s*(?:$|\.|" + B + r"(?:END-|ELSE|WHEN)))",
+                    re.IGNORECASE)
+_ALTER = re.compile(B + rf"ALTER\s+({ID})\s+TO\s+(?:PROCEED\s+TO\s+)?({ID})", re.IGNORECASE)
+_SORT_PROC = re.compile(B + rf"(INPUT|OUTPUT)\s+PROCEDURE\s+(?:IS\s+)?({ID})(?:\s+(?:THRU|THROUGH)\s+({ID}))?",
+                        re.IGNORECASE)
+_SORT_USING = re.compile(B + r"(USING|GIVING)\s+((?:" + ID + r"\s*)+?)(?=\s*(?:$|\.|" + B + r"(?:USING|GIVING|INPUT|OUTPUT|ON|WITH|COLLATING|END-)))",
+                         re.IGNORECASE)
+_SECTION_HDR = re.compile(rf"^({ID})\s+SECTION(?:\s+\d{{1,2}})?\s*\.", re.IGNORECASE)
 
 _PERFORM = re.compile(
     B + rf"PERFORM\s+({ID})(?:\s+(?:THRU|THROUGH)\s+({ID}))?", re.IGNORECASE)
@@ -109,8 +124,32 @@ _NOT_PARAGRAPHS = {"EXIT", "GOBACK", "CONTINUE", "STOP", "END-IF", "END-EVALUATE
                    "END-PERFORM", "END-READ", "END-CALL", "ELSE", "END-EXEC"}
 
 _DLI_FUNCS = {"GU", "GHU", "GN", "GHN", "GNP", "GHNP", "ISRT", "REPL", "DLET",
-              "CHKP", "XRST", "ROLB", "ROLL", "PCB", "TERM", "SYNC", "INIT",
-              "GSCD", "LOG", "STAT", "APSB", "DPSB"}
+              "CHKP", "XRST", "ROLB", "ROLL", "ROLS", "PCB", "TERM", "SYNC", "INIT",
+              "GSCD", "LOG", "STAT", "APSB", "DPSB",
+              # IMS DC / system services: CHNG+ISRT on an alternate PCB is a
+              # message switch - the only way some transactions are reached.
+              "CHNG", "PURG", "AUTH", "SETS", "SETU", "INQY", "GMSG", "ICMD", "RCMD",
+              "CMD", "SNAP", "POS", "DEQ"}
+# Older programs pass a parameter count first: CALL 'CBLTDLI' USING PARM-CT GU PCB ...
+_PARMCOUNT_NAME = re.compile(r"^(?:PARM|PARMS|PARMCOUNT|PARM-COUNT|PARM-CT|PARMCT|PARM-CNT|PARM-NBR|"
+                             r".*-PARM-COUNT|.*-PARMCT|.*-PARM-CT|.*-PARM-CNT|.*-NBR-PARMS?)$", re.IGNORECASE)
+_ENTRY = re.compile(B + r"ENTRY\s+(['\"])([^'\"]+)\1(?:\s+USING\b(.*))?", re.IGNORECASE | re.DOTALL)
+_SQL_CALL = re.compile(r"^\s*CALL\s+(?:([A-Z0-9_$#@]+)\.)?([A-Z0-9_$#@]+)\s*(?:\(|$)", re.IGNORECASE)
+_SQL_DECLARE_TABLE = re.compile(r"\bDECLARE\s+([A-Z0-9_$#@]+(?:\.[A-Z0-9_$#@]+)?)\s+TABLE\s*\((.*)\)\s*$",
+                                re.IGNORECASE | re.DOTALL)
+_EXEC_ANY = re.compile(r"\bEXEC\s+(CICS|DLI|SQL)\b(.*?)\bEND-EXEC\b", re.IGNORECASE | re.DOTALL)
+_CICS_OPT = re.compile(r"\b([A-Z][A-Z0-9]*)\s*\(\s*([^()]*)\s*\)", re.IGNORECASE)
+# EXEC CICS options that RETURN data to the program (the program WRITES the
+# field) vs. options the command READS.
+_CICS_WRITE_OPTS = {"INTO", "SET", "RESP", "RESP2", "NUMITEMS", "NUMREC", "ASSIGN", "ABCODE", "TERMID",
+                    "EIBRESP", "DATE", "TIME", "ABSTIME", "RETRIEVE"}
+_CICS_READ_OPTS = {"FROM", "RIDFLD", "COMMAREA", "QUEUE", "KEYLENGTH", "LENGTH", "FLENGTH", "PROGRAM",
+                   "TRANSID", "MAP", "MAPSET", "FILE", "DATASET", "CHANNEL", "CONTAINER", "SYSID", "ITEM",
+                   "REQID", "TERMID", "FROMLENGTH", "CURSOR", "INTERVAL", "TIME", "QNAME"}
+_CICS_NOT_FIELDS = {"ERASE", "FREEKB", "ALARM", "NOHANDLE", "MAPONLY", "DATAONLY", "ASIS", "MAIN",
+                    "AUXILIARY", "REWRITE", "UPDATE", "EQUAL", "GTEQ", "TD", "TS", "WAIT", "LAST",
+                    "TRANSACTION", "IMMEDIATE", "NOCHECK", "PROTECT", "SYNCONRETURN", "NOTRUNCATE",
+                    "ANYKEY", "CTLCHAR", "STRFIELD", "CURSOR"}
 
 _SQL_VERBS = ("SELECT", "INSERT", "UPDATE", "DELETE", "DECLARE", "OPEN",
               "FETCH", "CLOSE", "CALL", "MERGE", "COMMIT", "ROLLBACK",
@@ -148,6 +187,7 @@ class ParagraphFact:
     start_line: int
     end_line: int
     ordinal: int
+    kind: str = "paragraph"          # paragraph | section (PERFORM of a section runs all its paragraphs)
 
 
 @dataclass
@@ -170,6 +210,9 @@ class DliFact:
     ssa_args: List[str]
     io_area: Optional[str]
     line: int
+    pcb_index: Optional[int] = None     # EXEC DLI ... USING PCB(n): the n-th PCB of the PSB
+    resolution: Optional[str] = None    # literal | value_clause | parmcount | unresolved
+    dest: Optional[str] = None          # CHNG destination (transaction / LTERM) - a message switch
 
 
 @dataclass
@@ -180,8 +223,10 @@ class FileDeclFact:
     access_mode: Optional[str]
     record_key: Optional[str]
     alt_keys: List[str]
-    fd_record: Optional[str]
+    fd_record: Optional[str]            # first 01 under the FD - WRITE/REWRITE name THIS, not the file
     line: int
+    fd_records: List[str] = dc_field(default_factory=list)   # every 01 under the FD (multi-record files)
+    is_sd: bool = False
 
 
 @dataclass
@@ -194,7 +239,8 @@ class ProgramFacts:
     uses_mq: bool = False
     linkage_using: List[str] = dc_field(default_factory=list)
     paragraphs: List[ParagraphFact] = dc_field(default_factory=list)
-    performs: List[Tuple[str, str, Optional[str], int]] = dc_field(default_factory=list)
+    # (from, to, thru, line, kind) - kind: perform | goto | goto_depending | alter | fallthrough | sort_proc
+    performs: List[Tuple[str, str, Optional[str], int, str]] = dc_field(default_factory=list)
     calls: List[CallFact] = dc_field(default_factory=list)
     copies: List[Tuple[str, Optional[str], Optional[str], int]] = dc_field(default_factory=list)
     files: List[FileDeclFact] = dc_field(default_factory=list)
@@ -202,7 +248,16 @@ class ProgramFacts:
     sql: List[SqlFact] = dc_field(default_factory=list)
     dli: List[DliFact] = dc_field(default_factory=list)
     cics: List[Tuple[str, str, int]] = dc_field(default_factory=list)
-    mq: List[Tuple[str, int]] = dc_field(default_factory=list)
+    # (verb, resource kind map|tdq|tsq|container|webservice|transid|file|program, resource, direction, line)
+    cics_cmds: List[Tuple[str, str, str, Optional[str], int]] = dc_field(default_factory=list)
+    # (call, queue name or None, direction in|out|None, message layout 01 or None, line)
+    mq: List[Tuple[str, Optional[str], Optional[str], Optional[str], int]] = dc_field(default_factory=list)
+    mq_handles: Dict[str, str] = dc_field(default_factory=dict)       # HOBJ variable -> MQOD structure
+    entries: List[Tuple[str, List[str], int]] = dc_field(default_factory=list)   # ENTRY 'name' USING ...
+    # DCLGEN / DECLARE TABLE: table -> [(column, type)] in declared order
+    declared_tables: Dict[str, List[Tuple[str, str]]] = dc_field(default_factory=dict)
+    # SELECT * / SELECT a,b,c INTO :GROUP - resolved against the group's children by build
+    sql_group_intos: List[Tuple[str, List[Tuple[str, Optional[str]]], List[str], str, int]] = dc_field(default_factory=list)
     # (field, mode read|write|test|display, statement verb, line). `write` is
     # what makes "where is this error code SET" answerable; `display` is what
     # makes "and where is it shown/written" answerable - often another program.
@@ -245,6 +300,8 @@ def parse_program(text: str, data: bytes = b"", enc: str = "utf-8") -> ProgramFa
     current_section = None
     ordinal = 0
     para_open: Optional[ParagraphFact] = None
+    cur_fd: Optional[FileDeclFact] = None        # the FD/SD whose 01 records come next
+    last_stmt: Dict[str, str] = {}               # paragraph -> its last statement (fall-through)
 
     want_program_id = False
 
@@ -279,12 +336,18 @@ def parse_program(text: str, data: bytes = b"", enc: str = "utf-8") -> ProgramFa
 
         # ---- paragraph / section headers (Area A only) --------------------
         if current_division == "PROCEDURE" and st.area_a:
-            ms = _SECTION.match(body)
+            ms = _SECTION_HDR.match(body)
             if ms:
                 current_section = ms.group(1).upper()
                 if para_open:
                     para_open.end_line = st.start - 1
-                    para_open = None
+                # A SECTION is a PERFORM target too: `PERFORM 1000-PROCESS`
+                # runs every paragraph under it.
+                ordinal += 1
+                para_open = ParagraphFact(name=current_section, section=current_section,
+                                          start_line=st.start, end_line=st.end, ordinal=ordinal,
+                                          kind="section")
+                f.paragraphs.append(para_open)
                 continue
             mp = _PARAGRAPH.match(body)
             if mp and mp.group(1).upper() not in _NOT_PARAGRAPHS:
@@ -300,13 +363,27 @@ def parse_program(text: str, data: bytes = b"", enc: str = "utf-8") -> ProgramFa
                 continue
 
         here = para_open.name if para_open else (current_section or "")
+        if para_open is not None and current_division == "PROCEDURE":
+            last_stmt[para_open.name] = up
 
         _extract_copy(f, st)
         if current_division in ("ENVIRONMENT", None):
             _extract_file_decl(f, st, body)
         if current_division == "DATA":
-            _extract_fd(f, st, body)
+            fd = _extract_fd(f, st, body)
+            if fd is not None:
+                cur_fd = fd
+            elif re.match(r"^(?:WORKING-STORAGE|LINKAGE|LOCAL-STORAGE)\s+SECTION", up):
+                cur_fd = None
+            elif cur_fd is not None:
+                ml = _LEVEL_ENTRY.match(body)
+                if ml and ml.group(1) == "01":
+                    # The 01s under an FD are its records: WRITE names these.
+                    cur_fd.fd_records.append(ml.group(2).upper())
+                    if cur_fd.fd_record is None:
+                        cur_fd.fd_record = ml.group(2).upper()
         if current_division == "PROCEDURE":
+            _extract_entry(f, st)
             _extract_calls(f, st, literal_map)
             _extract_performs(f, st, here)
             _extract_file_ops(f, st)
@@ -315,11 +392,18 @@ def parse_program(text: str, data: bytes = b"", enc: str = "utf-8") -> ProgramFa
             _extract_value_literals(f, st)
         _extract_sql(f, st)
         _extract_cics(f, st, literal_map)
-        _extract_dli(f, st)
-        _extract_mq(f, st)
+        _extract_dli(f, st, literal_map)
+        _extract_mq(f, st, literal_map)
 
     if para_open:
         para_open.end_line = len(lines)
+    # A section spans every paragraph under it.
+    for sec in f.paragraphs:
+        if sec.kind == "section":
+            ends = [p.end_line for p in f.paragraphs if p.kind == "paragraph" and p.section == sec.name]
+            if ends:
+                sec.end_line = max(ends)
+    _fallthrough_edges(f, last_stmt)
 
     f.uses_sql = bool(f.sql)
     f.uses_cics = bool(f.cics)
@@ -341,13 +425,32 @@ def _build_literal_map(stmts: Sequence[LogicalLine]) -> Dict[str, Set[str]]:
     dispatch table - and those must therefore remain visible as unresolved.
     """
     out: Dict[str, Set[str]] = {}
+    # 88 name -> (parent field, its literals): `SET WS-PGM-SUBA TO TRUE` then
+    # `CALL WS-PGM` is statically knowable.
+    conds: Dict[str, Tuple[str, List[str]]] = {}
+    last_field: Optional[str] = None
 
     for st in stmts:
         body = st.text
 
+        ml = _LEVEL_ENTRY.match(body)
+        if ml:
+            if ml.group(1) == "88":
+                if last_field:
+                    lits = [l.strip("'\"").upper() for l in _ALL_LITS.findall(ml.group(3) or "")
+                            if l[:1] in ("'", '"')]
+                    conds[ml.group(2).upper()] = (last_field, lits)
+            else:
+                last_field = ml.group(2).upper()
+
         mv = _SET_VALUE.match(body)
         if mv:
             out.setdefault(mv.group(1).upper(), set()).add(mv.group(3).strip().upper())
+
+        for ms in _SET_TRUE.finditer(body):
+            c = conds.get(ms.group(1).upper())
+            if c:
+                out.setdefault(c[0], set()).update(c[1])
 
         for m in _MOVE_LIT.finditer(body):
             lit = m.group(2).strip().upper()
@@ -364,37 +467,43 @@ def _build_literal_map(stmts: Sequence[LogicalLine]) -> Dict[str, Set[str]]:
 
 def _extract_calls(f: ProgramFacts, st: LogicalLine,
                    literal_map: Dict[str, Set[str]]) -> None:
-    body = st.text
-    up = st.upper
+    # EXEC SQL/CICS/DLI text is not COBOL: `EXEC SQL CALL PROC(:X)` is a
+    # stored-procedure call (recorded by _extract_sql), not a dynamic CALL.
+    body = _EXEC_ANY.sub(lambda m: " " * len(m.group(0)), st.text)
 
     # DL/I and MQ calls are CALLs syntactically but are handled elsewhere.
     if _DLI_CALL.search(body) or _MQ_CALL.search(body):
         return
 
-    using = _parse_using(body)
-
-    for m in _CALL_LIT.finditer(body):
-        target = m.group(2).strip().upper()
-        f.calls.append(CallFact(kind="static", target=target, via_var=None,
-                                resolved=[target], resolution="literal",
-                                using_args=using, line=st.start))
-
-    if not _CALL_LIT.search(body):
-        m = _CALL_VAR.search(body)
-        if m:
-            var = m.group(1).upper()
+    # One sentence may hold several CALLs (IF ... CALL 'A' ... ELSE CALL WS-B
+    # ... END-IF): every fragment is its own call with its own USING list.
+    for verb, frag, off in _split_verbs(body):
+        if verb != "CALL":
+            continue
+        line = st.line_at(off)
+        using = _parse_using("CALL " + frag)
+        ml = re.match(r"\s*(['\"])([^'\"]+)\1", frag)
+        if ml:
+            target = ml.group(2).strip().upper()
+            f.calls.append(CallFact(kind="static", target=target, via_var=None,
+                                    resolved=[target], resolution="literal",
+                                    using_args=using, line=line))
+            continue
+        mv = re.match(rf"\s*({ID})", frag, re.IGNORECASE)
+        if mv:
+            var = mv.group(1).upper()
             cands = sorted(literal_map.get(var, []))
             f.calls.append(CallFact(
                 kind="dynamic", target=None, via_var=var,
                 resolved=cands,
                 resolution="move_literal" if cands else "unresolved",
-                using_args=using, line=st.start))
+                using_args=using, line=line))
             if not cands:
                 f.unresolved.append((
                     "dynamic_call",
                     f"CALL {var} - target never assigned a literal in this program; "
                     f"it may come from a control card, a DB2 table, or LINKAGE",
-                    st.start))
+                    line))
 
     for m in _CANCEL.finditer(body):
         f.calls.append(CallFact(kind="cancel", target=m.group(2).upper(),
@@ -402,16 +511,32 @@ def _extract_calls(f: ProgramFacts, st: LogicalLine,
                                 resolution="literal", using_args=[], line=st.start))
 
 
+_USING_STOP = re.compile(r"\bEND-[A-Z]+\b|\bELSE\b|\bWHEN\b|\bON\s+(?:EXCEPTION|OVERFLOW|SIZE)\b|"
+                         r"\bNOT\s+ON\b|\bRETURNING\b|\bGIVING\b|" + B + r"(?:MOVE|PERFORM|IF|CALL|GO|DISPLAY|"
+                         r"COMPUTE|ADD|SUBTRACT|EVALUATE|SET|READ|WRITE|OPEN|CLOSE|GOBACK|STOP|EXIT|CONTINUE)" + E,
+                         re.IGNORECASE)
+
+
 def _parse_using(body: str) -> List[str]:
+    """Positional USING list: BY REFERENCE/CONTENT/VALUE dropped, LENGTH OF x
+    and ADDRESS OF x reduced to x, subscripts stripped, `A OF B` -> A, and the
+    list cut at the next verb / END-xxx / ELSE (a USING list never runs into
+    the ELSE branch of the IF that contains it)."""
     m = _USING.search(body)
     if not m:
         return []
     raw = m.group(1)
-    raw = re.split(r"\bEND-CALL\b|\.", raw)[0]
+    raw = re.split(r"\bEND-CALL\b|\.(?=\s|$)", raw)[0]
+    ms = _USING_STOP.search(raw)
+    if ms:
+        raw = raw[:ms.start()]
+    raw = re.sub(r"\b(?:LENGTH|ADDRESS)\s+OF\s+", " ", raw, flags=re.IGNORECASE)
+    raw = re.sub(r"\b(?:OF|IN)\s+" + ID, " ", raw, flags=re.IGNORECASE)     # qualifier, not an argument
+    raw = re.sub(r"\([^)]*\)", " ", raw)                                       # subscripts
     out = []
     for tok in re.split(r"[,\s]+", raw):
         tok = tok.strip().upper()
-        if not tok or tok in ("BY", "REFERENCE", "CONTENT", "VALUE", "OF", "IN"):
+        if not tok or tok in ("BY", "REFERENCE", "CONTENT", "VALUE", "OF", "IN", "USING"):
             continue
         if re.fullmatch(ID, tok, re.IGNORECASE):
             out.append(tok)
@@ -495,20 +620,63 @@ def _extract_file_decl(f: ProgramFacts, st: LogicalLine, body: str) -> None:
         line=st.start))
 
 
-def _extract_fd(f: ProgramFacts, st: LogicalLine, body: str) -> None:
+def _extract_fd(f: ProgramFacts, st: LogicalLine, body: str) -> Optional[FileDeclFact]:
+    """`FD name` / `SD name`: returns the file so the 01s that follow can be
+    attached to it as its record(s)."""
     m = _FD.match(body)
     if not m:
-        return
-    name = m.group(1).upper()
+        return None
+    name = m.group(2).upper()
     for fd in f.files:
-        if fd.select_name == name and fd.fd_record is None:
-            fd.fd_record = name
+        if fd.select_name == name:
+            fd.is_sd = m.group(1).upper() == "SD"
+            return fd
+    fd = FileDeclFact(select_name=name, assign_dd=None, organization="SORT" if m.group(1).upper() == "SD" else None,
+                      access_mode=None, record_key=None, alt_keys=[], fd_record=None, line=st.start,
+                      is_sd=m.group(1).upper() == "SD")
+    f.files.append(fd)
+    return fd
+
+
+def _record_of(f: ProgramFacts, name: str) -> Optional[FileDeclFact]:
+    """The file whose 01 record is `name` (WRITE/REWRITE/RELEASE name the record)."""
+    up = name.upper()
+    for fd in f.files:
+        if up in fd.fd_records:
+            return fd
+    return None
 
 
 def _extract_file_ops(f: ProgramFacts, st: LogicalLine) -> None:
-    for m in _FILE_OP.finditer(st.text):
-        op = re.sub(r"\s+", " ", m.group(1).upper())
-        f.io_ops.append((m.group(2).upper(), "file", op, st.start))
+    body = _EXEC_ANY.sub(lambda m: " " * len(m.group(0)), st.text)
+    for m in _OPEN_CLOSE.finditer(body):
+        verb = m.group(1).upper()
+        mode = None
+        for tok in re.findall(r"[A-Z0-9][A-Z0-9\-]*", m.group(2), re.IGNORECASE):
+            up = tok.upper()
+            if _OPEN_MODE.fullmatch(up):
+                mode = up
+            elif up in ("REVERSED", "WITH", "NO", "REWIND", "LOCK", "FOR", "REMOVAL"):
+                continue
+            elif verb == "OPEN" and mode:
+                f.io_ops.append((up, "file", f"OPEN {mode}", st.line_at(m.start())))
+            elif verb == "CLOSE":
+                f.io_ops.append((up, "file", "CLOSE", st.line_at(m.start())))
+    for m in _FILE_OP.finditer(body):
+        op = m.group(1).upper()
+        name = m.group(2).upper()
+        if op in ("WRITE", "REWRITE", "RELEASE"):
+            # These name the RECORD; the fact is about the FILE that owns it.
+            fd = _record_of(f, name)
+            f.io_ops.append((fd.select_name if fd else name, "file", op, st.line_at(m.start())))
+        else:
+            f.io_ops.append((name, "file", op, st.line_at(m.start())))
+    # SORT/MERGE file USING a GIVING b: the sort reads a and writes b.
+    if re.search(B + r"(?:SORT|MERGE)" + E, body, re.IGNORECASE):
+        for m in _SORT_USING.finditer(body):
+            op = "READ" if m.group(1).upper() == "USING" else "WRITE"
+            for tok in re.findall(ID, m.group(2), re.IGNORECASE):
+                f.io_ops.append((tok.upper(), "file", f"SORT {op}", st.line_at(m.start())))
 
 
 _SQL_PRED = re.compile(
@@ -550,7 +718,10 @@ _SQL_SELECT_INTO = re.compile(r"\bSELECT\s+(?:DISTINCT\s+)?(.*?)\s+INTO\s+(.*?)\
                               re.IGNORECASE | re.S)
 _SQL_DECLARE_CUR = re.compile(r"\bDECLARE\s+([A-Z0-9_\-]+)\s+(?:[A-Z]+\s+)*?CURSOR\b.*?\bFOR\s+SELECT\s+(?:DISTINCT\s+)?(.*?)\s+FROM\s+(.*?)"
                               + _SQL_CLAUSE_END, re.IGNORECASE | re.S)
-_SQL_FETCH = re.compile(r"\bFETCH\s+(?:(?:NEXT|PRIOR|FIRST|LAST|FROM)\s+)*([A-Z0-9_\-]+)\s+INTO\s+(.*)$", re.IGNORECASE | re.S)
+# FETCH [NEXT|PRIOR|...] [ROWSET] [FROM] cursor [FOR n ROWS] INTO :a, :b
+_SQL_FETCH = re.compile(r"\bFETCH\s+(?:(?:NEXT|PRIOR|FIRST|LAST|CURRENT|BEFORE|AFTER|ROWSET|FROM|ABSOLUTE|RELATIVE|"
+                        r"STARTING|AT|[+-]?\d+)\s+)*([A-Z0-9_\-]+)\s+(?:FOR\s+\S+\s+ROWS\s+)?INTO\s+(.*)$",
+                        re.IGNORECASE | re.S)
 _SQL_UPDATE = re.compile(r"\bUPDATE\s+([A-Z0-9_$#@.]+)(?:\s+(?:AS\s+)?(?!SET\b)([A-Z][A-Z0-9_]*))?\s+SET\s+(.*?)(?:\s+WHERE\s+(.*))?$",
                          re.IGNORECASE | re.S)
 _SQL_WHERE = re.compile(r"\bWHERE\s+(.*?)" + _SQL_CLAUSE_END.replace(r"\s+WHERE\b|", ""), re.IGNORECASE | re.S)
@@ -642,10 +813,16 @@ def _sql_columns(f: ProgramFacts, inner: str, verb: str, ln: int) -> None:
         if m:
             tables = _from_tables(m.group(3))
             cols, hvs = _split_top(m.group(1)), _hv_list(m.group(2))
-            for c, h in zip(cols, hvs):
-                cc = _col(c, tables)
-                if cc and h:
-                    f.sql_cols.append((cc[0], cc[1], h, "read", "SELECT", ln))
+            if len(hvs) == 1 and hvs[0] and (len(cols) > 1 or cols == ["*"]):
+                # SELECT * INTO :DCLPOLICY / SELECT a,b,c INTO :GROUP - the
+                # columns land in the group's children positionally; build
+                # resolves them against the field tree.
+                f.sql_group_intos.append((hvs[0], tables, [c.strip() for c in cols], "SELECT", ln))
+            else:
+                for c, h in zip(cols, hvs):
+                    cc = _col(c, tables)
+                    if cc and h:
+                        f.sql_cols.append((cc[0], cc[1], h, "read", "SELECT", ln))
             mw = _SQL_WHERE.search(inner)
             if mw:
                 _predicates(f, mw.group(1), tables, "SELECT", ln)
@@ -663,10 +840,14 @@ def _sql_columns(f: ProgramFacts, inner: str, verb: str, ln: int) -> None:
             cur = m.group(1).upper()
             if cur in f.cursors:
                 tables, cols = f.cursors[cur]
-                for c, h in zip(cols, _hv_list(m.group(2))):
-                    cc = _col(c, tables)
-                    if cc and h:
-                        f.sql_cols.append((cc[0], cc[1], h, "read", "FETCH", ln))
+                hvs = _hv_list(m.group(2))
+                if len(hvs) == 1 and hvs[0] and (len(cols) > 1 or cols == ["*"]):
+                    f.sql_group_intos.append((hvs[0], tables, [c.strip() for c in cols], "FETCH", ln))
+                else:
+                    for c, h in zip(cols, hvs):
+                        cc = _col(c, tables)
+                        if cc and h:
+                            f.sql_cols.append((cc[0], cc[1], h, "read", "FETCH", ln))
             else:
                 f.unresolved.append(("sql_cursor", f"FETCH {cur}: cursor not declared in this program", ln))
     elif v == "INSERT":
@@ -715,6 +896,18 @@ def _sql_host_modes(f: ProgramFacts, inner: str, ln: int) -> None:
         f.field_refs.append((h, "write" if h in writes else "read", "EXEC-SQL", ln))
 
 
+def _parse_declared_columns(body: str) -> List[Tuple[str, str]]:
+    """`POL_NO CHAR(12) NOT NULL, STATUS_CD CHAR(2), PREM_AMT DECIMAL(11,2)`
+    -> [(POL_NO, CHAR(12) NOT NULL), ...] in declared order."""
+    out: List[Tuple[str, str]] = []
+    for item in _split_top(body):
+        toks = item.strip().split(None, 1)
+        if not toks or not re.fullmatch(r"[A-Z0-9_$#@]+", toks[0], re.IGNORECASE):
+            continue
+        out.append((toks[0].upper(), (toks[1] if len(toks) > 1 else "").strip().upper()))
+    return out
+
+
 def _extract_sql(f: ProgramFacts, st: LogicalLine) -> None:
     for m in _EXEC_SQL.finditer(st.text):
         inner = " ".join(m.group(1).split())
@@ -724,6 +917,26 @@ def _extract_sql(f: ProgramFacts, st: LogicalLine) -> None:
             continue                     # handled as a copy in _extract_copy
         cur = _SQL_CURSOR.search(inner)
         tables = sorted({t.upper() for t in _SQL_TABLE.findall(inner)})
+        if verb == "FETCH":
+            tables = []                  # `FETCH ... FROM cursor` names a CURSOR, not a table
+        if verb == "DECLARE":
+            mt = _SQL_DECLARE_TABLE.search(inner)
+            if mt:
+                # DCLGEN: the positional column list behind SELECT * / :GROUP
+                f.declared_tables[mt.group(1).upper()] = _parse_declared_columns(mt.group(2))
+                tables = []
+        if verb == "CALL":
+            mc = _SQL_CALL.match(inner)
+            if mc:
+                # A DB2 stored procedure - in a COBOL shop usually a COBOL
+                # program of the estate, reached through DB2 rather than CALL.
+                proc = mc.group(2).upper()
+                f.calls.append(CallFact(kind="sql_call", target=proc, via_var=None, resolved=[proc],
+                                        resolution="literal",
+                                        using_args=[h.upper() for h in _SQL_HOSTVAR.findall(inner)],
+                                        line=st.start))
+                f.io_ops.append((proc, "db2", "CALL", st.start))
+                tables = []
         hvars = sorted({h.upper() for h in _SQL_HOSTVAR.findall(inner)})
         _sql_host_modes(f, inner, st.start)
         _sql_literals(f, inner, verb.upper(), st.start)
@@ -743,78 +956,183 @@ def _extract_sql(f: ProgramFacts, st: LogicalLine) -> None:
                 st.start))
 
 
+def _cics_value(arg: str, literal_map: Dict[str, Set[str]]) -> Tuple[Optional[str], List[str], str]:
+    """(literal value or None, candidates, resolution) for a CICS option
+    argument: 'MEMMAP' is literal; WS-NEXT-TRAN resolves through the
+    VALUE / MOVE literal map like a dynamic CALL."""
+    a = arg.strip()
+    lit = re.fullmatch(r"['\"]([^'\"]+)['\"]", a)
+    if lit:
+        return lit.group(1).strip().upper(), [lit.group(1).strip().upper()], "literal"
+    cands = sorted(literal_map.get(a.upper(), []))
+    if len(cands) == 1:
+        return cands[0], cands, "move_literal"
+    return None, cands, ("move_literal" if cands else "unresolved")
+
+
 def _extract_cics(f: ProgramFacts, st: LogicalLine,
                   literal_map: Dict[str, Set[str]]) -> None:
     for m in _EXEC_CICS.finditer(st.text):
         inner = " ".join(m.group(1).split())
+        ln = st.line_at(m.start())
         verb = _CICS_VERB.match(inner)
-        f.cics.append((verb.group(1).upper() if verb else "?", inner, st.start))
+        vb = verb.group(1).upper() if verb else "?"
+        f.cics.append((vb, inner, ln))
+        opts: Dict[str, str] = {}
+        for mo in _CICS_OPT.finditer(inner):
+            opts.setdefault(mo.group(1).upper(), mo.group(2).strip())
+        commarea = _idents(opts["COMMAREA"])[:1] if opts.get("COMMAREA") and opts["COMMAREA"][:1] not in ("'", '"') else []
+        if not commarea and vb == "START" and opts.get("FROM") and opts["FROM"][:1] not in ("'", '"'):
+            commarea = _idents(opts["FROM"])[:1]          # START TRANSID ... FROM(data): the started task RETRIEVEs it
 
         mp = _CICS_PROG.search(inner)
         if mp:
             kind = f"cics_{mp.group(1).lower()}"
-            arg = mp.group(2).strip()
-            lit = re.fullmatch(r"['\"]([^'\"]+)['\"]", arg)
-            if lit:
-                t = lit.group(1).upper()
-                f.calls.append(CallFact(kind=kind, target=t, via_var=None,
-                                        resolved=[t], resolution="literal",
-                                        using_args=[], line=st.start))
-            else:
-                var = arg.upper()
-                cands = sorted(literal_map.get(var, []))
-                f.calls.append(CallFact(
-                    kind=kind, target=None, via_var=var, resolved=cands,
-                    resolution="move_literal" if cands else "unresolved",
-                    using_args=[], line=st.start))
-                if not cands:
-                    f.unresolved.append((
-                        "dynamic_call",
-                        f"EXEC CICS {mp.group(1).upper()} PROGRAM({var}) - target "
-                        f"not resolvable from this source", st.start))
+            val, cands, res = _cics_value(mp.group(2), literal_map)
+            # COMMAREA is the positional argument of a LINK/XCTL: the callee
+            # sees it as DFHCOMMAREA, so a value flows through it.
+            f.calls.append(CallFact(kind=kind, target=val, via_var=None if res == "literal" else mp.group(2).strip().upper(),
+                                    resolved=cands, resolution=res, using_args=commarea, line=ln))
+            if res == "unresolved":
+                f.unresolved.append((
+                    "dynamic_call",
+                    f"EXEC CICS {mp.group(1).upper()} PROGRAM({mp.group(2).strip().upper()}) - target "
+                    f"not resolvable from this source", ln))
+            f.cics_cmds.append((vb, "program", val or mp.group(2).strip().upper(), "out", ln))
+
+        # START TRANSID / RETURN TRANSID: the online call graph written in
+        # code. Recorded as call edges to the TRANSACTION CODE; the CSD /
+        # stage-1 turns the code into a program.
+        if vb in ("START", "RETURN") and opts.get("TRANSID"):
+            val, cands, res = _cics_value(opts["TRANSID"], literal_map)
+            kind = "cics_start" if vb == "START" else "cics_return"
+            f.calls.append(CallFact(kind=kind, target=val, via_var=None if res == "literal" else opts["TRANSID"].upper(),
+                                    resolved=cands, resolution=res, using_args=commarea, line=ln))
+            f.cics_cmds.append((vb, "transid", val or opts["TRANSID"].upper(), "out", ln))
+            if res == "unresolved":
+                f.unresolved.append(("cics_transid", f"EXEC CICS {vb} TRANSID({opts['TRANSID'].upper()}) - "
+                                                     f"transaction code not resolvable from this source", ln))
+
+        if opts.get("MAP") or opts.get("MAPSET"):
+            mapv, _c, _r = _cics_value(opts.get("MAP", ""), literal_map)
+            setv, _c2, _r2 = _cics_value(opts.get("MAPSET", ""), literal_map)
+            res_name = ".".join(x for x in (setv or (opts.get("MAPSET") or "").upper() or None,
+                                            mapv or (opts.get("MAP") or "").upper() or None) if x)
+            f.cics_cmds.append((vb, "map", res_name, "in" if vb == "RECEIVE" else "out" if vb == "SEND" else None, ln))
 
         mf = _CICS_FILE.search(inner)
         if mf and verb:
-            arg = mf.group(1).strip().strip("'\"").upper()
-            f.io_ops.append((arg, "cics", verb.group(1).upper(), st.start))
+            val, cands, res = _cics_value(mf.group(1), literal_map)
+            name = val or mf.group(1).strip().strip("'\"").upper()
+            f.io_ops.append((name, "cics", vb, ln))
+            f.cics_cmds.append((vb, "file", name, None, ln))
+            if res == "unresolved":
+                f.unresolved.append(("cics_file_var", f"EXEC CICS {vb} FILE({mf.group(1).strip().upper()}) - "
+                                                      f"FCT name not resolvable from this source", ln))
+
+        if opts.get("QUEUE"):
+            qkind = "tdq" if re.search(r"\bTD\b", inner, re.IGNORECASE) else "tsq" if re.search(r"\bTS\b", inner, re.IGNORECASE) else "queue"
+            val, _c, _r = _cics_value(opts["QUEUE"], literal_map)
+            direction = "out" if vb.startswith("WRITEQ") else "in" if vb.startswith("READQ") else "delete" if vb.startswith("DELETEQ") else None
+            name = val or opts["QUEUE"].upper()
+            f.cics_cmds.append((vb, qkind, name, direction, ln))
+            f.io_ops.append((name, "cics_" + qkind, vb, ln))
+
+        if opts.get("CONTAINER"):
+            val, _c, _r = _cics_value(opts["CONTAINER"], literal_map)
+            chan, _c2, _r2 = _cics_value(opts.get("CHANNEL", ""), literal_map)
+            f.cics_cmds.append((vb, "container", f"{chan or ''}/{val or opts['CONTAINER'].upper()}".lstrip("/"),
+                                "out" if vb == "PUT" else "in" if vb == "GET" else None, ln))
+        if opts.get("WEBSERVICE"):
+            val, _c, _r = _cics_value(opts["WEBSERVICE"], literal_map)
+            f.cics_cmds.append((vb, "webservice", val or opts["WEBSERVICE"].upper(), "out", ln))
+        if vb == "WEB":
+            f.cics_cmds.append((vb, "web", inner.split()[1].upper() if len(inner.split()) > 1 else "?", None, ln))
 
 
-def _extract_dli(f: ProgramFacts, st: LogicalLine) -> None:
+def _extract_dli(f: ProgramFacts, st: LogicalLine, literal_map: Optional[Dict[str, Set[str]]] = None) -> None:
+    literal_map = literal_map or {}
     m = _DLI_CALL.search(st.text)
     if m:
         iface = m.group(2).upper()
         args = _split_call_args(m.group(3))
-        _record_dli(f, st, iface, args)
+        _record_dli(f, st, iface, args, literal_map)
         return
 
     for m2 in _EXEC_DLI.finditer(st.text):
+        # EXEC DLI GHU USING PCB(2) SEGMENT(POLICY) INTO(WS-AREA) WHERE(...)
         inner = " ".join(m2.group(1).split())
         verb = _CICS_VERB.match(inner)
-        f.dli.append(DliFact(interface="EXEC DLI",
-                             func=verb.group(1).upper() if verb else None,
-                             pcb_arg=None, ssa_args=[], io_area=None,
-                             line=st.start))
+        func = verb.group(1).upper() if verb else None
+        opts: Dict[str, str] = {}
+        for mo in _CICS_OPT.finditer(inner):
+            opts.setdefault(mo.group(1).upper(), mo.group(2).strip())
+        mp = re.search(r"\bPCB\s*\(\s*(\d+)\s*\)", inner, re.IGNORECASE)
+        pcb_n = int(mp.group(1)) if mp else None
+        seg = (opts.get("SEGMENT") or "").upper() or None
+        io = (opts.get("INTO") or opts.get("FROM") or "").upper() or None
+        ssa = [seg] if seg else []
+        if opts.get("WHERE"):
+            ssa.append(opts["WHERE"])
+        f.dli.append(DliFact(interface="EXEC DLI", func=func, pcb_arg=f"PCB({pcb_n})" if pcb_n else None,
+                             ssa_args=ssa, io_area=io, line=st.line_at(m2.start()), pcb_index=pcb_n,
+                             resolution="literal"))
+        if seg:
+            f.io_ops.append((seg, "ims", func or "?", st.line_at(m2.start())))
+
+
+def _is_dli_func(tok: str, literal_map: Dict[str, Set[str]]) -> bool:
+    return tok in _DLI_FUNCS or any(v.strip().upper() in _DLI_FUNCS for v in literal_map.get(tok, ()))
 
 
 def _record_dli(f: ProgramFacts, st: LogicalLine, iface: str,
-                args: List[str]) -> None:
-    """CALL 'CBLTDLI' USING func, pcb, io-area, ssa...
+                args: List[str], literal_map: Dict[str, Set[str]]) -> None:
+    """CALL 'CBLTDLI' USING [parmcount] func, pcb, io-area, ssa...
 
     The PCB argument is positional in the PSB, which is why it is captured
     verbatim: resolving which database it refers to requires the PSB, and
     guessing is how an analysis ends up naming the wrong IMS database.
+    The function is usually a VALUE-initialised field (`05 DLI-GU PIC X(4)
+    VALUE 'GU  '`): resolved through the literal map like a dynamic CALL.
     """
     func = None
     pcb = None
     io_area = None
     ssas: List[str] = []
+    resolution: Optional[str] = None
+
+    # Older programs pass a parameter count first; every argument shifts by
+    # one and the PCB (so the database) named for the call would be wrong.
+    if len(args) >= 2:
+        first = args[0].strip().strip("'\"").upper()
+        second = args[1].strip().strip("'\"").upper()
+        numeric = literal_map.get(first) and all(re.fullmatch(r"[+-]?\d+", v.strip()) for v in literal_map[first])
+        if not _is_dli_func(first, literal_map) and (_PARMCOUNT_NAME.match(first) or numeric
+                                                     or re.fullmatch(r"\d+", first)) \
+                and _is_dli_func(second, literal_map):
+            args = args[1:]
+            resolution = "parmcount"
 
     if args:
         first = args[0].strip().strip("'\"").upper()
         if first in _DLI_FUNCS:
             func = first
+            resolution = resolution or "literal"
         elif re.fullmatch(ID, first, re.IGNORECASE):
-            func = f"*{first}*"      # func held in a variable, e.g. WS-GU
+            cands = sorted({v.strip().upper() for v in literal_map.get(first, ()) if v.strip().upper() in _DLI_FUNCS})
+            if len(cands) == 1:
+                func = cands[0]
+                resolution = resolution or "value_clause"     # keep 'parmcount' when both apply
+            else:
+                func = f"*{first}*"      # func held in a variable never given a single literal
+                resolution = "unresolved"
+                f.unresolved.append((
+                    "dli_function",
+                    f"DL/I call function held in variable {first} - "
+                    + (f"candidates {', '.join(cands)}" if cands else
+                       "never assigned a literal in this program; the operation (read vs update) "
+                       "cannot be determined statically"),
+                    st.start))
     if len(args) > 1:
         pcb = args[1].strip().upper()
     if len(args) > 2:
@@ -822,15 +1140,22 @@ def _record_dli(f: ProgramFacts, st: LogicalLine, iface: str,
     if len(args) > 3:
         ssas = [a.strip().upper() for a in args[3:]]
 
-    f.dli.append(DliFact(interface=iface, func=func, pcb_arg=pcb,
-                         ssa_args=ssas, io_area=io_area, line=st.start))
+    dest = None
+    if func == "CHNG" and io_area:
+        # CHNG sets the destination of an alternate PCB; the ISRT that follows
+        # is a message switch to that transaction / LTERM.
+        cands = sorted(literal_map.get(io_area, ()))
+        dest = cands[0] if len(cands) == 1 else None
+        f.calls.append(CallFact(kind="ims_switch", target=dest, via_var=None if dest else io_area,
+                                resolved=cands, resolution="move_literal" if dest else ("move_literal" if cands else "unresolved"),
+                                using_args=[], line=st.start))
+        if not cands:
+            f.unresolved.append(("ims_switch", f"CHNG destination in {io_area} never assigned a literal - "
+                                               f"the transaction switched to is unknown", st.start))
 
-    if func and func.startswith("*"):
-        f.unresolved.append((
-            "dli_function",
-            f"DL/I call function held in variable {func.strip('*')} - the "
-            f"operation (read vs update) cannot be determined statically",
-            st.start))
+    f.dli.append(DliFact(interface=iface, func=func, pcb_arg=pcb,
+                         ssa_args=ssas, io_area=io_area, line=st.start,
+                         resolution=resolution, dest=dest or (f"*{io_area}*" if func == "CHNG" else None)))
     if pcb:
         f.io_ops.append((pcb, "ims", func or "?", st.start))
 
@@ -847,21 +1172,104 @@ def _split_call_args(raw: str) -> List[str]:
     return out
 
 
-def _extract_mq(f: ProgramFacts, st: LogicalLine) -> None:
+def _mq_queue(struct: Optional[str], literal_map: Dict[str, Set[str]]) -> Optional[str]:
+    """The queue name behind an MQOD structure: `MQOD-OBJECTNAME` (or
+    `<struct>-OBJECTNAME`) initialised by VALUE or MOVEd a literal."""
+    if not struct:
+        return None
+    keys = [f"{struct}-OBJECTNAME", "MQOD-OBJECTNAME"]
+    keys += [k for k in literal_map if k.endswith("OBJECTNAME") and k not in keys]
+    for k in keys:
+        vals = sorted(v for v in literal_map.get(k, ()) if v.strip())
+        if len(vals) == 1:
+            return vals[0]
+    return None
+
+
+def _extract_mq(f: ProgramFacts, st: LogicalLine, literal_map: Optional[Dict[str, Set[str]]] = None) -> None:
+    """MQOPEN/MQPUT/MQPUT1/MQGET with the queue name and the message layout.
+
+    USING positions (MQI): MQOPEN hconn, MQOD, options, hobj, cc, rc
+                          MQPUT  hconn, hobj, MQMD, PMO, buflen, BUFFER, cc, rc
+                          MQPUT1 hconn, MQOD, MQMD, PMO, buflen, BUFFER, cc, rc
+                          MQGET  hconn, hobj, MQMD, GMO, buflen, BUFFER, datalen, cc, rc
+    The queue is the MQOD's OBJECTNAME; PUT/GET reach it through the HOBJ
+    that MQOPEN filled. The BUFFER argument is the message layout - the
+    interface contract with whatever reads the queue.
+    """
+    literal_map = literal_map or {}
     for m in _MQ_CALL.finditer(st.text):
-        f.mq.append((m.group(1).upper(), st.start))
+        call = m.group(1).upper()
+        args = _parse_using(st.text[m.start():])
+        queue = layout = direction = None
+        if call == "MQOPEN" and len(args) > 3:
+            f.mq_handles[args[3]] = args[1]
+            queue = _mq_queue(args[1], literal_map)
+        elif call == "MQPUT1":
+            queue = _mq_queue(args[1] if len(args) > 1 else None, literal_map)
+            layout = args[5] if len(args) > 5 else None
+            direction = "out"
+        elif call in ("MQPUT", "MQGET"):
+            od = f.mq_handles.get(args[1]) if len(args) > 1 else None
+            queue = _mq_queue(od, literal_map)
+            layout = args[5] if len(args) > 5 else None
+            direction = "out" if call == "MQPUT" else "in"
+        f.mq.append((call, queue, direction, layout, st.start))
+
+
+def _extract_entry(f: ProgramFacts, st: LogicalLine) -> None:
+    """ENTRY 'name' USING ...: an alternate entry point (CALL 'name' reaches
+    this program) and, for `ENTRY 'DLITCBL'`, the PCB list of an older IMS
+    program that has no PROCEDURE DIVISION USING."""
+    for m in _ENTRY.finditer(st.text):
+        name = m.group(2).strip().upper()
+        using = _parse_using(m.group(0)) if m.group(3) else []
+        f.entries.append((name, using, st.start))
+        if using and not f.linkage_using:
+            f.linkage_using = using
 
 
 def _extract_performs(f: ProgramFacts, st: LogicalLine, here: str) -> None:
     if st.area_a and _PARAGRAPH.match(st.text.strip()):
         return
-    for m in _PERFORM.finditer(st.text):
+    body = _EXEC_ANY.sub(lambda m: " " * len(m.group(0)), st.text)
+    for m in _PERFORM.finditer(body):
         to = m.group(1).upper()
         thru = m.group(2).upper() if m.group(2) else None
-        # `PERFORM UNTIL`, `PERFORM VARYING`, `PERFORM n TIMES` are inline.
+        # `PERFORM UNTIL`, `PERFORM VARYING`, `PERFORM n TIMES`,
+        # `PERFORM WS-CNT TIMES` are inline - no edge to '3' or 'WS-CNT'.
         if to in ("UNTIL", "VARYING", "WITH", "TEST", "FOREVER"):
             continue
-        f.performs.append((here, to, thru, st.start))
+        if re.fullmatch(r"\d+", to) or re.match(r"\s+TIMES\b", body[m.end():], re.IGNORECASE):
+            continue
+        f.performs.append((here, to, thru, st.line_at(m.start()), "perform"))
+    # GO TO is control flow too: a paragraph reached only by GO TO is not dead.
+    for m in _GO_TO.finditer(body):
+        targets = [t.upper() for t in re.findall(ID, m.group(1), re.IGNORECASE)]
+        kind = "goto_depending" if m.group(2) else "goto"
+        for t in targets:
+            f.performs.append((here, t, None, st.line_at(m.start()), kind))
+    for m in _ALTER.finditer(body):
+        f.performs.append((here, m.group(2).upper(), None, st.line_at(m.start()), "alter"))
+    for m in _SORT_PROC.finditer(body):
+        f.performs.append((here, m.group(2).upper(), m.group(3).upper() if m.group(3) else None,
+                           st.line_at(m.start()), "sort_proc"))
+
+
+_TERMINAL = re.compile(B + r"(?:GOBACK|STOP\s+RUN|EXIT\s+PROGRAM|GO\s+TO)" + E, re.IGNORECASE)
+
+
+def _fallthrough_edges(f: ProgramFacts, last_stmt: Dict[str, str]) -> None:
+    """A paragraph whose last statement does not leave (GOBACK / STOP RUN /
+    EXIT PROGRAM / unconditional GO TO) runs straight into the next one.
+    Recorded as its own edge kind so `dead` and `paragraph` can say
+    "reached by fall-through" instead of "never performed"."""
+    paras = [p for p in f.paragraphs if p.kind == "paragraph"]
+    for a, b in zip(paras, paras[1:]):
+        last = last_stmt.get(a.name, "")
+        if last and _TERMINAL.search(last) and not re.search(B + r"IF|WHEN|ELSE" + E, last, re.IGNORECASE):
+            continue
+        f.performs.append((a.name, b.name, None, a.end_line, "fallthrough"))
 
 
 # --------------------------------------------------------------------------
@@ -963,7 +1371,10 @@ def _idents(text: str) -> List[str]:
     """Identifiers in a fragment: literals skipped, reserved words removed,
     subscripts stripped from the name and returned as their own reads."""
     out: List[str] = []
-    for m in _TOKEN.finditer(text or ""):
+    # `WS-KEY OF WS-REC` is ONE identifier (WS-KEY); the qualifier is not a
+    # second reference.
+    text = re.sub(r"\b(?:OF|IN)\s+[A-Z0-9][A-Z0-9\-]*", " ", text or "", flags=re.IGNORECASE)
+    for m in _TOKEN.finditer(text):
         t = m.group(0)
         if t[0] in ("'", '"'):
             continue
@@ -1034,8 +1445,50 @@ def _compare_literals(f: ProgramFacts, frag: str, context: str, ln: int,
             f.literal_refs.append((_norm_lit(m.group(0)), context, subject, ln))
 
 
+def _exec_refs(f: ProgramFacts, kind: str, inner: str, ln: int) -> None:
+    """Host fields inside EXEC CICS / EXEC DLI. INTO/SET/RESP receive data
+    (the program WRITES them); FROM/RIDFLD/QUEUE/... are read; COMMAREA is
+    both. SQL host variables are handled by _sql_host_modes."""
+    if kind == "SQL":
+        return
+    if kind == "DLI":
+        for m in _CICS_OPT.finditer(inner):
+            k, v = m.group(1).upper(), m.group(2)
+            if k == "INTO":
+                _refs(f, _idents(v), "write", "EXEC-DLI", ln)
+            elif k == "FROM":
+                _refs(f, _idents(v), "read", "EXEC-DLI", ln)
+            elif k == "WHERE":
+                _refs(f, _idents(v), "test", "EXEC-DLI", ln)
+        return
+    verb = _CICS_VERB.match(inner)
+    stmt = "EXEC-CICS-" + (verb.group(1).upper() if verb else "?")
+    for m in _CICS_OPT.finditer(inner):
+        k, v = m.group(1).upper(), m.group(2).strip()
+        if not v or v[0] in ("'", '"') or k in _CICS_NOT_FIELDS:
+            continue
+        names = _idents(v)
+        if k in _CICS_WRITE_OPTS:
+            _refs(f, names, "write", stmt, ln)
+        elif k == "COMMAREA":
+            _refs(f, names, "read", stmt, ln)
+            _refs(f, names, "write", stmt, ln)     # the callee may change it
+        elif k in _CICS_READ_OPTS:
+            _refs(f, names, "read", stmt, ln)
+
+
 def _extract_field_and_literal_refs(f: ProgramFacts, st: LogicalLine) -> None:
     body = st.text.strip().rstrip(".")
+    # EXEC CICS/DLI/SQL text is not COBOL: READ FILE('X') INTO(Y) is not a
+    # COBOL READ, WHERE(POLNO = K) is not a WHEN. Their host fields are taken
+    # by _exec_refs; the span is blanked (same length) so line attribution
+    # of everything else is unchanged.
+    for m in _EXEC_ANY.finditer(body):
+        _exec_refs(f, m.group(1).upper(), " ".join(m.group(2).split()), st.line_at(m.start()))
+    body = _EXEC_ANY.sub(lambda m: " " * len(m.group(0)), body)
+    # `WS-KEY OF WS-REC = 'B'` tests WS-KEY; the qualifier is blanked (same
+    # length, so line attribution is unchanged) before verbs are read.
+    body = re.sub(r"\b(?:OF|IN)\s+[A-Z0-9][A-Z0-9\-]*", lambda m: " " * len(m.group(0)), body, flags=re.IGNORECASE)
     # EVALUATE A ALSO B ... WHEN 3 ALSO 'M': one subject per ALSO position, and
     # each WHEN literal attaches to the subject at ITS position.
     eval_subjects: List[Optional[str]] = []

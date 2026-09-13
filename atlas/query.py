@@ -91,11 +91,26 @@ def source_line(conn: sqlite3.Connection, member_name: str, line: int) -> str:
 
 
 def programs_named(conn: sqlite3.Connection, name: str) -> List[sqlite3.Row]:
+    """Programs called `name`: by PROGRAM-ID, member name, or an ENTRY alias
+    (CALL 'RATEENT' reaches RATECALC)."""
+    n = name.upper()
     return conn.execute("""
         SELECT p.*, m.name AS member_name, m.path, m.library, m.authoritative, m.parse_status, m.system
         FROM program p JOIN member m ON m.id = p.member_id
         WHERE UPPER(p.program_id) = ? OR UPPER(m.name) = ?
-        ORDER BY m.authoritative DESC, m.path""", (name.upper(), name.upper())).fetchall()
+           OR p.id IN (SELECT program_id FROM program_alias WHERE UPPER(alias) = ?)
+        ORDER BY m.authoritative DESC, m.path""", (n, n, n)).fetchall()
+
+
+def _names_of(conn: sqlite3.Connection, name: str) -> List[str]:
+    """A program plus every ENTRY alias it answers to."""
+    n = name.upper()
+    out = {n}
+    for p in programs_named(conn, n):
+        out.add(p["program_id"].upper())
+        for (a,) in conn.execute("SELECT alias FROM program_alias WHERE program_id=?", (p["id"],)):
+            out.add(a.upper())
+    return sorted(out)
 
 
 def table(headers: Sequence[str], rows: Iterable[Sequence]) -> str:
@@ -300,16 +315,37 @@ def cmd_program(conn: sqlite3.Connection, name: str) -> str:
                 out.append(f"**{len(dyn)} dynamic SQL statement(s)** - tables not statically knowable.\n")
 
         # IMS
-        dli = conn.execute("SELECT func, pcb_arg, line FROM dli_call WHERE program_id=?", (pid,)).fetchall()
+        dli = conn.execute("""SELECT func, pcb_arg, io_area, ssa_args, line, resolution, dest, psb_name, dbd_name,
+                                     procopt, pcb_source FROM dli_call WHERE program_id=? ORDER BY line""", (pid,)).fetchall()
         if dli:
-            out.append("\n### IMS DL/I calls\n")
-            out.append(table(["func", "PCB arg (positional!)", "cite"],
-                             [(d["func"], d["pcb_arg"], cite(conn, pid, d["line"])) for d in dli]))
-            psbs = {s["parm"] for s in steps if s["parm"] and "PSB " in s["parm"]}
-            if psbs:
-                out.append("PSB from JCL: " + "; ".join(sorted(psbs))[:200] + "\n")
-            out.append("> Map PCB arguments through the PSB's PCB order (`ims_pcb.ordinal`), remembering "
-                       "the I/O PCB comes first in BMP/MPP or CMPAT=YES.\n")
+            out.append("\n### IMS DL/I calls (PCB resolved through the PSB)\n")
+            out.append(table(["func", "PCB arg", "database", "PROCOPT", "I/O area", "segment/SSA", "cite"],
+                             [(d["func"] + (f" (via {d['resolution']})" if d["resolution"] in ("value_clause", "parmcount") else ""),
+                               d["pcb_arg"] or "", d["dbd_name"] or "?", d["procopt"] or "", d["io_area"] or "",
+                               ", ".join(_jl(d["ssa_args"]))[:40] or (f"-> {d['dest']}" if d["dest"] else ""),
+                               cite(conn, pid, d["line"])) for d in dli]))
+            srcs = sorted({d["pcb_source"] for d in dli if d["pcb_source"]})
+            for s in srcs[:4]:
+                out.append(f"- PCB mapping: {s}\n")
+            if any(d["dbd_name"] is None for d in dli):
+                out.append("> `database ?` = position not resolved (see the mapping notes); the model must not guess it.\n")
+            switches = [d for d in dli if d["dest"]]
+            if switches:
+                out.append("- **message switch**: CHNG to " + ", ".join(sorted({d["dest"] for d in switches}))
+                           + " - the ISRT that follows reaches that transaction/LTERM\n")
+
+        # CICS commands: maps, transaction chaining, queues (facts, not name coincidence)
+        cc = conn.execute("""SELECT verb, resource_kind, resource, direction, line FROM cics_cmd
+                             WHERE program_id=? ORDER BY resource_kind, resource, line""", (pid,)).fetchall()
+        if cc:
+            out.append("\n### CICS commands (resources named in EXEC CICS)\n")
+            out.append(table(["verb", "kind", "resource", "dir", "cite"],
+                             [(c["verb"], c["resource_kind"], c["resource"], c["direction"] or "",
+                               cite(conn, pid, c["line"])) for c in cc]))
+        aliases = conn.execute("SELECT alias, linkage_using, line FROM program_alias WHERE program_id=?", (pid,)).fetchall()
+        if aliases:
+            out.append("- ENTRY points: " + ", ".join(f"`{a['alias']}` USING {', '.join(_jl(a['linkage_using'])) or '-'} "
+                                                     f"@{cite(conn, pid, a['line'])}" for a in aliases) + "\n")
 
         # interfaces
         ifs = conn.execute("SELECT kind, detail, direction, line FROM interface_edge WHERE member_id=?",
@@ -495,10 +531,29 @@ def _callees_of(conn: sqlite3.Connection, name: str) -> Tuple[List[Tuple[str, st
 
 
 def _callers_of(conn: sqlite3.Connection, name: str) -> List[Tuple[str, str]]:
-    rows = conn.execute("""
-        SELECT DISTINCT p.program_id, c.kind FROM call_edge c JOIN program p ON p.id=c.program_id
-        WHERE UPPER(c.target)=? OR c.resolved LIKE ?""", (name.upper(), f'%"{name.upper()}"%')).fetchall()
-    return [(r["program_id"], r["kind"]) for r in rows]
+    """Programs that reach `name`: CALL / LINK / XCTL / SQL CALL to the
+    program or any ENTRY alias of it, plus START/RETURN TRANSID and IMS
+    message switches to a transaction that the CSD / stage-1 routes to it."""
+    names = _names_of(conn, name)
+    out: List[Tuple[str, str]] = []
+    seen = set()
+    for n in names:
+        for r in conn.execute("""
+                SELECT DISTINCT p.program_id, c.kind FROM call_edge c JOIN program p ON p.id=c.program_id
+                WHERE (UPPER(c.target)=? OR c.resolved LIKE ?) AND c.kind NOT IN ('cics_start','cics_return','ims_switch')""",
+                              (n, f'%"{n}"%')):
+            if (r["program_id"], r["kind"]) not in seen:
+                seen.add((r["program_id"], r["kind"]))
+                out.append((r["program_id"], r["kind"] + ("" if n == name.upper() else f" via ENTRY {n}")))
+        for r in conn.execute("""
+                SELECT DISTINCT p.program_id, c.kind, t.tran_code FROM call_edge c JOIN program p ON p.id=c.program_id
+                JOIN transaction_def t ON (UPPER(c.target)=UPPER(t.tran_code) OR c.resolved LIKE '%"' || UPPER(t.tran_code) || '"%')
+                WHERE UPPER(t.program)=? AND c.kind IN ('cics_start','cics_return','ims_switch')""", (n,)):
+            key = (r["program_id"], r["kind"] + " " + r["tran_code"])
+            if key not in seen:
+                seen.add(key)
+                out.append((r["program_id"], f"{r['kind']} (transaction {r['tran_code']})"))
+    return out
 
 
 def cmd_graph(conn: sqlite3.Connection, name: str, direction: str, depth: int) -> str:
@@ -865,16 +920,46 @@ def cmd_dataset(conn: sqlite3.Connection, dsn: str) -> str:
     if proc_hidden:
         out.append(f"> {proc_hidden} row(s) from PROC members' default symbolics hidden: the jobs that "
                    f"expand those PROCs are listed with the real names.\n")
-    out.append(table(["dataset", "direction [source]", "system", "program", "job", "step", "gdg", "member"],
-                     [(r["dsn"], f"{r['mode']} [{r['mode_source'] or ''}]".replace(" []", ""),
-                       r["system"] or "?", r["pgm"],
-                       r["job_name"] or (f"(PROC {r['proc_name']} defaults - no indexed job runs it)"
-                                         if r["proc_name"] else ""),
-                       r["step_name"], r["gdg_rel"] or "", os.path.basename(r["path"] or ""))
-                      for r in rows]))
+    trows = [(r["dsn"], f"{r['mode']} [{r['mode_source'] or ''}]".replace(" []", ""),
+              r["system"] or "?", r["pgm"],
+              r["job_name"] or (f"(PROC {r['proc_name']} defaults - no indexed job runs it)"
+                                if r["proc_name"] else ""),
+              r["step_name"], r["gdg_rel"] or "", os.path.basename(r["path"] or ""))
+             for r in rows]
+    # ONLINE access: the CSD names the dataset (FILE ... DSNAME), the program
+    # names the FCT entry (EXEC CICS READ/REWRITE FILE). A VSAM master is
+    # updated all day by CICS; a batch-only answer here would be wrong.
+    online = conn.execute("""
+        SELECT cf.dsname, cf.name AS fct, p.program_id, p.id AS pid, m.system,
+               GROUP_CONCAT(DISTINCT o.op) AS ops, MIN(o.line) AS line
+        FROM cics_file cf JOIN io_op o ON UPPER(o.target)=UPPER(cf.name) AND o.target_kind='cics'
+        JOIN program p ON p.id=o.program_id JOIN member m ON m.id=p.member_id
+        WHERE UPPER(cf.dsname) LIKE ? GROUP BY cf.dsname, cf.name, p.program_id, p.id, m.system""",
+                          (f"%{dsn.upper()}%",)).fetchall()
+    online_rows = []
+    for o in online:
+        ops = {x.strip().upper() for x in (o["ops"] or "").split(",")}
+        writes = bool(ops & {"WRITE", "REWRITE", "DELETE"})
+        reads = bool(ops & {"READ", "STARTBR", "READNEXT", "READPREV"})
+        mode = "both" if writes and reads else "output" if writes else "input"
+        trans = [t[0] for t in conn.execute("SELECT tran_code FROM transaction_def WHERE UPPER(program)=?",
+                                            (o["program_id"].upper(),))]
+        online_rows.append({"dsn": o["dsname"], "mode": mode, "system": o["system"], "pgm": o["program_id"],
+                            "job": f"(online) FCT {o['fct']}" + (f" tran {', '.join(trans[:4])}" if trans else ""),
+                            "ops": ", ".join(sorted(ops)), "cite": cite(conn, o["pid"], o["line"])})
+        trows.append((o["dsname"], f"{mode} [cics_verb]", o["system"] or "?", o["program_id"],
+                      online_rows[-1]["job"], ", ".join(sorted(ops)), "", f"{cite(conn, o['pid'], o['line'])}"))
+    tdq = conn.execute("SELECT detail, direction, line, member_id FROM interface_edge WHERE kind='cics_tdq' AND UPPER(detail) LIKE ?",
+                       (f"%{dsn.upper()}%",)).fetchall()
+    for t in tdq:
+        trows.append((t["detail"].split("->")[-1].strip(), f"{'output' if t['direction'] == 'out' else 'input' if t['direction'] == 'in' else 'unknown'} [cics_tdq]",
+                      "?", "(CICS)", t["detail"].split("->")[0].strip(), "", "", f"CSD:{t['line']}"))
+    out.append(table(["dataset", "direction [source]", "system", "program", "job", "step", "gdg", "member/cite"], trows))
     # delete / alloc / none (IEFBR14 housekeeping) are not writers.
     writers = {r["system"] for r in rows if r["mode"] in ("output", "mod", "both", "create") and r["system"]}
     readers = {r["system"] for r in rows if r["mode"] in ("input", "both") and r["system"]}
+    writers |= {o["system"] for o in online_rows if o["mode"] in ("output", "both") and o["system"]}
+    readers |= {o["system"] for o in online_rows if o["mode"] in ("input", "both") and o["system"]}
     if writers and readers and writers != readers:
         out.append(f"\n**Crosses departments:** written by {', '.join(sorted(writers))}; read by "
                    f"{', '.join(sorted(readers))}. A layout or value change here is an interface change "
@@ -955,12 +1040,25 @@ def cmd_dead(conn: sqlite3.Connection) -> str:
            "paragraph above it falls through, and a never-called program is still live if the scheduler, "
            "an online transaction, or an unresolved dynamic CALL runs it. Every caveat below is real.\n"]
     called = set()
-    for r in conn.execute("SELECT target, resolved FROM call_edge"):
-        if r["target"]:
-            called.add(r["target"].upper())
-        called.update(t.upper() for t in _jl(r["resolved"]))
+    codes = set()
+    for r in conn.execute("SELECT kind, target, resolved FROM call_edge"):
+        tgt = {r["target"].upper()} if r["target"] else set()
+        tgt.update(t.upper() for t in _jl(r["resolved"]))
+        if r["kind"] in ("cics_start", "cics_return", "ims_switch"):
+            codes.update(tgt)            # transaction codes, routed to programs below
+        else:
+            called.update(tgt)
+    # CALL 'RATEENT' reaches RATECALC through its ENTRY point.
+    for r in conn.execute("SELECT p.program_id, a.alias FROM program_alias a JOIN program p ON p.id=a.program_id"):
+        if r["alias"].upper() in called:
+            called.add(r["program_id"].upper())
     run = {r[0].upper() for r in conn.execute("SELECT DISTINCT effective_pgm FROM step WHERE effective_pgm IS NOT NULL")}
     tx = {r[0].upper() for r in conn.execute("SELECT DISTINCT program FROM transaction_def WHERE program IS NOT NULL")}
+    if codes:
+        q = ",".join("?" * len(codes))
+        tx.update(r[0].upper() for r in conn.execute(
+            f"SELECT DISTINCT program FROM transaction_def WHERE program IS NOT NULL AND UPPER(tran_code) IN ({q})",
+            sorted(codes)))
     progs = conn.execute("SELECT p.program_id, m.name, m.path FROM program p JOIN member m ON m.id=p.member_id").fetchall()
     dead = [(p["program_id"], p["name"], p["path"]) for p in progs
             if p["program_id"].upper() not in called | run | tx]
@@ -1218,14 +1316,27 @@ def cmd_column(conn: sqlite3.Connection, name: str) -> str:
     through the host variable, where that value came from or went next."""
     n = name.upper()
     tbl, _, col = n.rpartition(".")
-    q = "UPPER(c.col)=?" + (" AND UPPER(c.tbl)=?" if tbl else "")
-    args = (col, tbl) if tbl else (col,)
+    # PRD.POLICY_TBL and POLICY_TBL are the same table written two ways: match
+    # on the unqualified name unless the question itself carries a qualifier.
+    base = tbl.rpartition(".")[2] if tbl else ""
+    if tbl and "." in tbl:
+        q, args = "UPPER(c.col)=? AND UPPER(c.tbl)=?", (col, tbl)
+    elif tbl:
+        q, args = "UPPER(c.col)=? AND (UPPER(c.tbl)=? OR UPPER(c.tbl) LIKE ?)", (col, base, f"%.{base}")
+    else:
+        q, args = "UPPER(c.col)=?", (col,)
     rows = conn.execute(f"""SELECT c.*, p.program_id AS pname FROM sql_col_ref c JOIN program p ON p.id=c.program_id
                             WHERE {q} ORDER BY c.mode, p.program_id, c.line""", args).fetchall()
     out = [f"# DB2 column {n}\n"]
+    decl = conn.execute("""SELECT o.qualifier, o.name, o.source, dc.type, dc.ordinal FROM db2_column dc
+                           JOIN db2_object o ON o.id=dc.object_id WHERE UPPER(dc.name)=?""" +
+                        (" AND UPPER(o.name)=?" if base else ""), (col, base) if base else (col,)).fetchall()
+    for d in decl:
+        out.append(f"- declared: `{(d['qualifier'] + '.') if d['qualifier'] else ''}{d['name']}.{col}` "
+                   f"{d['type'] or ''} (column #{d['ordinal']}, from {d['source']})\n")
     if not rows:
-        return out[0] + ("\n**No static SQL references** to this column in indexed programs - dynamic SQL, "
-                         "a view, or a different column name. Check `search \"" + col + "\"`.\n")
+        return "".join(out) + ("\n**No static SQL references** to this column in indexed programs - dynamic SQL, "
+                               "a view, or a different column name. Check `search \"" + col + "\"`.\n")
     for mode, title in (("write", "Written (INSERT / UPDATE from a host variable)"),
                         ("read", "Read (SELECT INTO / FETCH INTO a host variable)"),
                         ("predicate", "Used in predicates (WHERE)")):
@@ -1278,12 +1389,37 @@ def cmd_transaction(conn: sqlite3.Connection, code: str) -> str:
         return "".join(out)
     out.append(table(["code", "system", "program", "PSB", "group", "detail", "cite"],
                      [(r["tran_code"], r["system"], r["program"] or "(none)", r["psb"] or "",
-                       r["group_name"] or "", (r["detail"] or "")[:80], f"{r['mem']}:{r['line']}") for r in rows]))
+                       r["group_name"] or "", (r["detail"] or "")[:120], f"{r['mem']}:{r['line']}") for r in rows]))
     for p in sorted({r["program"] for r in rows if r["program"]}):
         if programs_named(conn, p):
             out.append(f"- `{p}` is indexed - `program {p}` for its dossier\n")
         else:
             out.append(f"- **{p} is not in the index** (no source, or member / PROGRAM-ID / load name differ)\n")
+    # Routing written in code: START/RETURN TRANSID, IMS CHNG message switches.
+    codes = sorted({r["tran_code"].upper() for r in rows})
+    q = ",".join("?" * len(codes))
+    chain = conn.execute(f"""SELECT p.program_id, p.id AS pid, c.kind, c.target, c.resolved, c.line FROM call_edge c
+                             JOIN program p ON p.id=c.program_id
+                             WHERE c.kind IN ('cics_start','cics_return','ims_switch') AND
+                                   (UPPER(c.target) IN ({q}) OR {' OR '.join('c.resolved LIKE ?' for _ in codes)})
+                             ORDER BY p.program_id, c.line""", (*codes, *[f'%"{c}"%' for c in codes])).fetchall()
+    if chain:
+        out.append("\n### Reached from code (not from the CSD / stage-1)\n")
+        out.append(table(["from program", "how", "cite"],
+                         [(c["program_id"], {"cics_start": "START TRANSID", "cics_return": "RETURN TRANSID (next in the conversation)",
+                                             "ims_switch": "IMS message switch (CHNG + ISRT)"}[c["kind"]],
+                           cite(conn, c["pid"], c["line"])) for c in chain]))
+    # Which transactions the routed programs themselves start / return to.
+    progs = sorted({r["program"].upper() for r in rows if r["program"]})
+    if progs:
+        qp = ",".join("?" * len(progs))
+        nxt = conn.execute(f"""SELECT p.program_id, c.kind, COALESCE(c.target, c.resolved) AS t FROM call_edge c
+                               JOIN program p ON p.id=c.program_id WHERE UPPER(p.program_id) IN ({qp})
+                               AND c.kind IN ('cics_start','cics_return','ims_switch')""", progs).fetchall()
+        if nxt:
+            out.append("- next in the chain: " + "; ".join(
+                f"{x['program_id']} {x['kind'].replace('cics_', '').replace('ims_switch', 'switches to')} "
+                f"{', '.join(_jl(x['t'])) if (x['t'] or '').startswith('[') else x['t']}" for x in nxt) + "\n")
     out.append("\n> IMS: the load module is assumed to be named as the PSB unless APPLCTN used GPSB=. "
                "CICS: a REMOTESYSTEM transaction runs in another region.\n")
     return "".join(out)
@@ -1370,6 +1506,19 @@ def cmd_screen(conn: sqlite3.Connection, name: str) -> str:
                            f["length"], f"{f['offset']}/{f['seg']}" if f["offset"] is not None else "",
                            f["attrb"] or "", f["initial"] or "", f["literal"] or "",
                            "/".join(x for x in (f["picin"], f["picout"]) if x), f["line"]) for f in flds]))
+        # EXEC CICS SEND/RECEIVE MAP('X') MAPSET('Y'): the program<->map edge
+        # as a fact, before any field-name coincidence.
+        if s["kind"] == "bms_map":
+            keys = [s["name"].upper()] + ([f"{s['parent'].upper()}.{s['name'].upper()}"] if s["parent"] else [])
+            q = ",".join("?" * len(keys))
+            cm = conn.execute(f"""SELECT p.program_id, p.id AS pid, c.verb, c.direction, c.line FROM cics_cmd c
+                                  JOIN program p ON p.id=c.program_id
+                                  WHERE c.resource_kind='map' AND (UPPER(c.resource) IN ({q}) OR UPPER(c.resource) LIKE ?)
+                                  ORDER BY p.program_id, c.line""", (*keys, f"%.{s['name'].upper()}")).fetchall()
+            if cm:
+                out.append("\n**Programs that SEND / RECEIVE this map (EXEC CICS facts)**\n")
+                out.append(table(["program", "verb", "dir", "cite"],
+                                 [(c["program_id"], c["verb"], c["direction"] or "", cite(conn, c["pid"], c["line"])) for c in cm]))
         rows = []
         for fld in flds:
             if not fld["name"]:
@@ -1625,6 +1774,275 @@ def cmd_messages(conn: sqlite3.Connection, pattern: str) -> str:
 
 
 # --------------------------------------------------------------------------
+# table / dbd / segment / layout
+# --------------------------------------------------------------------------
+
+def cmd_table(conn: sqlite3.Connection, name: str) -> str:
+    """Who creates / reads / updates / deletes a DB2 table, its declared
+    columns, cursors, dynamic SQL and stored-procedure use - estate-wide."""
+    n = name.upper()
+    qual, _, base = n.rpartition(".")
+    out = [f"# DB2 table {n}\n"]
+    objs = conn.execute("""SELECT o.*, m.name AS mem FROM db2_object o LEFT JOIN member m ON m.id=o.member_id
+                           WHERE UPPER(o.name)=? AND o.kind='table'""" + (" AND UPPER(o.qualifier)=?" if qual else ""),
+                        (base, qual) if qual else (base,)).fetchall()
+    for o in objs:
+        cols = conn.execute("SELECT ordinal, name, type FROM db2_column WHERE object_id=? ORDER BY ordinal", (o["id"],)).fetchall()
+        out.append(f"\n### Columns of {(o['qualifier'] + '.') if o['qualifier'] else ''}{o['name']} "
+                   f"(from {o['source']}{(' in ' + o['mem']) if o['mem'] else ''})\n")
+        out.append(table(["#", "column", "type"], [(c["ordinal"], c["name"], c["type"] or "") for c in cols]))
+    if not objs:
+        out.append("\n_No DCLGEN / DDL declares this table in the index: column list unknown (host structures "
+                   "are still matched by SQL statement)._\n")
+    # statements: sql_stmt.tables is a JSON array of names as written
+    pats = [f'%"{base}"%', f'%.{base}"%']
+    rows = conn.execute("""SELECT s.stmt_type, s.tables, s.cursor_name, s.is_dynamic, s.start_line, p.program_id, p.id AS pid
+                           FROM sql_stmt s JOIN program p ON p.id=s.program_id
+                           WHERE s.tables LIKE ? OR s.tables LIKE ? ORDER BY p.program_id, s.start_line""", pats).fetchall()
+    if qual:
+        rows = [r for r in rows if any(t.upper() in (n, base) for t in _jl(r["tables"]))]
+    agg: Dict[str, Dict[str, List[str]]] = defaultdict(lambda: defaultdict(list))
+    for r in rows:
+        agg[r["program_id"]][r["stmt_type"]].append(cite(conn, r["pid"], r["start_line"]))
+    out.append(f"\n### Programs and verbs ({len(agg)} programs, {len(rows)} statements)\n")
+    trows = []
+    for pgm in sorted(agg):
+        crud = "".join(c for c, verbs in (("C", ("INSERT",)), ("R", ("SELECT", "DECLARE", "FETCH", "OPEN")),
+                                           ("U", ("UPDATE", "MERGE")), ("D", ("DELETE",)))
+                       if any(v in agg[pgm] for v in verbs))
+        trows.append((pgm, crud, ", ".join(f"{v} x{len(c)} @{c[0]}" for v, c in sorted(agg[pgm].items()))))
+    out.append(table(["program", "CRUD", "statements (first cite each)"], trows))
+    dyn = conn.execute("""SELECT COUNT(*) FROM sql_stmt s WHERE s.is_dynamic=1 AND (s.tables LIKE ? OR s.tables LIKE ?)""",
+                       pats).fetchone()[0]
+    dyn_all = conn.execute("SELECT COUNT(*) FROM sql_stmt WHERE is_dynamic=1").fetchone()[0]
+    if dyn_all:
+        out.append(f"\n**{dyn_all} dynamic SQL statement(s) in the estate** ({dyn} naming this table statically) - "
+                   f"their tables are not knowable from source.\n")
+    # column-level detail
+    cols = conn.execute("""SELECT c.col, c.mode, COUNT(*) AS n, COUNT(DISTINCT c.program_id) AS pgms FROM sql_col_ref c
+                           WHERE UPPER(c.tbl)=? OR UPPER(c.tbl) LIKE ? GROUP BY c.col, c.mode ORDER BY c.col, c.mode""",
+                        (base, f"%.{base}")).fetchall()
+    if cols:
+        out.append("\n### Columns referenced (see `column TABLE.COL` for the field lineage)\n")
+        out.append(table(["column", "mode", "refs", "programs"], [(c["col"], c["mode"], c["n"], c["pgms"]) for c in cols]))
+    plans = conn.execute("SELECT DISTINCT tran_code, detail FROM transaction_def WHERE detail LIKE '%DB2 plan%'").fetchall()
+    if plans:
+        out.append("\n- CICS transactions with a DB2 plan (from DB2ENTRY/DB2TRAN): "
+                   + "; ".join(f"{p['tran_code']}: {re.search(r'DB2 plan ([A-Z0-9@#$]+)', p['detail']).group(1)}"
+                               for p in plans if re.search(r'DB2 plan ([A-Z0-9@#$]+)', p['detail'] or ''))[:400] + "\n")
+    out.append("\n> Views, aliases and BIND QUALIFIER are not resolved: a program reading a VIEW over this table is "
+               "not listed. Batch LOAD/UNLOAD steps are not yet joined (see ROADMAP).\n")
+    return "".join(out)
+
+
+def cmd_dbd(conn: sqlite3.Connection, name: str) -> str:
+    """An IMS database: segments and fields, the PSBs/PCBs that address it
+    (with PROCOPT), the programs whose DL/I calls resolve to it, the utility
+    jobs that copy/unload/reload it, and its online definition."""
+    n = name.upper()
+    dbds = conn.execute("""SELECT d.*, m.name AS mem, m.path FROM ims_dbd d JOIN member m ON m.id=d.member_id
+                           WHERE UPPER(d.name)=?""", (n,)).fetchall()
+    out = [f"# IMS database {n}\n"]
+    if not dbds:
+        out.append("**NOT FOUND** - no DBD with this name is indexed.\n")
+    for d in dbds:
+        out.append(f"\n## DBD {d['name']}  ACCESS={d['access'] or '?'}  `{d['mem']}:{d['line']}`"
+                   + (f"  DD {d['dd1']}" + (f"/{d['dd2']}" if d['dd2'] else "") if d["dd1"] else "") + "\n")
+        segs = conn.execute("SELECT * FROM ims_segment WHERE dbd_id=? ORDER BY id", (d["id"],)).fetchall()
+        srows = []
+        for s in segs:
+            flds = conn.execute("SELECT name, start, bytes, is_seq FROM ims_field WHERE segment_id=? ORDER BY start", (s["id"],)).fetchall()
+            srows.append((s["name"], s["parent"] or "(root)", s["bytes"], s["seq_field"] or "",
+                          ", ".join(f"{f['name']}@{f['start']}/{f['bytes']}" + ("*" if f["is_seq"] else "") for f in flds)[:120]))
+        out.append(table(["segment", "parent", "bytes", "seq field", "fields (name@start/len, *=SEQ)"], srows))
+        xd = conn.execute("SELECT name, segment, srch FROM ims_xdfld WHERE dbd_id=?", (d["id"],)).fetchall()
+        if xd:
+            out.append("- secondary index search fields (XDFLD): " + "; ".join(
+                f"{x['name']} on {x['segment']} from {', '.join(_jl(x['srch']))}" for x in xd) + "\n")
+    pcbs = conn.execute("""SELECT ps.name AS psb, pc.ordinal, pc.procopt, pc.procseq, pc.list_no, pc.sensegs, m.name AS mem, pc.line
+                           FROM ims_pcb pc JOIN ims_psb ps ON ps.id=pc.psb_id JOIN member m ON m.id=ps.member_id
+                           WHERE UPPER(pc.dbd_name)=? ORDER BY ps.name, pc.ordinal""", (n,)).fetchall()
+    if pcbs:
+        out.append("\n### PSBs / PCBs addressing it\n")
+        out.append(table(["PSB", "PCB #", "PROCOPT", "PROCSEQ", "LIST", "sensitive segments", "cite"],
+                         [(p["psb"], p["ordinal"], p["procopt"] or "", p["procseq"] or "", "NO" if p["list_no"] else "",
+                           ", ".join(_jl(p["sensegs"]))[:60], f"{p['mem']}:{p['line']}") for p in pcbs]))
+    calls = conn.execute("""SELECT p.program_id, p.id AS pid, d.func, d.procopt, d.psb_name, d.io_area, d.line
+                            FROM dli_call d JOIN program p ON p.id=d.program_id WHERE UPPER(d.dbd_name)=?
+                            ORDER BY p.program_id, d.line""", (n,)).fetchall()
+    if calls:
+        out.append("\n### Programs whose DL/I calls resolve to it\n")
+        agg: Dict[str, List[sqlite3.Row]] = defaultdict(list)
+        for c in calls:
+            agg[c["program_id"]].append(c)
+        out.append(table(["program", "PSB", "functions", "PROCOPT", "updates?", "first cite"],
+                         [(pg, cs[0]["psb_name"] or "", ", ".join(sorted({c["func"] or "?" for c in cs})),
+                           cs[0]["procopt"] or "",
+                           "YES" if any((c["func"] or "") in ("ISRT", "REPL", "DLET") for c in cs) else "no",
+                           cite(conn, cs[0]["pid"], cs[0]["line"])) for pg, cs in sorted(agg.items())]))
+    util = conn.execute("""SELECT j.job_name, s.step_name, s.effective_pgm, d.mode, s.line, s.from_proc, m.name AS mem
+                           FROM dd d JOIN step s ON s.id=d.step_id LEFT JOIN job j ON j.id=s.job_id
+                           LEFT JOIN member m ON m.id=j.member_id
+                           WHERE d.dd_name='*DBD*' AND UPPER(d.dsn_resolved)=?""", (n,)).fetchall()
+    if util:
+        out.append("\n### Utility jobs (image copy / unload / reload)\n")
+        out.append(table(["job", "step", "utility", "reads/writes", "cite"],
+                         [(u["job_name"] or "(PROC)", u["step_name"], u["effective_pgm"], u["mode"],
+                           f"{u['from_proc'] or u['mem']}:{u['line']}") for u in util]))
+    onl = conn.execute("SELECT dbd, access, line FROM ims_online_db WHERE UPPER(dbd)=?", (n,)).fetchall()
+    if onl:
+        out.append("- online (stage-1 DATABASE): " + ", ".join(f"ACCESS={o['access'] or '?'}" for o in onl) + "\n")
+    out.append("\n> A program is listed only when its PCB position resolved through an indexed PSB; "
+               "`program X` shows the mapping notes for the rest.\n")
+    return "".join(out)
+
+
+def cmd_segment(conn: sqlite3.Connection, name: str) -> str:
+    """Who touches an IMS segment: the DBDs holding it, the PCBs sensitive to
+    it, and the programs using those PCBs (with function and PROCOPT)."""
+    n = name.upper()
+    segs = conn.execute("""SELECT s.*, d.name AS dbd FROM ims_segment s JOIN ims_dbd d ON d.id=s.dbd_id
+                           WHERE UPPER(s.name)=?""", (n,)).fetchall()
+    out = [f"# IMS segment {n}\n"]
+    if not segs:
+        return out[0] + "\n**NOT FOUND** in any indexed DBD.\n"
+    out.append(table(["DBD", "parent", "bytes", "seq field"],
+                     [(s["dbd"], s["parent"] or "(root)", s["bytes"], s["seq_field"] or "") for s in segs]))
+    dbds = sorted({s["dbd"].upper() for s in segs})
+    q = ",".join("?" * len(dbds))
+    pcbs = conn.execute(f"""SELECT ps.name AS psb, pc.ordinal, pc.dbd_name, pc.procopt, pc.sensegs
+                            FROM ims_pcb pc JOIN ims_psb ps ON ps.id=pc.psb_id
+                            WHERE UPPER(pc.dbd_name) IN ({q}) AND pc.sensegs LIKE ?""", (*dbds, f'%"{n}"%')).fetchall()
+    if pcbs:
+        out.append("\n### PCBs sensitive to it\n")
+        out.append(table(["PSB", "PCB #", "DBD", "PROCOPT"],
+                         [(p["psb"], p["ordinal"], p["dbd_name"], p["procopt"] or "") for p in pcbs]))
+    keys = {(p["psb"].upper(), p["ordinal"]) for p in pcbs}
+    # EXEC DLI SEGMENT(X) names the segment even when the PCB position could
+    # not be resolved through a PSB.
+    calls = conn.execute(f"""SELECT p.program_id, p.id AS pid, d.func, d.procopt, d.psb_name, d.pcb_ordinal, d.ssa_args, d.line
+                             FROM dli_call d JOIN program p ON p.id=d.program_id
+                             WHERE UPPER(d.dbd_name) IN ({q}) OR d.ssa_args LIKE ? ORDER BY p.program_id, d.line""",
+                         (*dbds, f'%"{n}"%')).fetchall()
+    rows = []
+    for c in calls:
+        via_pcb = (c["psb_name"] or "").upper(), c["pcb_ordinal"]
+        named = n in [x.upper() for x in _jl(c["ssa_args"])]
+        if via_pcb in keys or named:
+            rows.append((c["program_id"], c["func"] or "?", c["procopt"] or "", c["psb_name"] or "",
+                         "SEGMENT() names it" if named else "PCB sensitive to it", cite(conn, c["pid"], c["line"])))
+    if rows:
+        out.append("\n### Programs (DL/I calls on a PCB sensitive to this segment)\n")
+        out.append(table(["program", "func", "PROCOPT", "PSB", "how", "cite"], rows))
+        out.append("> CBLTDLI calls name the segment inside the SSA data, not in the call: a call on a "
+                   "multi-segment PCB may touch a sibling segment instead. EXEC DLI SEGMENT() is exact.\n")
+    return "".join(out)
+
+
+def cmd_layout(conn: sqlite3.Connection, name: str, program: Optional[str] = None) -> str:
+    """The byte layout of a copybook / 01 record from the parser's numbers:
+    offsets, lengths, PIC, usage, OCCURS/ODO/REDEFINES, 88 values, record
+    length. This is what test data and interface contracts are built from -
+    never from the model's own COMP-3 arithmetic."""
+    n = name.upper()
+    out = [f"# Layout {n}" + (f" (as seen in {program.upper()})" if program else "") + "\n"]
+    def top_of(fid: int) -> sqlite3.Row:
+        r = conn.execute("SELECT * FROM field WHERE id=?", (fid,)).fetchone()
+        while r and r["parent_id"]:
+            r = conn.execute("SELECT * FROM field WHERE id=?", (r["parent_id"],)).fetchone()
+        return r
+
+    members: List[Tuple[int, sqlite3.Row]] = []
+    if program:
+        progs = programs_named(conn, program)
+        if not progs:
+            return out[0] + f"\nprogram {program} not found\n"
+        mid, pid = progs[0]["member_id"], progs[0]["id"]
+        roots = conn.execute("SELECT * FROM field WHERE member_id=? AND parent_id IS NULL AND UPPER(name)=?", (mid, n)).fetchall()
+        members = [(mid, r) for r in roots]
+        if not members:
+            # COPY X REPLACING: the renamed fields live in the PROGRAM's rows
+            # under the 01 that holds the COPY - find it through the aliases.
+            renamed = [r["new_name"].upper() for r in conn.execute(
+                "SELECT new_name FROM field_alias WHERE program_id=? AND (UPPER(copybook)=? OR UPPER(orig_name)=?)",
+                (pid, n, n))]
+            seen_ids = set()
+            for nm in renamed:
+                fr = conn.execute("SELECT id FROM field WHERE member_id=? AND UPPER(name)=?", (mid, nm)).fetchone()
+                if fr:
+                    top = top_of(fr["id"])
+                    if top and top["id"] not in seen_ids:
+                        seen_ids.add(top["id"])
+                        members.append((mid, top))
+        if not members:
+            # a copybook the program includes without REPLACING: its own rows
+            cb = conn.execute("""SELECT resolved_member_id FROM copy_use WHERE member_id=? AND UPPER(copybook)=?
+                                 AND resolved_member_id IS NOT NULL""", (mid, n)).fetchone()
+            if cb:
+                members = [(cb[0], r) for r in conn.execute(
+                    "SELECT * FROM field WHERE member_id=? AND parent_id IS NULL ORDER BY id", (cb[0],)).fetchall()]
+    else:
+        for m in conn.execute("SELECT id, name, path FROM member WHERE UPPER(name)=? AND kind IN ('copybook','cobol')", (n,)):
+            for r in conn.execute("SELECT * FROM field WHERE member_id=? AND parent_id IS NULL ORDER BY id", (m["id"],)):
+                members.append((m["id"], r))
+        if not members:
+            for r in conn.execute("""SELECT f.* FROM field f WHERE UPPER(f.name)=? AND f.parent_id IS NULL""", (n,)):
+                members.append((r["member_id"], r))
+    if not members:
+        return out[0] + "\n**NOT FOUND** - no copybook member or 01 level with this name is indexed.\n"
+
+    # A copybook FRAGMENT (a run of 05s with the 01 in the including program)
+    # is one layout, not one table per 05.
+    groups: List[Tuple[int, List[sqlite3.Row]]] = []
+    for mid, root in members:
+        if groups and groups[-1][0] == mid and root["level"] > 1 and groups[-1][1][-1]["level"] > 1:
+            groups[-1][1].append(root)
+        else:
+            groups.append((mid, [root]))
+    for mid, roots in groups:
+        mem = conn.execute("SELECT name, path, kind FROM member WHERE id=?", (mid,)).fetchone()
+        root = roots[0]
+        title = root["name"] if len(roots) == 1 else f"(fragment: {len(roots)} top-level items, 01 is in the including program)"
+        out.append(f"\n## {title}  in `{mem['name']}` ({mem['kind']})  line {root['line']}\n")
+        out.append("```\n")
+        out.append(f"{'OFF':>6} {'LEN':>4} {'LVL':>3}  {'FIELD':<34} {'PIC':<16} {'USAGE':<8}\n")
+        out.append("-" * 82 + "\n")
+        warn = []
+
+        def walk(f, depth):
+            ind = "  " * depth
+            occ = f"  OCCURS {f['occurs_max']}" if f["occurs_max"] else ""
+            odo = f" DEPENDING ON {f['odo_on']}" if f["odo_on"] else ""
+            red = f"  REDEFINES {f['redefines']}" if f["redefines"] else ""
+            nm = f["name"]
+            out.append(f"{f['offset']:>6} {f['length']:>4} {f['level']:>3}  {(ind + nm):<34} {(f['pic'] or ''):<16} "
+                       f"{(f['usage'] or ''):<8}{occ}{odo}{red}\n")
+            if f["odo_on"]:
+                warn.append(f"{nm}: OCCURS DEPENDING ON {f['odo_on']} - offsets after it hold for the MAXIMUM "
+                            f"({f['occurs_max']}) occurrences only")
+            for c in conn.execute("SELECT name, values_lit FROM cond88 WHERE field_id=? ORDER BY id", (f["id"],)):
+                out.append(f"{'':>6} {'':>4}  88  {(ind + '  ' + c['name']):<34} VALUE {' '.join(_jl(c['values_lit']))}\n")
+            for c in conn.execute("SELECT * FROM field WHERE parent_id=? ORDER BY id", (f["id"],)):
+                walk(c, depth + 1)
+
+        for r in roots:
+            walk(r, 0)
+        total = max(r["offset"] + r["length"] for r in roots)
+        out.append("-" * 82 + "\n")
+        out.append(f"record length: {total} bytes (VB files: +4 for the RDW; the LRECL in the JCL/IDCAMS must agree)\n")
+        out.append("```\n")
+        for w in warn:
+            out.append(f"- {w}\n")
+        aliases = conn.execute("SELECT p.program_id, a.new_name, a.orig_name FROM field_alias a JOIN program p ON p.id=a.program_id "
+                               "WHERE UPPER(a.copybook)=? LIMIT 12", (mem["name"].upper(),)).fetchall()
+        if aliases:
+            out.append("- REPLACING in: " + "; ".join(f"{a['program_id']} ({a['orig_name']} -> {a['new_name']})" for a in aliases[:6]) + "\n")
+    out.append("\n> Offsets are 0-based bytes from the parser (COMP-3 packed, COMP 2/4/8, SIGN SEPARATE +1); SYNC "
+               "alignment is NOT modelled. Cite as `[[MEMBER line \"05  FIELD-NAME\"]]`.\n")
+    return "".join(out)
+
+
+# --------------------------------------------------------------------------
 # main
 # --------------------------------------------------------------------------
 
@@ -1632,8 +2050,12 @@ def _main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Query atlas.db (markdown out, citations in).")
     ap.add_argument("--db", default="atlas.db")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for c in ("program", "job", "field", "dataset", "copybook", "values", "screen", "transaction", "column"):
+    for c in ("program", "job", "field", "dataset", "copybook", "values", "screen", "transaction", "column",
+              "table", "dbd", "segment"):
         sub.add_parser(c).add_argument("name")
+    s = sub.add_parser("layout")
+    s.add_argument("name")
+    s.add_argument("--program", help="the 01 as this program sees it (REPLACING applied)")
     s = sub.add_parser("literal")
     s.add_argument("name")
     s.add_argument("--field", help="only uses on this field (common values like 3 or 'M' appear everywhere)")
@@ -1689,6 +2111,14 @@ def _main(argv: Optional[List[str]] = None) -> int:
             print(cmd_transaction(conn, a.name))
         elif a.cmd == "column":
             print(cmd_column(conn, a.name))
+        elif a.cmd == "table":
+            print(cmd_table(conn, a.name))
+        elif a.cmd == "dbd":
+            print(cmd_dbd(conn, a.name))
+        elif a.cmd == "segment":
+            print(cmd_segment(conn, a.name))
+        elif a.cmd == "layout":
+            print(cmd_layout(conn, a.name, a.program))
         elif a.cmd == "docs":
             print(cmd_docs(conn, a.term))
         elif a.cmd == "images":

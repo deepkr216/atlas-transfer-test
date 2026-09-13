@@ -61,6 +61,9 @@ class Expansion:
     warnings: List[str] = dc_field(default_factory=list)
     copies: List[Tuple[str, Optional[str], Optional[str], int, Optional[int]]] = dc_field(default_factory=list)
     # (copybook, library, replacing_text, line_in_including_member, resolved_member_id)
+    # REPLACING renamed a copybook field: (copybook, name as stored, name in this program, copybook line).
+    # Without this, every reference to LK-POLICY-STATUS is invisible to `field PM-POLICY-STATUS`.
+    aliases: List[Tuple[str, str, str, int]] = dc_field(default_factory=list)
 
     def origin(self, exp_line: int) -> Tuple[Optional[int], Optional[int], int]:
         """(src_member, src_line, depth) for an expanded line number."""
@@ -74,40 +77,83 @@ class Expansion:
 # REPLACING
 # --------------------------------------------------------------------------
 
-def parse_replacing(text: str) -> List[Tuple[str, str]]:
-    """'==:PFX:== BY ==WS==, OLD BY NEW' -> [(':PFX:', 'WS'), ('OLD', 'NEW')]"""
-    pairs: List[Tuple[str, str]] = []
+def parse_replacing(text: str) -> List[Tuple[str, ...]]:
+    """'==:PFX:== BY ==WS==, OLD BY NEW, LEADING ==PM-== BY ==LK-=='
+    -> [(':PFX:', 'WS'), ('OLD', 'NEW'), ('PM-', 'LK-', 'LEADING')]"""
+    pairs: List[Tuple[str, ...]] = []
     if not text:
         return pairs
     # Tokenise into pseudo-text or words, then pair around BY.
     toks = re.findall(r"==.*?==|'[^']*'|\"[^\"]*\"|[^\s,]+", text, re.S)
     i = 0
+    mode = ""
     while i + 2 < len(toks):
         a, by, b = toks[i], toks[i + 1], toks[i + 2]
+        if a.upper() in ("LEADING", "TRAILING"):
+            mode = a.upper()
+            i += 1
+            continue
         if by.upper() == "BY":
-            pairs.append((_strip_pseudo(a), _strip_pseudo(b)))
+            # ==PM-== BY ==LK-== is PSEUDO-TEXT: it matches the START of
+            # PM-POLICY-NO (the prefix-rename idiom). A bare word matches a
+            # whole word only. The distinction must survive the parse.
+            src, src_pseudo = _strip_pseudo(a)
+            dst, _d = _strip_pseudo(b)
+            pairs.append((src, dst, mode or ("PSEUDO" if src_pseudo else "")) if (mode or src_pseudo) else (src, dst))
+            mode = ""
             i += 3
         else:
             i += 1
     return pairs
 
 
-def _strip_pseudo(t: str) -> str:
+def _strip_pseudo(t: str) -> Tuple[str, bool]:
     m = _PSEUDO.fullmatch(t.strip())
-    return m.group(1).strip() if m else t.strip()
+    return (m.group(1).strip(), True) if m else (t.strip(), False)
 
 
-def apply_replacing(code: str, pairs: Sequence[Tuple[str, str]]) -> str:
+_LIT_MASK = re.compile(r"'(?:[^']|'')*'|\"(?:[^\"]|\"\")*\"")
+
+
+def _mask_literals(code: str) -> str:
+    """Same length, alphanumeric literals blanked: a COPY word inside
+    DISPLAY 'COPY FAILED' is text, not a statement."""
+    return _LIT_MASK.sub(lambda m: " " * len(m.group(0)), code)
+
+
+def apply_replacing(code: str, pairs: Sequence[Tuple[str, ...]]) -> str:
     out = code
-    for src, dst in pairs:
+    for pair in pairs:
+        src, dst = pair[0], pair[1]
+        mode = pair[2] if len(pair) > 2 else ""
         if not src:
             continue
-        if re.fullmatch(r"[A-Z0-9][A-Z0-9\-_]*", src, re.I):
-            out = re.sub(B + re.escape(src) + E, dst.replace("\\", "\\\\"), out, flags=re.I)
+        rep = dst.replace("\\", "\\\\")
+        if mode == "LEADING":
+            out = re.sub(B + re.escape(src) + r"(?=[A-Z0-9\-])", rep, out, flags=re.I)
+        elif mode == "TRAILING":
+            out = re.sub(r"(?<=[A-Z0-9\-])" + re.escape(src) + E, rep, out, flags=re.I)
+        elif re.fullmatch(r"\d+", src):
+            # `==01== BY ==05==` renumbers LEVELS: only the first word of an
+            # entry, never the 01 inside PIC X(01) or OCCURS 01 TIMES.
+            out = re.sub(r"^(\s*)" + re.escape(src) + E, r"\g<1>" + rep, out)
+        elif mode == "PSEUDO" or not re.fullmatch(r"[A-Z0-9][A-Z0-9\-_]*", src, re.I):
+            # Pseudo-text: character-string replacement (==PM-== renames the
+            # prefix of PM-POLICY-NO), case-insensitive, literals excluded.
+            masked = _mask_literals(out)
+            pieces, last = [], 0
+            for mm in re.finditer(re.escape(src), masked, flags=re.I):
+                pieces.append(out[last:mm.start()])
+                pieces.append(dst)
+                last = mm.end()
+            pieces.append(out[last:])
+            out = "".join(pieces)
         else:
-            # Pseudo-text: plain substring replacement, case-insensitive.
-            out = re.sub(re.escape(src), dst.replace("\\", "\\\\"), out, flags=re.I)
+            out = re.sub(B + re.escape(src) + E, rep, out, flags=re.I)
     return out
+
+
+_LEVEL_NAME = re.compile(r"^\s*\d{1,2}\s+([A-Z0-9][A-Z0-9\-_]*)", re.I)
 
 
 # --------------------------------------------------------------------------
@@ -116,11 +162,12 @@ def apply_replacing(code: str, pairs: Sequence[Tuple[str, str]]) -> str:
 
 def expand(lines: Sequence[Line], member_id: int, resolver: Resolver,
            depth: int = 0, stack: Tuple[str, ...] = (),
-           replacing: Sequence[Tuple[str, str]] = ()) -> Expansion:
+           replacing: Sequence[Tuple[str, ...]] = ()) -> Expansion:
     out: List[Line] = []
     runs: List[Run] = []
     warnings: List[str] = []
     copies: List[Tuple[str, Optional[str], Optional[str], int, Optional[int]]] = []
+    aliases: List[Tuple[str, str, str, int]] = []
 
     def emit(src_line: Line, code: str, src_member: int, src_no: int, d: int,
              indicator: Optional[str] = None, via: Optional[str] = None) -> None:
@@ -142,14 +189,19 @@ def expand(lines: Sequence[Line], member_id: int, resolver: Resolver,
     while i < n:
         ln = lines[i]
         code = apply_replacing(ln.code, replacing) if replacing else ln.code
+        if replacing and code != ln.code and not ln.is_comment:
+            mo, mn = _LEVEL_NAME.match(ln.code), _LEVEL_NAME.match(code)
+            if mo and mn and mo.group(1).upper() != mn.group(1).upper():
+                aliases.append((stack[-1] if stack else "", mo.group(1).upper(), mn.group(1).upper(), ln.no))
 
         if ln.is_comment or not code.strip():
             emit(ln, code, member_id, ln.no, depth)
             i += 1
             continue
 
-        m = _COPY_START.search(code) if _COPY_START.search(code.upper()) else None
-        msql = _SQL_INCLUDE_START.search(code)
+        masked = _mask_literals(code)
+        m = _COPY_START.search(masked)
+        msql = _SQL_INCLUDE_START.search(masked)
         if not m and not msql:
             emit(ln, code, member_id, ln.no, depth)
             i += 1
@@ -213,6 +265,7 @@ def expand(lines: Sequence[Line], member_id: int, resolver: Resolver,
         sub = expand(cb_lines, cb_member, resolver, depth + 1, stack + (name,), inner_pairs)
         warnings.extend(f"(in COPY {name}) {w}" for w in sub.warnings)
         copies.extend(sub.copies)
+        aliases.extend(sub.aliases)
         base = len(out)
         for r in sub.runs:
             runs.append(Run(exp_start=base + r.exp_start, exp_end=base + r.exp_end,
@@ -224,7 +277,7 @@ def expand(lines: Sequence[Line], member_id: int, resolver: Resolver,
                             is_debug=sl.is_debug, is_blank=sl.is_blank))
         i = j + 1
 
-    return Expansion(lines=out, runs=runs, warnings=warnings, copies=copies)
+    return Expansion(lines=out, runs=runs, warnings=warnings, copies=copies, aliases=aliases)
 
 
 def expanded_text(exp: Expansion) -> str:

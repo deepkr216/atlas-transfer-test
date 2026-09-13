@@ -25,6 +25,10 @@ python -m atlas.query --db atlas.db messages <PATTERN>        # message texts na
 python -m atlas.query --db atlas.db screen   <MAP|MID|MOD>    # screen fields, defaults, validating programs
 python -m atlas.query --db atlas.db transaction <CODE|PGM>    # CICS/IMS routing: transaction <-> program
 python -m atlas.query --db atlas.db column   <TABLE.COL>      # DB2 column: written from / read into which fields
+python -m atlas.query --db atlas.db table    <TABLE>          # CRUD per program, declared columns, cursors, dynamic SQL
+python -m atlas.query --db atlas.db dbd      <DBD>            # IMS database: segments/fields, PSBs+PROCOPT, programs, utilities
+python -m atlas.query --db atlas.db segment  <SEGMENT>        # who reads/updates an IMS segment
+python -m atlas.query --db atlas.db layout   <COPYBOOK> [--program PGM]  # byte layout for test data / contracts
 python -m atlas.query --db atlas.db docs     <TERM>           # documents (and OCR'd pictures) mentioning it
 python -m atlas.query --db atlas.db images   [DOC]            # pictures inside documents, read or not
 ```

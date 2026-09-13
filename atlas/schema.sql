@@ -89,7 +89,8 @@ CREATE TABLE IF NOT EXISTS perform_edge (
     from_para   TEXT,
     to_para     TEXT NOT NULL,
     thru_para   TEXT,                     -- PERFORM A THRU B
-    line        INTEGER
+    line        INTEGER,
+    kind        TEXT DEFAULT 'perform'    -- perform|goto|goto_depending|alter|fallthrough|sort_proc
 );
 
 -- CALL: the single most important cross-program edge, and the one most often
@@ -267,7 +268,37 @@ CREATE TABLE IF NOT EXISTS ims_dbd (
     id          INTEGER PRIMARY KEY,
     member_id   INTEGER NOT NULL REFERENCES member(id) ON DELETE CASCADE,
     name        TEXT NOT NULL,
-    access      TEXT,                     -- HDAM|HIDAM|DEDB|INDEX|LOGICAL...
+    access      TEXT,                     -- HDAM|HIDAM|DEDB|INDEX|LOGICAL|GSAM...
+    line        INTEGER,
+    dd1         TEXT,                     -- DATASET DD1= : the JCL DD (GSAM: the file the program writes/reads)
+    dd2         TEXT
+);
+
+CREATE TABLE IF NOT EXISTS ims_field (
+    id          INTEGER PRIMARY KEY,
+    segment_id  INTEGER NOT NULL REFERENCES ims_segment(id) ON DELETE CASCADE,
+    name        TEXT NOT NULL,
+    start       INTEGER,                  -- 1-based byte in the segment
+    bytes       INTEGER,
+    is_seq      INTEGER DEFAULT 0,
+    line        INTEGER
+);
+CREATE INDEX IF NOT EXISTS ix_ims_field_name ON ims_field(name);
+
+CREATE TABLE IF NOT EXISTS ims_xdfld (
+    id          INTEGER PRIMARY KEY,
+    dbd_id      INTEGER NOT NULL REFERENCES ims_dbd(id) ON DELETE CASCADE,
+    name        TEXT NOT NULL,            -- secondary index search field
+    segment     TEXT,
+    srch        TEXT,                     -- JSON array of source fields
+    line        INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS ims_online_db (
+    id          INTEGER PRIMARY KEY,
+    member_id   INTEGER NOT NULL REFERENCES member(id) ON DELETE CASCADE,
+    dbd         TEXT NOT NULL,            -- stage-1 DATABASE DBD=
+    access      TEXT,                     -- UP|RO|RD|EX
     line        INTEGER
 );
 
@@ -309,7 +340,9 @@ CREATE TABLE IF NOT EXISTS ims_pcb (
     procopt     TEXT,                     -- G|GO|I|R|D|A ... read vs update intent
     keylen      INTEGER,
     sensegs     TEXT,                     -- JSON array
-    line        INTEGER
+    line        INTEGER,
+    list_no     INTEGER DEFAULT 0,        -- LIST=NO: not in the program's PCB address list
+    procseq     TEXT                      -- PROCSEQ=: accessed through this secondary index
 );
 
 CREATE TABLE IF NOT EXISTS dli_call (
@@ -318,10 +351,17 @@ CREATE TABLE IF NOT EXISTS dli_call (
     interface   TEXT,                     -- CBLTDLI|AIBTDLI|EXEC DLI
     func        TEXT,                     -- GU|GN|GHU|GNP|ISRT|REPL|DLET|CHKP|XRST|ROLB
     pcb_arg     TEXT,                     -- the PCB variable as written
-    pcb_ordinal INTEGER,                  -- resolved position, NULL if unresolved
+    pcb_ordinal INTEGER,                  -- resolved PCB number in the PSB, NULL if unresolved
     ssa_args    TEXT,                     -- JSON array
     io_area     TEXT,
-    line        INTEGER
+    line        INTEGER,
+    pcb_index   INTEGER,                  -- EXEC DLI USING PCB(n)
+    resolution  TEXT,                     -- how the function was known: literal|value_clause|parmcount|unresolved
+    dest        TEXT,                     -- CHNG destination (message switch target)
+    psb_name    TEXT,                     -- PSB the position was resolved through
+    dbd_name    TEXT,                     -- the database the PCB addresses (after resolution)
+    procopt     TEXT,                     -- its PROCOPT: read vs update intent
+    pcb_source  TEXT                      -- how (or why not) the PCB was resolved
 );
 
 -- ---------------------------------------------------------------- JCL / PROC
@@ -514,6 +554,68 @@ CREATE TABLE IF NOT EXISTS cics_file (
     group_name  TEXT,
     line        INTEGER
 );
+
+-- Every EXEC CICS command that names a resource: the online call graph
+-- (START/RETURN TRANSID), the program<->map edge (SEND/RECEIVE MAP), the
+-- queues that carry data between programs and to batch (WRITEQ/READQ TD/TS).
+CREATE TABLE IF NOT EXISTS cics_cmd (
+    id            INTEGER PRIMARY KEY,
+    program_id    INTEGER NOT NULL REFERENCES program(id) ON DELETE CASCADE,
+    verb          TEXT,                   -- SEND|RECEIVE|START|RETURN|WRITEQ|READQ|LINK|PUT|...
+    resource_kind TEXT,                   -- map|transid|tdq|tsq|container|webservice|program|file|web
+    resource      TEXT,                   -- MAPSET.MAP | tran code | queue | ...
+    direction     TEXT,                   -- in|out|delete|NULL
+    line          INTEGER
+);
+CREATE INDEX IF NOT EXISTS ix_cics_cmd_res ON cics_cmd(resource_kind, resource);
+
+-- Every CSD resource block, whatever its type (TDQUEUE, DB2ENTRY, URIMAP...).
+CREATE TABLE IF NOT EXISTS cics_resource (
+    id          INTEGER PRIMARY KEY,
+    member_id   INTEGER REFERENCES member(id) ON DELETE CASCADE,
+    type        TEXT NOT NULL,
+    name        TEXT NOT NULL,
+    group_name  TEXT,
+    attrs       TEXT,                     -- JSON object of the block's attributes
+    line        INTEGER
+);
+CREATE INDEX IF NOT EXISTS ix_cics_resource ON cics_resource(type, name);
+
+-- Columns of a DB2 table as declared (DCLGEN DECLARE TABLE, DDL, catalog):
+-- the positional list behind `SELECT * INTO :DCLPOLICY`.
+CREATE TABLE IF NOT EXISTS db2_column (
+    id          INTEGER PRIMARY KEY,
+    object_id   INTEGER NOT NULL REFERENCES db2_object(id) ON DELETE CASCADE,
+    ordinal     INTEGER,
+    name        TEXT NOT NULL,
+    type        TEXT,
+    check_text  TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_db2_column ON db2_column(name);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_db2_object ON db2_object(kind, name, COALESCE(qualifier, ''));
+
+-- ENTRY 'name' USING ...: CALL 'name' reaches this program.
+CREATE TABLE IF NOT EXISTS program_alias (
+    id            INTEGER PRIMARY KEY,
+    program_id    INTEGER NOT NULL REFERENCES program(id) ON DELETE CASCADE,
+    alias         TEXT NOT NULL,
+    linkage_using TEXT,                   -- JSON array, positional
+    line          INTEGER
+);
+CREATE INDEX IF NOT EXISTS ix_program_alias ON program_alias(alias);
+
+-- COPY ... REPLACING renamed a copybook field inside this program:
+-- `field PM-POLICY-STATUS` must find the program's LK-POLICY-STATUS references.
+CREATE TABLE IF NOT EXISTS field_alias (
+    id          INTEGER PRIMARY KEY,
+    program_id  INTEGER NOT NULL REFERENCES program(id) ON DELETE CASCADE,
+    copybook    TEXT,
+    orig_name   TEXT NOT NULL,            -- as stored in the copybook
+    new_name    TEXT NOT NULL,            -- as the compiler sees it in this program
+    line        INTEGER                   -- copybook line
+);
+CREATE INDEX IF NOT EXISTS ix_field_alias_orig ON field_alias(orig_name);
+CREATE INDEX IF NOT EXISTS ix_field_alias_new ON field_alias(new_name);
 CREATE INDEX IF NOT EXISTS ix_cicsfile_name ON cics_file(name);
 
 CREATE TABLE IF NOT EXISTS interface_edge (

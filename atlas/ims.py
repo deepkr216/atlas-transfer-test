@@ -133,17 +133,36 @@ class DbdFacts:
     lchild: List[Tuple[str, str, str, int]] = dc_field(default_factory=list)   # (seg, dbd, in_seg, line)
     xdfld: List[Tuple[str, str, List[str], int]] = dc_field(default_factory=list)  # (name, seg, srch, line)
     warnings: List[str] = dc_field(default_factory=list)
+    dd1: Optional[str] = None      # DATASET DD1= : for GSAM, the JCL DD the program writes/reads
+    dd2: Optional[str] = None
+    line: int = 0
 
 
 def parse_dbd(text: str) -> DbdFacts:
+    """The first DBD in the member (a member normally holds one)."""
+    return parse_dbd_all(text)[0]
+
+
+def parse_dbd_all(text: str) -> List[DbdFacts]:
+    """One DbdFacts per DBD macro. A member holding two DBDs must not keep
+    the last name with the first segments."""
+    out: List[DbdFacts] = []
     f = DbdFacts()
     cur: Optional[Segment] = None
     for st in parse_macros(text):
         kw = _kw(st.operands)
         if st.op == "DBD":
+            if f.name or f.segments:
+                out.append(f)
+                f = DbdFacts()
+                cur = None
             f.name = (kw.get("NAME") or st.label or "").upper() or None
             acc = _list(kw.get("ACCESS"))
             f.access = acc[0] if acc else None
+            f.line = st.start
+        elif st.op == "DATASET":
+            f.dd1 = (kw.get("DD1") or "").upper() or f.dd1
+            f.dd2 = (kw.get("DD2") or "").upper() or f.dd2
         elif st.op == "SEGM":
             parent = _list(kw.get("PARENT"))
             b = _list(kw.get("BYTES"))
@@ -178,9 +197,11 @@ def parse_dbd(text: str) -> DbdFacts:
             f.xdfld.append(((kw.get("NAME") or "").upper(),
                             (kw.get("SEGMENT") or (cur.name if cur else "")).upper(),
                             _list(kw.get("SRCH")), st.start))
-    if not f.name:
-        f.warnings.append("no DBD NAME= found")
-    return f
+    out.append(f)
+    for d in out:
+        if not d.name:
+            d.warnings.append("no DBD NAME= found")
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -197,6 +218,8 @@ class Pcb:
     name: Optional[str]            # label or NAME=/PCBNAME= - used by AIBTDLI
     sensegs: List[Tuple[str, Optional[str], Optional[str]]] = dc_field(default_factory=list)
     line: int = 0
+    list_no: bool = False          # LIST=NO: not in the PCB address list the program receives
+    procseq: Optional[str] = None  # PROCSEQ=: the database is accessed through this secondary index
 
 
 @dataclass
@@ -223,7 +246,9 @@ def parse_psb(text: str, fallback_name: Optional[str] = None) -> PsbFacts:
                       procopt=(kw.get("PROCOPT") or "").upper() or None,
                       keylen=_int(kw.get("KEYLEN")),
                       name=(kw.get("PCBNAME") or kw.get("NAME") or st.label or "").upper() or None,
-                      line=st.start)
+                      line=st.start,
+                      list_no=(kw.get("LIST") or "").upper() == "NO",
+                      procseq=(kw.get("PROCSEQ") or "").upper() or None)
             f.pcbs.append(cur)
         elif st.op == "SENSEG" and cur is not None:
             parent = _list(kw.get("PARENT"))
@@ -270,6 +295,8 @@ def program_positions(psb: PsbFacts, region_type: Optional[str] = None
         out.append((1, "IO-PCB", None))
         pos = 2
     for p in psb.pcbs:
+        if p.list_no:
+            continue                 # LIST=NO: addressed by name (AIB), not in the list
         out.append((pos, p.name or f"PCB{p.ordinal}", p))
         pos += 1
     return out
