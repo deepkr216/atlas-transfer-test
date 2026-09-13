@@ -307,9 +307,10 @@ class App(tk.Tk if tk else object):
         self._sync_cfg()
 
         def go():
-            ok, msg = fetch.check_zowe(self.cfg)
-            self._log(("OK   " if ok else "FAIL ") + msg)
-            self.after(0, lambda: self.v_status.set(msg))
+            ok, msg = fetch.check_zowe(self.cfg, log=self._log)
+            self._log("RESULT: OK - Fetch will work" if ok else "RESULT: FAIL - fix the stage above, then Check again")
+            last = msg.strip().splitlines()[-1] if msg.strip() else ""
+            self.after(0, lambda: self.v_status.set(("OK: " if ok else "FAIL: ") + last[:120]))
         self._run_bg(go)
 
     def sign_in(self) -> None:
