@@ -292,7 +292,7 @@ python -m atlas.query  --db atlas.db ambiguous       # duplicate member names</c
 <tbody>
 <tr><td>It crashed</td><td class="mono">atlas-crash.txt</td><td>Toolkit version, Python/OS, the exception, the toolkit's own code frames. Paths and dataset names already stripped; written automatically by <code>build</code> and <code>query</code>.</td></tr>
 <tr><td>Coverage looks wrong</td><td class="mono">python -m atlas.diag --db atlas.db --redact</td><td>Failure signatures grouped (three signatures are usually three bugs), unresolved counts, format-detection stats. Member names hashed.</td></tr>
-<tr><td>Wrong answer</td><td>Five lines + a tiny fake fixture</td><td><code>command / expected / got / pattern / fixture</code>. The fixture is 10–30 lines with invented names that reproduce the <em>shape</em> (the continuation, the level numbers, the PARM layout). It becomes a regression test before the fix — see <code>LESSONS.md</code>, 121 entries so far.</td></tr>
+<tr><td>Wrong answer</td><td>Five lines + a tiny fake fixture</td><td><code>command / expected / got / pattern / fixture</code>. The fixture is 10–30 lines with invented names that reproduce the <em>shape</em> (the continuation, the level numbers, the PARM layout). It becomes a regression test before the fix — see <code>LESSONS.md</code>, 126 entries so far.</td></tr>
 </tbody></table></div>
 <div class="callout crit"><strong>Never paste</strong>Real members, copybooks or JCL; dataset, library or job names that identify the company; anything from <code>out/expanded/</code> or <code>atlas.db</code>. The toolkit never sends anything anywhere; sharing is always your copy-paste.</div>
 

@@ -114,8 +114,12 @@ _SORT_USING = re.compile(B + r"(USING|GIVING)\s+((?:" + ID + r"\s*)+?)(?=\s*(?:$
                          re.IGNORECASE)
 _SECTION_HDR = re.compile(rf"^({ID})\s+SECTION(?:\s+\d{{1,2}})?\s*\.", re.IGNORECASE)
 
+# PERFORM X [OF/IN SECTION] [THRU Y [OF/IN SECTION]] - the qualifier matters
+# when the same paragraph name lives in two sections.
 _PERFORM = re.compile(
-    B + rf"PERFORM\s+({ID})(?:\s+(?:THRU|THROUGH)\s+({ID}))?", re.IGNORECASE)
+    B + rf"PERFORM\s+({ID})(?:\s+(?:OF|IN)\s+({ID}))?(?:\s+(?:THRU|THROUGH)\s+({ID})(?:\s+(?:OF|IN)\s+({ID}))?)?",
+    re.IGNORECASE)
+_QUALIFIED_TARGET = re.compile(rf"({ID})(?:\s+(?:OF|IN)\s+({ID}))?", re.IGNORECASE)
 
 # Single-word statements that end in a period and sit in Area A after a
 # paragraph header on the same line (`1000-EXIT.  EXIT.`). Without this list
@@ -1235,17 +1239,24 @@ def _extract_performs(f: ProgramFacts, st: LogicalLine, here: str) -> None:
     body = _EXEC_ANY.sub(lambda m: " " * len(m.group(0)), st.text)
     for m in _PERFORM.finditer(body):
         to = m.group(1).upper()
-        thru = m.group(2).upper() if m.group(2) else None
+        thru = m.group(3).upper() if m.group(3) else None
         # `PERFORM UNTIL`, `PERFORM VARYING`, `PERFORM n TIMES`,
         # `PERFORM WS-CNT TIMES` are inline - no edge to '3' or 'WS-CNT'.
         if to in ("UNTIL", "VARYING", "WITH", "TEST", "FOREVER"):
             continue
         if re.fullmatch(r"\d+", to) or re.match(r"\s+TIMES\b", body[m.end():], re.IGNORECASE):
             continue
+        # PERFORM WORK OF SUB-B: two paragraphs may share a name; the section
+        # travels with the target as "WORK OF SUB-B"
+        if m.group(2):
+            to = f"{to} OF {m.group(2).upper()}"
+        if thru and m.group(4):
+            thru = f"{thru} OF {m.group(4).upper()}"
         f.performs.append((here, to, thru, st.line_at(m.start()), "perform"))
     # GO TO is control flow too: a paragraph reached only by GO TO is not dead.
     for m in _GO_TO.finditer(body):
-        targets = [t.upper() for t in re.findall(ID, m.group(1), re.IGNORECASE)]
+        targets = [f"{a.upper()} OF {q.upper()}" if q else a.upper()
+                   for a, q in _QUALIFIED_TARGET.findall(m.group(1))]
         kind = "goto_depending" if m.group(2) else "goto"
         for t in targets:
             f.performs.append((here, t, None, st.line_at(m.start()), kind))
@@ -1267,8 +1278,9 @@ def _fallthrough_edges(f: ProgramFacts, last_stmt: Dict[str, str]) -> None:
     paras = [p for p in f.paragraphs if p.kind == "paragraph"]
     for a, b in zip(paras, paras[1:]):
         last = last_stmt.get(a.name, "")
-        if last and _TERMINAL.search(last) and not re.search(B + r"IF|WHEN|ELSE" + E, last, re.IGNORECASE):
-            continue
+        if last and _TERMINAL.search(last) and not re.search(B + r"IF|WHEN|ELSE" + E, last, re.IGNORECASE) \
+                and not re.search(B + r"DEPENDING" + E, last, re.IGNORECASE):
+            continue                                      # GO TO ... DEPENDING ON falls through out of range
         f.performs.append((a.name, b.name, None, a.end_line, "fallthrough"))
 
 

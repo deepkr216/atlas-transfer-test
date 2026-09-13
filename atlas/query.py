@@ -383,7 +383,7 @@ def cmd_program(conn: sqlite3.Connection, name: str) -> str:
         edges = conn.execute("SELECT to_para, thru_para, kind FROM perform_edge WHERE program_id=?", (pid,)).fetchall()
         reached: Dict[str, set] = defaultdict(set)
         for e in edges:
-            reached[e["to_para"]].add(e["kind"])
+            reached[e["to_para"].split(" OF ")[0]].add(e["kind"])
         names = [q["name"] for q in paras if q["kind"] == "paragraph"]
         for e in edges:
             if e["thru_para"] and e["to_para"] in names and e["thru_para"] in names:
@@ -2608,8 +2608,10 @@ def cmd_paragraph(conn: sqlite3.Connection, name: str, para: str) -> str:
     out = [f"# {p['program_id']} {row['name']} ({row['kind']}, expanded lines {s}-{e}, "
            f"{cite(conn, pid, s)} - {cite(conn, pid, e)})\n"]
     inbound = conn.execute("""SELECT from_para, kind, thru_para, line FROM perform_edge WHERE program_id=? AND
-                              (UPPER(to_para)=? OR UPPER(thru_para)=?) ORDER BY line""",
-                           (pid, row["name"].upper(), row["name"].upper())).fetchall()
+                              (UPPER(to_para)=? OR UPPER(thru_para)=? OR UPPER(to_para) LIKE ? OR UPPER(thru_para) LIKE ?)
+                              ORDER BY line""",
+                           (pid, row["name"].upper(), row["name"].upper(),
+                            row["name"].upper() + " OF %", row["name"].upper() + " OF %")).fetchall()
     # a THRU range that covers this paragraph reaches it too
     names = [q["name"] for q in conn.execute("SELECT name FROM paragraph WHERE program_id=? AND kind='paragraph' ORDER BY ordinal", (pid,))]
     thru = []
@@ -2746,6 +2748,10 @@ def _walk_block(conn: sqlite3.Connection, pid: int, pname: str, row: sqlite3.Row
     head = f"#### {ind}{title}  {reach}  [depth {depth}]  {span}\n"
     facts = _walk_facts(conn, pid, s, e)
     fl = f"{ind}- facts: {facts}\n" if facts else ""
+    first_txt = source_line(conn, m1, l1) if m1 and l1 is not None else ""
+    if d1 and first_txt and not first_txt.upper().startswith(row["name"].upper()):
+        fl += (f"{ind}- note: the copybook line reads `{first_txt}` - COPY REPLACING renames it to {row['name']} "
+               f"in this program; cite the copybook's own text\n")
     summ = head + fl                          # the span in the header is the `cite` range when source is omitted
     if not source:
         return summ, summ
@@ -2760,7 +2766,10 @@ def _walk_block(conn: sqlite3.Connection, pid: int, pname: str, row: sqlite3.Row
             if cur is not None or d:
                 body.append(f"------ {'from COPY ' + v + ' - ' if d and v else ''}cite as [[{m} line \"token\"]] ------\n")
             cur = m
-        body.append(f"{ln:6d} | {source_line_raw(conn, m, ln)}\n")
+        txt = source_line_raw(conn, m, ln)
+        if not txt:
+            continue                                    # a blank line: nothing to read, nothing to cite
+        body.append(f"{ln:6d} | {txt}\n")
         shown += 1
         if shown >= max_lines and x < e:
             body.append(f"   ... {e - x} more lines: `cite {m} {ln + 1}-{l2}`\n")
@@ -2923,19 +2932,37 @@ def cmd_walk(conn: sqlite3.Connection, name: str, start: Optional[str] = None, b
     paras = conn.execute("SELECT id, name, section, kind, start_line, end_line, ordinal FROM paragraph "
                          "WHERE program_id=? ORDER BY start_line, kind='paragraph'", (pid,)).fetchall()
     if not paras:
-        return f"# Walk {pname}\n\nno paragraphs indexed for this program (parse status: {p['parse_status']})\n"
-    by_name: Dict[str, sqlite3.Row] = {}
-    for r in paras:                      # a paragraph and a section may share a name: the paragraph wins
-        key = r["name"].upper()
-        if key not in by_name or (by_name[key]["kind"] == "section" and r["kind"] == "paragraph"):
-            by_name[key] = r
+        return (f"# Walk {pname}\n\nThe PROCEDURE DIVISION has no paragraphs or sections in the index (parse status: "
+                f"{p['parse_status']}). Read it with `cite {mname} <first>-<last>`; `program {pname}` lists its facts.\n")
+    by_name: Dict[str, List[sqlite3.Row]] = defaultdict(list)   # a name can live in several sections
+    for r in paras:
+        by_name[r["name"].upper()].append(r)
+    by_id: Dict[int, sqlite3.Row] = {r["id"]: r for r in paras}
     plain = [r for r in paras if r["kind"] == "paragraph"]
-    ordinal = {r["name"].upper(): i for i, r in enumerate(plain)}
+    ordinal = {r["id"]: i for i, r in enumerate(plain)}
     in_section: Dict[str, List[sqlite3.Row]] = defaultdict(list)
     for r in plain:
         if r["section"]:
             in_section[r["section"].upper()].append(r)
-    edges: Dict[str, List[sqlite3.Row]] = defaultdict(list)
+
+    def resolve(key: Optional[str], from_section: Optional[str] = None) -> Optional[sqlite3.Row]:
+        """A target as the parser wrote it: NAME, or NAME OF SECTION. A bare
+        name that exists in several sections prefers the caller's own
+        section, then a paragraph over a section, then the first in source."""
+        if not key:
+            return None
+        name, _sep, qual = key.upper().partition(" OF ")
+        cands = by_name.get(name.strip(), [])
+        if qual:
+            cands = [c for c in cands if (c["section"] or "").upper() == qual.strip()]
+        if not cands:
+            return None
+        if len(cands) > 1 and from_section:
+            same = [c for c in cands if (c["section"] or "").upper() == from_section.upper()]
+            cands = same or cands
+        return sorted(cands, key=lambda c: (c["kind"] != "paragraph", c["start_line"]))[0]
+
+    edges: Dict[str, List[sqlite3.Row]] = defaultdict(list)     # keyed by the parser's from_para name
     for e in conn.execute("SELECT from_para, to_para, thru_para, line, kind FROM perform_edge WHERE program_id=? "
                           "ORDER BY line, id", (pid,)):
         edges[(e["from_para"] or "").upper()].append(e)
@@ -2957,84 +2984,95 @@ def cmd_walk(conn: sqlite3.Connection, name: str, start: Optional[str] = None, b
         return m == mname and not depth and ln is not None and decl_lo <= ln <= decl_hi
 
     if start:
-        entry = by_name.get(start.upper())
+        entry = resolve(start)
         if entry is None:
             return f"# Walk {pname}\n\n**NOT FOUND** - no paragraph or section named {start.upper()} in {pname}.\n"
     else:
         entry = next((r for r in paras if not in_declaratives(r)), paras[0])
 
-    def thru_range(a: str, b: str) -> List[str]:
-        if a in ordinal and b in ordinal and ordinal[a] < ordinal[b]:
-            return [r["name"].upper() for r in plain[ordinal[a] + 1: ordinal[b] + 1]]
+    def thru_range(a: sqlite3.Row, b: sqlite3.Row) -> List[sqlite3.Row]:
+        ia, ib = ordinal.get(a["id"]), ordinal.get(b["id"])
+        if ia is not None and ib is not None and ia < ib:
+            return plain[ia + 1: ib + 1]
         return []
 
     def first_para_line(sec: sqlite3.Row) -> Optional[int]:
         ps = in_section.get(sec["name"].upper(), [])
         return ps[0]["start_line"] if ps else None
 
-    visited: Dict[str, int] = {}
-    blocks: List[Tuple[str, str, int]] = []           # (full, summary, depth)
+    visited: Dict[int, int] = {}                          # paragraph id -> order shown
+    blocks: List[Tuple[str, str, int]] = []               # (full, summary, depth)
     repeats: Dict[Tuple[str, str], int] = defaultdict(int)
-    noted: Dict[str, int] = defaultdict(int)
+    noted: Dict[int, int] = defaultdict(int)
     missing: Dict[Tuple[str, str], List[str]] = defaultdict(list)
 
-    def children_of(row: sqlite3.Row, key: str, depth: int, stop: Optional[str]) -> List[tuple]:
+    # a frame: (target key, how, depth, from name, via line, stop paragraph id, caller's section, explicit row id)
+    def children_of(row: sqlite3.Row, depth: int, stop: Optional[int], how: str) -> List[tuple]:
         out: List[tuple] = []
+        key = row["name"].upper()
+        from_sec = row["name"] if row["kind"] == "section" else row["section"]
         if row["kind"] == "section":
             secp = in_section.get(key, [])
-            last = secp[-1]["name"].upper() if secp else None
-            out += [(q["name"].upper(), "section", depth + 1, row["name"], None, last) for q in secp]
+            # a PERFORMed section returns after its last paragraph; a section
+            # entered by the entry, a GO TO or fall-through keeps flowing
+            last = secp[-1]["id"] if (secp and how in ("perform", "sort_proc", "range")) else stop
+            out += [(q["name"].upper(), "section", depth + 1, row["name"], None, last, from_sec, q["id"]) for q in secp]
         for e in edges.get(key, []):
             kind, tgt = e["kind"], e["to_para"].upper()
             thru = (e["thru_para"] or "").upper() or None
             if kind == "fallthrough":
-                if stop and key == stop:
-                    continue                          # the PERFORM returns here
-                out.append((tgt, "fallthrough", depth, row["name"], e["line"], stop))
+                if stop is not None and row["id"] == stop:
+                    continue                              # the PERFORM returns here
+                out.append((tgt, "fallthrough", depth, row["name"], e["line"], stop, from_sec, None))
             elif kind in ("perform", "sort_proc"):
-                out.append((tgt, kind, depth + 1, row["name"], e["line"], thru or tgt))
-                if thru:
-                    out += [(q, "range", depth + 1, row["name"], e["line"], thru) for q in thru_range(tgt, thru)]
-            else:                                     # goto / goto_depending / alter: no return, same return point
-                out.append((tgt, kind, depth + 1, row["name"], e["line"], stop))
+                t_row = resolve(tgt, from_sec)
+                th_row = resolve(thru, from_sec) if thru else None
+                end = th_row or t_row
+                out.append((tgt, kind, depth + 1, row["name"], e["line"], end["id"] if end else None, from_sec, None))
+                if t_row and th_row:
+                    out += [(q["name"].upper(), "range", depth + 1, row["name"], e["line"], end["id"], from_sec, q["id"])
+                            for q in thru_range(t_row, th_row)]
+            else:                                         # goto / goto_depending / alter: no return, same return point
+                out.append((tgt, kind, depth + 1, row["name"], e["line"], stop, from_sec, None))
         return out
 
     def run(root: sqlite3.Row, how0: str) -> None:
-        stack: List[tuple] = [(root["name"].upper(), how0, 0, None, None, None)]
+        stack: List[tuple] = [(root["name"].upper(), how0, 0, None, None, None, None, root["id"])]
         while stack:
-            key, how, depth, frm, via, stop = stack.pop()
-            row = by_name.get(key)
+            key, how, depth, frm, via, stop, from_sec, rid = stack.pop()
+            row = by_id.get(rid) if rid is not None else resolve(key, from_sec)
             if row is None:
                 missing[(key, how)].append(f"{frm or '?'} @{cite(conn, pid, via)}" if via else (frm or "?"))
                 continue
-            if key in visited:
+            if row["id"] in visited:
                 if how in _NOTED_REACH:
                     repeats[(row["name"], how)] += 1
-                    if noted[key] < 2:
-                        noted[key] += 1
+                    if noted[row["id"]] < 2:
+                        noted[row["id"]] += 1
                         line = (f"{'  ' * min(depth, 8)}> {row['name']} <- {_HOW_LABEL[how]}" + (f" from {frm}" if frm else "")
                                 + (f" @{cite(conn, pid, via)}" if via else "") + " - shown above\n")
                         blocks.append((line, line, depth))
                 continue
-            visited[key] = len(visited) + 1
+            visited[row["id"]] = len(visited) + 1
             full, summ = _walk_block(conn, pid, pname, row, how, depth, frm, via,
                                      first_para_line(row) if row["kind"] == "section" else None, source, max_lines)
             blocks.append((full, summ, depth))
-            for c in reversed(children_of(row, key, depth, stop)):
+            for c in reversed(children_of(row, depth, stop, how)):
                 stack.append(c)
 
     run(entry, "start")
     for a in conn.execute("SELECT alias, line FROM program_alias WHERE program_id=? ORDER BY line", (pid,)):
-        r = conn.execute("""SELECT name FROM paragraph WHERE program_id=? AND kind='paragraph' AND ? BETWEEN start_line AND end_line
+        r = conn.execute("""SELECT id FROM paragraph WHERE program_id=? AND kind='paragraph' AND ? BETWEEN start_line AND end_line
                             ORDER BY start_line DESC LIMIT 1""", (pid, a["line"])).fetchone()
-        if r and r["name"].upper() not in visited:
+        if r and r["id"] not in visited:
             note = f"\n### Entry point `{a['alias']}` (ENTRY @{cite(conn, pid, a['line'])}) - callers of that name start here\n"
             blocks.append((note, note, 0))
-            run(by_name[r["name"].upper()], "entry")
+            run(by_id[r["id"]], "entry")
 
     # ---- assemble, then fit the budget by dropping SOURCE from the end (order and facts stay)
     # `DECLARATIVES.` itself parses like a paragraph header; it is a keyword, not code
-    never = [r for r in paras if r["name"].upper() not in visited and r["name"].upper() != "DECLARATIVES"]
+    never = [r for r in paras if r["id"] not in visited and r["name"].upper() != "DECLARATIVES"
+             and not (r["kind"] == "section" and any(q["id"] in visited for q in in_section.get(r["name"].upper(), [])))]
     secs = [r for r in paras if r["kind"] == "section"]
     names = _names_of(conn, pname)
     ph = ",".join("?" for _ in names)
