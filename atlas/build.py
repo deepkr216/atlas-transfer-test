@@ -298,8 +298,17 @@ def inventory(ctx: Ctx, roots, limit: Optional[int] = None, force_all: bool = Fa
         roots = [roots]
 
     found: List[tuple] = []
+    ctx.say("  reading and fingerprinting every file (a document folder on OneDrive is downloaded now - minutes of "
+            "disk work; a line every 10 s says how far)")
+    t_start = t_tick = time.time()
+    n_read = bytes_read = 0
     for dirpath, fn in (pair for root in roots for pair in _scan_files(root, limit)):
         path = os.path.normpath(os.path.join(dirpath, fn))
+        n_read += 1
+        if time.time() - t_tick >= 10:
+            t_tick = time.time()
+            ctx.say(f"  ... {n_read} files read ({bytes_read // 1024 // 1024} MB) in {int(t_tick - t_start)} s - "
+                    f"now in {os.path.basename(dirpath) or dirpath}")
         try:
             st = os.stat(docs.long_path(path))
             if st.st_size > MAX_MEMBER_BYTES:
@@ -308,6 +317,7 @@ def inventory(ctx: Ctx, roots, limit: Optional[int] = None, force_all: bool = Fa
                 continue
             with open(docs.long_path(path), "rb") as fh:
                 data = fh.read()
+            bytes_read += len(data)
         except OSError as e:
             ctx.bump("unreadable")
             hint = ""
@@ -1522,9 +1532,16 @@ def _main(argv: Optional[List[str]] = None) -> int:
     # Copybooks first so field rows exist; programs; then everything else.
     order = {"copybook": 0, "cobol": 1, "proc": 2, "jcl": 3, "dbd": 4, "psb": 5, "doc": 9}
     ok = partial = failed = 0
+    n_parse = sum(1 for m in ctx.members if not m.skip)
+    ctx.say(f"parsing {n_parse} member(s) ({len(ctx.members) - n_parse} unchanged, kept) - a line every 10 s")
+    t_tick = time.time()
     for i, mem in enumerate(sorted(ctx.members, key=lambda m: order.get(m.kind, 6)), 1):
         if mem.skip:
             continue                       # unchanged since last build; facts kept
+        if time.time() - t_tick >= 10:
+            t_tick = time.time()
+            conn.commit()
+            ctx.say(f"  ... {i}/{len(ctx.members)} - now {mem.kind}: {os.path.basename(mem.path)}")
         handler = HANDLERS.get(mem.kind)
         try:
             if handler:
