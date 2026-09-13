@@ -108,6 +108,27 @@ class Resume(unittest.TestCase):
         self.assertIsNotNone(conn.execute("SELECT finished_at FROM build_run ORDER BY id DESC LIMIT 1").fetchone()[0])
         conn.close()
 
+    def test_a_toolkit_change_after_an_interrupted_run_redoes_the_parsed_members(self):
+        # 4,000 members parsed by the OLD toolkit, Ctrl+C, git pull, build again:
+        # the unfinished run's fingerprint must count, or stale facts are kept
+        real = build.HANDLERS["cobol"]
+        calls = {"n": 0}
+
+        def flaky(ctx, mem):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise KeyboardInterrupt
+            return real(ctx, mem)
+
+        with mock.patch.dict(build.HANDLERS, {"cobol": flaky}):
+            rc, _out = self._build(extra=["--rebuild"])
+        self.assertEqual(rc, 130)
+        with mock.patch.object(build, "tool_fingerprint", return_value="feedfacefeedface"):
+            rc, out = self._build()
+        self.assertEqual(rc, 0)
+        self.assertIn("toolkit changed since the last build: every member is re-parsed", out)
+        self.assertRegex(out, r"parsing \d+ member\(s\) \(0 unchanged, kept\)")
+
     def test_progress_line_carries_the_rate_and_time_left(self):
         with mock.patch.object(build.time, "time", side_effect=[1000.0 + 20 * k for k in range(4000)]):
             rc, out = self._build(extra=["--rebuild"])

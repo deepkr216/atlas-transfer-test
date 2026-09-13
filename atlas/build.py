@@ -1578,8 +1578,9 @@ def _main(argv: Optional[List[str]] = None) -> int:
     if args.manifest and os.path.isfile(args.manifest):
         with open(args.manifest, "rb") as fh:
             man_sha = sha(fh.read())[:16]
-    last = conn.execute("SELECT fingerprint, manifest_sha FROM build_run WHERE finished_at IS NOT NULL "
-                        "ORDER BY id DESC LIMIT 1").fetchone()
+    # the LATEST run, finished or not: members parsed by an interrupted run
+    # were parsed by that run's toolkit, and must be redone if it changed
+    last = conn.execute("SELECT fingerprint, manifest_sha FROM build_run ORDER BY id DESC LIMIT 1").fetchone()
     force_all = False
     if last is not None and not args.rebuild:
         if last["fingerprint"] and last["fingerprint"] != fp:
