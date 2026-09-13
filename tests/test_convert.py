@@ -226,6 +226,31 @@ class Convert(unittest.TestCase):
             self.assertEqual(convert.main([self.docs]), 130)
         self.assertIn("interrupted", out.getvalue())
 
+    def test_office_getters_return_one_object(self):
+        """LESSONS 132: nothing inside the Get-Word / Get-Excel / Get-PPT
+        functions may write to the pipeline, or the COM object comes back as
+        a list and every .Open fails with 'cannot call a method on a
+        null-valued expression'. Checked statically, and - where PowerShell
+        exists - by running the script's own Report-NewPid inside a function."""
+        import re
+        script = convert._PS_SCRIPT
+        for name in ("Get-Word", "Get-Excel", "Get-PPT", "Report-NewPid"):
+            body = re.search(r"function " + re.escape(name) + r".*?\n}", script, re.S).group(0)
+            code = "\n".join(l for l in body.splitlines() if not l.strip().startswith("#"))   # comments may say the word
+            self.assertNotIn("Write-Output", code, name)
+        if shutil.which("powershell") is None:
+            self.skipTest("no powershell here")
+        fn = re.search(r"function Report-NewPid.*?\n}", script, re.S).group(0)
+        harness = fn + "\nfunction Get-X { Report-NewPid 'NOSUCHPROCESSNAME' @(); return 42 }\n$x = Get-X\n" \
+                       "Write-Output ('array=' + ($x -is [array]) + ' value=' + $x)\n"
+        path = os.path.join(self.td, "probe.ps1")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(harness)
+        import subprocess
+        p = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", path],
+                           capture_output=True, text=True, timeout=120)
+        self.assertIn("array=False value=42", p.stdout, p.stdout + p.stderr)
+
     def test_cli(self):
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):

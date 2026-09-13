@@ -128,9 +128,12 @@ $script:ppt = $null
 
 function Report-NewPid([string]$Name, $Before) {
     # the process this script just started, so an interrupted run can close
-    # exactly that one and leave the user's own Word / Excel alone
+    # exactly that one and leave the user's own Word / Excel alone.
+    # Straight to stdout: Write-Output inside a function becomes part of the
+    # function's RETURN VALUE, which turned the Word object into a list and
+    # broke every file (LESSONS 132).
     $after = @(Get-Process -Name $Name -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
-    foreach ($id in $after) { if ($Before -notcontains $id) { Write-Output "PID`t$Name`t$id" } }
+    foreach ($id in $after) { if ($Before -notcontains $id) { [Console]::Out.WriteLine("PID`t$Name`t$id") } }
 }
 function Get-Word {
     if ($script:word -eq $null) {
