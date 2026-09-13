@@ -55,7 +55,7 @@ class Convert(unittest.TestCase):
     def test_convert_tree_reports_and_never_deletes(self):
         lines = []
         with mock.patch("atlas.convert._run_powershell") as ps:
-            def fake(pairs, timeout, log=None):
+            def fake(pairs, timeout, log=None, *rest):
                 out = []
                 for src, dst in pairs:
                     if src.endswith("OLD.DOC"):
@@ -122,7 +122,7 @@ class Convert(unittest.TestCase):
         self.assertIn("1 copies STALE", "\n".join(lines))
         self.assertIn("STALE " + doc, "\n".join(lines))
         with mock.patch("atlas.convert._run_powershell") as ps:
-            ps.side_effect = lambda pairs, timeout, log=None: (0, "".join(f"OK\t{s}\t{d}\n" for s, d in pairs), "")
+            ps.side_effect = lambda pairs, timeout, log=None, *rest: (0, "".join(f"OK\t{s}\t{d}\n" for s, d in pairs), "")
             convert.convert_tree(self.docs, log=lines.append, refresh=True)
             remade = [d for s, d in ps.call_args[0][0]]
         self.assertIn(docx, remade)                          # --refresh remakes the stale copy
@@ -250,6 +250,41 @@ class Convert(unittest.TestCase):
         p = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", path],
                            capture_output=True, text=True, timeout=120)
         self.assertIn("array=False value=42", p.stdout, p.stdout + p.stderr)
+
+    def test_watchdog_skips_a_file_office_never_finishes(self):
+        """Office silent on one file (an invisible dialog) must not hang the
+        run: that file is failed, Office closed, the rest converted."""
+        import subprocess
+        fake = os.path.join(self.td, "fakeps.py")
+        with open(fake, "w", encoding="utf-8") as fh:
+            fh.write(
+                "import sys, time\n"
+                "listing = sys.argv[1]\n"
+                "for line in open(listing, encoding='utf-8'):\n"
+                "    src, dst = line.rstrip('\\n').split('\\t', 1)\n"
+                "    print('START\\t' + src, flush=True)\n"
+                "    if 'STALL' in src:\n"
+                "        time.sleep(30)\n"
+                "    open(dst, 'w').write('ok')\n"
+                "    print('OK\\t' + src + '\\t' + dst, flush=True)\n")
+        for n in ("A.doc", "M-STALL.doc", "Z.doc"):        # the stalling file in the middle of the run
+            with open(os.path.join(self.docs, n), "w") as fh:
+                fh.write("x")
+        for n in ("Claims Manual.doc", "sub/Flow.ppt", "sub/deeper/OLD.DOC"):
+            os.remove(os.path.join(self.docs, n))
+        lines = []
+        with mock.patch("atlas.convert._ps_command", side_effect=lambda script, listing, visible: [sys.executable, fake, listing]), \
+                mock.patch("atlas.convert._close_office") as closer:
+            ok, have, fail = convert.convert_tree(self.docs, log=lines.append, stall_seconds=2)
+        self.assertEqual((ok, fail), (2, 1), "\n".join(lines))
+        self.assertTrue(os.path.exists(os.path.join(self.docs, "A.docx")))
+        self.assertTrue(os.path.exists(os.path.join(self.docs, "Z.docx")))
+        self.assertFalse(os.path.exists(os.path.join(self.docs, "M-STALL.docx")))
+        text = "\n".join(lines)
+        self.assertIn("M-STALL.doc: Office did not finish this file in 2 s", text)
+        self.assertIn("--visible", text)
+        self.assertIn("restarting Office for the remaining 1 file(s)", text)
+        closer.assert_called()
 
     def test_cli(self):
         buf = io.StringIO()

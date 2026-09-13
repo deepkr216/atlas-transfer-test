@@ -23,10 +23,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import queue
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import zipfile
 from typing import Callable, List, Optional, Tuple
 
@@ -120,8 +122,9 @@ def unzip_tree(root: str, log: Callable[[str], None] = print, dry_run: bool = Fa
 # read-only, macros disabled (AutomationSecurity=3), alerts off, so nothing
 # pops up and nothing in the original can run.
 _PS_SCRIPT = r'''
-param([string]$ListFile)
+param([string]$ListFile, [int]$Visible = 0)
 $ErrorActionPreference = 'Continue'
+$script:show = ($Visible -eq 1)
 $script:word = $null
 $script:excel = $null
 $script:ppt = $null
@@ -139,7 +142,7 @@ function Get-Word {
     if ($script:word -eq $null) {
         $before = @(Get-Process -Name WINWORD -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
         $script:word = New-Object -ComObject Word.Application
-        $script:word.Visible = $false
+        $script:word.Visible = $script:show
         $script:word.DisplayAlerts = 0
         try { $script:word.AutomationSecurity = 3 } catch {}
         Report-NewPid "WINWORD" $before
@@ -150,7 +153,7 @@ function Get-Excel {
     if ($script:excel -eq $null) {
         $before = @(Get-Process -Name EXCEL -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
         $script:excel = New-Object -ComObject Excel.Application
-        $script:excel.Visible = $false
+        $script:excel.Visible = $script:show
         $script:excel.DisplayAlerts = $false
         try { $script:excel.AutomationSecurity = 3 } catch {}
         Report-NewPid "EXCEL" $before
@@ -171,11 +174,13 @@ $pairs = Get-Content -LiteralPath $ListFile -Encoding UTF8 | Where-Object { $_ -
 foreach ($line in $pairs) {
     $src, $dst = $line -split "`t", 2
     $ext = [System.IO.Path]::GetExtension($src).ToLower()
+    [Console]::Out.WriteLine("START`t$src")
     try {
+        $win = 0; if ($script:show) { $win = -1 }
         switch ($ext) {
             '.doc' { $w = Get-Word; $d = $w.Documents.Open($src, $false, $true); $d.SaveAs2([ref]$dst, [ref]12); $d.Close(0) }
             '.xls' { $x = Get-Excel; $b = $x.Workbooks.Open($src, 0, $true); $b.SaveAs($dst, 51); $b.Close($false) }
-            '.ppt' { $p = Get-PPT; $r = $p.Presentations.Open($src, -1, 0, 0); $r.SaveAs($dst, 24); $r.Close() }
+            '.ppt' { $p = Get-PPT; $r = $p.Presentations.Open($src, -1, 0, $win); $r.SaveAs($dst, 24); $r.Close() }
         }
         if (Test-Path -LiteralPath $dst) { Write-Output "OK`t$src`t$dst" } else { Write-Output "FAIL`t$src`tno output written" }
     } catch {
@@ -251,12 +256,24 @@ def parse_output(text: str) -> List[Tuple[str, str, str]]:
     return rows
 
 
+STALL_SECONDS = 300     # Office silent on one file for this long = a dialog nobody can click
+
+
+def _ps_command(script: str, listing: str, visible: bool) -> List[str]:
+    return ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+            "-File", script, "-ListFile", listing, "-Visible", "1" if visible else "0"]
+
+
 def _run_powershell(pairs: List[Tuple[str, str]], timeout: int,
-                    log: Optional[Callable[[str], None]] = None) -> Tuple[int, str, str]:
+                    log: Optional[Callable[[str], None]] = None, visible: bool = False,
+                    stall_seconds: int = STALL_SECONDS) -> Tuple[int, str, str]:
     """Run the conversion script and report every file THE MOMENT Office is
-    done with it (a 40-file run is minutes of silence otherwise, and looks
-    stuck). Returns (rc, everything the script printed, stderr)."""
-    if shutil.which("powershell") is None:
+    done with it. A watchdog ends a run in which Office has gone silent on
+    one file for `stall_seconds` (a dialog in an invisible window): that
+    file is reported as failed, the Office processes this run started are
+    closed, and the caller carries on with the rest. Returns (rc,
+    everything the script printed, stderr); rc 124 = stopped by the watchdog."""
+    if shutil.which("powershell") is None and _ps_command(".", ".", False)[0] == "powershell":
         return 127, "", "powershell.exe not found on PATH"
     td = tempfile.mkdtemp(prefix="atlas-convert-")
     script = os.path.join(td, "convert.ps1")
@@ -267,22 +284,47 @@ def _run_powershell(pairs: List[Tuple[str, str]], timeout: int,
         for src, dst in pairs:
             fh.write(f"{src}\t{dst}\n")
     if log:
-        log(f"  starting Office for {len(pairs)} file(s) - the first answer takes 20-40 s, then one line per file")
+        log(f"  starting Office for {len(pairs)} file(s) - the first answer takes 20-40 s, then one line per file"
+            + (" (Office windows visible)" if visible else ""))
     lines: List[str] = []
     office_pids: List[Tuple[str, int]] = []
+    current: Optional[str] = None
     p = None
     try:
-        p = subprocess.Popen(["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-                              "-File", script, "-ListFile", listing],
+        p = subprocess.Popen(_ps_command(script, listing, visible),
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8",
                              errors="replace", stdin=subprocess.DEVNULL)
         assert p.stdout is not None
-        for raw in p.stdout:
+        q: "queue.Queue[Optional[str]]" = queue.Queue()
+
+        def pump(stream):
+            for raw in stream:
+                q.put(raw)
+            q.put(None)
+        threading.Thread(target=pump, args=(p.stdout,), daemon=True).start()
+        while True:
+            try:
+                raw = q.get(timeout=stall_seconds)
+            except queue.Empty:
+                p.kill()
+                _close_office(office_pids, log)
+                stalled = current or (pairs[0][0] if pairs else "?")
+                why = (f"Office did not finish this file in {stall_seconds} s - usually a dialog in an invisible "
+                       f"window (Document Recovery, a repair prompt); rerun with --visible to see and dismiss it")
+                lines.append(f"FAIL\t{stalled}\t{why}")
+                if log:
+                    log(f"  FAIL {stalled}: {why}")
+                return 124, "\n".join(lines) + "\n", "stalled"
+            if raw is None:
+                break
             line = raw.rstrip("\r\n")
             if line.startswith("PID\t"):
                 parts = line.split("\t")
                 if len(parts) == 3 and parts[2].isdigit():
                     office_pids.append((parts[1], int(parts[2])))
+                continue
+            if line.startswith("START\t"):
+                current = line.split("\t", 1)[1]
                 continue
             lines.append(line)
             rows = parse_output(line)
@@ -294,7 +336,7 @@ def _run_powershell(pairs: List[Tuple[str, str]], timeout: int,
         except subprocess.TimeoutExpired:
             p.kill()
             _close_office(office_pids, log)
-            return 124, "\n".join(lines), f"timed out after {timeout}s"
+            return 124, "\n".join(lines) + "\n", f"timed out after {timeout}s"
         return p.returncode, "\n".join(lines) + "\n", err
     except KeyboardInterrupt:
         if p is not None:
@@ -341,7 +383,8 @@ def _run_libreoffice(pairs: List[Tuple[str, str]], timeout: int, log: Callable[[
 
 
 def convert_tree(root: str, dry_run: bool = False, log: Callable[[str], None] = print,
-                 timeout: int = 3600, refresh: bool = False) -> Tuple[int, int, int]:
+                 timeout: int = 3600, refresh: bool = False, visible: bool = False,
+                 stall_seconds: int = STALL_SECONDS) -> Tuple[int, int, int]:
     """Convert every legacy Office file under `root`. Returns
     (converted, already present, failed). A copy older than its legacy
     original is reported as STALE and left alone unless `refresh`."""
@@ -360,8 +403,19 @@ def convert_tree(root: str, dry_run: bool = False, log: Callable[[str], None] = 
             tag = {"exists": "have ", "stale": "stale", "convert": "todo "}[st]
             log(f"  {tag} {s} -> {os.path.basename(d)}")
         return 0, have, 0
-    rc, out, err = _run_powershell(todo, timeout, log)
+    rc, out, err = _run_powershell(todo, timeout, log, visible, stall_seconds)
     rows = parse_output(out)
+    restarts = 0
+    while rc == 124 and err == "stalled" and restarts < 5:
+        # the watchdog stopped Office on one file: go on with the ones not yet attempted
+        reported = {src for _st, src, _d in rows}
+        rest = [(s, d) for s, d in todo if s not in reported]
+        if not rest:
+            break
+        restarts += 1
+        log(f"  restarting Office for the remaining {len(rest)} file(s)")
+        rc, out, err = _run_powershell(rest, timeout, log, visible, stall_seconds)
+        rows += parse_output(out)
     com_missing = rc != 0 and not rows or any("80040154" in d or "Cannot create" in d or "COM class factory" in d
                                               for _s, _src, d in rows if _s == "FAIL")
     if com_missing and (shutil.which("soffice") or shutil.which("soffice.exe")):
@@ -393,6 +447,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                     help="also remake a copy whose legacy original changed after the copy was made (overwrites the copy)")
     ap.add_argument("--timeout", type=int, default=3600)
     ap.add_argument("--no-unzip", action="store_true", help="do not extract .zip archives first")
+    ap.add_argument("--visible", action="store_true",
+                    help="show the Word / Excel / PowerPoint windows while converting, to see and dismiss a dialog")
+    ap.add_argument("--stall-seconds", type=int, default=STALL_SECONDS,
+                    help="give up on a file Office has been silent on for this long (default 300) and go on")
     a = ap.parse_args(argv)
     tot_ok = tot_have = tot_fail = 0
     try:
@@ -412,7 +470,7 @@ def _run_folders(a) -> int:
             z_ok, z_have, z_fail = unzip_tree(folder, print, a.dry_run)
             print(f"archives: {z_ok} extracted, {z_have} already extracted, {z_fail} failed")
             tot_fail += z_fail
-        ok, have, fail = convert_tree(folder, a.dry_run, print, a.timeout, a.refresh)
+        ok, have, fail = convert_tree(folder, a.dry_run, print, a.timeout, a.refresh, a.visible, a.stall_seconds)
         tot_ok, tot_have, tot_fail = tot_ok + ok, tot_have + have, tot_fail + fail
     print(f"converted {tot_ok}, already present {tot_have}, failed {tot_fail}")
     return 1 if tot_fail else 0
