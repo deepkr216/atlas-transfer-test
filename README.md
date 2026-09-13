@@ -361,8 +361,11 @@ code-generation bundle, test conditions, abend triage).
 
 ### From VS Code
 
-Open the toolkit folder as the workspace and the loop is three clicks and
-one chat message - see [docs/VSCODE.md](docs/VSCODE.md):
+Open the toolkit folder as the workspace, open the chat, type `/atlas` and
+ask in your own words: the model runs the queries itself, answers with a
+citation on every fact and ends with the gate's verdict. That is the whole
+loop for most questions - see [docs/VSCODE.md](docs/VSCODE.md). The pieces
+below do the same step by step, when you want to choose the report yourself:
 
 - `Terminal > Run Task > Atlas: pack NAME -> work/pack.md` (and `field`,
   `layout`, `job`, `crud`, `conditions`, `literal`, `value domain`,

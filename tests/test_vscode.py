@@ -184,7 +184,8 @@ class TasksAndPrompts(unittest.TestCase):
             self.assertIn("mode:", head, f)
             self.assertIn("description:", head, f)
             links = re.findall(r"\]\(\.\./\.\./work/([^)]+)\)", text)
-            self.assertTrue(links, (f, "a prompt must attach at least one work/ file"))
+            if "mode: 'agent'" not in head:                     # an agent prompt writes its own reports
+                self.assertTrue(links, (f, "an ask-mode prompt must attach at least one work/ file"))
             for name in links:
                 self.assertTrue(name in self.outputs or name in USER_WRITTEN,
                                 (f, name, "no task writes this file"))

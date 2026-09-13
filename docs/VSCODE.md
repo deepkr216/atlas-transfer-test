@@ -4,6 +4,24 @@ You open the toolkit folder (the `git pull` clone, which also holds
 `atlas.db`) as the VS Code workspace. Everything below then works without
 installing anything: the files arrive with `git pull`.
 
+## The easy way: `/atlas` and a question in your own words
+
+1. Open the chat (**Ctrl+Alt+I**).
+2. Type `/atlas`, press Enter, and type your question the way you would
+   ask a colleague - for example: *Gender is M, F or U and we are adding N.
+   Which error messages must change, which are related but need no change,
+   in which copybook or program is each one, and where is each message ID
+   created?*
+3. The chat switches to agent mode and runs the toolkit's queries itself
+   (it asks before each terminal command - click **Continue**), reads the
+   reports, answers with a citation on every fact, and finishes by running
+   the gate. The last line of the reply is the gate's verdict:
+   `RESULT: citations verified` or `RESULT: REJECT`.
+
+That is all you need. The tasks and the other `/atlas-*` prompts below do
+the same work step by step when you want to control which report the model
+sees, or when a chat has no agent mode.
+
 ```
 .vscode/tasks.json               Terminal > Run Task > "Atlas: ..."  - runs the queries, writes work/*.md
 .github/copilot-instructions.md  the operating contract; Copilot Chat loads it by itself
