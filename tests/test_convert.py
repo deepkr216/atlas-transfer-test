@@ -304,9 +304,9 @@ class Convert(unittest.TestCase):
         without the dialog the user answers with Read Only; a 'password to
         open' file must fail with Office's message, not prompt."""
         script = convert._PS_SCRIPT
-        self.assertIn('$w.Documents.Open($src, $false, $true, $false, "", "", $false, "", ""', script)   # ReadOnly, empty passwords
-        self.assertIn('$x.Workbooks.Open($src, 0, $true, $miss, "", "", $true', script)                # ReadOnly, empty passwords, IgnoreReadOnlyRecommended
-        self.assertIn("$true)\n", script)                                                            # NoEncodingDialog on Word
+        self.assertIn('$w.Documents.Open($p, $false, $true, $false, "", "", $false, "", ""', script)   # ReadOnly, empty passwords
+        self.assertIn('$x.Workbooks.Open($p, 0, $true, $miss, "", "", $true', script)                # ReadOnly, empty passwords, IgnoreReadOnlyRecommended
+        self.assertIn("$miss, $true) }", script)                                                     # NoEncodingDialog on Word
         self.assertIn("[System.Reflection.Missing]::Value", script)
 
     def test_a_dead_office_is_replaced_for_the_next_file(self):
@@ -385,6 +385,23 @@ class Convert(unittest.TestCase):
                         side_effect=lambda pairs, timeout, log=None, *rest: (0, "".join(f"FAIL\t{s}\tCommand failed\n" for s, d in pairs), "")):
             convert.convert_tree(od, log=lines.append)
         self.assertIn("Rules.doc: Command failed [path is under OneDrive/SharePoint; 3 KB; Word]", "\n".join(lines))
+
+    def test_powershell_script_parses(self):
+        """No Office here, but PowerShell is: the conversion script must be
+        syntactically valid - a typo in it fails every file on the laptop."""
+        import subprocess
+        if shutil.which("powershell") is None:
+            self.skipTest("no powershell here")
+        path = os.path.join(self.td, "convert.ps1")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(convert._PS_SCRIPT)
+        probe = ("$errs = $null; $null = [System.Management.Automation.Language.Parser]::ParseFile('" + path.replace("'", "''")
+                 + "', [ref]$null, [ref]$errs); if ($errs.Count -gt 0) { $errs | ForEach-Object { Write-Output ('ERR ' + $_.Message) } } else { Write-Output 'PARSE OK' }")
+        p = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", probe],
+                           capture_output=True, text=True, timeout=120)
+        self.assertIn("PARSE OK", p.stdout, p.stdout + p.stderr)
+        for fn in ("Convert-Doc", "Convert-Xls", "Describe-Doc", "Report-NewPid"):
+            self.assertIn("function " + fn, convert._PS_SCRIPT)
 
     def test_cli(self):
         buf = io.StringIO()

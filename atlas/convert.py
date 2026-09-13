@@ -170,6 +170,70 @@ function Get-PPT {
     return $script:ppt
 }
 
+
+# Several ways to open and save, tried in turn: Office's "Command failed"
+# never says what it objected to, so the way that works is found by trying,
+# reported as a NOTE line, and the FAIL line of a file nothing works for
+# carries every attempt's error and the document's own state.
+function Close-Matching($app, $src) {
+    try { foreach ($od in @($app.Documents)) { if ($od.FullName -eq $src) { $od.Close(0) } } } catch {}
+}
+function Describe-Doc($d) {
+    try { return "ReadOnly=$($d.ReadOnly) HasPassword=$($d.HasPassword) Protection=$($d.ProtectionType) Type=$($d.Type) Compat=$($d.CompatibilityMode)" } catch { return "" }
+}
+function Convert-Doc($w, $src, $dst) {
+    $miss = [System.Reflection.Missing]::Value
+    $errs = @()
+    $tries = @(
+        @{ name = "readonly-open, docx"; open = { param($p) $w.Documents.Open($p, $false, $true, $false, "", "", $false, "", "", $miss, $miss, $script:show, $false, $miss, $true) }; fmt = 12 },
+        @{ name = "plain open, docx";    open = { param($p) $w.Documents.Open($p, $false, $true) }; fmt = 12 },
+        @{ name = "plain open, default"; open = { param($p) $w.Documents.Open($p, $false, $true) }; fmt = 16 },
+        @{ name = "minimal open, docx";  open = { param($p) $w.Documents.Open($p) }; fmt = 12 }
+    )
+    for ($t = 0; $t -lt $tries.Count; $t++) {
+        $try = $tries[$t]
+        $info = ""
+        try {
+            $d = & $try.open $src
+            $info = Describe-Doc $d
+            $d.SaveAs2([ref]$dst, [ref]$try.fmt)
+            $d.Close(0)
+            if (Test-Path -LiteralPath $dst) { return "$($try.name)" }
+            $errs += "$($try.name): no file written [$info]"
+        } catch {
+            $m = $_.Exception.Message -replace "[`r`n]+", " "
+            $hr = ""; try { $hr = " hr=0x{0:x}" -f $_.Exception.HResult } catch {}
+            $errs += "$($try.name): $m$hr [$info]"
+            Close-Matching $w $src
+        }
+    }
+    throw ($errs -join " | ")
+}
+function Convert-Xls($x, $src, $dst) {
+    $miss = [System.Reflection.Missing]::Value
+    $errs = @()
+    $tries = @(
+        @{ name = "readonly-open"; open = { param($p) $x.Workbooks.Open($p, 0, $true, $miss, "", "", $true, $miss, $miss, $false, $false, $miss, $false) } },
+        @{ name = "plain open";    open = { param($p) $x.Workbooks.Open($p, 0, $true) } },
+        @{ name = "minimal open";  open = { param($p) $x.Workbooks.Open($p) } }
+    )
+    for ($t = 0; $t -lt $tries.Count; $t++) {
+        $try = $tries[$t]
+        try {
+            $b = & $try.open $src
+            $b.SaveAs($dst, 51)
+            $b.Close($false)
+            if (Test-Path -LiteralPath $dst) { return "$($try.name)" }
+            $errs += "$($try.name): no file written"
+        } catch {
+            $m = $_.Exception.Message -replace "[`r`n]+", " "
+            $errs += "$($try.name): $m"
+            try { foreach ($ob in @($x.Workbooks)) { if ($ob.FullName -eq $src) { $ob.Close($false) } } } catch {}
+        }
+    }
+    throw ($errs -join " | ")
+}
+
 $pairs = Get-Content -LiteralPath $ListFile -Encoding UTF8 | Where-Object { $_ -ne '' }
 foreach ($line in $pairs) {
     $src, $dst = $line -split "`t", 2
@@ -183,25 +247,13 @@ foreach ($line in $pairs) {
         # "password to open" fails at once with Office's own message instead
         # of a prompt nobody can answer. No repair prompts, no encoding
         # dialog, nothing added to the recent-files list.
-        $miss = [System.Reflection.Missing]::Value
+        $how = ""
         switch ($ext) {
-            '.doc' {
-                $w = Get-Word
-                # FileName, ConfirmConversions, ReadOnly, AddToRecentFiles, PasswordDocument, PasswordTemplate,
-                # Revert, WritePasswordDocument, WritePasswordTemplate, Format, Encoding, Visible, OpenAndRepair,
-                # DocumentDirection, NoEncodingDialog
-                $d = $w.Documents.Open($src, $false, $true, $false, "", "", $false, "", "", $miss, $miss, $script:show, $false, $miss, $true)
-                $d.SaveAs2([ref]$dst, [ref]12); $d.Close(0)
-            }
-            '.xls' {
-                $x = Get-Excel
-                # Filename, UpdateLinks, ReadOnly, Format, Password, WriteResPassword, IgnoreReadOnlyRecommended,
-                # Origin, Delimiter, Editable, Notify, Converter, AddToMru
-                $b = $x.Workbooks.Open($src, 0, $true, $miss, "", "", $true, $miss, $miss, $false, $false, $miss, $false)
-                $b.SaveAs($dst, 51); $b.Close($false)
-            }
+            '.doc' { $w = Get-Word; $how = Convert-Doc $w $src $dst }
+            '.xls' { $x = Get-Excel; $how = Convert-Xls $x $src $dst }
             '.ppt' { $p = Get-PPT; $r = $p.Presentations.Open($src, -1, 0, $win); $r.SaveAs($dst, 24); $r.Close() }
         }
+        if ($how) { [Console]::Out.WriteLine("NOTE`t$src`tconverted via: $how") }
         if (Test-Path -LiteralPath $dst) { Write-Output "OK`t$src`t$dst" } else { Write-Output "FAIL`t$src`tno output written" }
     } catch {
         $msg = $_.Exception.Message -replace "[`r`n]+", " "
@@ -356,6 +408,12 @@ def _run_powershell(pairs: List[Tuple[str, str]], timeout: int,
                 continue
             if line.startswith("START\t"):
                 current = line.split("\t", 1)[1]
+                continue
+            if line.startswith("NOTE\t"):
+                parts = line.split("\t", 2)
+                if log and len(parts) == 3:
+                    shown = names.get(parts[1], (parts[1], ""))[0] if names else parts[1]
+                    log(f"  note {os.path.basename(shown)}: {parts[2]}")
                 continue
             lines.append(line)
             rows = parse_output(line)
