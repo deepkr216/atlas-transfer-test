@@ -336,11 +336,23 @@ def password_hint(rc: int, out: str, err: str) -> str:
     """What to tell the user when zowe failed - or hung - because it wanted
     a password. rc 124 (timed out) with no output is the hang: zowe put up
     its password prompt and, run in the background, waits forever."""
-    if rc == 124 and not (out or "").strip() and has_session_credentials() is False:
+    text = f"{out}\n{err}"
+    if rc != 0 and re.search(r"host\s*name|hostname|Enter the host", text, re.IGNORECASE):
+        return ("zowe asked for the HOST NAME: the plain CLI (daemon off) does not see the profile your window "
+                "uses. Put the connection into sources.json -> zowe.extra_args, e.g. "
+                "[\"--host\", \"HOST\", \"--port\", \"PORT\", \"--reject-unauthorized\", \"false\"] "
+                "(`zowe config list --locations` shows them) - never the password")
+    if rc == 124 and not (out or "").strip():
+        if has_session_credentials():
+            return ("zowe printed nothing and did not come back although a session password was given: it is "
+                    "waiting for something else it cannot ask for - usually the HOST NAME, when the plain CLI "
+                    "(daemon off) does not see your profile. Put --host / --port (and --reject-unauthorized "
+                    "false if your certificate needs it) into sources.json -> zowe.extra_args; "
+                    "`zowe config list --locations` shows the values")
         return ("zowe printed nothing and did not come back: it is waiting for the mainframe password it asked "
                 "you for when you ran it by hand. Give it for this run - Sign in (UI) or --ask-password (CLI) - "
                 "or store it once with `zowe config secure` (Windows Credential Manager)")
-    if rc != 0 and re.search(r"password", f"{out}\n{err}", re.IGNORECASE):
+    if rc != 0 and re.search(r"password", text, re.IGNORECASE):
         return ("zowe wanted a password and a background run cannot type one: store it in the "
                 "profile once (`zowe config secure`, kept in Windows Credential Manager) or use "
                 "Sign in (UI) / --ask-password (CLI) for this session")

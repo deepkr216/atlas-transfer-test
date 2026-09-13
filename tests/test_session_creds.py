@@ -160,12 +160,16 @@ class StagedCheck(unittest.TestCase):
         self.assertIn("waiting for the mainframe password", msg)
         self.assertIn("--ask-password", msg)
         self.assertIn("zowe config secure", msg)
-        # with a session password the same timeout is NOT explained as a prompt
+        # with a session password the same silence is the HOST prompt (the plain CLI
+        # not seeing the profile) - the confirmed case on the work laptop
         fetch.set_session_credentials("DEEPAK", "pw")
         try:
-            self.assertEqual(fetch.password_hint(124, "", "timed out"), "")
+            self.assertIn("HOST NAME", fetch.password_hint(124, "", "timed out"))
+            self.assertIn("extra_args", fetch.password_hint(124, "", "timed out"))
         finally:
             fetch.set_session_credentials(None, None)
+        # and when zowe manages to print the prompt, it is named directly
+        self.assertIn("HOST NAME", fetch.password_hint(1, "Enter the host name of your service:", ""))
 
     def test_host_refuses_for_another_reason(self):
         with mock.patch("atlas.fetch.zowe_exe", return_value="zowe"):
