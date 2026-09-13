@@ -4,7 +4,6 @@
     "executable": "zowe",
     "profile": "",
     "encoding": "",
-    "max_concurrent": 8,
     "timeout_seconds": 3600,
     "extra_args": []
   },

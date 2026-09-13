@@ -41,8 +41,7 @@ EXT_FOR_KIND = {"cobol": "cbl", "copybook": "cpy", "jcl": "jcl", "proc": "prc", 
                 "other": "txt"}
 
 DEFAULT_CONFIG: Dict = {
-    "zowe": {"executable": "zowe", "profile": "", "encoding": "", "max_concurrent": 8,
-             "timeout_seconds": 3600, "extra_args": []},
+    "zowe": {"executable": "zowe", "profile": "", "encoding": "", "timeout_seconds": 3600, "extra_args": []},
     "local_root": "C:/estate",
     "extra_roots": [],       # folders indexed as well - the documentation folder, listings, exports
     "db": "atlas.db",
@@ -221,9 +220,12 @@ def download_cmd(cfg: Dict, src: Dict) -> List[str]:
     if src.get("type", "pds") == "seq":
         return ([_exe(cfg), "zos-files", "download", "data-set", src["dataset"], "--file", dest]
                 + _flags(cfg, src))
-    return ([_exe(cfg), "zos-files", "download", "all-members", src["dataset"],
-             "--directory", dest, "--extension", src.get("ext") or EXT_FOR_KIND.get(src.get("kind", ""), "txt"),
-             "--max-concurrent-requests", str(cfg["zowe"].get("max_concurrent") or 8)]
+    # Exactly the command a developer types by hand:
+    #     zowe zos-files download all-members "DSN" --directory <folder>
+    # Nothing else by default: a Zowe CLI that does not know a flag rejects
+    # the whole command and downloads nothing (LESSONS 127). A shop that wants
+    # --extension or --max-concurrent-requests puts them in extra_args.
+    return ([_exe(cfg), "zos-files", "download", "all-members", src["dataset"], "--directory", dest]
             + _flags(cfg, src))
 
 

@@ -185,7 +185,17 @@ class FetchLayer(unittest.TestCase):
         self.assertIn("--directory", pds)
         self.assertIn(fetch.local_path(cfg, cfg["sources"][0]), pds)
         self.assertTrue(fetch.local_path(cfg, cfg["sources"][0]).endswith(os.path.join("CLAIMS", "PROD.CLAIMS.SRC")))
-        self.assertEqual(pds[pds.index("--extension") + 1], "cbl")
+        # exactly what a developer types by hand: no flag the shop's Zowe may not know (LESSONS 127)
+        self.assertNotIn("--extension", pds)
+        self.assertNotIn("--max-concurrent-requests", pds)
+        self.assertEqual(pds[pds.index("--directory") + 1], fetch.local_path(cfg, cfg["sources"][0]))
+        cfg["zowe"]["extra_args"] = ["--max-concurrent-requests", "4"]        # a shop that wants more says so
+        cfg["sources"][0]["extra_args"] = ["--extension", "cbl"]
+        opt = fetch.download_cmd(cfg, cfg["sources"][0])
+        self.assertEqual(opt[opt.index("--extension") + 1], "cbl")
+        self.assertEqual(opt[opt.index("--max-concurrent-requests") + 1], "4")
+        cfg["zowe"]["extra_args"] = []
+        cfg["sources"][0]["extra_args"] = []
         self.assertEqual(pds[pds.index("--zosmf-profile") + 1], "prod")
         self.assertEqual(pds[pds.index("--encoding") + 1], "1047")
         seq = fetch.download_cmd(cfg, cfg["sources"][1])
