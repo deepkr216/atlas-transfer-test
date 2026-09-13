@@ -453,9 +453,13 @@ list all-members`): a download that stopped part-way is reported
 `INCOMPLETE n/m`, the listed-but-missing members are named, local members
 the host no longer lists are moved to `<folder>/.stale/`, and the record
 (`.atlas-library.json`) is loaded so `program X` answers **NOT FETCHED**
-instead of NOT FOUND. The build re-parses everything when the toolkit's own
-source changed (`git pull`) or the manifest changed, re-parses every job
-when a PROC / INCLUDE / card member changed, never indexes its own outputs
+instead of NOT FOUND. The build re-parses everything when a **parser**
+module changed (`git pull` that touches `cobol.py`, `jcl.py`, `docs.py`… -
+never for a query, prompt or UI change) or the manifest changed, re-parses
+every job when a PROC / INCLUDE / card member changed, prints every 10 s
+how many members are parsed, the rate and the **time left at that rate**,
+stops cleanly on **Ctrl+C** (what was parsed is kept; the same command
+continues from there), never indexes its own outputs
 (`.atlas-output` marker, `*.exp.cbl`), types empty and comment-only members
 as `empty`, refuses a program row to a member with no `PROGRAM-ID` or
 DIVISION header, re-types a card deck found in a JCL library as `ctlcard`,

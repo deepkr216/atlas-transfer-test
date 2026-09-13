@@ -206,15 +206,34 @@ def sha(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def tool_fingerprint() -> str:
-    """sha256 of the parser source. A `git pull` that changes a parser must
-    re-parse every member, or the index keeps facts an older parser made."""
+# The modules whose code decides what a member's facts ARE. A change to one
+# of them makes the index stale and forces a re-parse of every member. The
+# query / gate / UI / fetch / convert / OCR modules read the index or write
+# beside it; changing them must not cost a 121,000-member estate hours.
+FACT_MODULES = ("build.py", "schema.sql", "reader.py", "classify.py", "cobol.py", "copybook.py", "expand.py",
+                "jcl.py", "ims.py", "screens.py", "txn.py", "docs.py")
+
+
+def tool_fingerprint(where: str = HERE) -> str:
+    """sha256 of the fact-producing source (FACT_MODULES). A `git pull` that
+    changes a parser must re-parse every member, or the index keeps facts an
+    older parser made; a pull that only changes queries or prompts does not."""
     h = hashlib.sha256()
-    for fn in sorted(os.listdir(HERE)):
-        if fn.endswith((".py", ".sql")):
-            with open(os.path.join(HERE, fn), "rb") as fh:
+    for fn in FACT_MODULES:
+        p = os.path.join(where, fn)
+        if os.path.isfile(p):
+            with open(p, "rb") as fh:
                 h.update(fn.encode() + fh.read())
     return h.hexdigest()[:16]
+
+
+def _hms(seconds: float) -> str:
+    s = int(max(0, seconds))
+    if s < 60:
+        return f"{s} s"
+    if s < 3600:
+        return f"{s // 60} min"
+    return f"{s // 3600} h {(s % 3600) // 60:02d} min"
 
 
 def code_line_count(kind: str, text: str, data: bytes, enc: str) -> int:
@@ -1594,15 +1613,22 @@ def _main(argv: Optional[List[str]] = None) -> int:
     ok = partial = failed = 0
     slow: List[Tuple[float, str, str]] = []
     n_parse = sum(1 for m in ctx.members if not m.skip)
-    ctx.say(f"parsing {n_parse} member(s) ({len(ctx.members) - n_parse} unchanged, kept) - a line every 10 s")
-    t_tick = time.time()
+    ctx.say(f"parsing {n_parse} member(s) ({len(ctx.members) - n_parse} unchanged, kept) - a line every 10 s "
+            "with the time left at the current rate; Ctrl+C stops cleanly and the same command continues later")
+    t_tick = t_start = time.time()
+    done = 0
+    stopped = False
     for i, mem in enumerate(sorted(ctx.members, key=lambda m: order.get(m.kind, 6)), 1):
         if mem.skip:
             continue                       # unchanged since last build; facts kept
         if time.time() - t_tick >= 10:
             t_tick = time.time()
             conn.commit()
-            ctx.say(f"  ... {i}/{len(ctx.members)} - now {mem.kind}: {os.path.basename(mem.path)}")
+            elapsed = t_tick - t_start
+            rate = done / elapsed if elapsed > 0 else 0.0
+            eta = _hms((n_parse - done) / rate) if rate > 0 else "?"
+            ctx.say(f"  ... {i}/{len(ctx.members)} - {done}/{n_parse} parsed in {_hms(elapsed)}, {rate:.1f}/s, "
+                    f"about {eta} left at this rate - now {mem.kind}: {os.path.basename(mem.path)}")
         handler = HANDLERS.get(mem.kind)
         try:
             with Heartbeat(ctx.say, f"{mem.kind} {os.path.basename(mem.path)}") as hb:
@@ -1617,15 +1643,29 @@ def _main(argv: Optional[List[str]] = None) -> int:
             st = conn.execute("SELECT parse_status FROM member WHERE id=?", (mem.id,)).fetchone()[0]
             ok += st == "ok"
             partial += st == "partial"
+        except KeyboardInterrupt:
+            # what is parsed is committed and kept; the member being parsed
+            # stays 'pending' (its half-written rows go with it) and is
+            # parsed again by the next run
+            conn.commit()
+            stopped = True
+            ctx.say(f"\nstopped by Ctrl+C at {done}/{n_parse} parsed ({_hms(time.time() - t_start)}). Run the same "
+                    f"build command again (without --rebuild) to continue: parsed members are kept, "
+                    f"{n_parse - done} remain")
+            break
         except Exception as e:                                          # noqa: BLE001
             failed += 1
             conn.execute("UPDATE member SET parse_status='failed', parse_error=? WHERE id=?",
                          (f"{type(e).__name__}: {e}"[:500], mem.id))
             ctx.say(f"  FAILED {mem.kind} {mem.path}: {type(e).__name__}: {e}")
+        done += 1
         if i % 500 == 0:
             conn.commit()
             ctx.say(f"  {i}/{len(ctx.members)} ...")
     conn.commit()
+    if stopped:
+        conn.close()
+        return 130
     if slow:
         slow.sort(reverse=True)
         ctx.say("  slowest members: " + "; ".join(f"{k} {n} {int(s)} s" for s, k, n in slow[:5]))
