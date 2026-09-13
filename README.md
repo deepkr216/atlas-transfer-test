@@ -160,6 +160,9 @@ change to the toolkit and before copying it to another machine.
 
 Every parse failure is recorded on the member; every unresolved reference is a
 row in `unresolved`; every report ends with the unresolved items in its scope.
+[ROADMAP.md](ROADMAP.md) holds the full coverage matrix - every artefact type
+and developer question, what produces facts, what is text only, and what is
+not built yet - from the 2026-09-12 coverage audit.
 
 ## Direction of I/O
 

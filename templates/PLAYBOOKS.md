@@ -25,12 +25,18 @@ explanation in the answer).
 Question shape: "If I change `PM-POLICY-STATUS` (PIC/length/values), what breaks?"
 
 ```
-python -m atlas.query --db atlas.db field    PM-POLICY-STATUS      > f.md
-python -m atlas.query --db atlas.db copybook PMASTREC              > c.md
+python -m atlas.query --db atlas.db field    PM-POLICY-STATUS      > f.md   # --all for every site
+python -m atlas.query --db atlas.db copybook PMASTREC              > c.md   # copies grouped by resolved version
+python -m atlas.query --db atlas.db layout   PMASTREC              > y.md   # the byte layout (record length!)
+python -m atlas.query --db atlas.db crud     --copybook PMASTREC   > x.md   # who creates/reads/updates/deletes
 python -m atlas.query --db atlas.db literal  AC                    > l.md   # for each 88 value in play
+python -m atlas.query --db atlas.db interfaces --dsn PROD.POLICY   > i.md   # does the record leave the mainframe?
 ```
 
-Hand the model: `f.md`, `c.md`, the relevant `l.md`s, and the change request.
+Hand the model: `f.md`, `c.md`, `y.md`, `x.md`, the relevant `l.md`s, `i.md`,
+and the change request - or one `pack copybook PMASTREC --budget 12000`.
+`field` follows COPY REPLACING renames (`LK-POLICY-STATUS`), answers an 88
+name, and never drops a program silently.
 
 The model must produce, in FACTS: (1) every copybook copy and its offset/length
 for the field, flagging version skew; (2) every program including each copy,
@@ -48,12 +54,15 @@ authoritative, any consumer outside the index.
 ## A2. What does this job do
 
 ```
-python -m atlas.query --db atlas.db job CLMNIGHT > j.md
+python -m atlas.query --db atlas.db job  CLMNIGHT > j.md
+python -m atlas.query --db atlas.db pack CLMNIGHT > p.md    # pack job: the FULL control cards, cited
 ```
 
-The model narrates step by step from `j.md` only: effective program (not
-`PGM=`), what the control cards make the step do (quote them), datasets in/out
-with direction source, GDG generation, COND/IF flow. `EXEC PROC=` steps are
+The model narrates step by step from `j.md` / `p.md` only: effective program
+(not `PGM=`), what the control cards make the step do (quote them - cards in
+`PROD.PARMLIB(MEMBER)` are in the pack too), datasets in/out with direction
+source, GDG generation, COND/IF flow (**runs only when** marks the
+error/backout steps), JOBLIB, the jobs it submits through INTRDR. `EXEC PROC=` steps are
 shown as their **effective steps** (`NIGHT.PS010 (from PROC NIGHTLY)`) with
 this job's symbolics and `//STEP.DD` overrides applied — those rows, not the
 PROC member, carry the real dataset names. IDCAMS steps show `create` /
@@ -70,12 +79,15 @@ Question shape: "Where does `E001` come from and where is it shown?"
 python -m atlas.query --db atlas.db literal E001 > l.md
 ```
 
-`l.md` already contains: where the literal is defined (VALUE / 88), set (MOVE),
-tested (IF / WHEN), displayed, and where the value flows after being set -
-positionally through `CALL ... USING` to the callee's LINKAGE, back to callers,
-and through file records to other programs at the same **bytes**. The model
-turns that into a chain with citations, and lists routes it could not follow
-(DB2/IMS/MQ, group-level MOVEs, unresolved CALLs).
+`l.md` already contains: where the literal is defined (VALUE / 88 - and, for a
+code kept in a message table, the text beside it), set (MOVE), tested (IF /
+WHEN), displayed, and where the value flows after being set - positionally
+through `CALL ... USING` (or a CICS LINK's COMMAREA) to the callee's LINKAGE,
+back to callers, and through file records to other programs at the same
+**bytes**. The model turns that into a chain with citations, and lists routes
+it could not follow (DB2/IMS/MQ, group-level MOVEs, unresolved CALLs).
+`callers <PGM> --args` shows every call site with its USING list when the
+chain crosses a subroutine.
 
 If `l.md` says the literal is not found: the code may be built (STRING,
 arithmetic), read from a table, or spelled differently. Say so; do not guess a
@@ -96,10 +108,13 @@ positions; every hop is a FACT with a citation or it is a gap.
 For a DB2 column: `column TABLE.COL` gives every program that writes it
 (INSERT/UPDATE from a host variable — and where that host variable was set),
 reads it (SELECT INTO / FETCH INTO — and where the value goes next) or
-filters on it. `field <host-var>` shows the same from the COBOL side. For an
-IMS field: `field` lists the DL/I calls whose I/O area holds it (GU/GN read
-into the area, ISRT/REPL write from it) with the positional PCB; map the PCB
-through the PSB in the `program` dossier to name the database and segment.
+filters on it; `SELECT * INTO :DCLGEN-group` is expanded column by column.
+`table [QUAL.]NAME` gives the CRUD per program plus the batch LOAD/UNLOAD
+steps. `field <host-var>` shows the same from the COBOL side. For an IMS
+field: `field` lists the DL/I calls whose I/O area holds it (GU/GN read into
+the area, ISRT/REPL write from it) with the database and PROCOPT already
+resolved through the PSB; `dbd <NAME>` / `segment <NAME>` give every program
+touching the database or segment and whether it updates.
 
 ## A5. Abend triage
 
@@ -114,10 +129,14 @@ python -m atlas.query --db atlas.db pack <PROGRAM> > p.md
 The model gives at most three ranked hypotheses, each with a disconfirming
 check. Per code: S0C7 - which COMP-3/numeric field at the reported offset
 (needs the compile listing to map offset→statement; without it say "cannot
-localise"); S0C4 - LINKAGE/USING count mismatch (compare `linkage_using` vs the
-caller's USING list in `program`); SQLCODE -805/-818 - bind/timestamp, not
-code; -911/-913 - contention, look at the concurrent jobs; IMS AI/AJ/AM -
-PROCOPT vs call function (`ims_pcb.procopt`), GE/GB - SSA/path, not a bug.
+localise"; `layout` gives the field lengths, `conditions` the tests around
+them); S0C4 - `callers <PGM> --args` flags every call site whose USING count
+differs from the callee's LINKAGE; SQLCODE -805/-818 - bind/timestamp, not
+code (`transaction` shows the DB2 plan of a CICS transaction); -911/-913 -
+contention, look at the concurrent jobs; IMS AI/AJ/AM - the `program`
+dossier already shows each call's database and PROCOPT: an update function
+on a PROCOPT=G PCB is the answer; GE/GB - SSA/path, not a bug. `paragraph
+<PGM> <line>` explains the paragraph around any line the dump names.
 
 ## A6. Dead code
 
@@ -128,7 +147,13 @@ python -m atlas.query --db atlas.db dead > d.md
 Candidates only. The report states whether the scheduler and online
 definitions were loaded and how many dynamic CALLs are unresolved; the model
 repeats those caveats and recommends the export that would close them. Never
-recommend deletion from this report alone.
+recommend deletion from this report alone. A program reached only by
+`START`/`RETURN TRANSID`, an IMS message switch, an ENTRY alias, a
+stored-procedure CALL or a synthesised system PROC is **not** a candidate.
+The same report lists datasets written but never read (and read but never
+written), copybooks nobody COPYs, and jobs absent from the scheduler export;
+`paragraph <PGM> <NAME>` says whether a paragraph is reached by PERFORM,
+GO TO, fall-through or a THRU range before anyone calls it dead.
 
 For an online program, `transaction <PROGRAM>` shows which CICS transactions
 (CSD) or IMS transactions (stage-1 `APPLCTN`/`TRANSACT`) route to it; if the
@@ -154,6 +179,8 @@ python -m atlas.query --db atlas.db field    WS-GENDER-CD           > f.md    # 
 python -m atlas.query --db atlas.db copybook <record copybook>      > c.md    # jobs, datasets, readers
 python -m atlas.query --db atlas.db values   GENDER                 > s.md    # the SCREEN field: default, validators
 python -m atlas.query --db atlas.db screen   <map or MID/MOD name>  > s2.md   # every field on the screen
+python -m atlas.query --db atlas.db table    <DB2 table holding the code>  > t.md   # who INSERTs/UPDATEs the column, declared type
+python -m atlas.query --db atlas.db interfaces --dsn <extract DSN>  > i.md   # non-mainframe readers of the value
 ```
 
 Online: `values` on the *screen* field name (BMS `GENDER`, referenced by
@@ -180,15 +207,24 @@ What each inventory gives the design:
   offset/length (skew!), programs, jobs, datasets written and who reads them,
   callers. The value change does not move bytes, so file contracts survive -
   but every reader that tests the old values is on this list.
+- **`table`** - if the code lives in a DB2 column: every program that
+  INSERTs/UPDATEs it (with the host field it is written from), the declared
+  type and length, cursors and dynamic SQL that filter on it, and the DB2
+  utilities/plans that touch the table.
+- **`interfaces`** - every NDM/FTP/MQ/DDF/web-service edge carrying the
+  value off the mainframe, with the peer from `manifest.json`; each is an
+  external contract change, not a code change.
 
 The model then produces, in FACTS: per system, the value table, the rule
 list, the message list, the reader list. In INFERENCE: for each rule, keep /
 rewrite / delete; for each message, new text; for each reader outside the
 mainframe (interface_edge rows), a contract note. The mandatory HUMAN MUST
 VERIFY items: values that exist in data but not in code (compare against the
-tables' actual distinct values), screens (BMS/MFS validation and picklists
-are not parsed), DB2 CHECK constraints and lookup tables, and any program the
-index could not expand.
+tables' actual distinct values), screen picklists and any validation done
+outside COBOL (BMS/MFS field lists, defaults and lengths ARE parsed; the
+validating IF/EVALUATE is in the program and `values` finds it), DB2 CHECK
+constraints and lookup tables, non-mainframe consumers not declared in
+`manifest.json`, and any program the index could not expand.
 
 Tests come straight from `values`: every old value, every new value, every
 pair combination the rules mention, and one value outside all of them.
@@ -198,15 +234,28 @@ pair combination the rules mention, and one value outside all of them.
 ## D1. Change design document (two passes)
 
 **Pass 1 - facts (no model):** run A1 for every field touched and A2 for every
-job touched; concatenate into `facts.md`.
+job touched, then the cross-cutting matrices:
+
+```
+python -m atlas.query --db atlas.db crud       --job <JOB> [--job ...]     > crud.md    # C/R/U/D per program x dataset/table/segment, cited
+python -m atlas.query --db atlas.db interfaces --system <SYSTEM>           > ifc.md     # what leaves/enters the mainframe and via whom
+python -m atlas.query --db atlas.db table      <TABLE>                     > t-<T>.md   # per touched DB2 table: writers, columns, plans
+python -m atlas.query --db atlas.db dbd        <DBD>                       > d-<D>.md   # per touched IMS DB: segments, PSBs+PROCOPT, utilities
+python -m atlas.query --db atlas.db layout     <COPYBOOK> [--program PGM]  > l-<C>.md   # byte contract, as the named program sees it
+```
+
+Concatenate into `facts.md`. `crud` is the affected-components table in
+raw form; `interfaces` is the external-contract section; `layout` is the
+"contracts in bytes" section; `dbd` says whether a DBDGEN/PSBGEN is in play.
 
 **Pass 2 - narrative (one model call):** hand `facts.md` + the requirement.
 The design must contain: affected components table (from FACTS, each with a
 change type: RECOMPILE-ONLY / SOURCE-CHANGE / BIND / PSBGEN+ACBGEN /
 DBDGEN+RELOAD / JCL-CHANGE / DATA-CONVERSION / EXTERNAL-CONTRACT); CRUD matrix
-derived from `sql_stmt` verbs, DL/I functions and file OPEN modes; before/after
-data flow; interface contracts in bytes (RECFM, LRECL, RDW, code page, whether
-COMP/COMP-3 crosses the boundary); backout plan per change type (a DBD BYTES
+copied from `crud` (it already combines SQL verbs, DL/I functions, CICS
+file commands and file OPEN modes); before/after
+data flow; interface contracts in bytes from `layout` and `interfaces` (RECFM, LRECL,
+RDW, code page, whether COMP/COMP-3 crosses the boundary, the peer); backout plan per change type (a DBD BYTES
 change has no fast backout - say so); a non-empty risks/unknowns section
 seeded from UNRESOLVED.
 
@@ -215,9 +264,17 @@ seeded from UNRESOLVED.
 ```
 python -m atlas.query --db atlas.db pack     <similar existing program>  > exemplar-facts.md
 python -m atlas.query --db atlas.db cite     <similar member> 1-400     > exemplar.cbl
-python -m atlas.query --db atlas.db copybook <each record copybook>     > layout.md
-python -m atlas.query --db atlas.db job      <a job that runs the exemplar> > exemplar-jcl.md
+python -m atlas.query --db atlas.db layout   <each record copybook> --program <exemplar> > layout.md  # offsets as the exemplar sees them
+python -m atlas.query --db atlas.db copybook <each record copybook>     > copies.md   # every copy, skew, readers
+python -m atlas.query --db atlas.db paragraph <exemplar> <error/checkpoint paragraph> > house-style.md  # the shop's real error handling
+python -m atlas.query --db atlas.db pack     <a job that runs the exemplar> --kind job > exemplar-jcl.md  # full control cards
+python -m atlas.query --db atlas.db dbd      <each IMS DB touched>      > dbd.md      # PROCOPT the exemplar's PSB really has
 ```
+
+`paragraph` on the exemplar's error/abend/checkpoint paragraph is the house
+style in source form: SQLCODE tests, status-code tests, the ABEND routine it
+calls, the restart logic. `pack --kind job` carries the exact control cards
+(sort, IDCAMS, DB2 utility) the new job must imitate.
 
 The bundle contains: source (field names only from `layout.md`); copybook
 changes; compile/bind member modelled on the shop's real one; run JCL modelled
@@ -230,15 +287,20 @@ logic, anything crossing to a non-mainframe system).
 ## T1. Test conditions and data
 
 ```
-python -m atlas.query --db atlas.db field    <each input field>   > f.md   # 88 values
-python -m atlas.query --db atlas.db pack     <program>            > p.md   # paragraphs, calls, SQL
-python -m atlas.query --db atlas.db copybook <record copybook>    > layout.md
+python -m atlas.query --db atlas.db conditions <program>          > cond.md  # every IF/WHEN with its literal or 88 values, cited
+python -m atlas.query --db atlas.db field    <each input field>   > f.md     # 88 values
+python -m atlas.query --db atlas.db pack     <program>            > p.md     # paragraphs, calls, SQL
+python -m atlas.query --db atlas.db layout   <record copybook> --program <program> > layout.md  # byte positions for the records
+python -m atlas.query --db atlas.db pack     <record copybook> --kind copybook       > cb.md     # layout + who else reads it
 ```
 
-Condition inventory: every 88 value is a positive class, every THRU range gives
-low/high/mid, one value outside all 88s under a field is the mandatory
-negative; every IF gets true and false (implicit false when no ELSE); every
-EVALUATE gets each WHEN plus OTHER. Test records are built to the copybook
+Condition inventory comes from `conditions`: it lists every IF / EVALUATE
+WHEN / sort INCLUDE-OMIT test in the program with the field, the operator, the
+literal or the 88 name (expanded to its values) and the line - so every 88
+value is a positive class, every THRU range gives low/high/mid, one value
+outside all 88s under a field is the mandatory negative; every IF gets true
+and false (implicit false when no ELSE); every EVALUATE gets each WHEN plus
+OTHER. Test records are built to the copybook
 byte layout (COMP-3 packed, correct lengths, RDW if VB) - the parser's numbers,
 not the model's.
 
