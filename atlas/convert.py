@@ -174,6 +174,25 @@ foreach ($app in @($script:word, $script:excel, $script:ppt)) {
 '''
 
 
+_MAIN_PART = {".docx": "word/document.xml", ".xlsx": "xl/workbook.xml", ".pptx": "ppt/presentation.xml"}
+
+
+def modern_copy_is_whole(path: str) -> bool:
+    """A .docx / .xlsx / .pptx is a zip with one main part; a copy cut short
+    by Ctrl+C or a crash mid-save is neither, and must be made again."""
+    ext = os.path.splitext(path)[1].lower()
+    try:
+        if not zipfile.is_zipfile(path):
+            return False
+        with zipfile.ZipFile(path) as z:
+            names = set(z.namelist())
+            if z.testzip() is not None:
+                return False
+        return _MAIN_PART.get(ext, "") in names or ext not in _MAIN_PART
+    except (OSError, zipfile.BadZipFile):
+        return False
+
+
 def plan(root: str) -> List[Tuple[str, str, str]]:
     """(source, target, 'convert' | 'exists') for every legacy Office file
     under `root`, subfolders included. `exists` = a modern copy is already
@@ -191,12 +210,16 @@ def plan(root: str) -> List[Tuple[str, str, str]]:
             src_path, dst_path = os.path.join(dirpath, fn), os.path.join(dirpath, target)
             if target.lower() in lower:
                 # both exist: the copy is current unless the legacy file was
-                # changed AFTER the copy was made - then the copy is stale
+                # changed AFTER the copy was made (stale) - or the copy is not
+                # a whole file (an interrupted save): then it is made again
                 try:
                     stale = os.path.getmtime(src_path) > os.path.getmtime(dst_path) + 1
                 except OSError:
                     stale = False
-                status = "stale" if stale else "exists"
+                if not modern_copy_is_whole(dst_path):
+                    status = "convert"
+                else:
+                    status = "stale" if stale else "exists"
             else:
                 status = "convert"
             out.append((src_path, dst_path, status))

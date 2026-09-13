@@ -30,9 +30,10 @@ class Convert(unittest.TestCase):
                     "~$Claims Manual.doc"):
             with open(os.path.join(self.docs, rel), "w") as fh:
                 fh.write("x")
-        # one already converted: a modern copy beside the legacy file
-        with open(os.path.join(self.docs, "rates.xlsx"), "w") as fh:
-            fh.write("x")
+        # one already converted: a (minimal but whole) modern copy beside the legacy file
+        import zipfile
+        with zipfile.ZipFile(os.path.join(self.docs, "rates.xlsx"), "w") as z:
+            z.writestr("xl/workbook.xml", "<workbook/>")
 
     def tearDown(self):
         shutil.rmtree(self.td, ignore_errors=True)
@@ -190,6 +191,23 @@ class Convert(unittest.TestCase):
             z.writestr("again.txt", "x")
         convert.unzip_tree(self.docs, log=lines.append, dry_run=True)
         self.assertFalse(os.path.exists(os.path.join(top, "again.txt")))
+
+    def test_a_half_written_copy_is_made_again(self):
+        """Ctrl+C during a save leaves a truncated .docx beside the .doc: the
+        next run must treat it as not converted, not as done."""
+        import zipfile
+        doc = os.path.join(self.docs, "Claims Manual.doc")
+        docx = os.path.join(self.docs, "Claims Manual.docx")
+        with open(docx, "wb") as fh:
+            fh.write(b"PK\x03\x04 truncated in the middle of a save")
+        self.assertFalse(convert.modern_copy_is_whole(docx))
+        self.assertEqual([st for s, _d, st in convert.plan(self.docs) if s == doc], ["convert"])
+        # a whole one is left alone
+        with zipfile.ZipFile(docx, "w") as z:
+            z.writestr("word/document.xml", "<w:document/>")
+        self.assertTrue(convert.modern_copy_is_whole(docx))
+        os.utime(doc, (1_600_000_000, 1_600_000_000))
+        self.assertEqual([st for s, _d, st in convert.plan(self.docs) if s == doc], ["exists"])
 
     def test_cli(self):
         buf = io.StringIO()
