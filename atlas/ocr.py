@@ -96,20 +96,50 @@ def ocr_available() -> Tuple[bool, str]:
     return True, "Windows OCR via PowerShell"
 
 
-def _run_ps(script: str, args: List[str], timeout: int = 1800) -> Tuple[int, str, str]:
+def _run_ps(script: str, args: List[str], timeout: int = 1800,
+            on_line=None) -> Tuple[int, str, str]:
+    """Run a PowerShell script; every line it prints is handed to `on_line`
+    the moment it appears (a thousand images are minutes of silence
+    otherwise). Returns (rc, everything printed, stderr)."""
     with tempfile.NamedTemporaryFile("w", suffix=".ps1", delete=False, encoding="utf-8") as fh:
         fh.write(script)
         path = fh.name
+    lines: List[str] = []
     try:
-        p = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-                            "-File", path, *args], capture_output=True, text=True, encoding="utf-8",
-                           errors="replace", timeout=timeout)
-        return p.returncode, p.stdout or "", p.stderr or ""
+        p = subprocess.Popen(["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                              "-File", path, *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                             encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL)
+        assert p.stdout is not None
+        for raw in p.stdout:
+            line = raw.rstrip("\r\n")
+            lines.append(line)
+            if on_line:
+                on_line(line)
+        try:
+            err = p.communicate(timeout=timeout)[1] or ""
+        except subprocess.TimeoutExpired:
+            p.kill()
+            return 124, "\n".join(lines) + "\n", f"timed out after {timeout}s"
+        return p.returncode, "\n".join(lines) + "\n", err
     finally:
         try:
             os.remove(path)
         except OSError:
             pass
+
+
+def _ticker(log, what: str, total: int):
+    """A callback that says `n/total what` every 10 s as JSON result lines stream past."""
+    import time as _t
+    state = {"n": 0, "t": _t.time()}
+
+    def on_line(line: str) -> None:
+        if line.startswith("{") and '"path"' in line or '"page"' in line:
+            state["n"] += 1
+        if log and _t.time() - state["t"] >= 10:
+            state["t"] = _t.time()
+            log(f"  ... {state['n']}/{total} {what}")
+    return on_line
 
 
 def render_text_png(text: str, out_path: str) -> bool:
@@ -167,7 +197,7 @@ PDF_RENDER_WIDTH = 1700    # pixels across the page: enough for 9-point print
 
 
 def render_pdf_pages(pdf_path: str, out_dir: str, max_pages: int = PDF_MAX_PAGES,
-                     width: int = PDF_RENDER_WIDTH) -> Tuple[int, List[Tuple[int, str]], List[str]]:
+                     width: int = PDF_RENDER_WIDTH, log=None) -> Tuple[int, List[Tuple[int, str]], List[str]]:
     """Render a PDF's pages to page-NNNN.png under out_dir with the Windows
     PDF renderer. Returns (pages in the document, [(page, png path)], warnings)."""
     ok, why = ocr_available()
@@ -175,7 +205,8 @@ def render_pdf_pages(pdf_path: str, out_dir: str, max_pages: int = PDF_MAX_PAGES
         return 0, [], [why]
     os.makedirs(out_dir, exist_ok=True)
     rc, out, err = _run_ps(_PS_PDF, ["-Pdf", os.path.abspath(pdf_path), "-OutDir", os.path.abspath(out_dir),
-                                     "-MaxPages", str(max_pages), "-Width", str(width)], timeout=3600)
+                                     "-MaxPages", str(max_pages), "-Width", str(width)], timeout=3600,
+                           on_line=_ticker(log, f"pages of {os.path.basename(pdf_path)} rendered", max_pages))
     pages: List[Tuple[int, str]] = []
     warnings: List[str] = []
     total = 0
@@ -200,16 +231,20 @@ def render_pdf_pages(pdf_path: str, out_dir: str, max_pages: int = PDF_MAX_PAGES
     return total, pages, warnings
 
 
-def ocr_images(paths: List[str]) -> Tuple[Dict[str, str], List[str]]:
-    """{path: text} for every image Windows OCR could read, plus warnings."""
+def ocr_images(paths: List[str], log=None) -> Tuple[Dict[str, str], List[str]]:
+    """{path: text} for every image Windows OCR could read, plus warnings.
+    With `log`, a progress line every 10 s."""
     ok, why = ocr_available()
     if not ok or not paths:
         return {}, ([] if ok else [why])
     with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as fh:
         fh.write("\n".join(os.path.abspath(p) for p in paths))
         listfile = fh.name
+    if log:
+        log(f"  OCR engine starting on {len(paths)} image(s) - a line every 10 s")
     try:
-        rc, out, err = _run_ps(_PS_OCR, ["-ListFile", listfile])
+        rc, out, err = _run_ps(_PS_OCR, ["-ListFile", listfile], timeout=max(1800, 3 * len(paths)),
+                               on_line=_ticker(log, "images read", len(paths)))
     finally:
         try:
             os.remove(listfile)
@@ -296,7 +331,8 @@ def extract_images(conn: sqlite3.Connection, out_dir: str, member: Optional[str]
                                 (mid,)).fetchone()[0]
             if done:
                 continue                                    # pages already read on an earlier run
-            total, pages, warns = render_pdf_pages(path, dest_dir)
+            log(f"  {name}: rendering PDF pages for OCR ...")
+            total, pages, warns = render_pdf_pages(path, dest_dir, log=log)
             for w in warns[:5]:
                 log("  " + w)
             if pages:
@@ -324,7 +360,7 @@ def run(conn: sqlite3.Connection, out_dir: str, do_ocr: bool = True, member: Opt
     todo = [(mid, name, img, dest) for (mid, name, img, dest) in images
             if conn.execute("SELECT ocr_text FROM doc_image WHERE member_id=? AND name=?", (mid, img)).fetchone()[0] is None]
     log(f"OCR: {len(todo)} image(s) to read ({len(images) - len(todo)} already done)")
-    texts, warnings = ocr_images([d for (_m, _n, _i, d) in todo])
+    texts, warnings = ocr_images([d for (_m, _n, _i, d) in todo], log=log)
     for w in warnings[:20]:
         log("  " + w)
     for mid, name, img, dest in todo:
