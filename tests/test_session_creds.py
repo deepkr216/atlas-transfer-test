@@ -124,6 +124,30 @@ class StagedCheck(unittest.TestCase):
         self.assertIn("3. the host did NOT answer", msg)
         self.assertIn("zowe wanted a password", msg)
 
+    def test_host_command_hangs_on_the_password_prompt(self):
+        """The real symptom: stages 1-2 pass, the first command that logs on
+        never comes back (zowe put up its password prompt). The check must
+        name it, not sit there."""
+        class Hanging(self.Fake):
+            def run(self, cmd):
+                if "list" in cmd:
+                    return 124, "", "timed out after 120s"
+                return super().run(cmd)
+        fetch.set_session_credentials(None, None)
+        with mock.patch("atlas.fetch.zowe_exe", return_value="zowe"):
+            ok, msg = fetch.check_zowe(self._cfg(), runner=Hanging())
+        self.assertFalse(ok)
+        self.assertIn("did NOT answer", msg)
+        self.assertIn("waiting for the mainframe password", msg)
+        self.assertIn("--ask-password", msg)
+        self.assertIn("zowe config secure", msg)
+        # with a session password the same timeout is NOT explained as a prompt
+        fetch.set_session_credentials("DEEPAK", "pw")
+        try:
+            self.assertEqual(fetch.password_hint(124, "", "timed out"), "")
+        finally:
+            fetch.set_session_credentials(None, None)
+
     def test_host_refuses_for_another_reason(self):
         with mock.patch("atlas.fetch.zowe_exe", return_value="zowe"):
             ok, msg = fetch.check_zowe(self._cfg(), runner=self.Fake(1, "Error: self signed certificate in certificate chain"))

@@ -309,8 +309,17 @@ def session_env() -> Dict[str, str]:
     return env
 
 
+HANG_SECONDS = 120     # a host command that prints nothing for this long is waiting for a password
+
+
 def password_hint(rc: int, out: str, err: str) -> str:
-    """What to tell the user when zowe failed because it wanted a password."""
+    """What to tell the user when zowe failed - or hung - because it wanted
+    a password. rc 124 (timed out) with no output is the hang: zowe put up
+    its password prompt and, run in the background, waits forever."""
+    if rc == 124 and not (out or "").strip() and has_session_credentials() is False:
+        return ("zowe printed nothing and did not come back: it is waiting for the mainframe password it asked "
+                "you for when you ran it by hand. Give it for this run - Sign in (UI) or --ask-password (CLI) - "
+                "or store it once with `zowe config secure` (Windows Credential Manager)")
     if rc != 0 and re.search(r"password", f"{out}\n{err}", re.IGNORECASE):
         return ("zowe wanted a password and a background run cannot type one: store it in the "
                 "profile once (`zowe config secure`, kept in Windows Credential Manager) or use "
@@ -387,10 +396,12 @@ def check_zowe(cfg: Dict, runner: Optional[Runner] = None,
     if first is None:
         say("3. no enabled PDS in the table yet - add one, then Check again to test the host connection")
         return True, "\n".join(lines)
-    say(f"   asking the host for the member list of {first['dataset']} ...")
-    rc, out, err = runner.run(list_members_cmd(cfg, first["dataset"]))
+    say(f"   asking the host for the member list of {first['dataset']} (this is the first command that logs on; "
+        f"if nothing comes back within {HANG_SECONDS} s, zowe is waiting for a password) ...")
+    lister = runner if runner is not None and not isinstance(runner, Runner) else Runner(HANG_SECONDS)
+    rc, out, err = lister.run(list_members_cmd(cfg, first["dataset"]))
     if rc != 0:
-        tail = " | ".join((err or out).strip().splitlines()[-3:])[:400]
+        tail = " | ".join((err or out).strip().splitlines()[-3:])[:400] or "(no output at all)"
         hint = password_hint(rc, out, err)
         say(f"3. the host did NOT answer `zowe zos-files list all-members {first['dataset']}` (rc {rc}): {tail}"
             + (f"\n   -> {hint}" if hint else
@@ -462,7 +473,8 @@ def reconcile_library(cfg: Dict, src: Dict, dest: str, rc: int, runner: Runner,
     retired program does not stay alive in the index. Returns the record,
     or None when the member list could not be obtained (then nothing is
     moved and the folder is trusted as it is)."""
-    rc_l, out, err = runner.run(list_members_cmd(cfg, src["dataset"]))
+    lister = runner if not isinstance(runner, Runner) else Runner(max(HANG_SECONDS, 300))
+    rc_l, out, err = lister.run(list_members_cmd(cfg, src["dataset"]))
     if rc_l != 0:
         log(f"  (member list unavailable, rc {rc_l}: folder taken as is)")
         return None
