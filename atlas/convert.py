@@ -265,7 +265,8 @@ def convert_tree(root: str, dry_run: bool = False, log: Callable[[str], None] = 
     todo = [(s, d) for s, d, st in items if st == "convert" or (refresh and st == "stale")]
     have = sum(1 for _s, _d, st in items if st == "exists")
     stale = [s for s, _d, st in items if st == "stale"]
-    log(f"{len(items)} legacy Office file(s) under {root}: {len(todo)} to convert, {have} already have a modern copy"
+    log(f"{len(items)} legacy .doc/.xls/.ppt file(s) under {root}: {len(todo)} to convert, {have} already converted earlier "
+        f"(.docx/.xlsx/.pptx/.pdf files are read as they are and are not counted here)"
         + (f", {len(stale)} copies STALE (the legacy file changed after the copy was made)" if stale else ""))
     if stale and not refresh:
         for s in stale:

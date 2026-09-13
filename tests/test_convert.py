@@ -196,7 +196,7 @@ class Convert(unittest.TestCase):
         with contextlib.redirect_stdout(buf):
             rc = convert.main([self.docs, "--dry-run"])
         self.assertEqual(rc, 0)
-        self.assertIn("3 to convert, 1 already have a modern copy", buf.getvalue())
+        self.assertIn("3 to convert, 1 already converted earlier", buf.getvalue())
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(convert.main([os.path.join(self.td, "nope")]), 2)
 
