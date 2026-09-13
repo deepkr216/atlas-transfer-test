@@ -134,7 +134,7 @@ def _ticker(log, what: str, total: int):
     state = {"n": 0, "t": _t.time()}
 
     def on_line(line: str) -> None:
-        if line.startswith("{") and '"path"' in line or '"page"' in line:
+        if line.startswith("{") and ('"path"' in line or '"page"' in line):
             state["n"] += 1
         if log and _t.time() - state["t"] >= 10:
             state["t"] = _t.time()
