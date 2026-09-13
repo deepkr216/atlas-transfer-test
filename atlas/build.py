@@ -34,6 +34,7 @@ from . import classify, cobol, copybook, docs, expand, ims, jcl, reader, screens
 from .reader import Line
 
 VERSION = "0.1.0"
+MAX_MEMBER_BYTES = 300 * 1024 * 1024      # a file bigger than this is not a document to index, it is a dump
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 CODE_KINDS = {"cobol", "copybook", "jcl", "proc", "ctlcard", "dbd", "psb", "bms", "mfs",
@@ -300,11 +301,23 @@ def inventory(ctx: Ctx, roots, limit: Optional[int] = None, force_all: bool = Fa
     for dirpath, fn in (pair for root in roots for pair in _scan_files(root, limit)):
         path = os.path.normpath(os.path.join(dirpath, fn))
         try:
-            with open(path, "rb") as fh:
+            st = os.stat(docs.long_path(path))
+            if st.st_size > MAX_MEMBER_BYTES:
+                ctx.bump("too_large")
+                ctx.say(f"  skipped, too large to index: {path} ({st.st_size // 1024 // 1024} MB)")
+                continue
+            with open(docs.long_path(path), "rb") as fh:
                 data = fh.read()
         except OSError as e:
             ctx.bump("unreadable")
-            ctx.say(f"  unreadable: {path} ({e})")
+            hint = ""
+            try:
+                attrs = getattr(os.stat(docs.long_path(path)), "st_file_attributes", 0)
+                if attrs & 0x400000 or attrs & 0x1000:
+                    hint = " - a OneDrive placeholder not downloaded to this laptop: right-click the folder > Always keep on this device"
+            except OSError:
+                pass
+            ctx.say(f"  unreadable: {path} ({e}){hint}")
             continue
         ext = os.path.splitext(fn)[1].lower()
         if ext in classify.BINARY_EXTS or ext in docs.LEGACY or ext in (".pdf", ".docx", ".xlsx", ".pptx", ".vsdx"):

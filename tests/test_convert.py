@@ -315,7 +315,7 @@ class Convert(unittest.TestCase):
         start a fresh one for the next file, not fail the rest of the list."""
         script = convert._PS_SCRIPT
         self.assertIn("disconnected from its clients|RPC server is unavailable", script)
-        self.assertIn("'.doc' { $script:word = $null }", script)
+        self.assertIn("{ $_ -in '.doc', '.dot', '.rtf' } { $script:word = $null }", script)
         self.assertIn("a new one is started for the next file", script)
 
     def test_office_works_on_a_local_copy_and_the_result_lands_beside_the_original(self):
@@ -402,6 +402,56 @@ class Convert(unittest.TestCase):
         self.assertIn("PARSE OK", p.stdout, p.stdout + p.stderr)
         for fn in ("Convert-Doc", "Convert-Xls", "Describe-Doc", "Report-NewPid"):
             self.assertIn("function " + fn, convert._PS_SCRIPT)
+
+    def test_robustness_pass(self):
+        """Templates and RTF convert too; a name with a control character is
+        refused with a reason; Office's known messages get a hint; a result
+        held by OneDrive for a moment is retried; a long path gets the prefix."""
+        from atlas import docs
+        for n in ("old.dot", "spec.rtf", "sheet.xlt", "deck.pot"):
+            with open(os.path.join(self.docs, n), "w") as fh:
+                fh.write("x")
+        by_src = {os.path.basename(s): os.path.basename(d) for s, d, _st in convert.plan(self.docs)}
+        self.assertEqual(by_src["old.dot"], "old.docx")
+        self.assertEqual(by_src["spec.rtf"], "spec.docx")
+        self.assertEqual(by_src["sheet.xlt"], "sheet.xlsx")
+        self.assertEqual(by_src["deck.pot"], "deck.pptx")
+        self.assertIn("File Block Settings", convert.hint_for("You are attempting to open a file type that is blocked"))
+        self.assertIn("password to OPEN", convert.hint_for("The password is incorrect. Word cannot open the document."))
+        self.assertIn("damaged", convert.hint_for("Word found unreadable content in x.doc"))
+        self.assertIn("open elsewhere", convert.hint_for("The file is locked for editing by another user"))
+        self.assertIn("generic refusal", convert.hint_for("readonly-open, docx: Command failed hr=0x800a1066 [ReadOnly=True]"))
+        self.assertEqual(convert.hint_for("something new"), "")
+        # a replace that fails twice then succeeds (OneDrive sync holding the new file)
+        calls = {"n": 0}
+        real_replace = os.replace
+
+        def flaky(a, b):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise PermissionError("being used by another process")
+            return real_replace(a, b)
+        stage = tempfile.mkdtemp()
+        produced = os.path.join(stage, "0", "Claims Manual.docx")
+        os.makedirs(os.path.dirname(produced))
+        with open(produced, "w") as fh:
+            fh.write("new")
+        ssrc = os.path.join(stage, "0", "Claims Manual.doc")
+        back = {ssrc: (os.path.join(self.docs, "Claims Manual.doc"), os.path.join(self.docs, "Claims Manual.docx"))}
+        with mock.patch("atlas.convert.os.replace", side_effect=flaky), mock.patch("atlas.convert.time.sleep"):
+            rows = convert._unstage([("OK", ssrc, produced)], back, lambda l: None)
+        self.assertEqual(rows[0][0], "OK")
+        self.assertEqual(calls["n"], 3)
+        self.assertTrue(os.path.exists(os.path.join(self.docs, "Claims Manual.docx")))
+        # long paths
+        deep = "C:\\" + "\\".join(["folder-with-a-long-name"] * 12) + "\\file.doc"
+        lp = docs.long_path(deep)
+        if os.name == "nt":
+            self.assertTrue(lp.startswith("\\\\?\\"), lp)
+            self.assertEqual(docs.long_path("C:\\short.doc"), "C:\\short.doc")
+        for fn in ("Convert-Ppt", "Tick-App"):
+            self.assertIn("function " + fn, convert._PS_SCRIPT)
+        self.assertIn("[Console]::OutputEncoding = [System.Text.Encoding]::UTF8", convert._PS_SCRIPT)
 
     def test_cli(self):
         buf = io.StringIO()

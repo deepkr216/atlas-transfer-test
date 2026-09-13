@@ -42,9 +42,24 @@ NS = {
 
 IMAGE_EXT = (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".emf", ".wmf", ".tif", ".tiff", ".svg")
 
-LEGACY_TO_MODERN = {".doc": ".docx", ".xls": ".xlsx", ".ppt": ".pptx"}   # atlas.convert writes the right-hand side
-LEGACY = {".doc": "Word 97-2003", ".xls": "Excel 97-2003", ".ppt": "PowerPoint 97-2003",
+# atlas.convert writes the right-hand side beside the original (templates and
+# RTF too - Word / Excel / PowerPoint open them all)
+LEGACY_TO_MODERN = {".doc": ".docx", ".dot": ".docx", ".rtf": ".docx",
+                    ".xls": ".xlsx", ".xlt": ".xlsx",
+                    ".ppt": ".pptx", ".pot": ".pptx"}
+LEGACY = {".doc": "Word 97-2003", ".dot": "Word 97-2003 template", ".rtf": "Rich Text",
+          ".xls": "Excel 97-2003", ".xlt": "Excel 97-2003 template",
+          ".ppt": "PowerPoint 97-2003", ".pot": "PowerPoint 97-2003 template",
           ".vsd": "Visio 2003-2010", ".msg": "Outlook message"}
+
+
+def long_path(path: str) -> str:
+    r"""Windows refuses paths longer than ~260 characters unless they carry
+    the \\?\ prefix; deep OneDrive trees reach that easily."""
+    if os.name == "nt" and len(path) > 240 and not path.startswith("\\\\?\\"):
+        p = os.path.abspath(path)
+        return "\\\\?\\UNC\\" + p[2:] if p.startswith("\\\\") else "\\\\?\\" + p
+    return path
 
 
 @dataclass
@@ -76,6 +91,7 @@ class DocText:
 # --------------------------------------------------------------------------
 
 def extract(path: str) -> DocText:
+    path = long_path(path)
     ext = os.path.splitext(path)[1].lower()
     try:
         if ext == ".docx" or ext == ".dotx":

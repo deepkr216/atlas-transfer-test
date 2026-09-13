@@ -24,15 +24,17 @@ import argparse
 import json
 import os
 import queue
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import zipfile
 from typing import Callable, Dict, List, Optional, Tuple
 
-from .docs import LEGACY_TO_MODERN
+from .docs import LEGACY_TO_MODERN, long_path
 
 SKIP_DIRS = {"out", "atlas_out", ".git", "__pycache__", ".stale"}
 
@@ -124,7 +126,22 @@ def unzip_tree(root: str, log: Callable[[str], None] = print, dry_run: bool = Fa
 _PS_SCRIPT = r'''
 param([string]$ListFile, [int]$Visible = 0)
 $ErrorActionPreference = 'Continue'
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $script:show = ($Visible -eq 1)
+$script:done = @{ WINWORD = 0; EXCEL = 0; POWERPNT = 0 }
+$script:restartEvery = 40      # Office leaks memory over a long run: a fresh instance every N files
+function Tick-App([string]$Name) {
+    $script:done[$Name] = $script:done[$Name] + 1
+    if ($script:done[$Name] % $script:restartEvery -eq 0) {
+        try {
+            switch ($Name) {
+                'WINWORD'  { if ($script:word)  { $script:word.Quit();  $script:word = $null } }
+                'EXCEL'    { if ($script:excel) { $script:excel.Quit(); $script:excel = $null } }
+                'POWERPNT' { if ($script:ppt)   { $script:ppt.Quit();   $script:ppt = $null } }
+            }
+        } catch {}
+    }
+}
 $script:word = $null
 $script:excel = $null
 $script:ppt = $null
@@ -209,6 +226,27 @@ function Convert-Doc($w, $src, $dst) {
     }
     throw ($errs -join " | ")
 }
+function Convert-Ppt($p, $src, $dst, $win) {
+    $errs = @()
+    $tries = @(
+        @{ name = "no-window open, SaveAs";  run = { param($s, $d) $r = $p.Presentations.Open($s, -1, 0, $win); $r.SaveAs($d, 24); $r.Close() } },
+        @{ name = "windowed open, SaveAs";   run = { param($s, $d) $r = $p.Presentations.Open($s, -1, 0, -1); $r.SaveAs($d, 24); $r.Close() } },
+        @{ name = "minimal open, SaveCopyAs"; run = { param($s, $d) $r = $p.Presentations.Open($s); $r.SaveCopyAs($d, 24); $r.Close() } }
+    )
+    for ($t = 0; $t -lt $tries.Count; $t++) {
+        $try = $tries[$t]
+        try {
+            & $try.run $src $dst
+            if (Test-Path -LiteralPath $dst) { return "$($try.name)" }
+            $errs += "$($try.name): no file written"
+        } catch {
+            $m = $_.Exception.Message -replace "[`r`n]+", " "
+            $errs += "$($try.name): $m"
+            try { foreach ($op in @($p.Presentations)) { if ($op.FullName -eq $src) { $op.Close() } } } catch {}
+        }
+    }
+    throw ($errs -join " | ")
+}
 function Convert-Xls($x, $src, $dst) {
     $miss = [System.Reflection.Missing]::Value
     $errs = @()
@@ -249,9 +287,9 @@ foreach ($line in $pairs) {
         # dialog, nothing added to the recent-files list.
         $how = ""
         switch ($ext) {
-            '.doc' { $w = Get-Word; $how = Convert-Doc $w $src $dst }
-            '.xls' { $x = Get-Excel; $how = Convert-Xls $x $src $dst }
-            '.ppt' { $p = Get-PPT; $r = $p.Presentations.Open($src, -1, 0, $win); $r.SaveAs($dst, 24); $r.Close() }
+            { $_ -in '.doc', '.dot', '.rtf' } { $w = Get-Word;  $how = Convert-Doc $w $src $dst;      Tick-App 'WINWORD' }
+            { $_ -in '.xls', '.xlt' }         { $x = Get-Excel; $how = Convert-Xls $x $src $dst;      Tick-App 'EXCEL' }
+            { $_ -in '.ppt', '.pot' }         { $p = Get-PPT;   $how = Convert-Ppt $p $src $dst $win; Tick-App 'POWERPNT' }
         }
         if ($how) { [Console]::Out.WriteLine("NOTE`t$src`tconverted via: $how") }
         if (Test-Path -LiteralPath $dst) { Write-Output "OK`t$src`t$dst" } else { Write-Output "FAIL`t$src`tno output written" }
@@ -261,9 +299,9 @@ foreach ($line in $pairs) {
         # the next file starts a fresh one instead of failing the same way
         if ($msg -match "disconnected from its clients|RPC server is unavailable|0x80010108|0x800706BA") {
             switch ($ext) {
-                '.doc' { $script:word = $null }
-                '.xls' { $script:excel = $null }
-                '.ppt' { $script:ppt = $null }
+                { $_ -in '.doc', '.dot', '.rtf' } { $script:word = $null }
+                { $_ -in '.xls', '.xlt' }         { $script:excel = $null }
+                { $_ -in '.ppt', '.pot' }         { $script:ppt = $null }
             }
             $msg = "$msg - Office had gone away; a new one is started for the next file, rerun for this one"
         }
@@ -310,6 +348,9 @@ def plan(root: str) -> List[Tuple[str, str, str]]:
                 continue
             target = stem + LEGACY_TO_MODERN[ext]
             src_path, dst_path = os.path.join(dirpath, fn), os.path.join(dirpath, target)
+            if any(ord(c) < 32 for c in src_path):
+                out.append((src_path, dst_path, "unusable"))    # a tab or newline in the name: cannot be listed
+                continue
             if target.lower() in lower:
                 # both exist: the copy is current unless the legacy file was
                 # changed AFTER the copy was made (stale) - or the copy is not
@@ -496,7 +537,7 @@ def _stage(pairs: List[Tuple[str, str]], log: Callable[[str], None]) -> Tuple[Li
         ssrc = os.path.join(d, os.path.basename(src))
         sdst = os.path.join(d, os.path.basename(dst))
         try:
-            shutil.copyfile(src, ssrc)          # data only: no Zone.Identifier "mark of the web" travels with it
+            shutil.copyfile(long_path(src), ssrc)   # data only: no Zone.Identifier "mark of the web" travels with it
         except OSError as e:
             failed.append(("FAIL", src, f"could not read the file ({e}) - a OneDrive file not downloaded to this "
                                         "laptop? open the folder once so it syncs, or right-click > Always keep on this device"))
@@ -519,14 +560,40 @@ def _unstage(rows: List[Tuple[str, str, str]], back: Dict[str, Tuple[str, str]],
             if not os.path.exists(produced):
                 out.append(("FAIL", src, "Office reported success but wrote no file"))
                 continue
-            try:
-                os.replace(produced, dst)        # atomic where possible; an old copy is only replaced by a whole new one
-                out.append(("OK", src, dst))
-            except OSError as e:
-                out.append(("FAIL", src, f"converted, but the copy could not be written beside the original ({e})"))
+            err: Optional[OSError] = None
+            for attempt in range(6):            # OneDrive / antivirus hold a new file for a moment
+                try:
+                    os.replace(produced, long_path(dst))   # an old copy is only replaced by a whole new one
+                    out.append(("OK", src, dst))
+                    err = None
+                    break
+                except OSError as e:
+                    err = e
+                    time.sleep(attempt + 1)
+            if err is not None:
+                out.append(("FAIL", src, f"converted, but the copy could not be written beside the original ({err})"))
         else:
-            out.append((st, src, f"{detail} [{circumstances(src)}]"))
+            out.append((st, src, f"{detail} [{circumstances(src)}]{hint_for(detail)}"))
     return out
+
+
+_HINTS = [
+    (r"blocked|File Block", " -> Office's Trust Center > File Block Settings blocks this old format: untick it "
+                            "(File > Options > Trust Center > Trust Center Settings > File Block Settings), then rerun"),
+    (r"password", " -> a password to OPEN: nothing can read it without the password; leave it, or save an unprotected copy by hand"),
+    (r"corrupt|not a valid|damaged|memory or disk space|unreadable content|cannot open the file",
+     " -> the file is damaged, or not really an Office file (an exported report with a .xls name?): open it by hand once"),
+    (r"locked for editing|in use|being used|sharing violation",
+     " -> the file is open elsewhere (Word, Excel, OneDrive sync): close it and rerun"),
+    (r"Command failed", " -> Word's generic refusal; the attempts and the document state above say which way was tried"),
+]
+
+
+def hint_for(detail: str) -> str:
+    for rx, hint in _HINTS:
+        if re.search(rx, detail, re.IGNORECASE):
+            return hint
+    return ""
 
 
 _APP = {".doc": "Word", ".xls": "Excel", ".ppt": "PowerPoint"}
@@ -574,6 +641,9 @@ def convert_tree(root: str, dry_run: bool = False, log: Callable[[str], None] = 
     items = plan(root)
     todo = [(s, d) for s, d, st in items if st == "convert" or (refresh and st == "stale")]
     have = sum(1 for _s, _d, st in items if st == "exists")
+    for s, _d, st in items:
+        if st == "unusable":
+            log(f"  FAIL {s}: the file name contains a control character - rename it, then rerun")
     stale = [s for s, _d, st in items if st == "stale"]
     log(f"{len(items)} legacy .doc/.xls/.ppt file(s) under {root}: {len(todo)} to convert, {have} already converted earlier "
         f"(.docx/.xlsx/.pptx/.pdf files are read as they are and are not counted here)"
