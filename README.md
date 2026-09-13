@@ -266,6 +266,17 @@ falls back to the bare PROC only when no indexed job expands it.
   it tests (88s expanded), per paragraph, plus one negative case per field.
 - `paragraph PGM NAME|line` — who reaches a paragraph and how (PERFORM, GO TO,
   fall-through, THRU range, section), what it performs/calls/does, its source.
+- `walk PGM [--budget N] [--from PARA] [--depth D] [--no-source]` — the
+  program in **reading order**: the entry paragraph first, then each
+  paragraph the first time control reaches it (PERFORM returns at the end of
+  its target or THRU range, GO TO does not return, fall-through, performed
+  SECTIONs, ENTRY points as extra roots, DECLARATIVES listed not walked),
+  each with its resolved facts (call targets, tables, database + PROCOPT,
+  CICS resources, files, codes set) and its source with original line
+  numbers - copybook paragraphs cite the copybook; the fields the PROCEDURE
+  DIVISION names, and only those, with offsets; the paragraphs nothing
+  reaches. A budget keeps the order and the facts and drops source from the
+  end. This is the program-by-program read, done for the model.
 - `callers X --args` — every call site with its full USING list against the
   callee's LINKAGE; a count mismatch is flagged (the S0C4 check).
 - `interfaces [--system S] [--dsn X]` — what leaves and enters the

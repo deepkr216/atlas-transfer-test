@@ -229,6 +229,43 @@ constraints and lookup tables, non-mainframe consumers not declared in
 Tests come straight from `values`: every old value, every new value, every
 pair combination the rules mention, and one value outside all of them.
 
+## A8. What does this program do (the program-by-program read)
+
+Question shape: "Explain CLMPOST", "walk me through the nightly posting
+program", "what happens between the read and the write".
+
+```
+python -m atlas.query --db atlas.db walk CLMPOST --budget 12000 > w.md   # reading order + facts + source + data
+python -m atlas.query --db atlas.db pack CLMPOST --budget 6000  > p.md   # where it runs, JCL datasets, copybooks (optional)
+```
+
+`walk` is the read an analyst does by hand, done once by the toolkit: the
+entry paragraph first, then every paragraph the first time control reaches
+it - PERFORM (which returns at the end of its target or THRU range, so the
+paragraph after a performed one is *not* reached by falling out of it), GO TO
+(no return), fall-through, THRU range, performed SECTION. Each paragraph
+carries its resolved facts (call targets, SQL verbs and tables, DL/I with the
+database and PROCOPT from the PSB, CICS resources, file operations, codes
+set) and its source with the original line numbers; a paragraph from a
+procedure copybook cites the copybook. Before the walk: the fields the
+PROCEDURE DIVISION names - and only those - with offsets and lengths. After
+it: paragraphs reached more than once, paragraphs nothing reaches (with the
+reason), ENTRY points as their own roots, DECLARATIVES listed, not walked.
+
+The budget drops **source** from the end of the walk, never order or facts;
+a header's span (`CLMPOST:412-440`) is the `cite` range for anything left
+out. `--from 2000-PROCESS` starts mid-way; `--depth 1` keeps source only for
+the main line; `--no-source` gives the skeleton.
+
+The model produces, in FACTS: where it runs and what it is given; inputs and
+outputs with direction; the processing in the walk's order, one cited line per
+paragraph, saying where a PERFORM returns and where a GO TO does not; every
+CALL/LINK/XCTL with its arguments; every error path. In INFERENCE: what the
+program is for. In NOT READ: the paragraphs the walk lists as not reached and
+those whose source was left out - by name. HUMAN MUST VERIFY: run-time
+decisions (dynamic CALL targets, GO TO DEPENDING, values from tables) and
+anything the walk marks unresolved.
+
 ---
 
 ## D1. Change design document (two passes)

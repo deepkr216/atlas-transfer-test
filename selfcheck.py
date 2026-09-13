@@ -38,7 +38,7 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as td:
         db = os.path.join(td, "smoke.db")
         r = run(["-m", "atlas.build", os.path.join(HERE, "tests", "fixtures"), "--db", db, "--rebuild", "--quiet"])
-        all_ok &= stage("smoke build", r.returncode == 0 and "programs 6" in r.stdout,
+        all_ok &= stage("smoke build", r.returncode == 0 and "programs 7" in r.stdout,
                         "" if r.returncode == 0 else (r.stderr.strip().splitlines() or ["?"])[-1])
 
         checks = [
@@ -61,6 +61,8 @@ def main() -> int:
             (["job", "NIGHTJOB"], ["NIGHT.PS010", "PROD.CLM.MASTER", "runs **CLMRPT**", "PROD.CLM.NEW.KSDS", "CLMSUB"]),
             (["column", "MEMBER_TBL.GENDER_CD"], ["SQLCOLS", "WS-GENDER-CD", "Written"]),
             (["messages", "INVALID GENDER"], ["INVALID GENDER <WS-GENDER-CD> FOR MEMBER <WS-MEMBER-ID>"]),
+            (["walk", "WALKPGM"], ["0000-MAIN  - entry", "<- PERFORM from 0000-MAIN", "| 1500-UNUSED | paragraph |",
+                                   "WALKPROC:1-2 (via COPY WALKPROC)", "Entry point `WALKENT`"]),
         ]
         for args, needles in checks:
             r = run(["-m", "atlas.query", "--db", db, *args])

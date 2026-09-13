@@ -30,16 +30,20 @@ Answer this question using ONLY the attached pack: <question>
 
 ## Explain what a program does
 
-Attach `work/pack.md` and `work/cite.md` (`--out work/cite.md cite PGM 1-9999`).
+Attach `work/walk.md` (`--out work/walk.md walk PGM --budget 12000`) and, if
+useful, `work/pack.md`.
 
 ```
-Explain what this program does using ONLY the attached pack (facts outside the
-program: jobs, symbolics, copybook offsets after REPLACING, PSB order) and the
-numbered source. FACTS: where it runs and what it is given; inputs and outputs
-with direction; the processing in execution order - start at the first
-paragraph, follow PERFORMs and GO TOs, one cited line per paragraph; every
-CALL/LINK/XCTL with arguments; every error path. INFERENCE: what it is for.
-NOT READ: paragraphs you did not walk, by name.
+Explain what this program does using ONLY the attached walk (the program in
+reading order: entry first, each paragraph the first time control reaches it,
+with resolved facts and numbered source; the fields it names; the paragraphs
+nothing reaches) and the pack if attached. FACTS: where it runs and what it is
+given; inputs and outputs with direction; the processing in the walk's order,
+one cited line per paragraph, saying where a PERFORM returns and where a GO TO
+does not; every CALL/LINK/XCTL with arguments; every error path. INFERENCE:
+what it is for. NOT READ: the paragraphs the walk lists as not reached, and
+those whose source was left out for the budget, by name. A copybook paragraph
+cites the copybook named in its block.
 <rules>
 ```
 

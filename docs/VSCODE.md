@@ -41,7 +41,7 @@ answer is checked mechanically before you rely on it.
 | You want | Run the task(s) | Then type |
 |---|---|---|
 | One question about a program, job, copybook, transaction, field | Atlas: pack | `/atlas-answer` |
-| What does this program do (the read you do by hand) | Atlas: pack, Atlas: whole member | `/atlas-program` |
+| What does this program do (the read you do by hand) | Atlas: walk (and pack for the JCL side) | `/atlas-program` |
 | Impact of changing a field | Atlas: field, layout, crud for a job, pack (copybook), interfaces | `/atlas-impact` |
 | What does this job do | Atlas: job, pack (choose kind: job) | `/atlas-job` |
 | Where does error code E001 come from | Atlas: literal / error code | `/atlas-trace` |

@@ -1,0 +1,2 @@
+       8000-COMMON.
+           DISPLAY 'COMMON ROUTINE'.

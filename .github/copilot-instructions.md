@@ -32,6 +32,7 @@ python -m atlas.query --db atlas.db --out work/job.md        job <JOB>
 python -m atlas.query --db atlas.db --out work/crud.md       crud --job <JOB> | <PGM...> | --copybook <X>
 python -m atlas.query --db atlas.db --out work/conditions.md conditions <PGM>
 python -m atlas.query --db atlas.db --out work/paragraph.md  paragraph <PGM> <NAME|line>
+python -m atlas.query --db atlas.db --out work/walk.md       walk <PGM> [--budget 12000] [--from PARA] [--depth D]   # the program in reading order
 python -m atlas.query --db atlas.db --out work/callers.md    callers|callees <PGM> --depth 2 [--args]
 python -m atlas.query --db atlas.db --out work/dataset.md    dataset <DSN>
 python -m atlas.query --db atlas.db --out work/table.md      table <TABLE> | column <TABLE.COL>

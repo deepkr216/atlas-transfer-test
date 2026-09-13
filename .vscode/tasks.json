@@ -36,6 +36,15 @@
       "problemMatcher": []
     },
     {
+      "label": "Atlas: walk PROGRAM -> work/walk.md",
+      "detail": "The program in reading order: entry first, each paragraph as control reaches it, resolved facts, source, the data it touches. For 'what does this program do'.",
+      "type": "shell",
+      "command": "python -m atlas.query --db atlas.db --out work/walk.md walk ${input:program} --budget ${input:budget}",
+      "options": {"cwd": "${workspaceFolder}", "env": {"PYTHONUTF8": "1"}},
+      "presentation": {"reveal": "always", "panel": "shared", "showReuseMessage": false},
+      "problemMatcher": []
+    },
+    {
       "label": "Atlas: whole member -> work/cite.md",
       "detail": "Numbered source lines of one member (default: all of it). For 'explain this program' and for checking a citation.",
       "type": "shell",

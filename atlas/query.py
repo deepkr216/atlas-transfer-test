@@ -92,6 +92,14 @@ def source_line(conn: sqlite3.Connection, member_name: str, line: int) -> str:
     return r["text"].strip() if r else ""
 
 
+def source_line_raw(conn: sqlite3.Connection, member_name: str, line: int) -> str:
+    """The code area as written (columns 8-72), indentation kept - the IF /
+    ELSE nesting an analyst reads by eye."""
+    r = conn.execute("SELECT text FROM src_fts WHERE member_name=? AND line_no=? LIMIT 1",
+                     (member_name, line)).fetchone()
+    return r["text"].rstrip() if r else ""
+
+
 def programs_named(conn: sqlite3.Connection, name: str) -> List[sqlite3.Row]:
     """Programs called `name`: by PROGRAM-ID, member name, or an ENTRY alias
     (CALL 'RATEENT' reaches RATECALC)."""
@@ -2650,6 +2658,463 @@ def cmd_paragraph(conn: sqlite3.Connection, name: str, para: str) -> str:
     return "".join(out)
 
 
+# --------------------------------------------------------------------------
+# walk - a program in READING order: the entry paragraph first, then every
+# paragraph the first time control reaches it (PERFORM, GO TO, fall-through,
+# THRU range, performed SECTION), each with its resolved facts and its
+# source; the data it touches - and only that; the paragraphs nothing
+# reaches. This is the read an analyst does by hand, so a model can do it
+# from a few hundred lines instead of the whole member.
+# --------------------------------------------------------------------------
+
+_HOW_LABEL = {"perform": "PERFORM", "goto": "GO TO", "goto_depending": "GO TO DEPENDING", "alter": "ALTER GO TO",
+              "sort_proc": "SORT PROCEDURE", "fallthrough": "falls through", "section": "in section",
+              "range": "in THRU range", "entry": "ENTRY", "start": "entry"}
+_CALL_LABEL = {"static": "CALL", "dynamic": "CALL", "cics_link": "LINK", "cics_xctl": "XCTL", "cics_start": "START",
+               "cics_return": "RETURN TRANSID", "ims_switch": "CHNG ->", "proc_call": "SQL CALL"}
+_NOTED_REACH = ("perform", "goto", "goto_depending", "alter", "sort_proc", "fallthrough")
+
+
+def _walk_facts(conn: sqlite3.Connection, pid: int, s: int, e: int) -> str:
+    """One line of RESOLVED facts for the statements on expanded lines s..e:
+    calls with their targets, SQL verbs and tables, DL/I with the database
+    and PROCOPT the PSB gave it, CICS resources, file operations, codes set."""
+    bits: List[str] = []
+    for c in conn.execute("SELECT kind, target, via_var, resolved, line FROM call_edge WHERE program_id=? "
+                          "AND line BETWEEN ? AND ? ORDER BY line", (pid, s, e)):
+        label = _CALL_LABEL.get(c["kind"], c["kind"].upper())
+        if c["target"]:
+            bits.append(f"{label} {c['target']}")
+        else:
+            bits.append(f"{label} {c['via_var']} -> {', '.join(_jl(c['resolved'])) or 'unresolved'}")
+    for r in conn.execute("SELECT stmt_type, tables, cursor_name FROM sql_stmt WHERE program_id=? "
+                          "AND start_line BETWEEN ? AND ? ORDER BY start_line", (pid, s, e)):
+        bits.append(f"SQL {r['stmt_type']} " + (", ".join(_jl(r["tables"])) or (r["cursor_name"] or "")).strip())
+    for r in conn.execute("SELECT func, dbd_name, procopt, pcb_arg, dest FROM dli_call WHERE program_id=? "
+                          "AND line BETWEEN ? AND ? ORDER BY line", (pid, s, e)):
+        if r["dest"]:
+            bits.append(f"DL/I {r['func']} -> {r['dest']}")
+        elif r["dbd_name"]:
+            bits.append(f"DL/I {r['func']} {r['dbd_name']}" + (f" (PROCOPT={r['procopt']})" if r["procopt"] else ""))
+        else:
+            bits.append(f"DL/I {r['func']} (PCB {r['pcb_arg'] or '?'} unresolved)")
+    for r in conn.execute("SELECT verb, resource_kind, resource FROM cics_cmd WHERE program_id=? "
+                          "AND line BETWEEN ? AND ? ORDER BY line", (pid, s, e)):
+        bits.append(f"CICS {r['verb']} {r['resource_kind'] or ''} {r['resource'] or ''}".rstrip())
+    seen_io = set()
+    for r in conn.execute("SELECT op, target, target_kind FROM io_op WHERE program_id=? AND target_kind IN ('file','mq') "
+                          "AND line BETWEEN ? AND ? ORDER BY line", (pid, s, e)):
+        key = (r["op"], r["target"])
+        if key not in seen_io:
+            seen_io.add(key)
+            bits.append(f"{'MQ ' if r['target_kind'] == 'mq' else ''}{r['op']} {r['target']}")
+    sets = conn.execute("SELECT literal, field FROM literal_ref WHERE program_id=? AND context='move_to' "
+                        "AND line BETWEEN ? AND ? ORDER BY line LIMIT 7", (pid, s, e)).fetchall()
+    if sets:
+        bits.append("sets " + ", ".join(f"'{r['literal']}'->{r['field']}" for r in sets[:6]) + (" ..." if len(sets) > 6 else ""))
+    return "; ".join(bits)
+
+
+def _walk_block(conn: sqlite3.Connection, pid: int, pname: str, row: sqlite3.Row, how: str, depth: int,
+                frm: Optional[str], via: Optional[int], first_para_line: Optional[int],
+                source: bool, max_lines: int) -> Tuple[str, str]:
+    """(full, summary) text for one paragraph / section header. The summary
+    keeps the position, the reach and the facts; only the source goes."""
+    s, e = row["start_line"], row["end_line"]
+    if row["kind"] == "section" and first_para_line and first_para_line > s:
+        e = first_para_line - 1               # the header and any statements before its first paragraph
+    # the last paragraph's end_line may run past the expanded text, and a
+    # paragraph's trailing blank lines say nothing: end at the last real line
+    while e > s:
+        m, ln, _d, _v = origin(conn, pid, e)
+        if m and ln is not None and source_line(conn, m, ln):
+            break
+        e -= 1
+    m1, l1, d1, v1 = origin(conn, pid, s)
+    m2, l2, _d2, _v2 = origin(conn, pid, e)
+    span = f"{m1}:{l1}-{l2}" if m1 == m2 else f"{m1}:{l1} .. {m2}:{l2}"
+    if d1 and v1:
+        span += f" (via COPY {v1})"
+    ind = "  " * min(depth, 8)
+    if how == "start":
+        reach = "- entry"
+    elif how == "entry":
+        reach = "- ENTRY point"
+    else:
+        reach = f"<- {_HOW_LABEL.get(how, how)}" + (f" from {frm}" if frm else "") + (f" @{cite(conn, pid, via)}" if via else "")
+    title = row["name"] + (" SECTION" if row["kind"] == "section" else "")
+    head = f"#### {ind}{title}  {reach}  [depth {depth}]  {span}\n"
+    facts = _walk_facts(conn, pid, s, e)
+    fl = f"{ind}- facts: {facts}\n" if facts else ""
+    summ = head + fl                          # the span in the header is the `cite` range when source is omitted
+    if not source:
+        return summ, summ
+    body: List[str] = []
+    cur: Optional[str] = None
+    shown = 0
+    for x in range(s, e + 1):
+        m, ln, d, v = origin(conn, pid, x)
+        if not m or ln is None:
+            continue
+        if m != cur:
+            if cur is not None or d:
+                body.append(f"------ {'from COPY ' + v + ' - ' if d and v else ''}cite as [[{m} line \"token\"]] ------\n")
+            cur = m
+        body.append(f"{ln:6d} | {source_line_raw(conn, m, ln)}\n")
+        shown += 1
+        if shown >= max_lines and x < e:
+            body.append(f"   ... {e - x} more lines: `cite {m} {ln + 1}-{l2}`\n")
+            break
+    full = head + fl + "```\n" + "".join(body) + "```\n"
+    return full, summ
+
+
+def _walk_data(conn: sqlite3.Connection, pid: int, mid: int, limit: int = 200) -> Tuple[str, int]:
+    """The fields the PROCEDURE DIVISION names - and only those - grouped
+    under their 01 with offset, length, PIC and how they are used. Program
+    rows (WORKING-STORAGE, COPY ... REPLACING) cite through the line map;
+    copybook rows cite the copybook. Returns (text, rows)."""
+    refs = conn.execute("""SELECT UPPER(name) AS name, GROUP_CONCAT(DISTINCT mode) AS modes, MIN(line) AS first_line
+                           FROM field_ref WHERE program_id=? GROUP BY UPPER(name) ORDER BY MIN(line)""", (pid,)).fetchall()
+    # OPEN / READ / CLOSE name files, not fields
+    files = {r[0].upper() for r in conn.execute("SELECT select_name FROM file_decl WHERE program_id=?", (pid,))}
+    refs = [r for r in refs if r["name"] not in files]
+    if not refs:
+        return "", 0, []
+
+    def root_of(fid: int) -> sqlite3.Row:
+        r = conn.execute("SELECT * FROM field WHERE id=?", (fid,)).fetchone()
+        while r and r["parent_id"]:
+            r = conn.execute("SELECT * FROM field WHERE id=?", (r["parent_id"],)).fetchone()
+        return r
+
+    def def_cite(f: sqlite3.Row, member_name: str) -> str:
+        return cite(conn, pid, f["line"]) if f["member_id"] == mid else f"{member_name}:{f['line']}"
+
+    groups: Dict[int, Tuple[sqlite3.Row, str, List[Tuple[sqlite3.Row, sqlite3.Row, Optional[str]]]]] = {}
+    order: List[int] = []
+    unknown: List[str] = []
+    for ref in refs:
+        defs = conn.execute("""SELECT f.*, m.name AS member_name FROM field f JOIN member m ON m.id=f.member_id
+                               WHERE f.member_id=? AND UPPER(f.name)=?""", (mid, ref["name"])).fetchall()
+        if not defs:
+            defs = conn.execute("""SELECT f.*, m.name AS member_name FROM copy_use c
+                                   JOIN field f ON f.member_id=c.resolved_member_id JOIN member m ON m.id=f.member_id
+                                   WHERE c.member_id=? AND UPPER(f.name)=?""", (mid, ref["name"])).fetchall()
+        c88: List[sqlite3.Row] = []
+        if not defs:
+            c88 = conn.execute("""SELECT c.name AS c88_name, c.values_lit, f.*, m.name AS member_name FROM cond88 c
+                                  JOIN field f ON f.id=c.field_id JOIN member m ON m.id=f.member_id
+                                  WHERE UPPER(c.name)=? AND (f.member_id=? OR f.member_id IN
+                                        (SELECT resolved_member_id FROM copy_use WHERE member_id=? AND resolved_member_id IS NOT NULL))""",
+                               (ref["name"], mid, mid)).fetchall()
+        if not defs and not c88:
+            unknown.append(ref["name"])
+            continue
+        tagged = [(d, None) for d in defs[:3]] + \
+                 [(c, f"88 {c['c88_name']} = {', '.join(_jl(c['values_lit'])) or '?'}") for c in c88[:3]]
+        for d, tag in tagged:
+            root = root_of(d["id"])
+            if root is None:
+                continue
+            # a copybook FRAGMENT (05s whose 01 sits in the program) groups under the copybook itself
+            gkey = -d["member_id"] if (root["level"] > 1 and d["member_id"] != mid) else root["id"]
+            if gkey not in groups:
+                groups[gkey] = (None if gkey < 0 else root, d["member_name"], [])
+                order.append(gkey)
+            groups[gkey][2].append((d, ref, tag))
+
+    out = ["\n### Data it touches (only the fields the PROCEDURE DIVISION names; offsets and lengths are the parser's)\n"]
+    total = 0
+    heads: List[str] = []                     # one short label per group, for a budget-cut data section
+    for rid in order:
+        root, member_name, items = groups[rid]
+        if root is None:
+            n_all = conn.execute("SELECT COUNT(*) FROM field WHERE member_id=?", (-rid,)).fetchone()[0]
+            out.append(f"\n**COPY {member_name}** (fragment - its 01 is in the program) - {len(items)} of {n_all} fields used\n")
+            heads.append(f"COPY {member_name} {len(items)}/{n_all}")
+        elif root["is_group"]:
+            # the 01 itself named (CALL USING, MOVE, INITIALIZE) is said on its header, not counted as a field
+            n_all = conn.execute("""WITH RECURSIVE sub(id) AS (SELECT id FROM field WHERE id=? UNION ALL
+                                    SELECT f.id FROM field f JOIN sub ON f.parent_id=sub.id) SELECT COUNT(*)-1 FROM sub""",
+                                 (rid,)).fetchone()[0]
+            own = [(f, ref, tag) for f, ref, tag in items if f["id"] == rid and tag is None]
+            items = [t for t in items if t not in own]
+            used_as = ""
+            if own:
+                modes = "".join(k[0] for k in ("write", "read", "test", "display") if k in (own[0][1]["modes"] or ""))
+                used_as = f", the group itself used as {modes} @{cite(conn, pid, own[0][1]['first_line'])}"
+            out.append(f"\n**{root['level']:02d} {root['name']}** ({def_cite(root, member_name)}"
+                       + (f", {root['length']} bytes" if root["length"] else "") + f"{used_as}) - {len(items)} of {n_all} fields used\n")
+            heads.append(f"{root['level']:02d} {root['name']} {len(items)}/{n_all}")
+        else:                                 # an elementary 01 / 77: the item is its own table
+            out.append(f"\n**{root['level']:02d} {root['name']}** ({def_cite(root, member_name)}"
+                       + (f", {root['length']} bytes" if root["length"] else "") + ")\n")
+            heads.append(f"{root['level']:02d} {root['name']}")
+        rows = []
+        for f, ref, tag in sorted(items, key=lambda t: (t[0]["offset"] if t[0]["offset"] is not None else 10 ** 9, t[0]["line"] or 0)):
+            modes = "".join(k[0] for k in ("write", "read", "test", "display") if k in (ref["modes"] or ""))
+            pic = (f["pic"] or ("group" if f["is_group"] else "")) + (f" {f['usage']}" if f["usage"] and f["usage"] != "DISPLAY" else "")
+            name = f"{f['level']:02d} {f['name']}" + (f" ({tag})" if tag else "")
+            rows.append((name, pic, "" if f["offset"] is None else f["offset"], f["length"] or "",
+                         modes, def_cite(f, member_name), cite(conn, pid, ref["first_line"])))
+            total += 1
+        out.append(table(["field", "PIC / usage", "offset", "len", "w/r/t/d", "defined", "first use"], rows))
+        if total >= limit:
+            out.append(f"_... capped at {limit} fields; `field NAME --program` for the rest_\n")
+            break
+    if unknown:
+        out.append(f"\n- referenced but not defined in this program or its copybooks ({len(unknown)}): "
+                   + ", ".join(unknown[:20]) + (" ..." if len(unknown) > 20 else "")
+                   + " - LINKAGE items are here too when the caller's layout was not copied\n")
+    return "".join(out), total, heads
+
+
+def _walk_touches(conn: sqlite3.Connection, pid: int) -> str:
+    out: List[str] = []
+    files = conn.execute("SELECT select_name, assign_dd, organization FROM file_decl WHERE program_id=? ORDER BY line", (pid,)).fetchall()
+    if files:
+        parts = []
+        for f in files:
+            ops = [r[0] for r in conn.execute("SELECT DISTINCT op FROM io_op WHERE program_id=? AND target_kind='file' AND UPPER(target)=? ORDER BY op",
+                                              (pid, f["select_name"].upper()))]
+            parts.append(f"{f['select_name']} (DD {f['assign_dd'] or '?'}" + (f", {f['organization']}" if f["organization"] else "") + ")"
+                         + (f" {'/'.join(ops)}" if ops else ""))
+        out.append("- files: " + "; ".join(parts[:12]) + (" ..." if len(parts) > 12 else "") + "\n")
+    tabs: Dict[str, set] = defaultdict(set)
+    for r in conn.execute("SELECT stmt_type, tables FROM sql_stmt WHERE program_id=?", (pid,)):
+        for t in _jl(r["tables"]):
+            tabs[t].add(r["stmt_type"] or "?")
+    if tabs:
+        out.append("- DB2: " + "; ".join(f"{t} {'/'.join(sorted(v))}" for t, v in list(tabs.items())[:12]) + "\n")
+    dbs: Dict[str, set] = defaultdict(set)
+    for r in conn.execute("SELECT func, dbd_name, procopt, pcb_arg FROM dli_call WHERE program_id=?", (pid,)):
+        key = (r["dbd_name"] + (f" (PROCOPT={r['procopt']})" if r["procopt"] else "")) if r["dbd_name"] else f"PCB {r['pcb_arg'] or '?'} unresolved"
+        dbs[key].add(r["func"] or "?")
+    if dbs:
+        out.append("- IMS: " + "; ".join(f"{k} {'/'.join(sorted(v))}" for k, v in list(dbs.items())[:12]) + "\n")
+    cics = conn.execute("SELECT DISTINCT verb, resource_kind, resource FROM cics_cmd WHERE program_id=? ORDER BY resource_kind, resource", (pid,)).fetchall()
+    if cics:
+        out.append("- CICS: " + "; ".join(f"{c['verb']} {c['resource_kind'] or ''} {c['resource'] or ''}".strip() for c in cics[:14])
+                   + (" ..." if len(cics) > 14 else "") + "\n")
+    calls = []
+    for c in conn.execute("SELECT kind, target, via_var, resolved FROM call_edge WHERE program_id=? ORDER BY line", (pid,)):
+        t = c["target"] or (", ".join(_jl(c["resolved"])) or f"{c['via_var']} (unresolved)")
+        item = f"{_CALL_LABEL.get(c['kind'], c['kind'].upper())} {t}"
+        if item not in calls:
+            calls.append(item)
+    if calls:
+        out.append("- calls: " + "; ".join(calls[:14]) + (" ..." if len(calls) > 14 else "") + "\n")
+    return "".join(out)
+
+
+def cmd_walk(conn: sqlite3.Connection, name: str, start: Optional[str] = None, budget: Optional[int] = None,
+             max_depth: Optional[int] = None, source: bool = True, data: bool = True, max_lines: int = 400) -> str:
+    """The program in reading order. PERFORM returns at the end of its
+    target (or THRU range), so the paragraph after a performed one is NOT
+    reached by falling out of it; GO TO does not return; a performed
+    SECTION runs its paragraphs in order; ENTRY points are extra roots;
+    DECLARATIVES run on their USE condition and are listed, not walked."""
+    progs = programs_named(conn, name)
+    if not progs:
+        return f"program {name} not found\n"
+    p = progs[0]
+    pid, mid, pname, mname = p["id"], p["member_id"], p["program_id"], p["member_name"]
+    paras = conn.execute("SELECT id, name, section, kind, start_line, end_line, ordinal FROM paragraph "
+                         "WHERE program_id=? ORDER BY start_line, kind='paragraph'", (pid,)).fetchall()
+    if not paras:
+        return f"# Walk {pname}\n\nno paragraphs indexed for this program (parse status: {p['parse_status']})\n"
+    by_name: Dict[str, sqlite3.Row] = {}
+    for r in paras:                      # a paragraph and a section may share a name: the paragraph wins
+        key = r["name"].upper()
+        if key not in by_name or (by_name[key]["kind"] == "section" and r["kind"] == "paragraph"):
+            by_name[key] = r
+    plain = [r for r in paras if r["kind"] == "paragraph"]
+    ordinal = {r["name"].upper(): i for i, r in enumerate(plain)}
+    in_section: Dict[str, List[sqlite3.Row]] = defaultdict(list)
+    for r in plain:
+        if r["section"]:
+            in_section[r["section"].upper()].append(r)
+    edges: Dict[str, List[sqlite3.Row]] = defaultdict(list)
+    for e in conn.execute("SELECT from_para, to_para, thru_para, line, kind FROM perform_edge WHERE program_id=? "
+                          "ORDER BY line, id", (pid,)):
+        edges[(e["from_para"] or "").upper()].append(e)
+
+    # DECLARATIVES sections run on a USE condition, never from the entry
+    decl_lo = decl_hi = None
+    for r in conn.execute("SELECT line_no, text FROM src_fts WHERE member_name=? AND UPPER(text) LIKE '%DECLARATIVES%' "
+                          "ORDER BY line_no", (mname,)):
+        t = r["text"].upper()
+        if re.search(r"\bEND\s+DECLARATIVES\b", t):
+            decl_hi = r["line_no"]
+        elif re.search(r"\bDECLARATIVES\s*\.", t) and decl_lo is None:
+            decl_lo = r["line_no"]
+
+    def in_declaratives(row: sqlite3.Row) -> bool:
+        if decl_lo is None or decl_hi is None:
+            return False
+        m, ln, depth, _v = origin(conn, pid, row["start_line"])
+        return m == mname and not depth and ln is not None and decl_lo <= ln <= decl_hi
+
+    if start:
+        entry = by_name.get(start.upper())
+        if entry is None:
+            return f"# Walk {pname}\n\n**NOT FOUND** - no paragraph or section named {start.upper()} in {pname}.\n"
+    else:
+        entry = next((r for r in paras if not in_declaratives(r)), paras[0])
+
+    def thru_range(a: str, b: str) -> List[str]:
+        if a in ordinal and b in ordinal and ordinal[a] < ordinal[b]:
+            return [r["name"].upper() for r in plain[ordinal[a] + 1: ordinal[b] + 1]]
+        return []
+
+    def first_para_line(sec: sqlite3.Row) -> Optional[int]:
+        ps = in_section.get(sec["name"].upper(), [])
+        return ps[0]["start_line"] if ps else None
+
+    visited: Dict[str, int] = {}
+    blocks: List[Tuple[str, str, int]] = []           # (full, summary, depth)
+    repeats: Dict[Tuple[str, str], int] = defaultdict(int)
+    noted: Dict[str, int] = defaultdict(int)
+    missing: Dict[Tuple[str, str], List[str]] = defaultdict(list)
+
+    def children_of(row: sqlite3.Row, key: str, depth: int, stop: Optional[str]) -> List[tuple]:
+        out: List[tuple] = []
+        if row["kind"] == "section":
+            secp = in_section.get(key, [])
+            last = secp[-1]["name"].upper() if secp else None
+            out += [(q["name"].upper(), "section", depth + 1, row["name"], None, last) for q in secp]
+        for e in edges.get(key, []):
+            kind, tgt = e["kind"], e["to_para"].upper()
+            thru = (e["thru_para"] or "").upper() or None
+            if kind == "fallthrough":
+                if stop and key == stop:
+                    continue                          # the PERFORM returns here
+                out.append((tgt, "fallthrough", depth, row["name"], e["line"], stop))
+            elif kind in ("perform", "sort_proc"):
+                out.append((tgt, kind, depth + 1, row["name"], e["line"], thru or tgt))
+                if thru:
+                    out += [(q, "range", depth + 1, row["name"], e["line"], thru) for q in thru_range(tgt, thru)]
+            else:                                     # goto / goto_depending / alter: no return, same return point
+                out.append((tgt, kind, depth + 1, row["name"], e["line"], stop))
+        return out
+
+    def run(root: sqlite3.Row, how0: str) -> None:
+        stack: List[tuple] = [(root["name"].upper(), how0, 0, None, None, None)]
+        while stack:
+            key, how, depth, frm, via, stop = stack.pop()
+            row = by_name.get(key)
+            if row is None:
+                missing[(key, how)].append(f"{frm or '?'} @{cite(conn, pid, via)}" if via else (frm or "?"))
+                continue
+            if key in visited:
+                if how in _NOTED_REACH:
+                    repeats[(row["name"], how)] += 1
+                    if noted[key] < 2:
+                        noted[key] += 1
+                        line = (f"{'  ' * min(depth, 8)}> {row['name']} <- {_HOW_LABEL[how]}" + (f" from {frm}" if frm else "")
+                                + (f" @{cite(conn, pid, via)}" if via else "") + " - shown above\n")
+                        blocks.append((line, line, depth))
+                continue
+            visited[key] = len(visited) + 1
+            full, summ = _walk_block(conn, pid, pname, row, how, depth, frm, via,
+                                     first_para_line(row) if row["kind"] == "section" else None, source, max_lines)
+            blocks.append((full, summ, depth))
+            for c in reversed(children_of(row, key, depth, stop)):
+                stack.append(c)
+
+    run(entry, "start")
+    for a in conn.execute("SELECT alias, line FROM program_alias WHERE program_id=? ORDER BY line", (pid,)):
+        r = conn.execute("""SELECT name FROM paragraph WHERE program_id=? AND kind='paragraph' AND ? BETWEEN start_line AND end_line
+                            ORDER BY start_line DESC LIMIT 1""", (pid, a["line"])).fetchone()
+        if r and r["name"].upper() not in visited:
+            note = f"\n### Entry point `{a['alias']}` (ENTRY @{cite(conn, pid, a['line'])}) - callers of that name start here\n"
+            blocks.append((note, note, 0))
+            run(by_name[r["name"].upper()], "entry")
+
+    # ---- assemble, then fit the budget by dropping SOURCE from the end (order and facts stay)
+    # `DECLARATIVES.` itself parses like a paragraph header; it is a keyword, not code
+    never = [r for r in paras if r["name"].upper() not in visited and r["name"].upper() != "DECLARATIVES"]
+    secs = [r for r in paras if r["kind"] == "section"]
+    names = _names_of(conn, pname)
+    ph = ",".join("?" for _ in names)
+    runs = conn.execute(f"""SELECT DISTINCT j.job_name || '.' || COALESCE(s.step_name, '?') AS r FROM step s
+                            JOIN job j ON j.id=s.job_id WHERE UPPER(s.effective_pgm) IN ({ph}) ORDER BY 1 LIMIT 9""",
+                        [n.upper() for n in names]).fetchall()
+    trans = conn.execute(f"SELECT DISTINCT tran_code || ' (' || COALESCE(system, '?') || ')' AS t FROM transaction_def "
+                         f"WHERE UPPER(program) IN ({ph}) ORDER BY 1 LIMIT 9", [n.upper() for n in names]).fetchall()
+    head = [f"# Walk {pname}  (member {mname}, {len(plain)} paragraphs"
+            + (f" in {len(secs)} section{'s' if len(secs) != 1 else ''}" if secs else "")
+            + f"; entry {entry['name']}; {len(visited)} reached, {len(never)} not reached)\n"]
+    if runs or trans:
+        head.append("- runs in: " + ", ".join([r["r"] for r in runs] + [t["t"] for t in trans]) + "\n")
+    else:
+        head.append("- runs in: no job step or transaction of the index names it (callers: `callers " + pname + "`)\n")
+    head.append("- order: the entry first, then each paragraph the first time control reaches it - PERFORM (returns at the end "
+                "of its target or THRU range), GO TO (no return), fall-through, THRU range, performed SECTION. `>` marks a "
+                "reach of a paragraph already shown. [depth] is PERFORM nesting. Lines are ORIGINAL member lines: cite as "
+                "`[[MEMBER line \"token\"]]`.\n")
+    touch = _walk_touches(conn, pid)
+    if touch:
+        head.append("\n### Touches\n" + touch)
+    data_txt, data_rows, data_heads = _walk_data(conn, pid, mid) if data else ("", 0, [])
+    tail: List[str] = []
+    if repeats:
+        tail.append("\n### Repeated reaches (already shown above)\n")
+        tail.append(table(["paragraph", "how", "times"], [(k[0], _HOW_LABEL[k[1]], v) for k, v in sorted(repeats.items(), key=lambda kv: -kv[1])[:40]]))
+    if never:
+        tail.append(f"\n### Not reached from the entry ({len(never)})\n")
+        rows = []
+        for r in never:
+            if in_declaratives(r):
+                why = "DECLARATIVES - runs on its USE condition, not from the entry"
+            elif r["kind"] == "section":
+                why = "section: never PERFORMed and never entered"
+            else:
+                why = "no PERFORM, GO TO, fall-through, THRU range or performed SECTION reaches it"
+            rows.append((r["name"], r["kind"], cite(conn, pid, r["start_line"]), why))
+        tail.append(table(["paragraph", "kind", "starts", "why"], rows[:80]))
+        if len(rows) > 80:
+            tail.append(f"_... {len(rows) - 80} more_\n")
+    if missing:
+        tail.append("\n### PERFORM / GO TO targets not found in this program\n")
+        tail.append(table(["target", "how", "from"], [(k[0], _HOW_LABEL.get(k[1], k[1]), ", ".join(v[:5])) for k, v in missing.items()]))
+    tail.append(unresolved_for(conn, [mid]))
+
+    chosen: List[str] = []
+    for full, summ, d in blocks:
+        chosen.append(summ if (max_depth is not None and d > max_depth) else full)
+    ih = index_header(conn)
+    # the leading comment (token count, budget note, index header) is part of the budget too
+    fixed = sum(len(x) for x in head) + sum(len(x) for x in tail) + len("\n## Walk\n\n") + len(ih) + 260
+    total = fixed + len(data_txt) + sum(len(c) for c in chosen)
+    omitted = 0
+    note = ""
+    if budget and total > budget:
+        for i in range(len(blocks) - 1, -1, -1):
+            if total <= budget:
+                break
+            full, summ, _d = blocks[i]
+            if chosen[i] is full and full is not summ:
+                total -= len(full) - len(summ)
+                chosen[i] = summ
+                omitted += 1
+        note = (f", budget {budget}: source omitted for {omitted} of {len(visited)} paragraphs (from the end; the first "
+                f"reached keep theirs; each header's span is the `cite` range)")
+        if total > budget and data_txt:
+            # sources gone and still over: keep the data section's shape, drop its tables
+            keep = (f"\n### Data it touches - cut for budget ({data_rows} fields named; `field NAME --program {pname}` "
+                    f"for offsets): " + "; ".join(data_heads) + "\n")
+            total -= len(data_txt) - len(keep)
+            data_txt = keep
+            note += "; data tables cut"
+        if total > budget:
+            note += f"; still ~{total - budget} chars over - the skeleton alone exceeds the budget"
+    text = "".join(head) + data_txt + "\n## Walk\n\n" + "".join(chosen) + "".join(tail)
+    est = len(text) // 4
+    return f"<!-- walk {pname}: ~{est} tokens ({len(text)} chars){note}; {index_header(conn)} -->\n" + text
+
+
 def _dead_extras(conn: sqlite3.Connection) -> str:
     """Decommissioning candidates beyond programs: datasets written but never
     read (or read but never written) IN THE INDEX, copybooks nobody COPYs,
@@ -2821,6 +3286,15 @@ def _main(argv: Optional[List[str]] = None) -> int:
     s = sub.add_parser("paragraph")
     s.add_argument("name")
     s.add_argument("para", help="paragraph / section name, or a line number")
+    s = sub.add_parser("walk", help="the program in reading order: entry first, each paragraph as control reaches it")
+    s.add_argument("name")
+    s.add_argument("--from", dest="start", help="start at this paragraph / section instead of the entry")
+    s.add_argument("--budget", type=int, help="character budget (about 4 per token): later paragraphs keep their "
+                                              "position and facts, lose their source")
+    s.add_argument("--depth", type=int, help="print source only down to this PERFORM depth; deeper ones are summarised")
+    s.add_argument("--no-source", action="store_true", help="skeleton only: order, reach, facts")
+    s.add_argument("--no-data", action="store_true", help="skip the data section")
+    s.add_argument("--max-lines", type=int, default=400, help="source lines per paragraph before truncation")
     s = sub.add_parser("literal")
     s.add_argument("name")
     s.add_argument("--field", help="only uses on this field (common values like 3 or 'M' appear everywhere)")
@@ -2898,6 +3372,8 @@ def _run(a: argparse.Namespace) -> int:
             print(cmd_interfaces(conn, a.system, a.dsn))
         elif a.cmd == "paragraph":
             print(cmd_paragraph(conn, a.name, a.para))
+        elif a.cmd == "walk":
+            print(cmd_walk(conn, a.name, a.start, a.budget, a.depth, not a.no_source, not a.no_data, a.max_lines))
         elif a.cmd == "literal":
             print(cmd_literal(conn, a.name, a.field, a.like))
         elif a.cmd == "values":
