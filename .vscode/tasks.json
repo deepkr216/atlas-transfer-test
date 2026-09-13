@@ -1,0 +1,178 @@
+{
+  "version": "2.0.0",
+  "_comment": "Terminal > Run Task > 'Atlas: ...'. Every report lands in work/ as UTF-8 (never use the shell's '>' - PowerShell 5.1 writes UTF-16). The /atlas-* chat prompts in .github/prompts read these files.",
+  "inputs": [
+    {"id": "name", "type": "promptString", "description": "Program / job / PROC / copybook / transaction / field name"},
+    {"id": "kind", "type": "pickString", "description": "What NAME is (when the index cannot tell, e.g. a PSB and a job share the program's name)", "options": ["program", "job", "copybook", "transaction", "field"], "default": "program"},
+    {"id": "budget", "type": "promptString", "description": "Pack budget in characters (about 4 characters per token)", "default": "12000"},
+    {"id": "field", "type": "promptString", "description": "Field name (copybook name or the program's REPLACING name; an 88 name works too)"},
+    {"id": "field2", "type": "promptString", "description": "Second field for the cross-field rules (repeat the first if there is none)"},
+    {"id": "pattern", "type": "promptString", "description": "Message-text pattern, e.g. GENDER or INVALID REL"},
+    {"id": "literal", "type": "promptString", "description": "Literal / error / status code, e.g. E001"},
+    {"id": "job", "type": "promptString", "description": "Job or PROC name"},
+    {"id": "program", "type": "promptString", "description": "Program name"},
+    {"id": "copybook", "type": "promptString", "description": "Copybook name"},
+    {"id": "member", "type": "promptString", "description": "Member name (a program, copybook, job, PROC, PSB, DBD, control card...)"},
+    {"id": "range", "type": "promptString", "description": "Line range, e.g. 1-9999 for the whole member or 120-180", "default": "1-9999"},
+    {"id": "paragraph", "type": "promptString", "description": "Paragraph / section name, or a line number"}
+  ],
+  "tasks": [
+    {
+      "label": "Atlas: pack NAME -> work/pack.md",
+      "detail": "The dossier plus the evidence lines, inside a budget. Kind is detected (program, job, copybook, transaction, field).",
+      "type": "shell",
+      "command": "python -m atlas.query --db atlas.db --out work/pack.md pack ${input:name} --budget ${input:budget}",
+      "options": {"cwd": "${workspaceFolder}", "env": {"PYTHONUTF8": "1"}},
+      "presentation": {"reveal": "always", "panel": "shared", "showReuseMessage": false},
+      "problemMatcher": []
+    },
+    {
+      "label": "Atlas: pack NAME (choose kind) -> work/pack.md",
+      "detail": "Same, but you say what NAME is - needed when a PSB or a job shares a program's name.",
+      "type": "shell",
+      "command": "python -m atlas.query --db atlas.db --out work/pack.md pack ${input:name} --kind ${input:kind} --budget ${input:budget}",
+      "options": {"cwd": "${workspaceFolder}", "env": {"PYTHONUTF8": "1"}},
+      "presentation": {"reveal": "always", "panel": "shared", "showReuseMessage": false},
+      "problemMatcher": []
+    },
+    {
+      "label": "Atlas: whole member -> work/cite.md",
+      "detail": "Numbered source lines of one member (default: all of it). For 'explain this program' and for checking a citation.",
+      "type": "shell",
+      "command": "python -m atlas.query --db atlas.db --out work/cite.md cite ${input:member} ${input:range}",
+      "options": {"cwd": "${workspaceFolder}", "env": {"PYTHONUTF8": "1"}},
+      "presentation": {"reveal": "always", "panel": "shared", "showReuseMessage": false},
+      "problemMatcher": []
+    },
+    {
+      "label": "Atlas: paragraph -> work/paragraph.md",
+      "detail": "One paragraph or section: who reaches it, what it does, its source.",
+      "type": "shell",
+      "command": "python -m atlas.query --db atlas.db --out work/paragraph.md paragraph ${input:program} ${input:paragraph}",
+      "options": {"cwd": "${workspaceFolder}", "env": {"PYTHONUTF8": "1"}},
+      "presentation": {"reveal": "always", "panel": "shared", "showReuseMessage": false},
+      "problemMatcher": []
+    },
+    {
+      "label": "Atlas: field -> work/field.md",
+      "detail": "Every definition (offset, length, skew), every program, every reference by mode, 88 values, sort cards on its bytes.",
+      "type": "shell",
+      "command": "python -m atlas.query --db atlas.db --out work/field.md field ${input:field}",
+      "options": {"cwd": "${workspaceFolder}", "env": {"PYTHONUTF8": "1"}},
+      "presentation": {"reveal": "always", "panel": "shared", "showReuseMessage": false},
+      "problemMatcher": []
+    },
+    {
+      "label": "Atlas: layout -> work/layout.md",
+      "detail": "Byte layout of a copybook (record length on top) - for test data and interface contracts.",
+      "type": "shell",
+      "command": "python -m atlas.query --db atlas.db --out work/layout.md layout ${input:copybook}",
+      "options": {"cwd": "${workspaceFolder}", "env": {"PYTHONUTF8": "1"}},
+      "presentation": {"reveal": "always", "panel": "shared", "showReuseMessage": false},
+      "problemMatcher": []
+    },
+    {
+      "label": "Atlas: literal / error code -> work/literal.md",
+      "detail": "Where a code is defined, set, tested, displayed, and where the value flows afterwards.",
+      "type": "shell",
+      "command": "python -m atlas.query --db atlas.db --out work/literal.md literal ${input:literal}",
+      "options": {"cwd": "${workspaceFolder}", "env": {"PYTHONUTF8": "1"}},
+      "presentation": {"reveal": "always", "panel": "shared", "showReuseMessage": false},
+      "problemMatcher": []
+    },
+    {
+      "label": "Atlas: job -> work/job.md",
+      "detail": "Effective steps (PROCs expanded), control cards quoted, datasets with direction, guards, INTRDR submits.",
+      "type": "shell",
+      "command": "python -m atlas.query --db atlas.db --out work/job.md job ${input:job}",
+      "options": {"cwd": "${workspaceFolder}", "env": {"PYTHONUTF8": "1"}},
+      "presentation": {"reveal": "always", "panel": "shared", "showReuseMessage": false},
+      "problemMatcher": []
+    },
+    {
+      "label": "Atlas: crud for a job -> work/crud.md",
+      "detail": "Create / Read / Update / Delete per program against datasets, tables, IMS databases, CICS files.",
+      "type": "shell",
+      "command": "python -m atlas.query --db atlas.db --out work/crud.md crud --job ${input:job}",
+      "options": {"cwd": "${workspaceFolder}", "env": {"PYTHONUTF8": "1"}},
+      "presentation": {"reveal": "always", "panel": "shared", "showReuseMessage": false},
+      "problemMatcher": []
+    },
+    {
+      "label": "Atlas: conditions -> work/conditions.md",
+      "detail": "Every IF / WHEN / sort INCLUDE-OMIT test in a program with its values - the test-condition inventory.",
+      "type": "shell",
+      "command": "python -m atlas.query --db atlas.db --out work/conditions.md conditions ${input:program}",
+      "options": {"cwd": "${workspaceFolder}", "env": {"PYTHONUTF8": "1"}},
+      "presentation": {"reveal": "always", "panel": "shared", "showReuseMessage": false},
+      "problemMatcher": []
+    },
+    {
+      "label": "Atlas: value domain (values + pair + messages + field) -> work/",
+      "detail": "For a value-domain change: work/values.md, work/pair.md, work/messages.md, work/field.md in one go.",
+      "type": "shell",
+      "command": "python -m atlas.query --db atlas.db --out work/values.md values ${input:field}; python -m atlas.query --db atlas.db --out work/pair.md pair ${input:field} ${input:field2}; python -m atlas.query --db atlas.db --out work/messages.md messages ${input:pattern}; python -m atlas.query --db atlas.db --out work/field.md field ${input:field}",
+      "options": {
+        "cwd": "${workspaceFolder}",
+        "env": {"PYTHONUTF8": "1"},
+        "shell": {"executable": "powershell.exe", "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command"]}
+      },
+      "presentation": {"reveal": "always", "panel": "shared", "showReuseMessage": false},
+      "problemMatcher": []
+    },
+    {
+      "label": "Atlas: interfaces -> work/interfaces.md",
+      "detail": "What leaves or enters the mainframe and via whom (FTP, NDM, MQ, DDF, web, TD queues), with declared peers.",
+      "type": "shell",
+      "command": "python -m atlas.query --db atlas.db --out work/interfaces.md interfaces",
+      "options": {"cwd": "${workspaceFolder}", "env": {"PYTHONUTF8": "1"}},
+      "presentation": {"reveal": "always", "panel": "shared", "showReuseMessage": false},
+      "problemMatcher": []
+    },
+    {
+      "label": "Atlas: coverage -> work/coverage.md",
+      "detail": "Read this before trusting anything: what contributed facts, what was skipped, what is missing.",
+      "type": "shell",
+      "command": "python -m atlas.query --db atlas.db --out work/coverage.md coverage",
+      "options": {"cwd": "${workspaceFolder}", "env": {"PYTHONUTF8": "1"}},
+      "presentation": {"reveal": "always", "panel": "shared", "showReuseMessage": false},
+      "problemMatcher": []
+    },
+    {
+      "label": "Atlas: verify work/answer.md -> work/gate.txt",
+      "detail": "The gate. Save the model's answer as work/answer.md first. FAIL means the answer is wrong; run /atlas-fix in the chat.",
+      "type": "shell",
+      "command": "python -m atlas.verify_citations work/answer.md --db atlas.db --out work/gate.txt",
+      "options": {"cwd": "${workspaceFolder}", "env": {"PYTHONUTF8": "1"}},
+      "presentation": {"reveal": "always", "panel": "shared", "showReuseMessage": false},
+      "problemMatcher": []
+    },
+    {
+      "label": "Atlas: verify the file open in the editor",
+      "detail": "Same gate on whatever answer file is open.",
+      "type": "shell",
+      "command": "python -m atlas.verify_citations \"${file}\" --db atlas.db",
+      "options": {"cwd": "${workspaceFolder}", "env": {"PYTHONUTF8": "1"}},
+      "presentation": {"reveal": "always", "panel": "shared", "showReuseMessage": false},
+      "problemMatcher": []
+    },
+    {
+      "label": "Atlas: UI (fetch, build, coverage)",
+      "detail": "The desktop window: sources, Fetch, Build index, Coverage, OCR images.",
+      "type": "shell",
+      "command": "python -m atlas.ui --config sources.json",
+      "options": {"cwd": "${workspaceFolder}", "env": {"PYTHONUTF8": "1"}},
+      "presentation": {"reveal": "always", "panel": "dedicated", "showReuseMessage": false},
+      "problemMatcher": []
+    },
+    {
+      "label": "Atlas: selfcheck",
+      "detail": "Run after every git pull. Must print SELFCHECK PASSED.",
+      "type": "shell",
+      "command": "python selfcheck.py",
+      "options": {"cwd": "${workspaceFolder}", "env": {"PYTHONUTF8": "1"}},
+      "presentation": {"reveal": "always", "panel": "shared", "showReuseMessage": false},
+      "problemMatcher": []
+    }
+  ]
+}

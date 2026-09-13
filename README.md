@@ -348,6 +348,25 @@ estate folder for a coding agent; `templates/PLAYBOOKS.md` has the per-task
 procedures (impact analysis, job dossier, error-code trace, design doc,
 code-generation bundle, test conditions, abend triage).
 
+### From VS Code
+
+Open the toolkit folder as the workspace and the loop is three clicks and
+one chat message - see [docs/VSCODE.md](docs/VSCODE.md):
+
+- `Terminal > Run Task > Atlas: pack NAME -> work/pack.md` (and `field`,
+  `layout`, `job`, `crud`, `conditions`, `literal`, `value domain`,
+  `interfaces`, `coverage`, `whole member`, `paragraph`) - every report is
+  written with `--out` into `work/` as UTF-8. Never use the shell's `>` for
+  a report: PowerShell 5.1 writes UTF-16 and the model reads garbage.
+- In Copilot Chat type `/atlas-answer` (or `/atlas-program`, `/atlas-impact`,
+  `/atlas-job`, `/atlas-trace`, `/atlas-populate`, `/atlas-abend`,
+  `/atlas-values`, `/atlas-tests`, `/atlas-design`): the prompt attaches
+  the `work/` files and carries the rules. `.github/copilot-instructions.md`
+  is the contract Copilot loads by itself; for another chat tool the same
+  requests are in `templates/REQUESTS.md`.
+- Save the answer as `work/answer.md`, `Run Task > Atlas: verify`. On FAIL,
+  `/atlas-fix` returns the corrected answer.
+
 ## Freshness and hygiene
 
 An answer is only as current as the index, so every pack and `coverage`
@@ -404,7 +423,11 @@ atlas/
   build.py             folder -> atlas.db
   query.py             questions -> markdown with citations
   verify_citations.py  the gate
-templates/             CLAUDE.md operating contract, PLAYBOOKS.md
+templates/             CLAUDE.md operating contract, PLAYBOOKS.md, REQUESTS.md (chat requests as text)
+.vscode/tasks.json     Run Task > "Atlas: ..." - queries into work/, the gate, the UI
+.github/               copilot-instructions.md (the contract Copilot loads), prompts/atlas-*.prompt.md (/atlas-... in chat)
+docs/                  FieldManual.html (offline manual), VSCODE.md (the loop in VS Code)
+work/                  reports and answers written by the tasks; git-ignored
 tests/                 regression suite; every bug found becomes a fixture + assertion (see LESSONS.md)
 selfcheck.py           run before trusting or copying the toolkit
 manifest.example.json  how to declare production libraries

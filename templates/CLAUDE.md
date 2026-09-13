@@ -2,7 +2,11 @@
 
 Copy this file to the root of the estate folder (next to `atlas.db`) as
 `CLAUDE.md`. It applies to any coding agent or chat model working here; the
-rules are about evidence, not about a vendor.
+rules are about evidence, not about a vendor. In VS Code with GitHub Copilot
+the same contract ships as `.github/copilot-instructions.md` (loaded
+automatically) with the requests as `/atlas-*` prompts; Cursor reads it as
+`.cursorrules`, Cline as `.clinerules` - see `docs/VSCODE.md`. Every query
+below takes `--out work/NAME.md` (UTF-8) - prefer it to the shell's `>`.
 
 ## 1. You do not know this estate. The index does.
 

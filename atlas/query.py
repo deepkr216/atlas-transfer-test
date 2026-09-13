@@ -28,6 +28,8 @@ omits them is incomplete by construction, not merely by accident.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
 import os
 import sqlite3
@@ -2793,6 +2795,9 @@ def cmd_interfaces(conn: sqlite3.Connection, system: Optional[str] = None, dsn: 
 def _main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Query atlas.db (markdown out, citations in).")
     ap.add_argument("--db", default="atlas.db")
+    ap.add_argument("--out", help="write the report to this file (UTF-8, LF, folders created) instead of "
+                                  "the terminal - use this rather than the shell's '>' (PowerShell 5.1 "
+                                  "writes UTF-16)")
     sub = ap.add_subparsers(dest="cmd", required=True)
     for c in ("program", "job", "dataset", "copybook", "values", "screen", "transaction", "column",
               "table", "dbd", "segment"):
@@ -2852,7 +2857,29 @@ def _main(argv: Optional[List[str]] = None) -> int:
     s.add_argument("--sections", help="comma-separated section names to keep, e.g. runs,calls,files,evidence")
     s.add_argument("--keep-paths", action="store_true", help="keep full file paths (default: file names only)")
     a = ap.parse_args(argv)
+    if a.out:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = _run(a)
+        write_out(a.out, buf.getvalue())
+        return rc
+    return _run(a)
 
+
+def write_out(path: str, text: str) -> None:
+    """Write a report as UTF-8 with LF, creating the folder. The shell's own
+    redirection is not used because its encoding is the shell's choice
+    (PowerShell 5.1 `>` produces UTF-16), which the chat model and the gate
+    then misread."""
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(text)
+    print(f"written {path}  ({len(text)} chars, ~{len(text) // 4} tokens)")
+
+
+def _run(a: argparse.Namespace) -> int:
     conn = connect(a.db)
     try:
         if a.cmd == "program":

@@ -29,7 +29,9 @@ Exit status 0 = every citation verified; 1 = at least one failed.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
+import io
 import json
 import os
 import re
@@ -316,6 +318,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--db", help="atlas.db built by atlas.build (preferred)")
     ap.add_argument("--root", help="source folder to search when no --db")
     ap.add_argument("--json", action="store_true", help="machine-readable output")
+    ap.add_argument("--out", help="also write the report to this file (UTF-8, folders created) - the "
+                                  "fix-up prompt reads it; the terminal still shows it")
     args = ap.parse_args(argv)
 
     with open(args.answer, "r", encoding="utf-8", errors="replace") as fh:
@@ -326,25 +330,39 @@ def main(argv: Optional[List[str]] = None) -> int:
     n_fail = sum(1 for r in results if r.status == "FAIL")
     n_warn = sum(1 for r in results if r.status == "WARN")
 
-    if args.json:
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        _report(args.json, results, uncited, n_pass, n_fail, n_warn)
+    report = buf.getvalue()
+    sys.stdout.write(report)
+    if args.out:
+        d = os.path.dirname(args.out)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        with open(args.out, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(report)
+    return 1 if n_fail or not results else 0
+
+
+def _report(as_json: bool, results, uncited, n_pass: int, n_fail: int, n_warn: int) -> None:
+    if as_json:
         print(json.dumps({"citations": [asdict(r) for r in results], "uncited": uncited,
                           "pass": n_pass, "fail": n_fail, "warn": n_warn}, indent=1))
+        return
+    for r in results:
+        print(f"{r.status:<4} {r.member} {r.start}-{r.end} \"{r.quote[:40]}\"  {r.detail}")
+    print("-" * 78)
+    print(f"{len(results)} citation(s): {n_pass} pass, {n_fail} FAIL, {n_warn} warn")
+    if uncited:
+        print(f"{len(uncited)} assertive line(s) with NO citation - treat as unverified:")
+        for u in uncited[:20]:
+            print(f"   ? {u}")
+    if n_fail:
+        print("RESULT: REJECT - unsupported claims present")
+    elif not results:
+        print("RESULT: NO CITATIONS - nothing here is verifiable")
     else:
-        for r in results:
-            print(f"{r.status:<4} {r.member} {r.start}-{r.end} \"{r.quote[:40]}\"  {r.detail}")
-        print("-" * 78)
-        print(f"{len(results)} citation(s): {n_pass} pass, {n_fail} FAIL, {n_warn} warn")
-        if uncited:
-            print(f"{len(uncited)} assertive line(s) with NO citation - treat as unverified:")
-            for u in uncited[:20]:
-                print(f"   ? {u}")
-        if n_fail:
-            print("RESULT: REJECT - unsupported claims present")
-        elif not results:
-            print("RESULT: NO CITATIONS - nothing here is verifiable")
-        else:
-            print("RESULT: citations verified" + (" (with warnings)" if n_warn else ""))
-    return 1 if n_fail or not results else 0
+        print("RESULT: citations verified" + (" (with warnings)" if n_warn else ""))
 
 
 if __name__ == "__main__":

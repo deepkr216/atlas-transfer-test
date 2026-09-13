@@ -134,3 +134,4 @@ then the fix, then a row here. Nothing is "fixed" until the test exists.
 - Zowe command syntax is built from the documented `zos-files download all-members / data-set` forms; a shop's profile type or flags go in `extra_args` — run `--check` and `--plan` before the first real fetch.
 - PDF text with CID fonts may be garbled; the extractor says so but cannot fix it.
 - Compiler listings are the authoritative expansion; a listing loader would supersede `expand.py`.
+| 118 | A pack redirected with PowerShell 5.1 `>` arrived as UTF-16 (`python -m atlas.query ... > pack.md`); the chat model saw NUL-separated characters and the gate read garbage | The shell, not the toolkit, chose the file encoding | `test_vscode.py::test_query_out_writes_utf8` - `--out FILE` on `atlas.query` and `atlas.verify_citations` writes UTF-8 with LF and creates the folder, independent of the shell |
