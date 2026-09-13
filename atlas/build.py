@@ -1102,7 +1102,8 @@ def index_psb(ctx: Ctx, mem: Mem) -> None:
 def index_doc(ctx: Ctx, mem: Mem) -> None:
     conn = ctx.conn
     d = docs.extract(mem.path)
-    for i, (h, t) in enumerate(d.sections, 1):
+    # every section small enough to hand to a model whole and to cite precisely
+    for i, (h, t) in enumerate(docs.chunk_sections(d.sections), 1):
         conn.execute("INSERT INTO doc_section(member_id,heading,text,ordinal) VALUES(?,?,?,?)", (mem.id, h, t, i))
         if t:
             conn.execute("INSERT INTO src_fts(member_name,kind,member_id,line_no,text) VALUES(?,?,?,?,?)",

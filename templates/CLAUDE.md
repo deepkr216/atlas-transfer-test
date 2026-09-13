@@ -34,6 +34,7 @@ python -m atlas.query --db atlas.db dbd      <DBD>            # IMS database: se
 python -m atlas.query --db atlas.db segment  <SEGMENT>        # who reads/updates an IMS segment
 python -m atlas.query --db atlas.db layout   <COPYBOOK> [--program PGM]  # byte layout for test data / contracts
 python -m atlas.query --db atlas.db docs     <TERM>           # documents (and OCR'd pictures) mentioning it
+python -m atlas.query --db atlas.db doc      <DOC> [--grep TERM | --sections 3-5]  # a document's sections in FULL (outline when alone)
 python -m atlas.query --db atlas.db images   [DOC]            # pictures inside documents, read or not
 ```
 

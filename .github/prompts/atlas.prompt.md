@@ -21,7 +21,9 @@ How to work:
    identifier or text - use it when the question names a concept but not a field) ·
    `conditions PGM` · `paragraph PGM NAME` · `crud --job JOB` · `callers PGM` / `callees PGM` ·
    `dataset DSN` · `table T` · `column T.C` · `dbd D` · `segment S` · `transaction CODE` ·
-   `screen MAP` · `interfaces` · `docs TERM` · `cite MEMBER a-b` · `coverage`.
+   `screen MAP` · `interfaces` · `docs TERM` (which documents mention it) · `doc NAME --grep TERM` /
+   `doc NAME --sections 3-5` (the FULL text of a document's sections - what you read for a business
+   rule or a flow; `doc NAME` alone is the outline) · `cite MEMBER a-b` · `coverage`.
    When the question is about a concept (gender, relationship, a status) rather than a named
    field: start with `search "GENDER"` and `messages GENDER` to learn the field names, the
    copybooks and the message texts; then `values` on each field found, `literal` on each

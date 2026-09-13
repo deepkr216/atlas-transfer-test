@@ -334,6 +334,12 @@ path; those are the few worth a vision-model call, chosen by hand.
 
 - `docs TERM` — every document mentioning a program, job, field, code or
   phrase, with the section (or image) and an excerpt.
+- `doc DOC [--sections 3-5 | --grep TERM] [--budget N]` — one document: its
+  outline (section numbers, headings, sizes), or the **full text** of chosen
+  sections by number or by the words they contain. Long heading-less
+  documents (a book-sized PDF or text file) are cut at build time into parts
+  of about 4,000 characters, so a business rule always sits in a section the
+  model can read whole and cite exactly.
 - `images [DOC]` — documents with pictures, how many were extracted, read,
   and had text.
 - `program`, `job` and `field` dossiers end with **Documents mentioning it**.

@@ -461,3 +461,43 @@ def _html(path: str) -> DocText:
     txt = re.sub(r"&gt;", ">", txt)
     d.sections = [("", re.sub(r"\n\s*\n+", "\n\n", txt).strip())]
     return d
+
+
+# --------------------------------------------------------------------------
+# sections a model can be handed one at a time
+# --------------------------------------------------------------------------
+
+def chunk_sections(sections: List[Tuple[str, str]], max_chars: int = 4000) -> List[Tuple[str, str]]:
+    """Split long sections so that every citable section is small enough to
+    hand to a model whole. A heading-less PDF or text file arrives as ONE
+    section (a 300-page specification, one number - LESSONS 129); it is cut
+    at paragraph boundaries into parts of about `max_chars`, the heading
+    carrying `(part k/n)`. Short sections are returned untouched."""
+    out: List[Tuple[str, str]] = []
+    for heading, text in sections:
+        if len(text or "") <= max_chars:
+            out.append((heading, text))
+            continue
+        paras = [p for p in re.split(r"\n\s*\n", text) if p.strip()]
+        parts: List[str] = []
+        buf = ""
+        for p in paras:
+            while len(p) > max_chars:                      # one huge paragraph: cut at sentence ends
+                cut = p.rfind(". ", 0, max_chars)
+                cut = cut + 1 if cut > max_chars // 2 else max_chars
+                head, p = p[:cut].rstrip(), p[cut:].lstrip()
+                if buf:
+                    parts.append(buf)
+                    buf = ""
+                parts.append(head)
+            if buf and len(buf) + len(p) + 2 > max_chars:
+                parts.append(buf)
+                buf = p
+            else:
+                buf = f"{buf}\n\n{p}" if buf else p
+        if buf:
+            parts.append(buf)
+        n = len(parts)
+        for k, part in enumerate(parts, 1):
+            out.append((f"{heading} (part {k}/{n})" if heading else f"part {k}/{n}", part))
+    return out

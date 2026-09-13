@@ -125,7 +125,7 @@
 atlas.build  (no model calls)  --->  atlas.db  (facts + citations + unresolved)
       |
       v
-atlas.query  pack / walk / program / job / field / layout / crud / literal / values / table / dbd / interfaces
+atlas.query  pack / walk / program / job / field / layout / crud / literal / values / table / dbd / interfaces / doc
       |
       v
 Model reads ONLY the pack  --->  answer.md with [[MEMBER line "token"]] citations
@@ -206,6 +206,7 @@ python -m atlas.query  --db atlas.db ambiguous       # duplicate member names</c
 <thead><tr><th>Command</th><th>Answers</th></tr></thead>
 <tbody>
 <tr><td class="mono">docs TERM</td><td>Every document mentioning a program, job, field, code or phrase, with the section or image and an excerpt.</td></tr>
+<tr><td class="mono">doc DOC [--sections 3-5 | --grep TERM]</td><td>One document: its outline (section numbers, headings, sizes), or the <strong>full text</strong> of chosen sections — by number or by the words they contain — inside a budget. Long heading-less documents are cut into parts of about 4,000 characters at build time, so every business rule sits in a section a model can read whole and cite exactly.</td></tr>
 <tr><td class="mono">images [DOC]</td><td>Documents with pictures: how many were extracted, read, and had text; per document, each image with its OCR text.</td></tr>
 <tr><td class="mono">program · job · field</td><td>Each dossier ends with <em>Documents mentioning it</em>.</td></tr>
 </tbody></table></div>
@@ -293,7 +294,7 @@ python -m atlas.query  --db atlas.db ambiguous       # duplicate member names</c
 <tbody>
 <tr><td>It crashed</td><td class="mono">atlas-crash.txt</td><td>Toolkit version, Python/OS, the exception, the toolkit's own code frames. Paths and dataset names already stripped; written automatically by <code>build</code> and <code>query</code>.</td></tr>
 <tr><td>Coverage looks wrong</td><td class="mono">python -m atlas.diag --db atlas.db --redact</td><td>Failure signatures grouped (three signatures are usually three bugs), unresolved counts, format-detection stats. Member names hashed.</td></tr>
-<tr><td>Wrong answer</td><td>Five lines + a tiny fake fixture</td><td><code>command / expected / got / pattern / fixture</code>. The fixture is 10–30 lines with invented names that reproduce the <em>shape</em> (the continuation, the level numbers, the PARM layout). It becomes a regression test before the fix — see <code>LESSONS.md</code>, 128 entries so far.</td></tr>
+<tr><td>Wrong answer</td><td>Five lines + a tiny fake fixture</td><td><code>command / expected / got / pattern / fixture</code>. The fixture is 10–30 lines with invented names that reproduce the <em>shape</em> (the continuation, the level numbers, the PARM layout). It becomes a regression test before the fix — see <code>LESSONS.md</code>, 129 entries so far.</td></tr>
 </tbody></table></div>
 <div class="callout crit"><strong>Never paste</strong>Real members, copybooks or JCL; dataset, library or job names that identify the company; anything from <code>out/expanded/</code> or <code>atlas.db</code>. The toolkit never sends anything anywhere; sharing is always your copy-paste.</div>
 

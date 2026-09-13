@@ -13,6 +13,7 @@
     {"id": "program", "type": "promptString", "description": "Program name"},
     {"id": "copybook", "type": "promptString", "description": "Copybook name"},
     {"id": "member", "type": "promptString", "description": "Member name (a program, copybook, job, PROC, PSB, DBD, control card...)"},
+    {"id": "document", "type": "promptString", "description": "Document name (the file name without extension, as `docs` shows it)"},
     {"id": "range", "type": "promptString", "description": "Line range, e.g. 1-9999 for the whole member or 120-180", "default": "1-9999"},
     {"id": "paragraph", "type": "promptString", "description": "Paragraph / section name, or a line number"}
   ],
@@ -126,6 +127,24 @@
         "env": {"PYTHONUTF8": "1"},
         "shell": {"executable": "powershell.exe", "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command"]}
       },
+      "presentation": {"reveal": "always", "panel": "shared", "showReuseMessage": false},
+      "problemMatcher": []
+    },
+    {
+      "label": "Atlas: document outline -> work/doc.md",
+      "detail": "A document's sections: numbers, headings, sizes. Then read them in full with the next task.",
+      "type": "shell",
+      "command": "python -m atlas.query --db atlas.db --out work/doc.md doc ${input:document}",
+      "options": {"cwd": "${workspaceFolder}", "env": {"PYTHONUTF8": "1"}},
+      "presentation": {"reveal": "always", "panel": "shared", "showReuseMessage": false},
+      "problemMatcher": []
+    },
+    {
+      "label": "Atlas: document sections about a term -> work/doc.md",
+      "detail": "The FULL text of every section of one document that contains the term - what the model reads for a business rule.",
+      "type": "shell",
+      "command": "python -m atlas.query --db atlas.db --out work/doc.md doc ${input:document} --grep ${input:pattern} --budget ${input:budget}",
+      "options": {"cwd": "${workspaceFolder}", "env": {"PYTHONUTF8": "1"}},
       "presentation": {"reveal": "always", "panel": "shared", "showReuseMessage": false},
       "problemMatcher": []
     },

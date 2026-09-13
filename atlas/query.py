@@ -1652,9 +1652,96 @@ def cmd_docs(conn: sqlite3.Connection, term: str) -> str:
             trows.append((_section_label(h["line_no"]), (head["heading"] if head and head["heading"] else "")[:40],
                           h["snip"].replace("\n", " ")[:160], f"{doc}:{h['line_no'] or 0}"))
         out.append(table(["where", "heading", "excerpt", "cite"], trows[:15]))
-    out.append("\n> Cite a document as `[[DOCNAME <section> \"token\"]]`; the gate checks the token against that "
+    out.append("\n> Full text of a section: `doc DOCNAME --sections n` (or `n-m`); every section about a term: "
+               "`doc DOCNAME --grep TERM`; the outline: `doc DOCNAME`.\n"
+               "> Cite a document as `[[DOCNAME <section> \"token\"]]`; the gate checks the token against that "
                "section (images are sections 1001+). Where a document and the code disagree, say so - the "
                "code is what runs.\n")
+    return "".join(out)
+
+
+def _doc_members(conn: sqlite3.Connection, name: str) -> List[sqlite3.Row]:
+    n = name.upper()
+    stem = os.path.splitext(n)[0]
+    rows = conn.execute("SELECT id, name, path FROM member WHERE kind='doc' AND (UPPER(name)=? OR UPPER(name)=?) "
+                        "ORDER BY path", (n, stem)).fetchall()
+    if not rows:
+        rows = conn.execute("SELECT id, name, path FROM member WHERE kind='doc' AND UPPER(name) LIKE ? ORDER BY path",
+                            (f"%{stem}%",)).fetchall()
+    return rows
+
+
+def _parse_sections(spec: str) -> set:
+    """'3' | '3-5' | '2,7,9-12' -> {section numbers}"""
+    out: set = set()
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        a, _, b = part.partition("-")
+        if a.strip().isdigit() and (not b or b.strip().isdigit()):
+            lo, hi = int(a), int(b or a)
+            out.update(range(min(lo, hi), max(lo, hi) + 1))
+    return out
+
+
+def cmd_doc(conn: sqlite3.Connection, name: str, sections: Optional[str] = None, grep: Optional[str] = None,
+            budget: Optional[int] = None) -> str:
+    """A document the model can read a section at a time: the outline
+    (section numbers, headings, sizes), or the FULL text of chosen sections
+    - by number or by content - each citable as [[DOC n "token"]]. Documents
+    are prose: what was intended, never a fact about what runs."""
+    rows = _doc_members(conn, name)
+    if not rows:
+        return (f"# Document {name}\n\n**NOT FOUND** - no indexed document is called that. `docs TERM` finds documents "
+                "by content; documents are indexed from the folders in `extra_roots` (UI: Document folders).\n")
+    m = rows[0]
+    out = [f"# Document {m['name']}  ({os.path.basename(m['path'])})\n"]
+    if len(rows) > 1:
+        out.append(f"- {len(rows)} documents share this name; showing the first. Others: "
+                   + ", ".join(os.path.basename(r["path"]) for r in rows[1:4]) + "\n")
+    secs = conn.execute("SELECT ordinal, heading, text FROM doc_section WHERE member_id=? ORDER BY ordinal",
+                        (m["id"],)).fetchall()
+    n_img, n_ocr = conn.execute("SELECT COUNT(*), SUM(ocr_text IS NOT NULL) FROM doc_image WHERE member_id=?",
+                                (m["id"],)).fetchone()
+    if not sections and not grep:
+        total = sum(len(s["text"] or "") for s in secs)
+        out.append(f"- {len(secs)} sections, {total} characters (~{total // 4} tokens); {n_img or 0} image(s), "
+                   f"{n_ocr or 0} read by OCR (their text is sections 1001+ once `OCR images` has run)\n")
+        out.append(f"- read one: `doc {m['name']} --sections 3` (or `3-5`, `2,7,9-12`); by content: "
+                   f"`doc {m['name']} --grep \"waiver\"`; cite as `[[{m['name']} 3 \"token\"]]`\n\n")
+        trows = [(s["ordinal"], (s["heading"] or "")[:50], len(s["text"] or ""),
+                  (s["text"] or "").strip().split("\n", 1)[0][:70]) for s in secs]
+        out.append(table(["section", "heading", "chars", "starts with"], trows[:400]))
+        if len(secs) > 400:
+            out.append(f"_... {len(secs) - 400} more sections_\n")
+        return "".join(out)
+    if sections:
+        want = _parse_sections(sections)
+        chosen = [s for s in secs if s["ordinal"] in want]
+        what = f"section(s) {sections}"
+    else:
+        g = (grep or "").upper()
+        chosen = [s for s in secs if g in ((s["heading"] or "") + "\n" + (s["text"] or "")).upper()]
+        what = f"section(s) containing `{grep}`"
+    if not chosen:
+        out.append(f"\n_no {what}_ - `doc {m['name']}` lists what there is\n")
+        return "".join(out)
+    out.append(f"- {len(chosen)} {what}; cite as `[[{m['name']} <section> \"token\"]]` with the token copied "
+               "from the text. Prose describes intent; where it disagrees with the code, say so.\n")
+    used = sum(len(x) for x in out)
+    shown = 0
+    for s in chosen:
+        block = (f"\n### {m['name']} section {s['ordinal']}" + (f" - {s['heading']}" if s["heading"] else "")
+                 + "\n```\n" + (s["text"] or "").rstrip() + "\n```\n")
+        if budget and shown and used + len(block) > budget:
+            rest = chosen[shown:]
+            out.append(f"\n_budget {budget}: {len(rest)} more section(s) not shown - "
+                       + ", ".join(str(x["ordinal"]) for x in rest[:30]) + (" ..." if len(rest) > 30 else "") + "_\n")
+            break
+        out.append(block)
+        used += len(block)
+        shown += 1
     return "".join(out)
 
 
@@ -3324,6 +3411,11 @@ def _main(argv: Optional[List[str]] = None) -> int:
     s = sub.add_parser("paragraph")
     s.add_argument("name")
     s.add_argument("para", help="paragraph / section name, or a line number")
+    s = sub.add_parser("doc", help="a document's outline, or the full text of its sections by number / by content")
+    s.add_argument("name")
+    s.add_argument("--sections", help="which sections to print in full: 3, 3-5, or 2,7,9-12")
+    s.add_argument("--grep", help="print every section containing this text (case-insensitive)")
+    s.add_argument("--budget", type=int, help="character budget for the printed sections")
     s = sub.add_parser("walk", help="the program in reading order: entry first, each paragraph as control reaches it")
     s.add_argument("name")
     s.add_argument("--from", dest="start", help="start at this paragraph / section instead of the entry")
@@ -3412,6 +3504,8 @@ def _run(a: argparse.Namespace) -> int:
             print(cmd_paragraph(conn, a.name, a.para))
         elif a.cmd == "walk":
             print(cmd_walk(conn, a.name, a.start, a.budget, a.depth, not a.no_source, not a.no_data, a.max_lines))
+        elif a.cmd == "doc":
+            print(cmd_doc(conn, a.name, a.sections, a.grep, a.budget))
         elif a.cmd == "literal":
             print(cmd_literal(conn, a.name, a.field, a.like))
         elif a.cmd == "values":

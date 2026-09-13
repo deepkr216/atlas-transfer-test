@@ -38,7 +38,7 @@ CONTRACT = os.path.join(ROOT, ".github", "copilot-instructions.md")
 INPUTS = {"name": "SAMPPGM", "kind": "program", "budget": "12000", "field": "PM-POLICY-STATUS",
           "field2": "PM-POLICY-STATUS", "pattern": "ERROR", "literal": "E001", "job": "SAMPJOB",
           "program": "SAMPPGM", "copybook": "PMASTREC", "member": "SAMPPGM", "range": "1-9999",
-          "paragraph": "100-MAIN"}
+          "paragraph": "100-MAIN", "document": "CLAIMSPEC"}
 USER_WRITTEN = {"abend.txt", "answer.md"}
 
 
