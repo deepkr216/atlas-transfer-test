@@ -100,8 +100,18 @@ def plan(root: str) -> List[Tuple[str, str, str]]:
             if ext not in LEGACY_TO_MODERN or fn.startswith("~$"):
                 continue
             target = stem + LEGACY_TO_MODERN[ext]
-            status = "exists" if target.lower() in lower else "convert"
-            out.append((os.path.join(dirpath, fn), os.path.join(dirpath, target), status))
+            src_path, dst_path = os.path.join(dirpath, fn), os.path.join(dirpath, target)
+            if target.lower() in lower:
+                # both exist: the copy is current unless the legacy file was
+                # changed AFTER the copy was made - then the copy is stale
+                try:
+                    stale = os.path.getmtime(src_path) > os.path.getmtime(dst_path) + 1
+                except OSError:
+                    stale = False
+                status = "stale" if stale else "exists"
+            else:
+                status = "convert"
+            out.append((src_path, dst_path, status))
     return out
 
 
@@ -159,16 +169,23 @@ def _run_libreoffice(pairs: List[Tuple[str, str]], timeout: int, log: Callable[[
 
 
 def convert_tree(root: str, dry_run: bool = False, log: Callable[[str], None] = print,
-                 timeout: int = 3600) -> Tuple[int, int, int]:
+                 timeout: int = 3600, refresh: bool = False) -> Tuple[int, int, int]:
     """Convert every legacy Office file under `root`. Returns
-    (converted, already present, failed)."""
+    (converted, already present, failed). A copy older than its legacy
+    original is reported as STALE and left alone unless `refresh`."""
     items = plan(root)
-    todo = [(s, d) for s, d, st in items if st == "convert"]
+    todo = [(s, d) for s, d, st in items if st == "convert" or (refresh and st == "stale")]
     have = sum(1 for _s, _d, st in items if st == "exists")
-    log(f"{len(items)} legacy Office file(s) under {root}: {len(todo)} to convert, {have} already have a modern copy")
+    stale = [s for s, _d, st in items if st == "stale"]
+    log(f"{len(items)} legacy Office file(s) under {root}: {len(todo)} to convert, {have} already have a modern copy"
+        + (f", {len(stale)} copies STALE (the legacy file changed after the copy was made)" if stale else ""))
+    if stale and not refresh:
+        for s in stale:
+            log(f"  STALE {s} - its converted copy is older than it; run with --refresh to remake the copy")
     if dry_run or not todo:
         for s, d, st in items:
-            log(f"  {'have ' if st == 'exists' else 'todo '} {s} -> {os.path.basename(d)}")
+            tag = {"exists": "have ", "stale": "stale", "convert": "todo "}[st]
+            log(f"  {tag} {s} -> {os.path.basename(d)}")
         return 0, have, 0
     rc, out, err = _run_powershell(todo, timeout)
     rows = parse_output(out)
@@ -196,6 +213,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Save legacy Office files (.doc/.xls/.ppt) as .docx/.xlsx/.pptx beside the originals.")
     ap.add_argument("folder", nargs="+", help="folder(s) to convert, subfolders included")
     ap.add_argument("--dry-run", action="store_true", help="list what would be converted; touch nothing")
+    ap.add_argument("--refresh", action="store_true",
+                    help="also remake a copy whose legacy original changed after the copy was made (overwrites the copy)")
     ap.add_argument("--timeout", type=int, default=3600)
     a = ap.parse_args(argv)
     tot_ok = tot_have = tot_fail = 0
@@ -203,7 +222,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         if not os.path.isdir(folder):
             print(f"not a folder: {folder}")
             return 2
-        ok, have, fail = convert_tree(folder, a.dry_run, print, a.timeout)
+        ok, have, fail = convert_tree(folder, a.dry_run, print, a.timeout, a.refresh)
         tot_ok, tot_have, tot_fail = tot_ok + ok, tot_have + have, tot_fail + fail
     print(f"converted {tot_ok}, already present {tot_have}, failed {tot_fail}")
     return 1 if tot_fail else 0

@@ -102,6 +102,42 @@ class Convert(unittest.TestCase):
         self.assertNotIn("rates.xls", names)                 # the legacy original beside its copy is skipped
         self.assertIn("claims manual.doc", names)            # no copy yet: still listed (as legacy, unreadable)
 
+    def test_both_versions_present(self):
+        """A .doc beside its .docx: the copy is used and the legacy file left
+        alone - unless the .doc changed after the copy was made (STALE):
+        then it is said, and --refresh remakes the copy."""
+        doc = os.path.join(self.docs, "rates.xls")
+        docx = os.path.join(self.docs, "rates.xlsx")
+        old, new = 1_600_000_000, 1_700_000_000
+        os.utime(doc, (old, old))
+        os.utime(docx, (new, new))                         # copy made after the legacy file: current
+        self.assertEqual([st for s, _d, st in convert.plan(self.docs) if s == doc], ["exists"])
+        os.utime(doc, (new + 3600, new + 3600))            # the legacy file edited later: copy is stale
+        self.assertEqual([st for s, _d, st in convert.plan(self.docs) if s == doc], ["stale"])
+        lines = []
+        with mock.patch("atlas.convert._run_powershell", return_value=(0, "", "")) as ps:
+            convert.convert_tree(self.docs, dry_run=True, log=lines.append)
+            ps.assert_not_called()
+        self.assertIn("1 copies STALE", "\n".join(lines))
+        self.assertIn("STALE " + doc, "\n".join(lines))
+        with mock.patch("atlas.convert._run_powershell") as ps:
+            ps.side_effect = lambda pairs, timeout: (0, "".join(f"OK\t{s}\t{d}\n" for s, d in pairs), "")
+            convert.convert_tree(self.docs, log=lines.append, refresh=True)
+            remade = [d for s, d in ps.call_args[0][0]]
+        self.assertIn(docx, remade)                          # --refresh remakes the stale copy
+        # the build indexes the copy, and says it is stale
+        est = os.path.join(self.td, "estate", "SRC")
+        os.makedirs(est)
+        shutil.copy(os.path.join(HERE, "fixtures", "SAMPPGM.cbl"), est)
+        db = os.path.join(self.td, "t.db")
+        with contextlib.redirect_stdout(io.StringIO()):
+            build._main([os.path.join(self.td, "estate"), "--db", db, "--rebuild", "--quiet", "--also", self.docs])
+        conn = query.connect(db)
+        row = conn.execute("SELECT parse_status, parse_error FROM member WHERE path LIKE '%rates.xlsx'").fetchone()
+        conn.close()
+        self.assertEqual(row[0], "partial")
+        self.assertIn("STALE copy: rates.xls changed after this conversion", row[1])
+
     def test_cli(self):
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):

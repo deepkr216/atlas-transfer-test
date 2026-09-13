@@ -1120,6 +1120,19 @@ def index_doc(ctx: Ctx, mem: Mem) -> None:
     conn.executemany("INSERT INTO doc_image(member_id,name) VALUES(?,?)",
                      [(mem.id, n) for n in d.images])
     ctx.bump("doc_images", len(d.images))
+    # a converted copy whose legacy original (.doc/.xls/.ppt beside it) was
+    # changed after the conversion: the index would describe the old text
+    stem, ext = os.path.splitext(mem.path)
+    for legacy, modern in docs.LEGACY_TO_MODERN.items():
+        old = stem + legacy
+        if ext.lower() == modern and os.path.exists(old):
+            try:
+                if os.path.getmtime(old) > os.path.getmtime(mem.path) + 1:
+                    d.ok = False
+                    d.notes.append(f"STALE copy: {os.path.basename(old)} changed after this conversion - "
+                                   "run atlas.convert --refresh")
+            except OSError:
+                pass
     conn.execute("UPDATE member SET parse_status=?, parse_error=? WHERE id=?",
                  ("ok" if d.ok else "partial", "; ".join(d.notes) or None, mem.id))
 
