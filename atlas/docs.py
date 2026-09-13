@@ -42,6 +42,7 @@ NS = {
 
 IMAGE_EXT = (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".emf", ".wmf", ".tif", ".tiff", ".svg")
 
+LEGACY_TO_MODERN = {".doc": ".docx", ".xls": ".xlsx", ".ppt": ".pptx"}   # atlas.convert writes the right-hand side
 LEGACY = {".doc": "Word 97-2003", ".xls": "Excel 97-2003", ".ppt": "PowerPoint 97-2003",
           ".vsd": "Visio 2003-2010", ".msg": "Outlook message"}
 

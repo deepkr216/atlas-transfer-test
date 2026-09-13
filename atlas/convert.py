@@ -1,0 +1,213 @@
+"""
+convert.py - save legacy Office files (.doc / .xls / .ppt) as .docx / .xlsx /
+.pptx, a whole folder tree at a time, using the Office already installed on
+the laptop (COM automation through PowerShell - nothing to install), or
+LibreOffice when Office is absent. The modern copy is written NEXT TO the
+original; nothing is deleted or modified. The build then indexes the modern
+copy and skips the legacy one.
+
+    python -m atlas.convert C:\\docs              # convert everything under the folder
+    python -m atlas.convert C:\\docs --dry-run    # list what would be converted, touch nothing
+
+Files that are password-protected, corrupt, or locked by another user are
+reported as FAIL with Office's own message and left alone.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from typing import Callable, List, Optional, Tuple
+
+from .docs import LEGACY_TO_MODERN
+
+SKIP_DIRS = {"out", "atlas_out", ".git", "__pycache__", ".stale"}
+
+# One PowerShell process for the whole tree: Word / Excel / PowerPoint are
+# started once each, on first use, and closed at the end. Files are opened
+# read-only, macros disabled (AutomationSecurity=3), alerts off, so nothing
+# pops up and nothing in the original can run.
+_PS_SCRIPT = r'''
+param([string]$ListFile)
+$ErrorActionPreference = 'Continue'
+$script:word = $null
+$script:excel = $null
+$script:ppt = $null
+
+function Get-Word {
+    if ($script:word -eq $null) {
+        $script:word = New-Object -ComObject Word.Application
+        $script:word.Visible = $false
+        $script:word.DisplayAlerts = 0
+        try { $script:word.AutomationSecurity = 3 } catch {}
+    }
+    return $script:word
+}
+function Get-Excel {
+    if ($script:excel -eq $null) {
+        $script:excel = New-Object -ComObject Excel.Application
+        $script:excel.Visible = $false
+        $script:excel.DisplayAlerts = $false
+        try { $script:excel.AutomationSecurity = 3 } catch {}
+    }
+    return $script:excel
+}
+function Get-PPT {
+    if ($script:ppt -eq $null) {
+        $script:ppt = New-Object -ComObject PowerPoint.Application
+        try { $script:ppt.AutomationSecurity = 3 } catch {}
+    }
+    return $script:ppt
+}
+
+$pairs = Get-Content -LiteralPath $ListFile -Encoding UTF8 | Where-Object { $_ -ne '' }
+foreach ($line in $pairs) {
+    $src, $dst = $line -split "`t", 2
+    $ext = [System.IO.Path]::GetExtension($src).ToLower()
+    try {
+        switch ($ext) {
+            '.doc' { $w = Get-Word; $d = $w.Documents.Open($src, $false, $true); $d.SaveAs2([ref]$dst, [ref]12); $d.Close(0) }
+            '.xls' { $x = Get-Excel; $b = $x.Workbooks.Open($src, 0, $true); $b.SaveAs($dst, 51); $b.Close($false) }
+            '.ppt' { $p = Get-PPT; $r = $p.Presentations.Open($src, -1, 0, 0); $r.SaveAs($dst, 24); $r.Close() }
+        }
+        if (Test-Path -LiteralPath $dst) { Write-Output "OK`t$src`t$dst" } else { Write-Output "FAIL`t$src`tno output written" }
+    } catch {
+        $msg = $_.Exception.Message -replace "[`r`n]+", " "
+        Write-Output "FAIL`t$src`t$msg"
+    }
+}
+foreach ($app in @($script:word, $script:excel, $script:ppt)) {
+    if ($app -ne $null) { try { $app.Quit() } catch {} }
+}
+'''
+
+
+def plan(root: str) -> List[Tuple[str, str, str]]:
+    """(source, target, 'convert' | 'exists') for every legacy Office file
+    under `root`, subfolders included. `exists` = a modern copy is already
+    beside it, so nothing to do."""
+    out: List[Tuple[str, str, str]] = []
+    for dirpath, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.startswith(".")]
+        lower = {f.lower() for f in files}
+        for fn in sorted(files):
+            stem, ext = os.path.splitext(fn)
+            ext = ext.lower()
+            if ext not in LEGACY_TO_MODERN or fn.startswith("~$"):
+                continue
+            target = stem + LEGACY_TO_MODERN[ext]
+            status = "exists" if target.lower() in lower else "convert"
+            out.append((os.path.join(dirpath, fn), os.path.join(dirpath, target), status))
+    return out
+
+
+def parse_output(text: str) -> List[Tuple[str, str, str]]:
+    """OK / FAIL lines from the PowerShell script -> (status, source, detail)."""
+    rows: List[Tuple[str, str, str]] = []
+    for line in text.splitlines():
+        parts = line.rstrip("\r").split("\t", 2)
+        if len(parts) == 3 and parts[0] in ("OK", "FAIL"):
+            rows.append((parts[0], parts[1], parts[2]))
+    return rows
+
+
+def _run_powershell(pairs: List[Tuple[str, str]], timeout: int) -> Tuple[int, str, str]:
+    if shutil.which("powershell") is None:
+        return 127, "", "powershell.exe not found on PATH"
+    td = tempfile.mkdtemp(prefix="atlas-convert-")
+    script = os.path.join(td, "convert.ps1")
+    listing = os.path.join(td, "files.txt")
+    with open(script, "w", encoding="utf-8") as fh:
+        fh.write(_PS_SCRIPT)
+    with open(listing, "w", encoding="utf-8") as fh:
+        for src, dst in pairs:
+            fh.write(f"{src}\t{dst}\n")
+    try:
+        p = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                            "-File", script, "-ListFile", listing],
+                           capture_output=True, text=True, encoding="utf-8", errors="replace",
+                           timeout=timeout, stdin=subprocess.DEVNULL)
+        return p.returncode, p.stdout or "", p.stderr or ""
+    except subprocess.TimeoutExpired:
+        return 124, "", f"timed out after {timeout}s"
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
+
+def _run_libreoffice(pairs: List[Tuple[str, str]], timeout: int, log: Callable[[str], None]) -> List[Tuple[str, str, str]]:
+    """Fallback when Office is not installed: `soffice --headless --convert-to`."""
+    soffice = shutil.which("soffice") or shutil.which("soffice.exe")
+    rows: List[Tuple[str, str, str]] = []
+    if not soffice:
+        return rows
+    for src, dst in pairs:
+        fmt = os.path.splitext(dst)[1].lstrip(".")
+        try:
+            p = subprocess.run([soffice, "--headless", "--convert-to", fmt, "--outdir", os.path.dirname(dst), src],
+                               capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout,
+                               stdin=subprocess.DEVNULL)
+            ok = p.returncode == 0 and os.path.exists(dst)
+            rows.append(("OK" if ok else "FAIL", src, dst if ok else (p.stderr or p.stdout).strip()[:200]))
+        except subprocess.TimeoutExpired:
+            rows.append(("FAIL", src, f"timed out after {timeout}s"))
+        log(f"  {rows[-1][0]:<4} {os.path.basename(src)}")
+    return rows
+
+
+def convert_tree(root: str, dry_run: bool = False, log: Callable[[str], None] = print,
+                 timeout: int = 3600) -> Tuple[int, int, int]:
+    """Convert every legacy Office file under `root`. Returns
+    (converted, already present, failed)."""
+    items = plan(root)
+    todo = [(s, d) for s, d, st in items if st == "convert"]
+    have = sum(1 for _s, _d, st in items if st == "exists")
+    log(f"{len(items)} legacy Office file(s) under {root}: {len(todo)} to convert, {have} already have a modern copy")
+    if dry_run or not todo:
+        for s, d, st in items:
+            log(f"  {'have ' if st == 'exists' else 'todo '} {s} -> {os.path.basename(d)}")
+        return 0, have, 0
+    rc, out, err = _run_powershell(todo, timeout)
+    rows = parse_output(out)
+    com_missing = rc != 0 and not rows or any("80040154" in d or "Cannot create" in d or "COM class factory" in d
+                                              for _s, _src, d in rows if _s == "FAIL")
+    if com_missing and (shutil.which("soffice") or shutil.which("soffice.exe")):
+        log("  Office automation is not available here - trying LibreOffice (soffice --headless)")
+        done = {src for st, src, _d in rows if st == "OK"}
+        rows = [r for r in rows if r[0] == "OK"] + _run_libreoffice([(s, d) for s, d in todo if s not in done], timeout, log)
+    elif rc != 0 and not rows:
+        log(f"  powershell rc {rc}: {(err or out).strip()[:300]}")
+        log("  Is Microsoft Office installed on this laptop? Without it (or LibreOffice on PATH) nothing can "
+            "open a .doc/.xls/.ppt - save them as .docx/.xlsx/.pptx from the application once.")
+        return 0, have, len(todo)
+    ok = sum(1 for st, _s, _d in rows if st == "OK")
+    for st, src, detail in rows:
+        log(f"  {st:<4} {src}" + ("" if st == "OK" else f": {detail}"))
+    missing = [s for s, _d in todo if s not in {src for _st, src, _d in rows}]
+    for s in missing:
+        log(f"  FAIL {s}: no result reported")
+    return ok, have, len(todo) - ok
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    ap = argparse.ArgumentParser(description="Save legacy Office files (.doc/.xls/.ppt) as .docx/.xlsx/.pptx beside the originals.")
+    ap.add_argument("folder", nargs="+", help="folder(s) to convert, subfolders included")
+    ap.add_argument("--dry-run", action="store_true", help="list what would be converted; touch nothing")
+    ap.add_argument("--timeout", type=int, default=3600)
+    a = ap.parse_args(argv)
+    tot_ok = tot_have = tot_fail = 0
+    for folder in a.folder:
+        if not os.path.isdir(folder):
+            print(f"not a folder: {folder}")
+            return 2
+        ok, have, fail = convert_tree(folder, a.dry_run, print, a.timeout)
+        tot_ok, tot_have, tot_fail = tot_ok + ok, tot_have + have, tot_fail + fail
+    print(f"converted {tot_ok}, already present {tot_have}, failed {tot_fail}")
+    return 1 if tot_fail else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

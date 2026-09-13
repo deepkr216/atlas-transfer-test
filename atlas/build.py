@@ -232,8 +232,14 @@ def _scan_files(root: str, limit: Optional[int] = None):
             dirs[:] = []
             continue
         dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.startswith(".")]
+        lower = {f.lower() for f in files}
         for fn in sorted(files):
             if fn.startswith(".") or fn.lower().endswith(".exp.cbl"):
+                continue
+            stem, ext = os.path.splitext(fn)
+            # a legacy Office file whose converted copy sits beside it
+            # (atlas.convert): the copy is readable, the original is not
+            if ext.lower() in docs.LEGACY_TO_MODERN and (stem + docs.LEGACY_TO_MODERN[ext.lower()]).lower() in lower:
                 continue
             yield dirpath, fn
             count += 1
