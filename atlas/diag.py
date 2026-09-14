@@ -173,11 +173,48 @@ def write_crash(exc: BaseException, argv: List[str], path: str = "atlas-crash.tx
     return text
 
 
+def time_document(path: str, stack_every: float = 30.0, out=None) -> int:
+    """Run ONE document through the same steps the build runs, in the
+    foreground, timing each; while any step runs, every `stack_every`
+    seconds the exact position (toolkit line numbers only) is written to
+    stderr - the way to find out where a build sits on a file."""
+    import faulthandler
+    from . import docs
+    say = out or (lambda s: print(s, flush=True))
+    say(f"document: {os.path.basename(path)} ({os.path.getsize(path) // 1024} KB)")
+    if stack_every:
+        faulthandler.dump_traceback_later(stack_every, repeat=True)
+    try:
+        t0 = time.time()
+        with open(path, "rb") as fh:
+            data = fh.read()
+        say(f"  read            {time.time() - t0:8.2f} s  ({len(data) // 1024} KB)")
+        t0 = time.time()
+        d = docs.extract(path)
+        say(f"  extract         {time.time() - t0:8.2f} s  ({len(d.sections)} sections, {len(d.images)} pictures, "
+            f"{sum(len(t) for _h, t in d.sections)} characters, kind {d.kind}, ok={d.ok})")
+        for n in d.notes[:5]:
+            say(f"    note: {n}")
+        t0 = time.time()
+        parts = docs.chunk_sections(d.sections)
+        say(f"  chunk           {time.time() - t0:8.2f} s  ({len(parts)} citable sections)")
+        say("  verdict: this document is not what holds the build" if True else "")
+    finally:
+        if stack_every:
+            faulthandler.cancel_dump_traceback_later()
+    return 0
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Shareable diagnostics for atlas (no source content).")
     ap.add_argument("--db", default="atlas.db")
     ap.add_argument("--redact", action="store_true", help="hash member names too")
+    ap.add_argument("--doc", metavar="FILE", help="time ONE document through the build's steps; if it hangs, its exact "
+                                                  "position is printed every 30 s (toolkit line numbers only)")
+    ap.add_argument("--stack-every", type=float, default=30.0, help="seconds between position dumps with --doc (0 = off)")
     a = ap.parse_args(argv)
+    if a.doc:
+        return time_document(a.doc, a.stack_every)
     print(report(a.db, a.redact))
     return 0
 

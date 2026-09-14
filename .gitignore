@@ -16,3 +16,4 @@ pack*.md
 # reports and answers written by the VS Code tasks (--out work/...) - real source lines, never committed
 /work/
 /.claude/settings.local.json
+atlas-stuck.txt

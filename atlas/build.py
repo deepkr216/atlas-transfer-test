@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import faulthandler
 import hashlib
 import json
 import os
@@ -115,6 +116,8 @@ def _clear_facts(conn: sqlite3.Connection, mid: int) -> None:
 
 
 PROGRESS_SECONDS = 10.0                   # the status line's own clock
+STUCK_DUMP_SECONDS = 300                  # one item in hand this long: the exact place is written to STUCK_FILE
+STUCK_FILE = "atlas-stuck.txt"
 
 
 class Progress:
@@ -125,14 +128,31 @@ class Progress:
     is what a status checked only between items gave (LESSONS 142)."""
 
     def __init__(self, say, every: Optional[float] = None, hint_after: float = SLOW_MEMBER_SECONDS,
-                 limit: float = 0):
+                 limit: float = 0, dump_after: Optional[float] = None, dump_file: Optional[str] = None):
         self.say = say
         self.every = PROGRESS_SECONDS if every is None else every
         self.hint_after, self.limit = hint_after, limit
+        self.dump_after = STUCK_DUMP_SECONDS if dump_after is None else dump_after
+        self.dump_file = dump_file or STUCK_FILE
         self.line = lambda: ""
         self.current: Optional[Tuple[str, float]] = None
+        self._dumped: Optional[Tuple[str, float]] = None
         self._stop = threading.Event()
         self._t = threading.Thread(target=self._run, daemon=True, name="progress")
+
+    def dump(self, cur: Tuple[str, float]) -> None:
+        """Where the build is stuck, as toolkit file names, line numbers and
+        function names only - nothing from the estate. Shareable."""
+        try:
+            with open(self.dump_file, "w", encoding="utf-8") as fh:
+                fh.write(f"atlas build: {cur[0]} in hand for {_hms(time.time() - cur[1])} at "
+                         f"{time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                         "Every thread's position (toolkit code only; the main thread is the one to read):\n\n")
+                faulthandler.dump_traceback(file=fh, all_threads=True)
+            self.say(f"  !!! {cur[0]} has been in hand for {_hms(time.time() - cur[1])}: the exact place is written "
+                     f"to {self.dump_file} - send that file (it holds toolkit line numbers, nothing from the estate)")
+        except OSError:
+            pass
 
     def set(self, line) -> None:
         """`line` is called on the clock: it returns the counters part."""
@@ -161,6 +181,10 @@ class Progress:
             t = self.text()
             if t:
                 self.say("  ... " + t)
+            cur = self.current
+            if cur and self.dump_after and time.time() - cur[1] >= self.dump_after and self._dumped != cur:
+                self._dumped = cur
+                self.dump(cur)
 
     def start(self) -> "Progress":
         self._t.start()
@@ -381,9 +405,17 @@ def _forget_member(conn: sqlite3.Connection, mid: int) -> None:
     conn.execute("DELETE FROM member WHERE id=?", (mid,))
 
 
-def _scan_files(root: str, limit: Optional[int] = None):
+def _scan_files(root: str, limit: Optional[int] = None, on_dir=None):
+    """Every file under `root`, folder by folder; `on_dir(text)` is told which
+    folder is being listed, so a folder that will not list (a dead network
+    path, a junction) is named on the status line, not hidden behind the
+    last file read."""
     count = 0
+    if on_dir:
+        on_dir(f"listing folder {root}")
     for dirpath, dirs, files in os.walk(root):
+        if on_dir:
+            on_dir(f"listing folder {dirpath} ({len(files)} files, {len(dirs)} subfolders)")
         # Folders the toolkit itself wrote (expanded sources, extracted
         # images) carry a marker: indexing them again would create a second
         # copy of every program from its own expansion.
@@ -404,6 +436,8 @@ def _scan_files(root: str, limit: Optional[int] = None):
             if ext.lower() == ".zip" and os.path.isdir(os.path.join(dirpath, stem + ".unzipped")):
                 continue
             yield dirpath, fn
+        if on_dir:
+            on_dir(f"listing the next folder after {dirpath}")
             count += 1
             if limit and count >= limit:
                 return
@@ -502,7 +536,7 @@ def inventory(ctx: Ctx, roots, limit: Optional[int] = None, force_all: bool = Fa
     box: List[tuple] = []
     progress = ctx.progress = Progress(ctx.say, limit=INVENTORY_TIME_LIMIT).start()
     progress.set(lambda: f"{n_read} files read ({bytes_read // 1024 // 1024} MB) in {_hms(time.time() - t_start)}")
-    for dirpath, fn in (pair for root in roots for pair in _scan_files(root, limit)):
+    for dirpath, fn in (pair for root in roots for pair in _scan_files(root, limit, progress.now)):
         path = os.path.normpath(os.path.join(dirpath, fn))
         n_read += 1
         folder = os.path.basename(dirpath) or dirpath

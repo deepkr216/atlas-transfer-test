@@ -261,6 +261,48 @@ class Resume(unittest.TestCase):
         self.assertEqual(conn.execute("SELECT COUNT(*) FROM program WHERE program_id='FAKE'").fetchone()[0], 0)
         conn.close()
 
+    def test_a_stuck_item_writes_its_position_to_a_file(self):
+        import time as _t
+        said = []
+        dump = os.path.join(self.td, "stuck.txt")
+        p = build.Progress(said.append, every=0.1, hint_after=0.2, limit=900, dump_after=0.3, dump_file=dump).start()
+        p.set(lambda: "1/2")
+        p.now("classifying file BIG.docx (3700 KB) in QA")
+        _t.sleep(0.9)
+        p.stop()
+        self.assertTrue(os.path.isfile(dump), said)
+        with open(dump, encoding="utf-8") as fh:
+            text = fh.read()
+        self.assertIn("classifying file BIG.docx (3700 KB) in QA in hand for", text)
+        self.assertIn("Thread", text)                       # faulthandler's per-thread positions
+        self.assertIn("build.py", text)
+        self.assertEqual(sum(1 for s in said if "the exact place is written to" in s), 1, "once per item")
+
+    def test_the_folder_walk_names_the_folder_it_lists(self):
+        seen = []
+        files = list(build._scan_files(os.path.join(self.td, "estate"), on_dir=seen.append))
+        self.assertGreaterEqual(len(files), 7)
+        self.assertTrue(any(s.startswith("listing folder ") and "SRC" in s and "files" in s for s in seen), seen)
+        self.assertTrue(any(s.startswith("listing the next folder after ") for s in seen), seen)
+
+    def test_diag_times_one_document(self):
+        from atlas import diag
+        p = os.path.join(self.td, "SPEC.txt")
+        with open(p, "w", encoding="utf-8") as fh:
+            fh.write("Premium waiver rules.\n\nThe waiver applies after six months.\n")
+        said = []
+        rc = diag.time_document(p, stack_every=0, out=said.append)
+        self.assertEqual(rc, 0)
+        self.assertTrue(any(s.strip().startswith("extract") and "sections" in s for s in said), said)
+        self.assertTrue(any(s.strip().startswith("chunk") for s in said), said)
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = diag.main(["--doc", p, "--stack-every", "0"])
+        self.assertEqual(rc, 0)
+        self.assertIn("document: SPEC.txt", buf.getvalue())
+
     def test_progress_line_carries_the_rate_and_time_left(self):
         import time as _t
         real = build.HANDLERS["cobol"]
