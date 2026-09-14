@@ -41,11 +41,13 @@ DIR_HINTS = [
     # CNTL / CARDLIB hold control cards; a real job inside one is caught by
     # its JOB/EXEC statements before the folder hint is consulted.
     (re.compile(r"CNTL(LIB)?$|CARD(LIB|S)?$|UTL$", re.I), "ctlcard"),
+    # the specific libraries before the generic SRC / SOURCE rule: DBDSRC,
+    # PSBSOURCE, BMSSRC and MFSSRC are not COBOL libraries
+    (re.compile(r"DBD(LIB|SRC|SOURCE)?$", re.I), "dbd"),
+    (re.compile(r"PSB(LIB|SRC|SOURCE)?$", re.I), "psb"),
+    (re.compile(r"BMS(LIB|SRC|SOURCE)?$|MAPS?$", re.I), "bms"),
+    (re.compile(r"MFS(LIB|SRC|SOURCE|GEN)?$|(^|\.)FORMATS?$|FMTLIB$|MSGLIB$", re.I), "mfs"),
     (re.compile(r"SRC$|SOURCE$|COBOL$|PGM(LIB)?$", re.I), "cobol"),
-    (re.compile(r"DBD(LIB|SRC)?$", re.I), "dbd"),
-    (re.compile(r"PSB(LIB|SRC)?$", re.I), "psb"),
-    (re.compile(r"BMS(LIB|SRC)?$|MAPS?$", re.I), "bms"),
-    (re.compile(r"MFS(LIB|SRC)?$", re.I), "mfs"),
     (re.compile(r"CTL(CARDS?)?$|PARM(LIB)?$|SYSIN$", re.I), "ctlcard"),
     (re.compile(r"DOCS?$|DOCUMENT.*$|SPECS?$|DESIGN$", re.I), "doc"),
 ]
@@ -74,7 +76,9 @@ _SIG_CSD = re.compile(r"^\s*(?:DEFINE|ALTER|USERDEFINE)\s+(?:TRANSACTION|PROGRAM
                       r"|^\s*(?:TRANSACTION|PROGRAM|FILE)\([A-Z0-9@#$]+\)\s+GROUP\(", re.I | re.M)
 # IMS stage-1 system definition: APPLCTN / TRANSACT macros (label optional in col 1).
 _SIG_IMSGEN = re.compile(r"^(?:[A-Z0-9@#$]{1,8})?\s+(?:APPLCTN|TRANSACT)\s+(?:PSB|GPSB|CODE)=", re.I | re.M)
-_SIG_MFS = re.compile(r"^\s*(MSG|FMT|DEV|DFLD|MFLD)\s", re.I | re.M)
+# MFS statements usually carry a label in column 1 (`MYFMT    FMT`,
+# `GENDER   DFLD  POS=(3,10)`): the label is optional, the operation is not
+_SIG_MFS = re.compile(r"^(?:[A-Z0-9@#$]{1,8})?\s+(MSG|FMT|DEV|DFLD|MFLD)\s", re.I | re.M)
 _SIG_SQL_DDL = re.compile(r"\bCREATE\s+(TABLE|VIEW|INDEX|TABLESPACE|DATABASE)\b", re.I)
 # Any level 01-49 plus 66/77/88. Level 49 is the DCLGEN VARCHAR structure and
 # 02/03/04/06/07/15/20 are all common; testing only 01/05/10 misfiles them.

@@ -79,5 +79,35 @@ class DeclaredKinds(unittest.TestCase):
         self.assertEqual(systems["SAMPPGM"], "GC")
 
 
+class MfsRecognition(unittest.TestCase):
+    """Every MFS statement can carry a label in column 1; a format library
+    can be called FORMAT rather than MFS."""
+
+    def test_labelled_statements_are_mfs(self):
+        from atlas import classify
+        head = ("MEMMSG   MSG   TYPE=INPUT,SOR=(MEMFMT,IGNORE),NXT=MEMOUT\n"
+                "         SEG\n"
+                "         MFLD  'MEMB'\n"
+                "GENDER   MFLD  (GENDER,'N'),LTH=1\n"
+                "         MSGEND\n")
+        self.assertEqual(classify.classify("PROD.GC.WHATEVER/MEMMSG.txt", head)[0], "mfs")
+        fmt = "MEMFMT   FMT\n         DEV   TYPE=3270-A2,FEAT=IGNORE\n"
+        self.assertEqual(classify.classify("X/MEMFMT.txt", fmt)[0], "mfs")
+        # a plain assembler member is not mistaken for MFS
+        asm = "MYPGM    CSECT\n         STM   14,12,12(13)\nMSG      DC    C'HELLO'\n"
+        self.assertNotEqual(classify.classify("X/MYPGM.txt", asm)[0], "mfs")
+
+    def test_format_library_names(self):
+        from atlas import classify
+        for lib in ("PROD.GC.MFS", "PROD.GC.MFSSRC", "PROD.GC.FORMAT", "PROD.GC.FORMATS", "PROD.GC.FMTLIB", "PROD.GC.MSGLIB"):
+            self.assertEqual(classify.classify(f"C:/estate/GC/{lib}/ANY.txt", "nothing here")[0], "mfs", lib)
+        self.assertNotEqual(classify.classify("C:/estate/GC/PROD.GC.REFORMAT/ANY.txt", "nothing here")[0], "mfs")
+        # the specific libraries win over the generic SRC / SOURCE rule
+        for lib, kind in (("PROD.GC.PSBSOURCE", "psb"), ("PROD.GC.PSBSRC", "psb"), ("PROD.GC.DBDSRC", "dbd"),
+                          ("PROD.GC.BMSSRC", "bms"), ("PROD.GC.MFSSRC", "mfs"), ("PROD.GC.SRC", "cobol"),
+                          ("PROD.GC.SOURCE", "cobol")):
+            self.assertEqual(classify.classify(f"C:/estate/GC/{lib}/ANY.txt", "nothing here")[0], kind, lib)
+
+
 if __name__ == "__main__":
     unittest.main()
