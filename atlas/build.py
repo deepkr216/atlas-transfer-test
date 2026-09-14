@@ -20,6 +20,7 @@ trusting any answer built on the index.
 from __future__ import annotations
 
 import argparse
+import ctypes
 import hashlib
 import json
 import os
@@ -37,6 +38,78 @@ from .reader import Line
 VERSION = "0.1.0"
 MAX_MEMBER_BYTES = 300 * 1024 * 1024      # a file bigger than this is not a document to index, it is a dump
 SLOW_MEMBER_SECONDS = 30                  # a member still parsing after this long is named on screen, and again every 30 s
+MEMBER_TIME_LIMIT = 900                   # a member still parsing after this long is given up on (--member-limit)
+STUCK_GRACE = 30                          # seconds a timed-out parse gets to notice the interruption
+
+
+class MemberTimeout(Exception):
+    """One member took longer than the limit: recorded as failed, skipped."""
+
+
+class ParserStuck(Exception):
+    """One member cannot even be interrupted (the parser is inside C code,
+    a regular expression gone quadratic): the build stops and names it."""
+
+
+def _stop_worker(t: threading.Thread, grace: float) -> bool:
+    """Raise MemberTimeout inside a worker thread; True if it stopped."""
+    if not t.is_alive():
+        return True
+    n = ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_ulong(t.ident), ctypes.py_object(MemberTimeout))
+    if n > 1:
+        ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_ulong(t.ident), None)
+    t.join(grace)
+    return not t.is_alive()
+
+
+def run_with_limit(fn, args: tuple, limit: float, label: str, grace: Optional[float] = None) -> None:
+    """Run fn(*args) in a worker thread and give up after `limit` seconds:
+    a 121,000-member build must never sit on ONE member all night. The
+    worker is interrupted with MemberTimeout (which fires between Python
+    statements); a worker that does not stop inside `grace` seconds is
+    stuck in C code and raises ParserStuck, which ends the build with the
+    member's name."""
+    grace = STUCK_GRACE if grace is None else grace
+    box: Dict[str, BaseException] = {}
+
+    def target():
+        try:
+            fn(*args)
+        except BaseException as e:                                      # noqa: BLE001 - handed to the caller
+            box["exc"] = e
+
+    t = threading.Thread(target=target, daemon=True, name=f"parse {label}")
+    t.start()
+    deadline = time.time() + limit
+    try:
+        while t.is_alive() and time.time() < deadline:
+            t.join(0.5)                                                 # short waits keep Ctrl+C working on Windows
+    except KeyboardInterrupt:
+        _stop_worker(t, 5)
+        raise
+    if t.is_alive():
+        if _stop_worker(t, grace):
+            raise MemberTimeout(f"exceeded the {int(limit)} s member limit ({label}) - facts of this member dropped, "
+                                f"build continued; raise --member-limit or move the file out of the estate")
+        raise ParserStuck(label)
+    exc = box.get("exc")
+    if isinstance(exc, MemberTimeout):
+        raise MemberTimeout(f"exceeded the {int(limit)} s member limit ({label}) - facts of this member dropped, "
+                            f"build continued; raise --member-limit or move the file out of the estate")
+    if exc is not None:
+        raise exc
+
+
+def _clear_facts(conn: sqlite3.Connection, mid: int) -> None:
+    """Drop every fact row of a member but keep its inventory row: a parse
+    that failed or timed out must not leave half a program behind."""
+    cur = conn.execute("SELECT * FROM member WHERE id=?", (mid,))
+    row = cur.fetchone()
+    if row is None:
+        return
+    cols = [d[0] for d in cur.description]
+    _forget_member(conn, mid)
+    conn.execute(f"INSERT INTO member({','.join(cols)}) VALUES({','.join('?' * len(cols))})", tuple(row))
 
 
 class Heartbeat:
@@ -52,7 +125,7 @@ class Heartbeat:
     def _run(self) -> None:
         while not self._stop.wait(self.every):
             self.say(f"  ... still parsing {self.label} ({int(time.time() - self.start)} s) - a big document, "
-                     "or one being downloaded from OneDrive")
+                     f"or one being downloaded from OneDrive; the build gives up on it at {MEMBER_TIME_LIMIT} s")
 
     def __enter__(self):
         self._t.start()
@@ -150,7 +223,7 @@ def open_db(path: str, rebuild: bool = False) -> sqlite3.Connection:
         for suffix in ("-wal", "-shm"):
             if os.path.exists(path + suffix):
                 os.remove(path + suffix)
-    conn = sqlite3.connect(path)
+    conn = sqlite3.connect(path, check_same_thread=False)   # one member at a time is parsed on a worker thread
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
@@ -343,8 +416,8 @@ def inventory(ctx: Ctx, roots, limit: Optional[int] = None, force_all: bool = Fa
     """
     conn = ctx.conn
     now = time.strftime("%Y-%m-%dT%H:%M:%S")
-    existing = {r[0]: (r[1], r[2], r[3]) for r in
-                conn.execute("SELECT path, id, sha256, parse_status FROM member")}
+    existing = {r[0]: (r[1], r[2], r[3], r[4]) for r in
+                conn.execute("SELECT path, id, sha256, parse_status, parse_error FROM member")}
     if isinstance(roots, str):
         roots = [roots]
 
@@ -426,12 +499,15 @@ def inventory(ctx: Ctx, roots, limit: Optional[int] = None, force_all: bool = Fa
         forced |= set(existing)
 
     kept: Dict[str, int] = {}
-    for path, (mid, ex_sha, ex_status) in existing.items():
+    for path, (mid, ex_sha, ex_status, ex_error) in existing.items():
         f = found_by.get(path)
+        settled = ex_status in ("ok", "partial", "skipped") or (
+            ex_status == "failed" and (ex_error or "").startswith(("MemberTimeout", "ParserStuck")))
+        # a member that hit the time limit is not retried until the parser changes
         if f is None:
             _forget_member(conn, mid)
             ctx.bump("pruned")
-        elif f[5] == ex_sha and ex_status in ("ok", "partial", "skipped") and path not in forced:
+        elif f[5] == ex_sha and settled and path not in forced:
             kept[path] = mid
         else:
             _forget_member(conn, mid)
@@ -453,6 +529,13 @@ def inventory(ctx: Ctx, roots, limit: Optional[int] = None, force_all: bool = Fa
         ctx.members.append(mem)
         ctx.by_name.setdefault(name, []).append(mem)
         ctx.bump(f"kind:{kind}")
+
+
+def _parse_one(ctx: Ctx, mem: Mem, handler) -> None:
+    if handler:
+        handler(ctx, mem)
+    if mem.kind in CODE_KINDS:
+        index_fts_code(ctx, mem)
 
 
 def load_sched(ctx: Ctx, csv_path: str) -> None:
@@ -1562,6 +1645,9 @@ def _main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--rebuild", action="store_true", help="delete the db first")
     ap.add_argument("--write-expanded", help="directory to write expanded COBOL sources into")
     ap.add_argument("--limit", type=int, help="index only the first N files (smoke test)")
+    ap.add_argument("--member-limit", type=float, default=MEMBER_TIME_LIMIT, metavar="SECONDS",
+                    help=f"give up on one member after this long (default {MEMBER_TIME_LIMIT} s): it is recorded as "
+                         "failed and the build goes on")
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args(argv)
 
@@ -1613,6 +1699,7 @@ def _main(argv: Optional[List[str]] = None) -> int:
     order = {"copybook": 0, "cobol": 1, "proc": 2, "jcl": 3, "dbd": 4, "psb": 5, "doc": 9}
     ok = partial = failed = 0
     slow: List[Tuple[float, str, str]] = []
+    member_limit = float(args.member_limit or MEMBER_TIME_LIMIT)
     n_parse = sum(1 for m in ctx.members if not m.skip)
     ctx.say(f"parsing {n_parse} member(s) ({len(ctx.members) - n_parse} unchanged, kept) - a line every 10 s "
             "with the time left at the current rate; Ctrl+C stops cleanly and the same command continues later")
@@ -1631,12 +1718,10 @@ def _main(argv: Optional[List[str]] = None) -> int:
             ctx.say(f"  ... {i}/{len(ctx.members)} - {done}/{n_parse} parsed in {_hms(elapsed)}, {rate:.1f}/s, "
                     f"about {eta} left at this rate - now {mem.kind}: {os.path.basename(mem.path)}")
         handler = HANDLERS.get(mem.kind)
+        label = f"{mem.kind} {os.path.basename(mem.path)}"
         try:
-            with Heartbeat(ctx.say, f"{mem.kind} {os.path.basename(mem.path)}") as hb:
-                if handler:
-                    handler(ctx, mem)
-                if mem.kind in CODE_KINDS:
-                    index_fts_code(ctx, mem)
+            with Heartbeat(ctx.say, label) as hb:
+                run_with_limit(_parse_one, (ctx, mem, handler), member_limit, label)
             if hb.seconds >= SLOW_MEMBER_SECONDS:
                 slow.append((hb.seconds, mem.kind, os.path.basename(mem.path)))
             if not handler:
@@ -1654,8 +1739,17 @@ def _main(argv: Optional[List[str]] = None) -> int:
                     f"build command again (without --rebuild) to continue: parsed members are kept, "
                     f"{n_parse - done} remain")
             break
+        except ParserStuck:
+            # the worker thread is still running inside C code: nothing more
+            # can be written safely; what the last tick committed is kept
+            ctx.say(f"\nSTOPPED: {label} has been parsing for {_hms(member_limit)} and cannot be interrupted - the "
+                    f"parser is stuck inside it. Parsed members are kept ({done}/{n_parse}). Move that one file out "
+                    f"of the estate (or into a folder holding an `.atlas-output` marker) and run the same build "
+                    f"command again; then report its kind, size in KB and line count so the parser can be fixed.")
+            return 3
         except Exception as e:                                          # noqa: BLE001
             failed += 1
+            _clear_facts(conn, mem.id)
             conn.execute("UPDATE member SET parse_status='failed', parse_error=? WHERE id=?",
                          (f"{type(e).__name__}: {e}"[:500], mem.id))
             ctx.say(f"  FAILED {mem.kind} {mem.path}: {type(e).__name__}: {e}")

@@ -129,6 +129,56 @@ class Resume(unittest.TestCase):
         self.assertIn("toolkit changed since the last build: every member is re-parsed", out)
         self.assertRegex(out, r"parsing \d+ member\(s\) \(0 unchanged, kept\)")
 
+    def test_a_member_over_the_time_limit_is_skipped_and_not_retried(self):
+        import time as _t
+        real = build.HANDLERS["cobol"]
+
+        def slow(ctx, mem):
+            if mem.name == "WALKPGM":
+                while True:                       # a parser loop that never ends (interruptible between statements)
+                    _t.sleep(0.01)
+            return real(ctx, mem)
+
+        with mock.patch.dict(build.HANDLERS, {"cobol": slow}):
+            rc, out = self._build(extra=["--rebuild", "--member-limit", "1"])
+        self.assertEqual(rc, 0)
+        self.assertIn("FAILED cobol", out)
+        self.assertIn("MemberTimeout: exceeded the 1 s member limit (cobol WALKPGM.cbl)", out)
+        conn = query.connect(self.db)
+        st = {r[0]: (r[1], r[2]) for r in conn.execute("SELECT name, parse_status, parse_error FROM member")}
+        self.assertEqual(st["WALKPGM"][0], "failed")
+        self.assertTrue(st["WALKPGM"][1].startswith("MemberTimeout"))
+        self.assertEqual(st["SAMPPGM"][0], "ok")                         # the build went on
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM program WHERE program_id='WALKPGM'").fetchone()[0], 0,
+                         "no half-written program row")
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM program").fetchone()[0], 3)
+        conn.close()
+        # the next run does not sit on it again for another limit
+        with mock.patch.dict(build.HANDLERS, {"cobol": slow}):
+            t0 = _t.time()
+            rc, out = self._build(extra=["--member-limit", "5"])
+        self.assertEqual(rc, 0)
+        self.assertLess(_t.time() - t0, 4, "the timed-out member must be kept, not parsed again")
+        self.assertNotIn("FAILED cobol", out)
+
+    def test_a_member_that_cannot_be_interrupted_stops_the_build_with_its_name(self):
+        import time as _t
+        real = build.HANDLERS["cobol"]
+
+        def stuck(ctx, mem):
+            if mem.name == "WALKPGM":
+                _t.sleep(3)                       # C code: the interruption lands only when it returns
+                return
+            return real(ctx, mem)
+
+        with mock.patch.dict(build.HANDLERS, {"cobol": stuck}), mock.patch.object(build, "STUCK_GRACE", 0.3):
+            rc, out = self._build(extra=["--rebuild", "--member-limit", "0.5"])
+        self.assertEqual(rc, 3)
+        self.assertIn("STOPPED: cobol WALKPGM.cbl has been parsing for", out)
+        self.assertIn("cannot be interrupted", out)
+        self.assertIn("run the same build command again", out)
+        _t.sleep(3.5)                             # let the worker finish before the temp dir goes
+
     def test_progress_line_carries_the_rate_and_time_left(self):
         with mock.patch.object(build.time, "time", side_effect=[1000.0 + 20 * k for k in range(4000)]):
             rc, out = self._build(extra=["--rebuild"])
