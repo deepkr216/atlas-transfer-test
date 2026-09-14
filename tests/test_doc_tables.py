@@ -312,6 +312,18 @@ class DocTables(unittest.TestCase):
         finally:
             old.close()
 
+    def test_a_huge_single_paragraph_chunks_in_linear_time(self):
+        import time
+        rows = "\n".join(f"row {i}: TC-{i:07d} | {'x' * 40} | PASS" for i in range(1, 400001))    # ~24 MB, one paragraph
+        t0 = time.time()
+        parts = docs.chunk_sections([("sheet: Huge", rows)])
+        took = time.time() - t0
+        self.assertLess(took, 8, f"chunking 24 MB took {took:.1f} s")
+        self.assertTrue(all(len(t) <= 4000 for _h, t in parts))
+        self.assertTrue(all(ln.startswith("row ") for _h, t in parts for ln in t.split("\n")))
+        self.assertEqual(sum(t.count("\n") + 1 for _h, t in parts), 400000)                   # every row, once
+        self.assertEqual("\n".join(t for _h, t in parts), rows)                                # nothing lost or altered
+
     def test_big_sheet_is_cut_between_rows(self):
         p = os.path.join(self.td, "BIG.xlsx")
         write_workbook(p, big_rows=400)

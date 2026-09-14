@@ -627,18 +627,29 @@ def chunk_sections(sections: List[Tuple[str, str]], max_chars: int = 4000) -> Li
         parts: List[str] = []
         buf = ""
         for p in paras:
-            while len(p) > max_chars:                      # one huge paragraph: cut between lines, else at sentence ends
-                cut = p.rfind("\n", 0, max_chars)
-                if cut > 0:                                # a short part beats a row cut in two
+            # one huge paragraph (a 30 MB table rendered as rows): cut between
+            # lines, else at sentence ends - walking an index, never re-slicing
+            # the remainder, which made a 100 MB paragraph take minutes
+            pos, n = 0, len(p)
+            while n - pos > max_chars:
+                end = pos + max_chars
+                cut = p.rfind("\n", pos, end)
+                if cut > pos:                              # a short part beats a row cut in two
                     cut = cut + 1
                 else:
-                    cut = p.rfind(". ", 0, max_chars)
-                    cut = cut + 1 if cut > max_chars // 2 else max_chars
-                head, p = p[:cut].rstrip(), p[cut:].lstrip()
+                    cut = p.rfind(". ", pos, end)
+                    cut = cut + 1 if cut - pos > max_chars // 2 else end
+                head = p[pos:cut].rstrip()
+                pos = cut
+                while pos < n and p[pos] in " \t\r\n":
+                    pos += 1
                 if buf:
                     parts.append(buf)
                     buf = ""
-                parts.append(head)
+                if head:
+                    parts.append(head)
+            if pos:
+                p = p[pos:]
             if buf and len(buf) + len(p) + 2 > max_chars:
                 parts.append(buf)
                 buf = p
