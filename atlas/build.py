@@ -114,32 +114,62 @@ def _clear_facts(conn: sqlite3.Connection, mid: int) -> None:
     conn.execute(f"INSERT INTO member({','.join(cols)}) VALUES({','.join('?' * len(cols))})", tuple(row))
 
 
-class Heartbeat:
-    """Names the member being parsed when it takes long, so a build that sits
-    on one huge PDF (or one pathological member) never looks stuck."""
+PROGRESS_SECONDS = 10.0                   # the status line's own clock
 
-    def __init__(self, say, label: str, every: float = SLOW_MEMBER_SECONDS):
-        self.say, self.label, self.every = say, label, every
-        self.start = time.time()
+
+class Progress:
+    """The build's status line on its OWN clock: a daemon thread prints
+    every `every` seconds whatever the loop last reported plus the item in
+    hand and how long it has been in hand. A file or member that takes two
+    hours then produces a line every 10 s naming it - not silence, which
+    is what a status checked only between items gave (LESSONS 142)."""
+
+    def __init__(self, say, every: Optional[float] = None, hint_after: float = SLOW_MEMBER_SECONDS,
+                 limit: float = 0):
+        self.say = say
+        self.every = PROGRESS_SECONDS if every is None else every
+        self.hint_after, self.limit = hint_after, limit
+        self.line = lambda: ""
+        self.current: Optional[Tuple[str, float]] = None
         self._stop = threading.Event()
-        self._t = threading.Thread(target=self._run, daemon=True)
+        self._t = threading.Thread(target=self._run, daemon=True, name="progress")
+
+    def set(self, line) -> None:
+        """`line` is called on the clock: it returns the counters part."""
+        self.line = line
+
+    def now(self, label: Optional[str]) -> None:
+        """What the loop holds at the moment (None between items)."""
+        self.current = (label, time.time()) if label else None
+
+    def text(self) -> str:
+        try:
+            head = self.line() or ""
+        except Exception:                                               # noqa: BLE001 - a status line never breaks a build
+            head = ""
+        cur = self.current
+        if cur:
+            held = time.time() - cur[1]
+            head += f" - now {cur[0]}"
+            if held >= self.hint_after:
+                head += (f" ({_hms(held)} on this one"
+                         + (f"; the build gives up on it at {_hms(self.limit)}" if self.limit else "") + ")")
+        return head
 
     def _run(self) -> None:
         while not self._stop.wait(self.every):
-            self.say(f"  ... still parsing {self.label} ({int(time.time() - self.start)} s) - a big document, "
-                     f"or one being downloaded from OneDrive; the build gives up on it at {MEMBER_TIME_LIMIT} s")
+            t = self.text()
+            if t:
+                self.say("  ... " + t)
 
-    def __enter__(self):
+    def start(self) -> "Progress":
         self._t.start()
         return self
 
-    def __exit__(self, *exc):
+    def stop(self) -> None:
         self._stop.set()
-        return False
-
-    @property
-    def seconds(self) -> float:
-        return time.time() - self.start
+        if self._t.is_alive():
+            self._t.join(1.0)
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 CODE_KINDS = {"cobol", "copybook", "jcl", "proc", "ctlcard", "dbd", "psb", "bms", "mfs",
@@ -197,6 +227,7 @@ class Ctx:
         self.proc_cache: Dict[str, Optional[jcl.JclFacts]] = {}
         self.copylib_order: Dict[str, List[str]] = {}   # SYSTEM -> copybook library folder names, SYSLIB order
         self.kind_of: Dict[str, str] = {}               # library folder name -> kind declared in sources.json
+        self.progress: Optional["Progress"] = None      # the status line's clock, stopped by whoever ends the build
 
     def bump(self, key: str, n: int = 1) -> None:
         self.stats[key] = self.stats.get(key, 0) + n
@@ -464,18 +495,18 @@ def inventory(ctx: Ctx, roots, limit: Optional[int] = None, force_all: bool = Fa
 
     found: List[tuple] = []
     ctx.say("  reading and fingerprinting every file (a document folder on OneDrive is downloaded now - minutes of "
-            f"disk work; a line every 10 s says how far; a file still being read after {SLOW_MEMBER_SECONDS} s is "
-            f"named, and given up on after {INVENTORY_TIME_LIMIT} s)")
-    t_start = t_tick = time.time()
+            f"disk work; a line every {int(PROGRESS_SECONDS)} s says how far and which file is in hand; a file "
+            f"still in hand after {SLOW_MEMBER_SECONDS} s is flagged, and given up on after {INVENTORY_TIME_LIMIT} s)")
+    t_start = time.time()
     n_read = bytes_read = 0
     box: List[tuple] = []
+    progress = ctx.progress = Progress(ctx.say, limit=INVENTORY_TIME_LIMIT).start()
+    progress.set(lambda: f"{n_read} files read ({bytes_read // 1024 // 1024} MB) in {_hms(time.time() - t_start)}")
     for dirpath, fn in (pair for root in roots for pair in _scan_files(root, limit)):
         path = os.path.normpath(os.path.join(dirpath, fn))
         n_read += 1
-        if time.time() - t_tick >= 10:
-            t_tick = time.time()
-            ctx.say(f"  ... {n_read} files read ({bytes_read // 1024 // 1024} MB) in {int(t_tick - t_start)} s - "
-                    f"now in {os.path.basename(dirpath) or dirpath}")
+        folder = os.path.basename(dirpath) or dirpath
+        progress.now(f"reading {fn} in {folder}")
         try:
             st = os.stat(docs.long_path(path))
             if st.st_size > MAX_MEMBER_BYTES:
@@ -505,14 +536,15 @@ def inventory(ctx: Ctx, roots, limit: Optional[int] = None, force_all: bool = Fa
             found.append((path, os.path.splitext(fn)[0].upper(), ex[4], ex[5], ex[6], sha_, ex[7], len(data),
                           ex[8] or 0, ex[9] or 0, None))
             continue
-        label = f"file {fn} ({len(data) // 1024} KB) in {os.path.basename(dirpath) or dirpath}"
+        label = f"file {fn} ({len(data) // 1024} KB) in {folder}"
+        progress.now(f"classifying {label}")
         try:
-            with Heartbeat(ctx.say, label):
-                box.clear()
-                run_with_limit(lambda: box.append(_inventory_one(ctx, path, fn, dirpath, data)), (),
-                               INVENTORY_TIME_LIMIT, label)
+            box.clear()
+            run_with_limit(lambda: box.append(_inventory_one(ctx, path, fn, dirpath, data)), (),
+                           INVENTORY_TIME_LIMIT, label)
             found.append(box[0])
         except ParserStuck:
+            progress.stop()
             ctx.say(f"\nSTOPPED: {label} has been read for {_hms(INVENTORY_TIME_LIMIT)} and cannot be interrupted - "
                     f"the classifier is stuck inside it. Move that one file out of the folder and run the same build "
                     f"command again; then report its extension, size and what it is so the classifier can be fixed.")
@@ -525,6 +557,7 @@ def inventory(ctx: Ctx, roots, limit: Optional[int] = None, force_all: bool = Fa
                           os.path.splitext(fn)[1].lower(), sha(data), sha(data), len(data), 0, 0,
                           f"InventoryTimeout: reading and classifying took longer than {INVENTORY_TIME_LIMIT} s - "
                           f"not indexed; move the file out of the folder, or report its extension, size and what it is"))
+    progress.stop()
     found_by = {f[0]: f for f in found}
     _load_library_markers(ctx, roots)
 
@@ -1741,6 +1774,8 @@ def _main(argv: Optional[List[str]] = None) -> int:
     except ParserStuck:
         return 3
     except KeyboardInterrupt:
+        if ctx.progress:
+            ctx.progress.stop()
         ctx.say("\nstopped by Ctrl+C during the inventory - nothing was written yet; run the same command again")
         return 130
     conn.commit()
@@ -1760,29 +1795,38 @@ def _main(argv: Optional[List[str]] = None) -> int:
     slow: List[Tuple[float, str, str]] = []
     member_limit = float(args.member_limit or MEMBER_TIME_LIMIT)
     n_parse = sum(1 for m in ctx.members if not m.skip)
-    ctx.say(f"parsing {n_parse} member(s) ({len(ctx.members) - n_parse} unchanged, kept) - a line every 10 s "
-            "with the time left at the current rate; Ctrl+C stops cleanly and the same command continues later")
-    t_tick = t_start = time.time()
+    ctx.say(f"parsing {n_parse} member(s) ({len(ctx.members) - n_parse} unchanged, kept) - a line every "
+            f"{int(PROGRESS_SECONDS)} s with the time left at the current rate and the member in hand; Ctrl+C stops "
+            "cleanly and the same command continues later")
+    t_commit = t_start = time.time()
     done = 0
+    i = 0
     stopped = False
+
+    def status() -> str:
+        elapsed = time.time() - t_start
+        rate = done / elapsed if elapsed > 0 else 0.0
+        eta = _hms((n_parse - done) / rate) if rate > 0 else "?"
+        return (f"{i}/{len(ctx.members)} - {done}/{n_parse} parsed in {_hms(elapsed)}, {rate:.1f}/s, "
+                f"about {eta} left at this rate")
+
+    progress = ctx.progress = Progress(ctx.say, limit=member_limit).start()
+    progress.set(status)
     for i, mem in enumerate(sorted(ctx.members, key=lambda m: order.get(m.kind, 6)), 1):
         if mem.skip:
             continue                       # unchanged since last build; facts kept
-        if time.time() - t_tick >= 10:
-            t_tick = time.time()
+        if time.time() - t_commit >= 10:
+            t_commit = time.time()
             conn.commit()
-            elapsed = t_tick - t_start
-            rate = done / elapsed if elapsed > 0 else 0.0
-            eta = _hms((n_parse - done) / rate) if rate > 0 else "?"
-            ctx.say(f"  ... {i}/{len(ctx.members)} - {done}/{n_parse} parsed in {_hms(elapsed)}, {rate:.1f}/s, "
-                    f"about {eta} left at this rate - now {mem.kind}: {os.path.basename(mem.path)}")
         handler = HANDLERS.get(mem.kind)
         label = f"{mem.kind} {os.path.basename(mem.path)}"
+        progress.now(label)
+        t_member = time.time()
         try:
-            with Heartbeat(ctx.say, label) as hb:
-                run_with_limit(_parse_one, (ctx, mem, handler), member_limit, label)
-            if hb.seconds >= SLOW_MEMBER_SECONDS:
-                slow.append((hb.seconds, mem.kind, os.path.basename(mem.path)))
+            run_with_limit(_parse_one, (ctx, mem, handler), member_limit, label)
+            held = time.time() - t_member
+            if held >= SLOW_MEMBER_SECONDS:
+                slow.append((held, mem.kind, os.path.basename(mem.path)))
             if not handler:
                 conn.execute("UPDATE member SET parse_status='skipped' WHERE id=?", (mem.id,))
             st = conn.execute("SELECT parse_status FROM member WHERE id=?", (mem.id,)).fetchone()[0]
@@ -1792,6 +1836,7 @@ def _main(argv: Optional[List[str]] = None) -> int:
             # what is parsed is committed and kept; the member being parsed
             # stays 'pending' (its half-written rows go with it) and is
             # parsed again by the next run
+            progress.stop()
             conn.commit()
             stopped = True
             ctx.say(f"\nstopped by Ctrl+C at {done}/{n_parse} parsed ({_hms(time.time() - t_start)}). Run the same "
@@ -1801,6 +1846,7 @@ def _main(argv: Optional[List[str]] = None) -> int:
         except ParserStuck:
             # the worker thread is still running inside C code: nothing more
             # can be written safely; what the last tick committed is kept
+            progress.stop()
             ctx.say(f"\nSTOPPED: {label} has been parsing for {_hms(member_limit)} and cannot be interrupted - the "
                     f"parser is stuck inside it. Parsed members are kept ({done}/{n_parse}). Move that one file out "
                     f"of the estate (or into a folder holding an `.atlas-output` marker) and run the same build "
@@ -1816,6 +1862,7 @@ def _main(argv: Optional[List[str]] = None) -> int:
         if i % 500 == 0:
             conn.commit()
             ctx.say(f"  {i}/{len(ctx.members)} ...")
+    progress.stop()
     conn.commit()
     if stopped:
         conn.close()

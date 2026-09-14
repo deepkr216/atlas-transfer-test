@@ -104,12 +104,17 @@ class DocSections(unittest.TestCase):
         self.assertIn("no extractable text", d.notes[0])
         self.assertIn("too large for the text extractor", d.notes[0])
 
-    def test_heartbeat_names_a_slow_member(self):
+    def test_progress_names_a_slow_member_on_its_own_clock(self):
         import time
         said = []
-        with build.Heartbeat(said.append, "doc BIG.pdf", every=0.2):
-            time.sleep(0.7)
-        self.assertTrue(any("still parsing doc BIG.pdf" in x for x in said), said)
+        p = build.Progress(said.append, every=0.2, hint_after=0.3, limit=900).start()
+        p.set(lambda: "10/100 parsed")
+        p.now("doc BIG.pdf")
+        time.sleep(0.9)                       # the main thread is "stuck" in one member the whole time
+        p.stop()
+        self.assertGreaterEqual(len(said), 3, said)
+        self.assertTrue(any("10/100 parsed - now doc BIG.pdf" in x for x in said), said)
+        self.assertTrue(any("on this one; the build gives up on it at 15 min" in x for x in said), said)
 
     def test_budget_and_not_found(self):
         n = self.conn.execute("SELECT COUNT(*) FROM doc_section WHERE member_id=(SELECT id FROM member WHERE name='RULES')").fetchone()[0]

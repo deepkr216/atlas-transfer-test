@@ -139,9 +139,12 @@ class Resume(unittest.TestCase):
                     _t.sleep(0.01)
             return real(ctx, mem)
 
-        with mock.patch.dict(build.HANDLERS, {"cobol": slow}):
+        with mock.patch.dict(build.HANDLERS, {"cobol": slow}), mock.patch.object(build, "PROGRESS_SECONDS", 0.2):
             rc, out = self._build(extra=["--rebuild", "--member-limit", "1"])
         self.assertEqual(rc, 0)
+        # the status kept coming while the loop sat on that one member, and named it
+        self.assertGreaterEqual(out.count("parsed in"), 3, out)
+        self.assertIn("- now cobol WALKPGM.cbl", out)
         self.assertIn("FAILED cobol", out)
         self.assertIn("MemberTimeout: exceeded the 1 s member limit (cobol WALKPGM.cbl)", out)
         conn = query.connect(self.db)
@@ -191,10 +194,13 @@ class Resume(unittest.TestCase):
 
         with open(os.path.join(self.root, "STUCK.txt"), "w") as fh:
             fh.write("just text\n")
-        with mock.patch.object(build.classify, "classify", slow), mock.patch.object(build, "INVENTORY_TIME_LIMIT", 1):
+        with mock.patch.object(build.classify, "classify", slow), mock.patch.object(build, "INVENTORY_TIME_LIMIT", 1), \
+                mock.patch.object(build, "PROGRESS_SECONDS", 0.2):
             rc, out = self._build(extra=["--rebuild"])
         self.assertEqual(rc, 0)
         self.assertIn("gave up on file STUCK.txt", out)
+        self.assertIn("files read (", out)
+        self.assertIn("- now classifying file STUCK.txt", out)     # named while the inventory sat on it
         conn = query.connect(self.db)
         st, err = conn.execute("SELECT parse_status, parse_error FROM member WHERE name='STUCK'").fetchone()
         self.assertEqual(st, "failed")
@@ -256,10 +262,17 @@ class Resume(unittest.TestCase):
         conn.close()
 
     def test_progress_line_carries_the_rate_and_time_left(self):
-        with mock.patch.object(build.time, "time", side_effect=[1000.0 + 20 * k for k in range(4000)]):
+        import time as _t
+        real = build.HANDLERS["cobol"]
+
+        def slowish(ctx, mem):
+            _t.sleep(0.5)                     # long enough for the clock to fire while this member is in hand
+            return real(ctx, mem)
+
+        with mock.patch.dict(build.HANDLERS, {"cobol": slowish}), mock.patch.object(build, "PROGRESS_SECONDS", 0.2):
             rc, out = self._build(extra=["--rebuild"])
         self.assertEqual(rc, 0)
-        self.assertRegex(out, r"parsed in .*?, \d+\.\d/s, about .* left at this rate - now ")
+        self.assertRegex(out, r"\d+/\d+ - \d+/\d+ parsed in .*?, \d+\.\d/s, about .* left at this rate - now cobol ")
 
 
 if __name__ == "__main__":
