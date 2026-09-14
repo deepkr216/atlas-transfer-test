@@ -463,7 +463,11 @@ continues from there), gives up on one member after **15 minutes**
 (`--member-limit`; the member is recorded as failed with the reason, its
 half-written facts dropped, and it is not retried until the parser changes)
 and, when a member cannot even be interrupted, stops and names it so the
-file can be moved aside and reported, never indexes its own outputs
+file can be moved aside and reported (the inventory step - reading and
+classifying every file - has the same guard: a file still being read after
+30 s is named, one over 15 minutes is recorded and skipped, and a text
+file over 32 MB is a document, never decoded as a member), never indexes
+its own outputs
 (`.atlas-output` marker, `*.exp.cbl`), types empty and comment-only members
 as `empty`, refuses a program row to a member with no `PROGRAM-ID` or
 DIVISION header, re-types a card deck found in a JCL library as `ctlcard`,

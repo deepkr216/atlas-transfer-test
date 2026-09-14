@@ -179,6 +179,82 @@ class Resume(unittest.TestCase):
         self.assertIn("run the same build command again", out)
         _t.sleep(3.5)                             # let the worker finish before the temp dir goes
 
+    def test_inventory_gives_up_on_a_file_that_will_not_classify(self):
+        import time as _t
+        real = build.classify.classify
+
+        def slow(path, head, ext_hint=None):
+            if path.endswith("STUCK.txt"):
+                while True:
+                    _t.sleep(0.01)
+            return real(path, head, ext_hint)
+
+        with open(os.path.join(self.root, "STUCK.txt"), "w") as fh:
+            fh.write("just text\n")
+        with mock.patch.object(build.classify, "classify", slow), mock.patch.object(build, "INVENTORY_TIME_LIMIT", 1):
+            rc, out = self._build(extra=["--rebuild"])
+        self.assertEqual(rc, 0)
+        self.assertIn("gave up on file STUCK.txt", out)
+        conn = query.connect(self.db)
+        st, err = conn.execute("SELECT parse_status, parse_error FROM member WHERE name='STUCK'").fetchone()
+        self.assertEqual(st, "failed")
+        self.assertTrue(err.startswith("InventoryTimeout"), err)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM program").fetchone()[0], 4)       # the rest went on
+        conn.close()
+        # the next run does not read it again for another limit: same bytes,
+        # same parser, the stored outcome stands (and so does every other
+        # unchanged file's classification - the inventory of an unchanged
+        # estate is a hash per file, nothing more)
+        with mock.patch.object(build.classify, "classify", slow), mock.patch.object(build, "INVENTORY_TIME_LIMIT", 5):
+            t0 = _t.time()
+            rc, out = self._build()
+        self.assertEqual(rc, 0)
+        self.assertLess(_t.time() - t0, 4)
+        self.assertNotIn("gave up on", out)
+        conn = query.connect(self.db)
+        st, err = conn.execute("SELECT parse_status, parse_error FROM member WHERE name='STUCK'").fetchone()
+        self.assertEqual((st, err[:16]), ("failed", "InventoryTimeout"))
+        conn.close()
+        # a parser change (new fingerprint) reads it again
+        with mock.patch.object(build.classify, "classify", slow), mock.patch.object(build, "INVENTORY_TIME_LIMIT", 1), \
+                mock.patch.object(build, "tool_fingerprint", return_value="feedfacefeedface"):
+            rc, out = self._build()
+        self.assertEqual(rc, 0)
+        self.assertIn("gave up on file STUCK.txt", out)
+
+    def test_inventory_names_a_file_that_cannot_be_interrupted(self):
+        import time as _t
+        real = build.classify.classify
+
+        def stuck(path, head, ext_hint=None):
+            if path.endswith("STUCK.txt"):
+                _t.sleep(3)
+            return real(path, head, ext_hint)
+
+        with open(os.path.join(self.root, "STUCK.txt"), "w") as fh:
+            fh.write("just text\n")
+        with mock.patch.object(build.classify, "classify", stuck), mock.patch.object(build, "INVENTORY_TIME_LIMIT", 0.5), \
+                mock.patch.object(build, "STUCK_GRACE", 0.3):
+            rc, out = self._build(extra=["--rebuild"])
+        self.assertEqual(rc, 3)
+        self.assertIn("STOPPED: file STUCK.txt", out)
+        self.assertIn("cannot be interrupted", out)
+        _t.sleep(3.5)
+
+    def test_a_huge_text_file_is_a_document_not_a_member(self):
+        p = os.path.join(self.root, "EXPORT.txt")
+        with open(p, "w") as fh:
+            fh.write("       IDENTIFICATION DIVISION.\n       PROGRAM-ID. FAKE.\n" + ("x" * 70 + "\n") * 40)
+        with mock.patch.object(build, "BIG_TEXT_BYTES", 1000):
+            rc, out = self._build(extra=["--rebuild"])
+        self.assertEqual(rc, 0)
+        conn = query.connect(self.db)
+        kind, lines = conn.execute("SELECT kind, lines FROM member WHERE name='EXPORT'").fetchone()
+        self.assertEqual(kind, "doc")
+        self.assertEqual(lines, 42)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM program WHERE program_id='FAKE'").fetchone()[0], 0)
+        conn.close()
+
     def test_progress_line_carries_the_rate_and_time_left(self):
         with mock.patch.object(build.time, "time", side_effect=[1000.0 + 20 * k for k in range(4000)]):
             rc, out = self._build(extra=["--rebuild"])

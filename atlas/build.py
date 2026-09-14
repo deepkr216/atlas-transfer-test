@@ -40,6 +40,8 @@ MAX_MEMBER_BYTES = 300 * 1024 * 1024      # a file bigger than this is not a doc
 SLOW_MEMBER_SECONDS = 30                  # a member still parsing after this long is named on screen, and again every 30 s
 MEMBER_TIME_LIMIT = 900                   # a member still parsing after this long is given up on (--member-limit)
 STUCK_GRACE = 30                          # seconds a timed-out parse gets to notice the interruption
+INVENTORY_TIME_LIMIT = 900                # reading + classifying ONE file may not take longer than this
+BIG_TEXT_BYTES = 32 * 1024 * 1024         # nothing this big is a mainframe member: hash it, classify by its first 8 KB, move on
 
 
 class MemberTimeout(Exception):
@@ -401,6 +403,44 @@ def _load_library_markers(ctx: Ctx, roots) -> None:
                 ctx.say(f"  INCOMPLETE library {rec.get('dataset')}: {rec.get('present')}/{rec.get('expected')} members")
 
 
+def _settled(status: Optional[str], error: Optional[str]) -> bool:
+    """A member whose last outcome stands until its bytes or the parser
+    change: parsed (ok / partial / skipped), or given up on with a reason."""
+    return status in ("ok", "partial", "skipped") or (
+        status == "failed" and (error or "").startswith(("MemberTimeout", "ParserStuck", "InventoryTimeout")))
+
+
+def _inventory_one(ctx: Ctx, path: str, fn: str, dirpath: str, data: bytes) -> tuple:
+    """Classify and fingerprint one file. Pure: no database, so it can run
+    on a worker thread under a time limit."""
+    ext = os.path.splitext(fn)[1].lower()
+    if ext in classify.BINARY_EXTS or ext in docs.LEGACY or ext in (".pdf", ".docx", ".xlsx", ".pptx", ".vsdx"):
+        kind, _why = classify.classify(path, "", None)
+        if kind == "binary":
+            kind = "doc"
+        norm, nlines, fixed = sha(data), 0, 0
+    elif len(data) > BIG_TEXT_BYTES:
+        # a 40 MB text export is a document (or a dump), never a member:
+        # decoding and line-splitting it as COBOL is where a build sits for hours
+        text, enc = reader.decode_bytes(data[:8192])
+        kind, _why = classify.classify(path, text)
+        if kind in CODE_KINDS or kind == "unknown":
+            kind = "doc" if kind in ("unknown", "listing") or ext in (".txt", ".md", ".html", ".htm", ".csv", ".xml") else "listing"
+        norm, nlines, fixed = sha(data), data.count(b"\n"), 0
+    else:
+        text, enc = reader.decode_bytes(data)
+        kind, _why = classify.classify(path, text[:8192])
+        if kind == "unknown":
+            # neither the content nor the folder name said: the kind the
+            # user declared for that library in sources.json does
+            kind = ctx.kind_of.get(os.path.basename(dirpath).upper(), kind)
+        norm, nlines, fixed = norm_hash(kind, text, data, enc)
+        if kind in CODE_KINDS and code_line_count(kind, text, data, enc) == 0:
+            kind = "empty"           # a stub or a retired member: never a program row
+    return (path, os.path.splitext(fn)[0].upper(), kind, os.path.basename(dirpath), ext,
+            sha(data), norm, len(data), nlines, fixed, None)
+
+
 def inventory(ctx: Ctx, roots, limit: Optional[int] = None, force_all: bool = False) -> None:
     """Hash and classify every file under each root; re-index only what changed.
 
@@ -416,16 +456,19 @@ def inventory(ctx: Ctx, roots, limit: Optional[int] = None, force_all: bool = Fa
     """
     conn = ctx.conn
     now = time.strftime("%Y-%m-%dT%H:%M:%S")
-    existing = {r[0]: (r[1], r[2], r[3], r[4]) for r in
-                conn.execute("SELECT path, id, sha256, parse_status, parse_error FROM member")}
+    existing = {r[0]: tuple(r[1:]) for r in
+                conn.execute("SELECT path, id, sha256, parse_status, parse_error, kind, library, ext, norm_sha, "
+                             "lines, fixed_format FROM member")}
     if isinstance(roots, str):
         roots = [roots]
 
     found: List[tuple] = []
     ctx.say("  reading and fingerprinting every file (a document folder on OneDrive is downloaded now - minutes of "
-            "disk work; a line every 10 s says how far)")
+            f"disk work; a line every 10 s says how far; a file still being read after {SLOW_MEMBER_SECONDS} s is "
+            f"named, and given up on after {INVENTORY_TIME_LIMIT} s)")
     t_start = t_tick = time.time()
     n_read = bytes_read = 0
+    box: List[tuple] = []
     for dirpath, fn in (pair for root in roots for pair in _scan_files(root, limit)):
         path = os.path.normpath(os.path.join(dirpath, fn))
         n_read += 1
@@ -453,24 +496,35 @@ def inventory(ctx: Ctx, roots, limit: Optional[int] = None, force_all: bool = Fa
                 pass
             ctx.say(f"  unreadable: {path} ({e}){hint}")
             continue
-        ext = os.path.splitext(fn)[1].lower()
-        if ext in classify.BINARY_EXTS or ext in docs.LEGACY or ext in (".pdf", ".docx", ".xlsx", ".pptx", ".vsdx"):
-            kind, _why = classify.classify(path, "", None)
-            if kind == "binary":
-                kind = "doc"
-            norm, nlines, fixed = sha(data), 0, 0
-        else:
-            text, enc = reader.decode_bytes(data)
-            kind, _why = classify.classify(path, text[:8192])
-            if kind == "unknown":
-                # neither the content nor the folder name said: the kind the
-                # user declared for that library in sources.json does
-                kind = ctx.kind_of.get(os.path.basename(dirpath).upper(), kind)
-            norm, nlines, fixed = norm_hash(kind, text, data, enc)
-            if kind in CODE_KINDS and code_line_count(kind, text, data, enc) == 0:
-                kind = "empty"           # a stub or a retired member: never a program row
-        found.append((path, os.path.splitext(fn)[0].upper(), kind, os.path.basename(dirpath), ext,
-                      sha(data), norm, len(data), nlines, fixed))
+        sha_ = sha(data)
+        ex = existing.get(path)
+        if ex and ex[1] == sha_ and not force_all and _settled(ex[2], ex[3]):
+            # same bytes, same parser, settled outcome: the stored classification
+            # stands - no decode, no classify, no line split (and a file the
+            # inventory once gave up on is not read again for another limit)
+            found.append((path, os.path.splitext(fn)[0].upper(), ex[4], ex[5], ex[6], sha_, ex[7], len(data),
+                          ex[8] or 0, ex[9] or 0, None))
+            continue
+        label = f"file {fn} ({len(data) // 1024} KB) in {os.path.basename(dirpath) or dirpath}"
+        try:
+            with Heartbeat(ctx.say, label):
+                box.clear()
+                run_with_limit(lambda: box.append(_inventory_one(ctx, path, fn, dirpath, data)), (),
+                               INVENTORY_TIME_LIMIT, label)
+            found.append(box[0])
+        except ParserStuck:
+            ctx.say(f"\nSTOPPED: {label} has been read for {_hms(INVENTORY_TIME_LIMIT)} and cannot be interrupted - "
+                    f"the classifier is stuck inside it. Move that one file out of the folder and run the same build "
+                    f"command again; then report its extension, size and what it is so the classifier can be fixed.")
+            raise
+        except MemberTimeout as e:
+            # recorded, not indexed: the name is what matters
+            ctx.bump("too_slow")
+            ctx.say(f"  gave up on {label}: {e}")
+            found.append((path, os.path.splitext(fn)[0].upper(), "unknown", os.path.basename(dirpath),
+                          os.path.splitext(fn)[1].lower(), sha(data), sha(data), len(data), 0, 0,
+                          f"InventoryTimeout: reading and classifying took longer than {INVENTORY_TIME_LIMIT} s - "
+                          f"not indexed; move the file out of the folder, or report its extension, size and what it is"))
     found_by = {f[0]: f for f in found}
     _load_library_markers(ctx, roots)
 
@@ -499,11 +553,9 @@ def inventory(ctx: Ctx, roots, limit: Optional[int] = None, force_all: bool = Fa
         forced |= set(existing)
 
     kept: Dict[str, int] = {}
-    for path, (mid, ex_sha, ex_status, ex_error) in existing.items():
+    for path, (mid, ex_sha, ex_status, ex_error, *_rest) in existing.items():
         f = found_by.get(path)
-        settled = ex_status in ("ok", "partial", "skipped") or (
-            ex_status == "failed" and (ex_error or "").startswith(("MemberTimeout", "ParserStuck")))
-        # a member that hit the time limit is not retried until the parser changes
+        settled = _settled(ex_status, ex_error)     # a member that hit a limit is not retried until the parser changes
         if f is None:
             _forget_member(conn, mid)
             ctx.bump("pruned")
@@ -514,16 +566,17 @@ def inventory(ctx: Ctx, roots, limit: Optional[int] = None, force_all: bool = Fa
             ctx.bump("changed")
 
     for f in found:
-        path, name, kind, library, ext, sha_, norm, nbytes, nlines, fixed = f
+        path, name, kind, library, ext, sha_, norm, nbytes, nlines, fixed, note = f
         if path in kept:
             mem = Mem(kept[path], path, name, kind, library, norm, skip=True)
             ctx.bump("unchanged")
         else:
             cur = conn.execute(
                 "INSERT INTO member(path,name,kind,library,ext,sha256,norm_sha,bytes,lines,"
-                "fixed_format,parse_status,scanned_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                (path, name, kind, library, ext, sha_, norm, nbytes, nlines, fixed, "pending", now))
-            mem = Mem(cur.lastrowid, path, name, kind, library, norm)
+                "fixed_format,parse_status,parse_error,scanned_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (path, name, kind, library, ext, sha_, norm, nbytes, nlines, fixed,
+                 "failed" if note else "pending", note, now))
+            mem = Mem(cur.lastrowid, path, name, kind, library, norm, skip=bool(note))
             if path not in existing:
                 ctx.bump("new")
         ctx.members.append(mem)
@@ -1683,7 +1736,13 @@ def _main(argv: Optional[List[str]] = None) -> int:
     roots = [args.root, *(args.also or [])]
     ctx.say("inventory: " + ", ".join(roots))
     load_declared_kinds(ctx, args.manifest)
-    inventory(ctx, roots, args.limit, force_all=force_all)
+    try:
+        inventory(ctx, roots, args.limit, force_all=force_all)
+    except ParserStuck:
+        return 3
+    except KeyboardInterrupt:
+        ctx.say("\nstopped by Ctrl+C during the inventory - nothing was written yet; run the same command again")
+        return 130
     conn.commit()
     ctx.say(f"  {len(ctx.members)} files: " + ", ".join(
         f"{k[5:]}={v}" for k, v in sorted(ctx.stats.items()) if k.startswith("kind:")))
