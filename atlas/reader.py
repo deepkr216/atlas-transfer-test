@@ -55,8 +55,11 @@ def sniff_encoding(data: bytes) -> str:
         return "utf-8"
     sample = data[:8192]
     space_ratio = sample.count(_EBCDIC_SPACE) / len(sample)
-    ascii_printable = sum(1 for b in sample if 0x20 <= b <= 0x7E or b in (0x09, 0x0A, 0x0D))
-    ascii_ratio = ascii_printable / len(sample)
+    # 0x40 is the EBCDIC blank and the ASCII '@': it says nothing either way,
+    # so it counts for neither side (counted as ASCII, a genuine EBCDIC member
+    # looked 60 % printable and was decoded as Windows text - LESSONS 146)
+    ascii_printable = sum(1 for b in sample if (0x20 <= b <= 0x7E and b != 0x40) or b in (0x09, 0x0A, 0x0D))
+    ascii_ratio = ascii_printable / (len(sample) - sample.count(_EBCDIC_SPACE) or 1)
     if space_ratio > 0.15 and ascii_ratio < 0.60:
         return "cp037"
     for enc in _TEXT_ENCODINGS:
@@ -90,6 +93,10 @@ def _split_records(text: str, data: bytes, enc: str) -> List[str]:
     for width in (80, 133, 132, 121):
         if n >= width * 2 and n % width == 0:
             return [text[i:i + width] for i in range(0, n, width)]
+    if n >= 160:
+        # a stray trailing byte (an EOF mark, a lone CR) must not turn 5 MB of
+        # 80-byte records into ONE record: cut at 80, the tail is the last one
+        return [text[i:i + 80] for i in range(0, n, 80)]
     return [text]
 
 
@@ -396,6 +403,32 @@ def _ends_inside_literal(text: str) -> bool:
     return in_q is not None
 
 
+def _scan_terminator(s: str, start: int, in_q: Optional[str], at_line_end: bool = True) -> Tuple[int, Optional[str]]:
+    """find_terminator with the literal state carried in and out: (index or
+    -1, the open quote at the end). Lets cobol_statements resume where it
+    stopped instead of rescanning the whole sentence for every line added -
+    a 1,000-line paragraph with one period at its end was quadratic (LESSONS 146)."""
+    i, n = start, len(s)
+    while i < n:
+        ch = s[i]
+        if in_q:
+            if ch == in_q:
+                if i + 1 < n and s[i + 1] == in_q:
+                    i += 1              # doubled quote is an escaped quote
+                else:
+                    in_q = None
+        elif ch in ("'", '"'):
+            in_q = ch
+        elif ch == ".":
+            if i + 1 >= n:
+                if at_line_end:
+                    return i, in_q
+            elif s[i + 1].isspace():
+                return i, in_q
+        i += 1
+    return -1, in_q
+
+
 def find_terminator(s: str, start: int = 0, at_line_end: bool = True) -> int:
     """Index of the first period that really ends a statement, or -1.
 
@@ -456,7 +489,21 @@ def cobol_statements(logical: Sequence[LogicalLine]) -> Iterator[LogicalLine]:
     buf = ""
     lmap: List[int] = []          # line number for each character in buf
     area_a = False                # only the statement starting a logical line
-    fresh = True                  # ... may be an Area A construct
+    fresh = True                  # ... may be an Area B construct
+    # scanner state, carried across lines: where the last scan stopped, the
+    # open quote there, and the EXEC SQL/CICS/DLI state up to exec_pos. Every
+    # character of the buffer is looked at once, whatever the sentence length.
+    scan_pos = 0
+    in_q: Optional[str] = None
+    exec_open = False
+    exec_pos = 0
+
+    def compact(cut: int) -> None:
+        nonlocal buf, lmap, scan_pos, exec_pos
+        buf = buf[cut:]
+        lmap = lmap[cut:]
+        scan_pos = max(0, scan_pos - cut)
+        exec_pos = max(0, exec_pos - cut)
 
     for ll in logical:
         if buf and not buf.endswith(" "):
@@ -468,17 +515,20 @@ def cobol_statements(logical: Sequence[LogicalLine]) -> Iterator[LogicalLine]:
         lmap.extend([ll.start] * len(ll.text))
         # `ll.text` is one logical line, so a trailing period really does end
         # the statement - there is no more text coming on this line.
-        scan_from = 0
         while True:
-            idx = find_terminator(buf, scan_from, at_line_end=True)
+            idx, in_q = _scan_terminator(buf, scan_pos, in_q, at_line_end=True)
             if idx < 0:
+                scan_pos = len(buf)
                 break
-            if _inside_exec(buf, idx):
+            # EXEC state up to this period, advanced incrementally
+            for m in _EXEC_TOKEN.finditer(buf, exec_pos, idx + 1):
+                exec_open = not m.group(0).upper().startswith("END")
+            exec_pos = idx + 1
+            if exec_open:
                 # `-- get the policy.` inside EXEC SQL ... END-EXEC is SQL
                 # text: the statement ends after END-EXEC, not here.
-                scan_from = idx + 1
+                scan_pos = idx + 1
                 continue
-            scan_from = 0
             raw_stmt = buf[:idx + 1]
             text = raw_stmt.strip()
             if text:
@@ -488,12 +538,15 @@ def cobol_statements(logical: Sequence[LogicalLine]) -> Iterator[LogicalLine]:
                 yield LogicalLine(text=text, start=s_line, end=e_line,
                                   lines=sorted(set(lmap[:idx + 1])),
                                   area_a=area_a, charmap=lmap[lead:idx + 1])
-            buf = buf[idx + 1:]
-            lmap = lmap[idx + 1:]
+            compact(idx + 1)
+            scan_pos = 0
+            in_q = None
             # Anything after the period sits in Area B by definition.
             area_a, fresh = False, False
         if not buf.strip():
             buf, lmap, fresh = "", [], True
+            scan_pos = exec_pos = 0
+            in_q, exec_open = None, False
 
     if buf.strip():
         lead = len(buf) - len(buf.lstrip())
@@ -504,6 +557,7 @@ def cobol_statements(logical: Sequence[LogicalLine]) -> Iterator[LogicalLine]:
 
 _DECIMAL_DOT = re.compile(r"\d\.\d")
 _EXEC_OPEN = re.compile(r"\bEXEC\s+(?:SQL|CICS|DLI)\b", re.IGNORECASE)
+_EXEC_TOKEN = re.compile(r"\bEXEC\s+(?:SQL|CICS|DLI)\b|END-EXEC", re.IGNORECASE)
 
 
 def _inside_exec(buf: str, idx: int) -> bool:

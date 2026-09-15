@@ -1063,8 +1063,8 @@ def index_cobol(ctx: Ctx, mem: Mem) -> None:
     for fld in copybook.flatten(roots):
         if fld.name == copybook.SYNTHETIC_ROOT:
             continue
-        _m, _l, depth = exp.origin(fld.line)
-        run = next((r for r in exp.runs if r.exp_start <= fld.line <= r.exp_end), None)
+        run = exp.run_at(fld.line)
+        depth = run.depth if run else 0
         if depth == 0 or (run and run.via_copy in replaced):
             keep.append(fld)
     _insert_fields(conn, mem.id, keep)

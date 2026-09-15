@@ -65,11 +65,27 @@ class Expansion:
     # Without this, every reference to LK-POLICY-STATUS is invisible to `field PM-POLICY-STATUS`.
     aliases: List[Tuple[str, str, str, int]] = dc_field(default_factory=list)
 
+    def run_at(self, exp_line: int) -> Optional["Run"]:
+        """The run holding an expanded line - by bisection over the runs'
+        starts (they are emitted in ascending order and do not overlap).
+        A linear scan per field made a 3,000-COPY program quadratic (LESSONS 146)."""
+        import bisect
+        starts = getattr(self, "_starts", None)
+        if starts is None or len(starts) != len(self.runs):
+            starts = [r.exp_start for r in self.runs]
+            object.__setattr__(self, "_starts", starts)
+        k = bisect.bisect_right(starts, exp_line) - 1
+        if k >= 0:
+            r = self.runs[k]
+            if r.exp_start <= exp_line <= r.exp_end:
+                return r
+        return None
+
     def origin(self, exp_line: int) -> Tuple[Optional[int], Optional[int], int]:
         """(src_member, src_line, depth) for an expanded line number."""
-        for r in self.runs:
-            if r.exp_start <= exp_line <= r.exp_end:
-                return r.src_member, r.src_start + (exp_line - r.exp_start), r.depth
+        r = self.run_at(exp_line)
+        if r is not None:
+            return r.src_member, r.src_start + (exp_line - r.exp_start), r.depth
         return None, None, 0
 
 

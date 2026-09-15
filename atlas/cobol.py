@@ -105,12 +105,16 @@ _SET_VALUE = re.compile(rf"^\s*\d{{1,2}}\s+({ID})\b.*\bVALUE\s+(?:IS\s+)?(['\"])
                         re.IGNORECASE)
 _LEVEL_ENTRY = re.compile(rf"^\s*(\d{{1,2}})\s+({ID})\b(.*)$", re.IGNORECASE | re.DOTALL)
 _SET_TRUE = re.compile(B + rf"SET\s+({ID})\s+TO\s+TRUE" + E, re.IGNORECASE)
-_GO_TO = re.compile(B + r"GO\s+TO\s+((?:" + ID + r"\s*)+?)(?:\s*DEPENDING\s+(?:ON\s+)?(" + ID + r"))?(?=\s*(?:$|\.|" + B + r"(?:END-|ELSE|WHEN)))",
+# target lists are identifiers separated by whitespace or a comma: with an
+# optional separator one word could be split at every character and an
+# unterminated `GO TO name MOVE ...` backtracked exponentially (LESSONS 146)
+_GO_TO = re.compile(B + r"GO\s+TO\s+(" + ID + r"(?:[\s,]+" + ID + r")*?)(?:[\s,]+DEPENDING\s+(?:ON\s+)?(" + ID + r"))?(?=\s*(?:$|\.|" + B + r"(?:END-|ELSE|WHEN)))",
                     re.IGNORECASE)
+MAX_RESOLVED = 40                         # candidate targets kept per dynamic CALL
 _ALTER = re.compile(B + rf"ALTER\s+({ID})\s+TO\s+(?:PROCEED\s+TO\s+)?({ID})", re.IGNORECASE)
 _SORT_PROC = re.compile(B + rf"(INPUT|OUTPUT)\s+PROCEDURE\s+(?:IS\s+)?({ID})(?:\s+(?:THRU|THROUGH)\s+({ID}))?",
                         re.IGNORECASE)
-_SORT_USING = re.compile(B + r"(USING|GIVING)\s+((?:" + ID + r"\s*)+?)(?=\s*(?:$|\.|" + B + r"(?:USING|GIVING|INPUT|OUTPUT|ON|WITH|COLLATING|END-)))",
+_SORT_USING = re.compile(B + r"(USING|GIVING)\s+(" + ID + r"(?:[\s,]+" + ID + r")*?)(?=\s*(?:$|\.|" + B + r"(?:USING|GIVING|INPUT|OUTPUT|ON|WITH|COLLATING|END-)))",
                          re.IGNORECASE)
 _SECTION_HDR = re.compile(rf"^({ID})\s+SECTION(?:\s+\d{{1,2}})?\s*\.", re.IGNORECASE)
 
@@ -471,6 +475,7 @@ def _build_literal_map(stmts: Sequence[LogicalLine]) -> Dict[str, Set[str]]:
 
 def _extract_calls(f: ProgramFacts, st: LogicalLine,
                    literal_map: Dict[str, Set[str]]) -> None:
+    sorted_cands: Dict[str, List[str]] = {}
     # EXEC SQL/CICS/DLI text is not COBOL: `EXEC SQL CALL PROC(:X)` is a
     # stored-procedure call (recorded by _extract_sql), not a dynamic CALL.
     body = _EXEC_ANY.sub(lambda m: " " * len(m.group(0)), st.text)
@@ -496,7 +501,12 @@ def _extract_calls(f: ProgramFacts, st: LogicalLine,
         mv = re.match(rf"\s*({ID})", frag, re.IGNORECASE)
         if mv:
             var = mv.group(1).upper()
-            cands = sorted(literal_map.get(var, []))
+            cands = sorted_cands.get(var)
+            if cands is None:
+                cands = sorted(literal_map.get(var, []))
+                if len(cands) > MAX_RESOLVED:          # a dispatcher moving 5,000 names to one variable
+                    cands = cands[:MAX_RESOLVED] + [f"(+{len(cands) - MAX_RESOLVED} more)"]
+                sorted_cands[var] = cands
             f.calls.append(CallFact(
                 kind="dynamic", target=None, via_var=var,
                 resolved=cands,
