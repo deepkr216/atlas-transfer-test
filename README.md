@@ -131,6 +131,10 @@ under a system of their own (`SHARED` in `sources.example.json`).
 ```bash
 # 1. index the estate (source + documents; minutes for tens of thousands of members)
 python -m atlas.build  C:/estate  --db atlas.db  --manifest manifest.json  --write-expanded out/expanded
+#    a big estate: the same arguments under the watchdog - a build that goes silent (a parser
+#    frozen inside a regular expression) is killed, the member in hand is recorded in
+#    atlas-skip.txt, and the build restarts keeping what was parsed
+python -m atlas.supervise  C:/estate  --db atlas.db  --manifest manifest.json
 
 # 2. read the coverage report FIRST - it lists what the index cannot know
 python -m atlas.query --db atlas.db coverage

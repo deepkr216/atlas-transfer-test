@@ -17,3 +17,5 @@ pack*.md
 /work/
 /.claude/settings.local.json
 atlas-stuck.txt
+atlas-current.txt
+atlas-skip.txt

@@ -116,6 +116,13 @@ def _clear_facts(conn: sqlite3.Connection, mid: int) -> None:
 
 
 PROGRESS_SECONDS = 10.0                   # the status line's own clock
+CURRENT_FILE = "atlas-current.txt"        # beside the db: the member in hand (path + label) - read by atlas.supervise
+SKIP_FILE = "atlas-skip.txt"              # beside the db: members that froze the parser - written by atlas.supervise
+_FREEZE = os.environ.get("ATLAS_TEST_FREEZE")   # tests only: this member freezes the whole process, output included
+
+
+def _stamp() -> str:
+    return time.strftime("%H:%M:%S")
 STUCK_DUMP_SECONDS = 300                  # one item in hand this long: the exact place is written to STUCK_FILE
 STUCK_FILE = "atlas-stuck.txt"
 
@@ -180,7 +187,7 @@ class Progress:
         while not self._stop.wait(self.every):
             t = self.text()
             if t:
-                self.say("  ... " + t)
+                self.say(f"{_stamp()}  ... " + t)
             cur = self.current
             if cur and self.dump_after and time.time() - cur[1] >= self.dump_after and self._dumped != cur:
                 self._dumped = cur
@@ -652,10 +659,33 @@ def inventory(ctx: Ctx, roots, limit: Optional[int] = None, force_all: bool = Fa
 
 
 def _parse_one(ctx: Ctx, mem: Mem, handler) -> None:
+    if _FREEZE and os.path.basename(mem.path) == _FREEZE:
+        if ctx.progress:                 # what a regular expression gone wrong looks like from outside:
+            ctx.progress.stop()          # no status line, no limit, nothing - until the supervisor acts
+        time.sleep(3600)
     if handler:
         handler(ctx, mem)
     if mem.kind in CODE_KINDS:
         index_fts_code(ctx, mem)
+
+
+def load_skip_list(path: Optional[str]) -> Tuple[set, set]:
+    """Members that froze the parser on an earlier run (atlas.supervise writes
+    them): full paths, or bare file names. (paths, names)"""
+    paths: set = set()
+    names: set = set()
+    if not path or not os.path.isfile(path):
+        return paths, names
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            item = line.split("\t", 1)[0].split("#", 1)[0].strip()
+            if not item:
+                continue
+            if os.sep in item or "/" in item:
+                paths.add(os.path.normcase(os.path.abspath(item)))
+            else:
+                names.add(item.upper())
+    return paths, names
 
 
 def load_sched(ctx: Ctx, csv_path: str) -> None:
@@ -1765,6 +1795,10 @@ def _main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--rebuild", action="store_true", help="delete the db first")
     ap.add_argument("--write-expanded", help="directory to write expanded COBOL sources into")
     ap.add_argument("--limit", type=int, help="index only the first N files (smoke test)")
+    ap.add_argument("--skip-list", metavar="FILE", help="members that froze the parser on an earlier run (one path or "
+                                                         "file name per line): recorded as failed, not parsed - "
+                                                         "atlas.supervise maintains it")
+    ap.add_argument("--no-current-file", action="store_true", help="do not write atlas-current.txt beside the db")
     ap.add_argument("--member-limit", type=float, default=MEMBER_TIME_LIMIT, metavar="SECONDS",
                     help=f"give up on one member after this long (default {MEMBER_TIME_LIMIT} s): it is recorded as "
                          "failed and the build goes on")
@@ -1844,6 +1878,11 @@ def _main(argv: Optional[List[str]] = None) -> int:
         return (f"{i}/{len(ctx.members)} - {done}/{n_parse} parsed in {_hms(elapsed)}, {rate:.1f}/s, "
                 f"about {eta} left at this rate")
 
+    skip_paths, skip_names = load_skip_list(args.skip_list)
+    if skip_paths or skip_names:
+        ctx.say(f"skip list: {len(skip_paths) + len(skip_names)} member(s) that froze the parser on an earlier run are "
+                f"recorded as failed, not parsed ({args.skip_list})")
+    current_file = None if args.no_current_file else os.path.join(os.path.dirname(os.path.abspath(args.db)), CURRENT_FILE)
     progress = ctx.progress = Progress(ctx.say, limit=member_limit).start()
     progress.set(status)
     for i, mem in enumerate(sorted(ctx.members, key=lambda m: order.get(m.kind, 6)), 1):
@@ -1854,6 +1893,21 @@ def _main(argv: Optional[List[str]] = None) -> int:
             conn.commit()
         handler = HANDLERS.get(mem.kind)
         label = f"{mem.kind} {os.path.basename(mem.path)}"
+        if current_file:
+            try:                                                        # the supervisor reads this if we freeze
+                with open(current_file, "w", encoding="utf-8") as fh:
+                    fh.write(f"{mem.path}\n{label}\n")
+            except OSError:
+                pass
+        if os.path.normcase(os.path.abspath(mem.path)) in skip_paths or os.path.basename(mem.path).upper() in skip_names:
+            _clear_facts(conn, mem.id)
+            conn.execute("UPDATE member SET parse_status='failed', parse_error=? WHERE id=?",
+                         ("ParserStuck: froze the parser on an earlier run - skipped (skip list); report its kind, "
+                          "size and shape so the parser can be fixed", mem.id))
+            ctx.say(f"{_stamp()}  SKIPPED {label}: froze the parser on an earlier run (skip list)")
+            failed += 1
+            done += 1
+            continue
         progress.now(label)
         t_member = time.time()
         try:
@@ -1891,7 +1945,7 @@ def _main(argv: Optional[List[str]] = None) -> int:
             _clear_facts(conn, mem.id)
             conn.execute("UPDATE member SET parse_status='failed', parse_error=? WHERE id=?",
                          (f"{type(e).__name__}: {e}"[:500], mem.id))
-            ctx.say(f"  FAILED {mem.kind} {mem.path}: {type(e).__name__}: {e}")
+            ctx.say(f"{_stamp()}  FAILED {mem.kind} {mem.path}: {type(e).__name__}: {e}")
         done += 1
         if i % 500 == 0:
             conn.commit()
