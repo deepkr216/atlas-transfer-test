@@ -91,7 +91,7 @@ class Supervise(unittest.TestCase):
         with contextlib.redirect_stdout(buf):
             rc = build._main([os.path.join(self.td, "estate"), "--db", self.db])
         self.assertEqual(rc, 0)
-        self.assertRegex(buf.getvalue(), r"parsing 0 member\(s\) \(\d+ unchanged, kept\)")
+        self.assertRegex(buf.getvalue(), r"== parsing 0 member\(s\)\n  \d+ unchanged and kept; to parse: nothing")
 
     def test_cli_help_and_usage(self):
         import contextlib

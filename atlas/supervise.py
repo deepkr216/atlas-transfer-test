@@ -71,6 +71,7 @@ def run(build_args: List[str], silence: float = SILENCE_SECONDS, max_restarts: i
     here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))          # the folder holding atlas/
     env["PYTHONPATH"] = here + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
     restarts = 0
+    last_phase_freeze: Optional[str] = None
     while True:
         cmd = [python, "-u", "-m", "atlas.build", *build_args, "--skip-list", skip]
         say(f"{_stamp()} supervisor: build started" + (f" (restart {restarts})" if restarts else "")
@@ -126,6 +127,18 @@ def run(build_args: List[str], silence: float = SILENCE_SECONDS, max_restarts: i
                 proc.wait(timeout=30)
             except Exception:                                                  # noqa: BLE001
                 pass
+            if member == "PHASE":
+                # a step of the build, not a member: nothing to put on the skip list
+                if last_phase_freeze == label:
+                    say(f"{_stamp()} supervisor: FROZEN twice in the same step ({label}) - stopping. Send "
+                        f"atlas-stuck.txt if it exists, and the last 20 lines above.")
+                    return 3
+                last_phase_freeze = label
+                say(f"{_stamp()} supervisor: FROZEN - nothing printed for {int(silence)} s during the step "
+                    f"'{label}'. Build killed; restarting once - parsed members are kept.")
+                restarts += 1
+                continue
+            last_phase_freeze = None
             if member:
                 _record(skip, member, label, f"froze the parser (no output for {int(silence)} s)")
             say(f"{_stamp()} supervisor: FROZEN - nothing printed for {int(silence)} s while parsing "
@@ -140,7 +153,7 @@ def run(build_args: List[str], silence: float = SILENCE_SECONDS, max_restarts: i
         rc = proc.wait()
         if rc == 3:
             member, label = _read_current(current)
-            if member:
+            if member and member != "PHASE":
                 _record(skip, member, label, "could not be interrupted (build stopped itself)")
             restarts += 1
             if restarts > max_restarts:

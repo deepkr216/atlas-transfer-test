@@ -99,7 +99,7 @@ class Resume(unittest.TestCase):
         # the same command again: parsed members kept, the rest parsed, run finished
         rc, out = self._build()
         self.assertEqual(rc, 0)
-        self.assertRegex(out, r"parsing \d+ member\(s\) \([1-9]\d* unchanged, kept\)")
+        self.assertRegex(out, r"== parsing \d+ member\(s\)\n  [1-9]\d* unchanged and kept")
         self.assertNotIn("toolkit changed since the last build", out)
         conn = query.connect(self.db)
         st = {r[0]: r[1] for r in conn.execute("SELECT name, parse_status FROM member")}
@@ -127,7 +127,7 @@ class Resume(unittest.TestCase):
             rc, out = self._build()
         self.assertEqual(rc, 0)
         self.assertIn("toolkit changed since the last build: every member is re-parsed", out)
-        self.assertRegex(out, r"parsing \d+ member\(s\) \(0 unchanged, kept\)")
+        self.assertRegex(out, r"== parsing \d+ member\(s\)\n  0 unchanged and kept")
 
     def test_a_member_over_the_time_limit_is_skipped_and_not_retried(self):
         import time as _t
@@ -200,7 +200,7 @@ class Resume(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("gave up on file STUCK.txt", out)
         self.assertIn("files read (", out)
-        self.assertIn("- now classifying file STUCK.txt", out)     # named while the inventory sat on it
+        self.assertRegex(out, r"- now classifying STUCK\.txt \(\d+ B\) in SRC")     # named while the inventory sat on it
         conn = query.connect(self.db)
         st, err = conn.execute("SELECT parse_status, parse_error FROM member WHERE name='STUCK'").fetchone()
         self.assertEqual(st, "failed")

@@ -116,6 +116,24 @@ def _clear_facts(conn: sqlite3.Connection, mid: int) -> None:
 
 
 PROGRESS_SECONDS = 10.0                   # the status line's own clock
+FOLDER_REPORT_FILES = 5                   # a folder is reported when done if it held this many files,
+FOLDER_REPORT_BYTES = 5 * 1024 * 1024     # ... or this many bytes,
+FOLDER_REPORT_SECONDS = 5.0               # ... or took this long; smaller ones are counted, not listed
+BULK_FORGET = 200                         # more changed members than this: old facts are removed in bulk
+
+KIND_LABELS = {"copybook": "copybooks", "cobol": "programs", "proc": "PROCs", "jcl": "jobs", "dbd": "DBDs",
+               "psb": "PSBs", "doc": "documents", "ctlcard": "control cards", "bms": "BMS maps",
+               "mfs": "MFS formats", "csd": "CSD extracts", "imsgen": "IMS stage-1 members",
+               "listing": "compiler listings", "unknown": "unrecognised members", "empty": "empty members",
+               "sql": "SQL members", "sched": "scheduler exports", "asm": "assembler members", "rexx": "REXX members"}
+
+
+def _size(n: int) -> str:
+    if n < 1024:
+        return f"{n} B"
+    if n < 1024 * 1024:
+        return f"{n // 1024} KB"
+    return f"{n / 1024 / 1024:.1f} MB"
 CURRENT_FILE = "atlas-current.txt"        # beside the db: the member in hand (path + label) - read by atlas.supervise
 SKIP_FILE = "atlas-skip.txt"              # beside the db: members that froze the parser - written by atlas.supervise
 _FREEZE = os.environ.get("ATLAS_TEST_FREEZE")   # tests only: this member freezes the whole process, output included
@@ -129,20 +147,25 @@ STUCK_FILE = "atlas-stuck.txt"
 
 class Progress:
     """The build's status line on its OWN clock: a daemon thread prints
-    every `every` seconds whatever the loop last reported plus the item in
-    hand and how long it has been in hand. A file or member that takes two
-    hours then produces a line every 10 s naming it - not silence, which
-    is what a status checked only between items gave (LESSONS 142)."""
+    every `every` seconds whatever the current step last reported plus the
+    item in hand and how long it has been in hand. One Progress runs for the
+    whole build and every step announces itself (`phase`), so there is no
+    stretch of the build without a status - the silent removal of old facts
+    after a `git pull` looked like a hang on the last control card read
+    (LESSONS 142, 147)."""
 
     def __init__(self, say, every: Optional[float] = None, hint_after: float = SLOW_MEMBER_SECONDS,
-                 limit: float = 0, dump_after: Optional[float] = None, dump_file: Optional[str] = None):
+                 limit: float = 0, dump_after: Optional[float] = None, dump_file: Optional[str] = None,
+                 current_file: Optional[str] = None):
         self.say = say
         self.every = PROGRESS_SECONDS if every is None else every
         self.hint_after, self.limit = hint_after, limit
         self.dump_after = STUCK_DUMP_SECONDS if dump_after is None else dump_after
         self.dump_file = dump_file or STUCK_FILE
+        self.current_file = current_file
         self.line = lambda: ""
         self.current: Optional[Tuple[str, float]] = None
+        self.phase_name: Optional[str] = None
         self._dumped: Optional[Tuple[str, float]] = None
         self._stop = threading.Event()
         self._t = threading.Thread(target=self._run, daemon=True, name="progress")
@@ -161,13 +184,37 @@ class Progress:
         except OSError:
             pass
 
+    def _write_current(self, first: str, second: str) -> None:
+        """atlas-current.txt: the member in hand (its path) or PHASE and the
+        step - what the outside supervisor reads when the build goes silent."""
+        if not self.current_file:
+            return
+        try:
+            with open(self.current_file, "w", encoding="utf-8") as fh:
+                fh.write(f"{first}\n{second}\n")
+        except OSError:
+            pass
+
     def set(self, line) -> None:
         """`line` is called on the clock: it returns the counters part."""
         self.line = line
 
-    def now(self, label: Optional[str]) -> None:
-        """What the loop holds at the moment (None between items)."""
+    def phase(self, name: str, limit: float = 0) -> None:
+        """A step of the build, announced with the time and named on every
+        status line until the next step starts."""
+        t0 = time.time()
+        self.phase_name, self.limit = name, limit
+        self.current = None
+        self.line = lambda: f"{name} for {_hms(time.time() - t0)}"
+        self.say(f"{_stamp()} == {name}")
+        self._write_current("PHASE", name)
+
+    def now(self, label: Optional[str], path: Optional[str] = None) -> None:
+        """What the step holds at the moment (None between items). With a
+        path, the item is a member the supervisor can put on the skip list."""
         self.current = (label, time.time()) if label else None
+        if path is not None:
+            self._write_current(path, label or "")
 
     def text(self) -> str:
         try:
@@ -194,7 +241,8 @@ class Progress:
                 self.dump(cur)
 
     def start(self) -> "Progress":
-        self._t.start()
+        if not self._t.is_alive() and not self._stop.is_set():
+            self._t.start()
         return self
 
     def stop(self) -> None:
@@ -244,6 +292,7 @@ class Mem:
     authoritative: int = 0
     skip: bool = False        # unchanged since the last build: facts kept, not re-parsed
     system: str = ""          # department, from the manifest (systems / system_of)
+    nbytes: int = 0           # size on disk, shown on the status line
 
 
 class Ctx:
@@ -407,9 +456,86 @@ def _forget_member(conn: sqlite3.Connection, mid: int) -> None:
     OTHER members that only reference it, which a cascade cannot reach."""
     conn.execute("UPDATE copy_use SET resolved_member_id=NULL WHERE resolved_member_id=?", (mid,))
     conn.execute("DELETE FROM expand_run WHERE src_member=?", (mid,))
+    conn.execute("DELETE FROM expand_map WHERE src_member=?", (mid,))
     conn.execute("DELETE FROM db2_object WHERE member_id=?", (mid,))
     conn.execute("DELETE FROM src_fts WHERE member_id=?", (mid,))
     conn.execute("DELETE FROM member WHERE id=?", (mid,))
+
+
+def _forget_members(conn: sqlite3.Connection, mids: Sequence[int], progress: Optional["Progress"] = None) -> None:
+    """Remove many members at once. One by one, each removal scanned the
+    search index and every table without an index on its member column:
+    quadratic - 2,000 members took 68 s, 121,000 would take days, silently,
+    after every `git pull` that changed a parser (LESSONS 147). In bulk, each
+    table is visited once."""
+    if len(mids) <= BULK_FORGET:
+        for mid in mids:
+            _forget_member(conn, mid)
+        return
+    conn.execute("CREATE TEMP TABLE IF NOT EXISTS forget_ids(id INTEGER PRIMARY KEY)")
+    conn.execute("DELETE FROM forget_ids")
+    conn.executemany("INSERT OR IGNORE INTO forget_ids(id) VALUES(?)", [(m,) for m in mids])
+    ids = "(SELECT id FROM forget_ids)"
+    steps = [("copybook references", f"UPDATE copy_use SET resolved_member_id=NULL WHERE resolved_member_id IN {ids}"),
+             ("copybook expansion runs", f"DELETE FROM expand_run WHERE src_member IN {ids}"),
+             ("expansion map", f"DELETE FROM expand_map WHERE src_member IN {ids}"),
+             ("DB2 objects", f"DELETE FROM db2_object WHERE member_id IN {ids}"),
+             ("search index", f"DELETE FROM src_fts WHERE member_id IN {ids}"),
+             ("members and every fact derived from them", f"DELETE FROM member WHERE id IN {ids}")]
+    for label, sql in steps:
+        if progress:
+            progress.now(f"removing {label}")
+        conn.execute(sql)
+    conn.execute("DELETE FROM forget_ids")
+    if progress:
+        progress.now(None)
+
+
+def ensure_fk_indexes(conn: sqlite3.Connection, say=None) -> int:
+    """An index on every foreign-key column. Without one, deleting a member
+    makes SQLite scan the whole child table for rows to cascade or check -
+    44 tables had none (LESSONS 147). Idempotent; a large index built by an
+    older toolkit gets them once, which takes a while and is announced."""
+    missing = []
+    for (t,) in conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").fetchall():
+        try:
+            fks = conn.execute(f"PRAGMA foreign_key_list('{t}')").fetchall()
+        except sqlite3.DatabaseError:
+            continue
+        if not fks:
+            continue
+        firsts = set()
+        for idx in conn.execute(f"PRAGMA index_list('{t}')").fetchall():
+            cols = conn.execute(f"PRAGMA index_info('{idx[1]}')").fetchall()
+            if cols:
+                firsts.add(cols[0][2])
+        for fk in fks:
+            col = fk[3]
+            if col not in firsts and (t, col) not in missing:
+                missing.append((t, col))
+    if missing:
+        big = conn.execute("SELECT COUNT(*) FROM member").fetchone()[0] > 5000
+        if say and big:
+            say(f"  adding {len(missing)} index(es) this index was missing (one time; a few minutes on a large index)")
+        for t, col in missing:
+            conn.execute(f"CREATE INDEX IF NOT EXISTS ix_fk_{t}_{col} ON {t}({col})")
+        conn.commit()
+    return len(missing)
+
+
+def load_inventory_skips(path: Optional[str]) -> set:
+    """Files the supervisor recorded while they were being CLASSIFIED (the
+    comment carries `classifying`): skipped by the inventory itself."""
+    out: set = set()
+    if not path or not os.path.isfile(path):
+        return out
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            item, _, comment = line.partition("\t")
+            item = item.split("#", 1)[0].strip()
+            if item and "classifying" in comment:
+                out.add(os.path.normcase(os.path.abspath(item)))
+    return out
 
 
 def _scan_files(root: str, limit: Optional[int] = None, on_dir=None):
@@ -525,6 +651,10 @@ def inventory(ctx: Ctx, roots, limit: Optional[int] = None, force_all: bool = Fa
     control-card member forces every job. `force_all` (parser or manifest
     changed) re-parses everything. Members that vanished are pruned.
     `--rebuild` starts from an empty db.
+
+    Three steps, each announced on the status line: reading every file
+    (a line per finished folder), comparing with the last build (and
+    removing the old facts of what changed), recording the members.
     """
     conn = ctx.conn
     now = time.strftime("%Y-%m-%dT%H:%M:%S")
@@ -533,129 +663,192 @@ def inventory(ctx: Ctx, roots, limit: Optional[int] = None, force_all: bool = Fa
                              "lines, fixed_format FROM member")}
     if isinstance(roots, str):
         roots = [roots]
+    own = ctx.progress is None
+    progress = ctx.progress or Progress(ctx.say).start()
+    ctx.progress = progress
+    skip_classify = getattr(ctx, "inventory_skips", set())
 
     found: List[tuple] = []
-    ctx.say("  reading and fingerprinting every file (a document folder on OneDrive is downloaded now - minutes of "
-            f"disk work; a line every {int(PROGRESS_SECONDS)} s says how far and which file is in hand; a file "
-            f"still in hand after {SLOW_MEMBER_SECONDS} s is flagged, and given up on after {INVENTORY_TIME_LIMIT} s)")
+    progress.phase("inventory: reading and fingerprinting every file", limit=INVENTORY_TIME_LIMIT)
+    ctx.say(f"  a line every {int(PROGRESS_SECONDS)} s says how far and which file is in hand; a line when a folder "
+            f"is done; a file still in hand after {SLOW_MEMBER_SECONDS} s is flagged, and given up on after "
+            f"{_hms(INVENTORY_TIME_LIMIT)} (a document folder on OneDrive is downloaded now - minutes of disk work)")
     t_start = time.time()
     n_read = bytes_read = 0
     box: List[tuple] = []
-    progress = ctx.progress = Progress(ctx.say, limit=INVENTORY_TIME_LIMIT).start()
-    progress.set(lambda: f"{n_read} files read ({bytes_read // 1024 // 1024} MB) in {_hms(time.time() - t_start)}")
-    for dirpath, fn in (pair for root in roots for pair in _scan_files(root, limit, progress.now)):
-        path = os.path.normpath(os.path.join(dirpath, fn))
-        n_read += 1
-        folder = os.path.basename(dirpath) or dirpath
-        progress.now(f"reading {fn} in {folder}")
-        try:
-            st = os.stat(docs.long_path(path))
-            if st.st_size > MAX_MEMBER_BYTES:
-                ctx.bump("too_large")
-                ctx.say(f"  skipped, too large to index: {path} ({st.st_size // 1024 // 1024} MB)")
-                continue
-            with open(docs.long_path(path), "rb") as fh:
-                data = fh.read()
-            bytes_read += len(data)
-        except OSError as e:
-            ctx.bump("unreadable")
-            hint = ""
-            try:
-                attrs = getattr(os.stat(docs.long_path(path)), "st_file_attributes", 0)
-                if attrs & 0x400000 or attrs & 0x1000:
-                    hint = " - a OneDrive placeholder not downloaded to this laptop: right-click the folder > Always keep on this device"
-            except OSError:
-                pass
-            ctx.say(f"  unreadable: {path} ({e}){hint}")
-            continue
-        sha_ = sha(data)
-        ex = existing.get(path)
-        if ex and ex[1] == sha_ and not force_all and _settled(ex[2], ex[3]):
-            # same bytes, same parser, settled outcome: the stored classification
-            # stands - no decode, no classify, no line split (and a file the
-            # inventory once gave up on is not read again for another limit)
-            found.append((path, os.path.splitext(fn)[0].upper(), ex[4], ex[5], ex[6], sha_, ex[7], len(data),
-                          ex[8] or 0, ex[9] or 0, None))
-            continue
-        label = f"file {fn} ({len(data) // 1024} KB) in {folder}"
-        progress.now(f"classifying {label}")
-        try:
-            box.clear()
-            run_with_limit(lambda: box.append(_inventory_one(ctx, path, fn, dirpath, data)), (),
-                           INVENTORY_TIME_LIMIT, label)
-            found.append(box[0])
-        except ParserStuck:
+    progress.set(lambda: f"{n_read:,} files read ({bytes_read // 1024 // 1024:,} MB) in {_hms(time.time() - t_start)}")
+    folder = {"dir": None, "path": None, "files": 0, "bytes": 0, "t0": time.time(), "small": 0, "small_files": 0}
+
+    def folder_done() -> None:
+        if folder["path"] is None:
+            return
+        secs = time.time() - folder["t0"]
+        if folder["files"] >= FOLDER_REPORT_FILES or folder["bytes"] >= FOLDER_REPORT_BYTES or secs >= FOLDER_REPORT_SECONDS:
+            extra = (f" (and {folder['small']} small folder(s) with {folder['small_files']} file(s) before it)"
+                     if folder["small"] else "")
+            ctx.say(f"{_stamp()}  folder done: {folder['path']} - {folder['files']:,} file(s), "
+                    f"{_size(folder['bytes'])}, {_hms(secs)}{extra}")
+            folder["small"] = folder["small_files"] = 0
+        elif folder["files"]:
+            folder["small"] += 1
+            folder["small_files"] += folder["files"]
+
+    try:
+        for root in roots:
+            root_label = os.path.basename(os.path.normpath(root)) or root
+            for dirpath, fn in _scan_files(root, limit, progress.now):
+                if dirpath != folder["dir"]:
+                    folder_done()
+                    rel = os.path.relpath(dirpath, root)
+                    folder.update(dir=dirpath, path=root_label if rel == "." else os.path.join(root_label, rel),
+                                  files=0, bytes=0, t0=time.time())
+                path = os.path.normpath(os.path.join(dirpath, fn))
+                n_read += 1
+                fold = os.path.basename(dirpath) or dirpath
+                progress.now(f"reading {fn} in {fold}")
+                try:
+                    st = os.stat(docs.long_path(path))
+                    progress.now(f"reading {fn} ({_size(st.st_size)}) in {fold}")
+                    if st.st_size > MAX_MEMBER_BYTES:
+                        ctx.bump("too_large")
+                        ctx.say(f"  skipped, too large to index: {path} ({st.st_size // 1024 // 1024} MB)")
+                        continue
+                    with open(docs.long_path(path), "rb") as fh:
+                        data = fh.read()
+                    bytes_read += len(data)
+                    folder["files"] += 1
+                    folder["bytes"] += len(data)
+                except OSError as e:
+                    ctx.bump("unreadable")
+                    hint = ""
+                    try:
+                        attrs = getattr(os.stat(docs.long_path(path)), "st_file_attributes", 0)
+                        if attrs & 0x400000 or attrs & 0x1000:
+                            hint = " - a OneDrive placeholder not downloaded to this laptop: right-click the folder > Always keep on this device"
+                    except OSError:
+                        pass
+                    ctx.say(f"  unreadable: {path} ({e}){hint}")
+                    continue
+                sha_ = sha(data)
+                ex = existing.get(path)
+                if ex and ex[1] == sha_ and not force_all and _settled(ex[2], ex[3]):
+                    # same bytes, same parser, settled outcome: the stored classification
+                    # stands - no decode, no classify, no line split (and a file the
+                    # inventory once gave up on is not read again for another limit)
+                    found.append((path, os.path.splitext(fn)[0].upper(), ex[4], ex[5], ex[6], sha_, ex[7], len(data),
+                                  ex[8] or 0, ex[9] or 0, None))
+                    continue
+                label = f"file {fn} ({len(data) // 1024} KB) in {fold}"
+                if os.path.normcase(os.path.abspath(path)) in skip_classify:
+                    ctx.bump("too_slow")
+                    ctx.say(f"{_stamp()}  SKIPPED {label}: froze the classifier on an earlier run (skip list)")
+                    found.append((path, os.path.splitext(fn)[0].upper(), "unknown", os.path.basename(dirpath),
+                                  os.path.splitext(fn)[1].lower(), sha_, sha_, len(data), 0, 0,
+                                  "InventoryTimeout: froze the classifier on an earlier run - skipped (skip list); "
+                                  "report its extension, size and what it is"))
+                    continue
+                progress.now(f"classifying {fn} ({_size(len(data))}) in {fold}", path=path)
+                try:
+                    box.clear()
+                    run_with_limit(lambda: box.append(_inventory_one(ctx, path, fn, dirpath, data)), (),
+                                   INVENTORY_TIME_LIMIT, label)
+                    found.append(box[0])
+                except ParserStuck:
+                    ctx.say(f"\nSTOPPED: {label} has been read for {_hms(INVENTORY_TIME_LIMIT)} and cannot be interrupted - "
+                            f"the classifier is stuck inside it. Move that one file out of the folder and run the same build "
+                            f"command again; then report its extension, size and what it is so the classifier can be fixed.")
+                    raise
+                except MemberTimeout as e:
+                    # recorded, not indexed: the name is what matters
+                    ctx.bump("too_slow")
+                    ctx.say(f"  gave up on {label}: {e}")
+                    found.append((path, os.path.splitext(fn)[0].upper(), "unknown", os.path.basename(dirpath),
+                                  os.path.splitext(fn)[1].lower(), sha(data), sha(data), len(data), 0, 0,
+                                  f"InventoryTimeout: reading and classifying took longer than {INVENTORY_TIME_LIMIT} s - "
+                                  f"not indexed; move the file out of the folder, or report its extension, size and what it is"))
+        folder_done()
+        if folder["small"]:
+            ctx.say(f"{_stamp()}  and {folder['small']} small folder(s) with {folder['small_files']} file(s)")
+        ctx.say(f"{_stamp()}  inventory done: {n_read:,} files, {bytes_read // 1024 // 1024:,} MB, "
+                f"{_hms(time.time() - t_start)}")
+
+        progress.phase("comparing with the last build")
+        found_by = {f[0]: f for f in found}
+        _load_library_markers(ctx, roots)
+
+        changed = [f for f in found if f[0] not in existing or existing[f[0]][1] != f[5]]
+        changed_names = {f[1] for f in changed if f[2] in ("copybook", "cobol")}
+        forced: set = set()
+        if changed_names and existing and not force_all:
+            # programs and copybooks that expand a changed copybook, transitively
+            progress.now(f"finding the programs that copy {len(changed_names):,} changed copybook(s) and program(s)")
+            pending = set(changed_names)
+            seen_names: set = set()
+            while pending:
+                batch = list(pending)
+                seen_names |= pending
+                pending = set()
+                for k in range(0, len(batch), 500):
+                    chunk = batch[k:k + 500]
+                    q = ",".join("?" * len(chunk))
+                    rows = conn.execute(f"SELECT DISTINCT m.path, m.name, m.kind FROM copy_use c JOIN member m ON m.id=c.member_id "
+                                        f"WHERE UPPER(c.copybook) IN ({q})", tuple(chunk)).fetchall()
+                    for r in rows:
+                        forced.add(r[0])
+                        if r[2] == "copybook" and r[1] not in seen_names:
+                            pending.add(r[1])
+        if any(f[2] in ("proc", "jcl", "ctlcard") for f in changed) and existing and not force_all:
+            # a PROC, INCLUDE or card member changed: every job that expands it
+            # carries its facts - re-parse all JCL (cheap next to COBOL)
+            forced |= {r[0] for r in conn.execute("SELECT path FROM member WHERE kind IN ('jcl','proc')")}
+        if force_all:
+            forced |= set(existing)
+
+        kept: Dict[str, int] = {}
+        to_forget: List[int] = []
+        for path, (mid, ex_sha, ex_status, ex_error, *_rest) in existing.items():
+            f = found_by.get(path)
+            settled = _settled(ex_status, ex_error)     # a member that hit a limit is not retried until the parser changes
+            if f is None:
+                to_forget.append(mid)
+                ctx.bump("pruned")
+            elif f[5] == ex_sha and settled and path not in forced:
+                kept[path] = mid
+            else:
+                to_forget.append(mid)
+                ctx.bump("changed")
+        ctx.say(f"{_stamp()}  {len(kept):,} member(s) unchanged and kept, {len(to_forget):,} to redo "
+                f"({ctx.stats.get('pruned', 0):,} gone from disk), {len(found) - len(kept) - ctx.stats.get('changed', 0):,} new")
+        if to_forget:
+            progress.phase(f"removing the old facts of {len(to_forget):,} member(s)")
+            _forget_members(conn, to_forget, progress)
+            conn.commit()
+
+        progress.phase(f"recording {len(found):,} member(s)")
+        k = 0
+        progress.set(lambda: f"{k:,}/{len(found):,} recorded")
+        for f in found:
+            path, name, kind, library, ext, sha_, norm, nbytes, nlines, fixed, note = f
+            if path in kept:
+                mem = Mem(kept[path], path, name, kind, library, norm, skip=True, nbytes=nbytes)
+                ctx.bump("unchanged")
+            else:
+                cur = conn.execute(
+                    "INSERT INTO member(path,name,kind,library,ext,sha256,norm_sha,bytes,lines,"
+                    "fixed_format,parse_status,parse_error,scanned_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (path, name, kind, library, ext, sha_, norm, nbytes, nlines, fixed,
+                     "failed" if note else "pending", note, now))
+                mem = Mem(cur.lastrowid, path, name, kind, library, norm, skip=bool(note), nbytes=nbytes)
+                if path not in existing:
+                    ctx.bump("new")
+            ctx.members.append(mem)
+            ctx.by_name.setdefault(name, []).append(mem)
+            ctx.bump(f"kind:{kind}")
+            k += 1
+    finally:
+        if own:
             progress.stop()
-            ctx.say(f"\nSTOPPED: {label} has been read for {_hms(INVENTORY_TIME_LIMIT)} and cannot be interrupted - "
-                    f"the classifier is stuck inside it. Move that one file out of the folder and run the same build "
-                    f"command again; then report its extension, size and what it is so the classifier can be fixed.")
-            raise
-        except MemberTimeout as e:
-            # recorded, not indexed: the name is what matters
-            ctx.bump("too_slow")
-            ctx.say(f"  gave up on {label}: {e}")
-            found.append((path, os.path.splitext(fn)[0].upper(), "unknown", os.path.basename(dirpath),
-                          os.path.splitext(fn)[1].lower(), sha(data), sha(data), len(data), 0, 0,
-                          f"InventoryTimeout: reading and classifying took longer than {INVENTORY_TIME_LIMIT} s - "
-                          f"not indexed; move the file out of the folder, or report its extension, size and what it is"))
-    progress.stop()
-    found_by = {f[0]: f for f in found}
-    _load_library_markers(ctx, roots)
-
-    changed = [f for f in found if f[0] not in existing or existing[f[0]][1] != f[5]]
-    changed_names = {f[1] for f in changed if f[2] in ("copybook", "cobol")}
-    forced: set = set()
-    if changed_names and existing:
-        # programs and copybooks that expand a changed copybook, transitively
-        pending = set(changed_names)
-        seen_names: set = set()
-        while pending:
-            q = ",".join("?" * len(pending))
-            rows = conn.execute(f"SELECT DISTINCT m.path, m.name, m.kind FROM copy_use c JOIN member m ON m.id=c.member_id "
-                                f"WHERE UPPER(c.copybook) IN ({q})", tuple(pending)).fetchall()
-            seen_names |= pending
-            pending = set()
-            for r in rows:
-                forced.add(r[0])
-                if r[2] == "copybook" and r[1] not in seen_names:
-                    pending.add(r[1])
-    if any(f[2] in ("proc", "jcl", "ctlcard") for f in changed) and existing:
-        # a PROC, INCLUDE or card member changed: every job that expands it
-        # carries its facts - re-parse all JCL (cheap next to COBOL)
-        forced |= {r[0] for r in conn.execute("SELECT path FROM member WHERE kind IN ('jcl','proc')")}
-    if force_all:
-        forced |= set(existing)
-
-    kept: Dict[str, int] = {}
-    for path, (mid, ex_sha, ex_status, ex_error, *_rest) in existing.items():
-        f = found_by.get(path)
-        settled = _settled(ex_status, ex_error)     # a member that hit a limit is not retried until the parser changes
-        if f is None:
-            _forget_member(conn, mid)
-            ctx.bump("pruned")
-        elif f[5] == ex_sha and settled and path not in forced:
-            kept[path] = mid
-        else:
-            _forget_member(conn, mid)
-            ctx.bump("changed")
-
-    for f in found:
-        path, name, kind, library, ext, sha_, norm, nbytes, nlines, fixed, note = f
-        if path in kept:
-            mem = Mem(kept[path], path, name, kind, library, norm, skip=True)
-            ctx.bump("unchanged")
-        else:
-            cur = conn.execute(
-                "INSERT INTO member(path,name,kind,library,ext,sha256,norm_sha,bytes,lines,"
-                "fixed_format,parse_status,parse_error,scanned_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (path, name, kind, library, ext, sha_, norm, nbytes, nlines, fixed,
-                 "failed" if note else "pending", note, now))
-            mem = Mem(cur.lastrowid, path, name, kind, library, norm, skip=bool(note))
-            if path not in existing:
-                ctx.bump("new")
-        ctx.members.append(mem)
-        ctx.by_name.setdefault(name, []).append(mem)
-        ctx.bump(f"kind:{kind}")
+            ctx.progress = None
 
 
 def _parse_one(ctx: Ctx, mem: Mem, handler) -> None:
@@ -1805,9 +1998,21 @@ def _main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args(argv)
 
-    t0 = time.time()
+    say = (lambda msg: None) if args.quiet else (lambda msg: print(msg, flush=True))
+    current_file = None if args.no_current_file else os.path.join(os.path.dirname(os.path.abspath(args.db)), CURRENT_FILE)
+    progress = Progress(say, current_file=current_file).start()
+    try:
+        return _build(args, progress, time.time())
+    finally:
+        progress.stop()
+
+
+def _build(args: argparse.Namespace, progress: Progress, t0: float) -> int:
+    progress.phase("opening the index")
     conn = open_db(args.db, rebuild=args.rebuild)
     ctx = Ctx(conn, quiet=args.quiet)
+    ctx.progress = progress
+    ensure_fk_indexes(conn, ctx.say)
     ctx.write_expanded = args.write_expanded
     if ctx.write_expanded:
         os.makedirs(ctx.write_expanded, exist_ok=True)
@@ -1829,26 +2034,34 @@ def _main(argv: Optional[List[str]] = None) -> int:
         elif (last["manifest_sha"] or None) != man_sha:
             force_all = True
             ctx.say("manifest changed since the last build: every member is re-parsed")
+    # Until the old facts are removed and every member is recorded again, this
+    # run carries the PREVIOUS fingerprint: stopped or crashed during the
+    # inventory, the next run must still see the toolkit as changed.
     run = conn.execute("INSERT INTO build_run(started_at,root,tool_version,fingerprint,manifest_sha) VALUES(?,?,?,?,?)",
-                       (time.strftime("%Y-%m-%dT%H:%M:%S"), args.root, VERSION, fp, man_sha))
+                       (time.strftime("%Y-%m-%dT%H:%M:%S"), args.root, VERSION,
+                        last["fingerprint"] if force_all else fp, last["manifest_sha"] if force_all else man_sha))
     run_id = run.lastrowid
     conn.commit()                              # a crash leaves a run with no finished_at: visible in `coverage`
 
+    skip_paths, skip_names = load_skip_list(args.skip_list)
+    ctx.inventory_skips = load_inventory_skips(args.skip_list)
     roots = [args.root, *(args.also or [])]
     ctx.say("inventory: " + ", ".join(roots))
     load_declared_kinds(ctx, args.manifest)
     try:
         inventory(ctx, roots, args.limit, force_all=force_all)
     except ParserStuck:
+        conn.rollback()
         return 3
     except KeyboardInterrupt:
-        if ctx.progress:
-            ctx.progress.stop()
-        ctx.say("\nstopped by Ctrl+C during the inventory - nothing was written yet; run the same command again")
+        conn.rollback()                        # nothing half-removed is kept; the next run starts the inventory again
+        ctx.say("\nstopped by Ctrl+C during the inventory - nothing was changed; run the same command again")
         return 130
+    conn.execute("UPDATE build_run SET fingerprint=?, manifest_sha=? WHERE id=?", (fp, man_sha, run_id))
     conn.commit()
     ctx.say(f"  {len(ctx.members)} files: " + ", ".join(
         f"{k[5:]}={v}" for k, v in sorted(ctx.stats.items()) if k.startswith("kind:")))
+    progress.phase("manifest and systems")
     if args.manifest:
         apply_manifest(ctx, args.manifest)
     else:
@@ -1856,49 +2069,66 @@ def _main(argv: Optional[List[str]] = None) -> int:
     derive_systems(ctx, args.root)
     for sched_path in args.sched or []:
         load_sched(ctx, sched_path)
+    conn.commit()
 
-    # Copybooks first so field rows exist; programs; then everything else.
+    # Copybooks first so field rows exist; programs; then everything else -
+    # grouped by kind, so the screen says when one kind is done.
     order = {"copybook": 0, "cobol": 1, "proc": 2, "jcl": 3, "dbd": 4, "psb": 5, "doc": 9}
+    members = sorted(ctx.members, key=lambda m: (order.get(m.kind, 6), m.kind))
     ok = partial = failed = 0
     slow: List[Tuple[float, str, str]] = []
     member_limit = float(args.member_limit or MEMBER_TIME_LIMIT)
-    n_parse = sum(1 for m in ctx.members if not m.skip)
-    ctx.say(f"parsing {n_parse} member(s) ({len(ctx.members) - n_parse} unchanged, kept) - a line every "
-            f"{int(PROGRESS_SECONDS)} s with the time left at the current rate and the member in hand; Ctrl+C stops "
-            "cleanly and the same command continues later")
+    n_parse = sum(1 for m in members if not m.skip)
+    todo_by_kind: Dict[str, int] = {}
+    for m in members:
+        if not m.skip:
+            todo_by_kind[m.kind] = todo_by_kind.get(m.kind, 0) + 1
+    progress.phase(f"parsing {n_parse:,} member(s)", limit=member_limit)
+    ctx.say(f"  {len(members) - n_parse:,} unchanged and kept; to parse: "
+            + (", ".join(f"{KIND_LABELS.get(k, k)} {v:,}" for k, v in todo_by_kind.items()) or "nothing")
+            + f". A line every {int(PROGRESS_SECONDS)} s with the time left at the current rate and the member in hand "
+              "with its size; a line when a kind is done; Ctrl+C stops cleanly and the same command continues later")
     t_commit = t_start = time.time()
     done = 0
     i = 0
     stopped = False
+    cur_kind: Optional[str] = None
+    kind_done = 0
+    kind_t0 = time.time()
 
     def status() -> str:
         elapsed = time.time() - t_start
         rate = done / elapsed if elapsed > 0 else 0.0
         eta = _hms((n_parse - done) / rate) if rate > 0 else "?"
-        return (f"{i}/{len(ctx.members)} - {done}/{n_parse} parsed in {_hms(elapsed)}, {rate:.1f}/s, "
+        return (f"{i}/{len(members)} - {done}/{n_parse} parsed in {_hms(elapsed)}, {rate:.1f}/s, "
                 f"about {eta} left at this rate")
 
-    skip_paths, skip_names = load_skip_list(args.skip_list)
+    def kind_line(nxt: Optional[str]) -> None:
+        if cur_kind is None:
+            ctx.say(f"{_stamp()}  starting with {KIND_LABELS.get(nxt, nxt)} ({todo_by_kind.get(nxt, 0):,})")
+            return
+        secs = time.time() - kind_t0
+        msg = (f"{_stamp()}  {KIND_LABELS.get(cur_kind, cur_kind)} done: {kind_done:,} in {_hms(secs)}"
+               + (f" ({kind_done / secs:.1f}/s)" if secs >= 1 else ""))
+        if nxt:
+            msg += f"; next: {KIND_LABELS.get(nxt, nxt)} ({todo_by_kind.get(nxt, 0):,})"
+        ctx.say(msg)
+
     if skip_paths or skip_names:
         ctx.say(f"skip list: {len(skip_paths) + len(skip_names)} member(s) that froze the parser on an earlier run are "
                 f"recorded as failed, not parsed ({args.skip_list})")
-    current_file = None if args.no_current_file else os.path.join(os.path.dirname(os.path.abspath(args.db)), CURRENT_FILE)
-    progress = ctx.progress = Progress(ctx.say, limit=member_limit).start()
     progress.set(status)
-    for i, mem in enumerate(sorted(ctx.members, key=lambda m: order.get(m.kind, 6)), 1):
+    for i, mem in enumerate(members, 1):
         if mem.skip:
             continue                       # unchanged since last build; facts kept
+        if mem.kind != cur_kind:
+            kind_line(mem.kind)
+            cur_kind, kind_done, kind_t0 = mem.kind, 0, time.time()
         if time.time() - t_commit >= 10:
             t_commit = time.time()
             conn.commit()
         handler = HANDLERS.get(mem.kind)
         label = f"{mem.kind} {os.path.basename(mem.path)}"
-        if current_file:
-            try:                                                        # the supervisor reads this if we freeze
-                with open(current_file, "w", encoding="utf-8") as fh:
-                    fh.write(f"{mem.path}\n{label}\n")
-            except OSError:
-                pass
         if os.path.normcase(os.path.abspath(mem.path)) in skip_paths or os.path.basename(mem.path).upper() in skip_names:
             _clear_facts(conn, mem.id)
             conn.execute("UPDATE member SET parse_status='failed', parse_error=? WHERE id=?",
@@ -1907,8 +2137,9 @@ def _main(argv: Optional[List[str]] = None) -> int:
             ctx.say(f"{_stamp()}  SKIPPED {label}: froze the parser on an earlier run (skip list)")
             failed += 1
             done += 1
+            kind_done += 1
             continue
-        progress.now(label)
+        progress.now(f"{label} ({_size(mem.nbytes)})", path=mem.path)
         t_member = time.time()
         try:
             run_with_limit(_parse_one, (ctx, mem, handler), member_limit, label)
@@ -1947,26 +2178,35 @@ def _main(argv: Optional[List[str]] = None) -> int:
                          (f"{type(e).__name__}: {e}"[:500], mem.id))
             ctx.say(f"{_stamp()}  FAILED {mem.kind} {mem.path}: {type(e).__name__}: {e}")
         done += 1
+        kind_done += 1
         if i % 500 == 0:
             conn.commit()
-            ctx.say(f"  {i}/{len(ctx.members)} ...")
-    progress.stop()
     conn.commit()
     if stopped:
         conn.close()
         return 130
+    if cur_kind is not None:
+        kind_line(None)
+    ctx.say(f"{_stamp()}  parsing done: {done:,} member(s) in {_hms(time.time() - t_start)}")
     if slow:
         slow.sort(reverse=True)
         ctx.say("  slowest members: " + "; ".join(f"{k} {n} {int(s)} s" for s, k, n in slow[:5]))
 
+    progress.phase("post: DD directions from OPEN verbs")
+    if _FREEZE == "PHASE:post":                    # tests only: a step that goes silent
+        progress.stop()
+        time.sleep(3600)
     n = post_open_modes(ctx)
     ctx.say(f"post: {n} DD direction(s) set from OPEN verbs")
+    progress.phase("post: DL/I calls mapped to databases through the PSB")
     n = post_pcb_positions(ctx)
     ctx.say(f"post: {n} DL/I call(s) mapped to a database through the PSB")
     conn.execute("UPDATE build_run SET finished_at=?, members=?, ok=?, partial=?, failed=? WHERE id=?",
                  (time.strftime("%Y-%m-%dT%H:%M:%S"), len(ctx.members), ok, partial, failed, run_id))
     conn.commit()
+    progress.phase("summary")
     summary(ctx, args.db, args.root, t0)
+    progress.phase("finished")
     conn.close()
     return 0
 

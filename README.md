@@ -469,8 +469,10 @@ the host no longer lists are moved to `<folder>/.stale/`, and the record
 instead of NOT FOUND. The build re-parses everything when a **parser**
 module changed (`git pull` that touches `cobol.py`, `jcl.py`, `docs.py`… -
 never for a query, prompt or UI change) or the manifest changed, re-parses
-every job when a PROC / INCLUDE / card member changed, prints every 10 s
-how many members are parsed, the rate and the **time left at that rate**,
+every job when a PROC / INCLUDE / card member changed, announces every step
+with the time (`== inventory`, `== removing the old facts of N member(s)`, `== parsing`, `== post: ...`),
+reports each folder when it is done and each kind of member when it is done, prints every 10 s
+how many members are parsed, the member in hand with its size, the rate and the **time left at that rate**,
 stops cleanly on **Ctrl+C** (what was parsed is kept; the same command
 continues from there), gives up on one member after **15 minutes**
 (`--member-limit`; the member is recorded as failed with the reason, its
