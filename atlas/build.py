@@ -137,6 +137,40 @@ def _size(n: int) -> str:
 CURRENT_FILE = "atlas-current.txt"        # beside the db: the member in hand (path + label) - read by atlas.supervise
 SKIP_FILE = "atlas-skip.txt"              # beside the db: members that froze the parser - written by atlas.supervise
 _FREEZE = os.environ.get("ATLAS_TEST_FREEZE")   # tests only: this member freezes the whole process, output included
+_FAULT = os.environ.get("ATLAS_TEST_FAULT")     # tests only: "diskfull:<member file>" or "crash:post"
+PROBLEMS_FILE = "atlas-problems.txt"            # beside the db: every problem of the run, one line each
+PROBLEM_EXAMPLES = 5                            # names shown per kind of problem in the end-of-build list
+
+
+class BuildFatal(Exception):
+    """The index itself cannot be written (disk full, I/O error, read-only,
+    locked): no further member can succeed, so the build stops once."""
+
+
+_FATAL_DB = ("disk is full", "database or disk is full", "disk i/o error", "attempt to write a readonly database",
+             "database is locked", "unable to open database", "no space left", "out of memory")
+
+
+def fatal_db_error(e: BaseException) -> Optional[str]:
+    """The message when `e` means the index cannot be written at all."""
+    if isinstance(e, (sqlite3.OperationalError, sqlite3.DatabaseError, MemoryError)) or \
+            (isinstance(e, OSError) and getattr(e, "errno", None) == 28):
+        msg = str(e) or type(e).__name__
+        if isinstance(e, MemoryError) or any(k in msg.lower() for k in _FATAL_DB) or getattr(e, "errno", None) == 28:
+            return msg
+    return None
+
+
+def toolkit_where(e: BaseException) -> str:
+    """`cobol.py:1234 in _extract_x` - the deepest toolkit frame, so a failure
+    line can be fixed from the screen alone (no estate text in it)."""
+    import traceback
+    frames = [f for f in traceback.extract_tb(e.__traceback__)
+              if "/atlas/" in f.filename.replace("\\", "/")]
+    if not frames:
+        return ""
+    f = frames[-1]
+    return f"{os.path.basename(f.filename)}:{f.lineno} in {f.name}"
 
 
 def _stamp() -> str:
@@ -316,6 +350,21 @@ class Ctx:
         self.copylib_order: Dict[str, List[str]] = {}   # SYSTEM -> copybook library folder names, SYSLIB order
         self.kind_of: Dict[str, str] = {}               # library folder name -> kind declared in sources.json
         self.progress: Optional["Progress"] = None      # the status line's clock, stopped by whoever ends the build
+        self.problems: List[Tuple[str, str, str]] = []   # (kind of problem, path, detail) - listed at the end of the build
+        self.problems_file: Optional[str] = None
+
+    def problem(self, kind: str, path: str, detail: str, line: Optional[str] = None) -> None:
+        """A member or file that could not be indexed: shown now (with the time),
+        written to atlas-problems.txt, and listed again at the end of the build -
+        after 121,000 members the line printed at 02:00 is long gone."""
+        self.problems.append((kind, path, detail))
+        self.say(line if line is not None else f"{_stamp()}  PROBLEM {kind}: {path} - {detail}")
+        if self.problems_file:
+            try:
+                with open(self.problems_file, "a", encoding="utf-8") as fh:
+                    fh.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}\t{kind}\t{path}\t{detail}\n")
+            except OSError:
+                pass
 
     def bump(self, key: str, n: int = 1) -> None:
         self.stats[key] = self.stats.get(key, 0) + n
@@ -801,7 +850,9 @@ def inventory(ctx: Ctx, roots, limit: Optional[int] = None, force_all: bool = Fa
                     progress.now(f"reading {fn} ({_size(st.st_size)}) in {fold}")
                     if st.st_size > MAX_MEMBER_BYTES:
                         ctx.bump("too_large")
-                        ctx.say(f"  skipped, too large to index: {path} ({st.st_size // 1024 // 1024} MB)")
+                        ctx.problem("too large to index", path, f"{st.st_size // 1024 // 1024} MB (limit "
+                                    f"{MAX_MEMBER_BYTES // 1024 // 1024} MB)",
+                                    f"{_stamp()}  skipped, too large to index: {path} ({st.st_size // 1024 // 1024} MB)")
                         continue
                     with open(docs.long_path(path), "rb") as fh:
                         data = fh.read()
@@ -817,7 +868,7 @@ def inventory(ctx: Ctx, roots, limit: Optional[int] = None, force_all: bool = Fa
                             hint = " - a OneDrive placeholder not downloaded to this laptop: right-click the folder > Always keep on this device"
                     except OSError:
                         pass
-                    ctx.say(f"  unreadable: {path} ({e}){hint}")
+                    ctx.problem("unreadable", path, f"{e}{hint}", f"{_stamp()}  unreadable: {path} ({e}){hint}")
                     continue
                 sha_ = sha(data)
                 ex = existing.get(path)
@@ -831,7 +882,8 @@ def inventory(ctx: Ctx, roots, limit: Optional[int] = None, force_all: bool = Fa
                 label = f"file {fn} ({len(data) // 1024} KB) in {fold}"
                 if os.path.normcase(os.path.abspath(path)) in skip_classify:
                     ctx.bump("too_slow")
-                    ctx.say(f"{_stamp()}  SKIPPED {label}: froze the classifier on an earlier run (skip list)")
+                    ctx.problem("skipped: froze the classifier on an earlier run", path, "skip list",
+                                f"{_stamp()}  SKIPPED {label}: froze the classifier on an earlier run (skip list)")
                     found.append((path, os.path.splitext(fn)[0].upper(), "unknown", os.path.basename(dirpath),
                                   os.path.splitext(fn)[1].lower(), sha_, sha_, len(data), 0, 0,
                                   "InventoryTimeout: froze the classifier on an earlier run - skipped (skip list); "
@@ -851,7 +903,7 @@ def inventory(ctx: Ctx, roots, limit: Optional[int] = None, force_all: bool = Fa
                 except MemberTimeout as e:
                     # recorded, not indexed: the name is what matters
                     ctx.bump("too_slow")
-                    ctx.say(f"  gave up on {label}: {e}")
+                    ctx.problem("classifier time limit", path, str(e), f"{_stamp()}  gave up on {label}: {e}")
                     found.append((path, os.path.splitext(fn)[0].upper(), "unknown", os.path.basename(dirpath),
                                   os.path.splitext(fn)[1].lower(), sha(data), sha(data), len(data), 0, 0,
                                   f"InventoryTimeout: reading and classifying took longer than {INVENTORY_TIME_LIMIT} s - "
@@ -942,6 +994,8 @@ def inventory(ctx: Ctx, roots, limit: Optional[int] = None, force_all: bool = Fa
 
 
 def _parse_one(ctx: Ctx, mem: Mem, handler) -> None:
+    if _FAULT and _FAULT.startswith("diskfull:") and os.path.basename(mem.path) == _FAULT[9:]:
+        raise sqlite3.OperationalError("database or disk is full")          # tests only
     if _FREEZE and os.path.basename(mem.path) == _FREEZE:
         if ctx.progress:                 # what a regular expression gone wrong looks like from outside:
             ctx.progress.stop()          # no status line, no limit, nothing - until the supervisor acts
@@ -2070,6 +2124,28 @@ def summary(ctx: Ctx, db_path: str, root: str, t0: float) -> None:
     print(f"\ndb: {db_path}   root: {root}   {time.time() - t0:.1f}s")
 
 
+def _problems_report(ctx: Ctx) -> None:
+    """The end-of-build list: every kind of problem with its count and the
+    first names, so nothing printed hours ago is missed."""
+    probs = ctx.problems
+    if not probs:
+        ctx.say("\n== problems in this run: none ==")
+        return
+    by_kind: Dict[str, List[Tuple[str, str]]] = {}
+    for kind, path, detail in probs:
+        by_kind.setdefault(kind, []).append((path, detail))
+    ctx.say(f"\n== problems in this run: {len(probs):,} member(s) or file(s) not indexed ==")
+    for kind, items in sorted(by_kind.items(), key=lambda kv: -len(kv[1])):
+        ctx.say(f"  {kind}: {len(items):,}")
+        for path, detail in items[:PROBLEM_EXAMPLES]:
+            ctx.say(f"    {os.path.basename(path)}  ({os.path.basename(os.path.dirname(path))})  {detail[:160]}")
+        if len(items) > PROBLEM_EXAMPLES:
+            ctx.say(f"    ... and {len(items) - PROBLEM_EXAMPLES:,} more")
+    if ctx.problems_file:
+        ctx.say(f"  every one of them, with its folder and reason: {ctx.problems_file}")
+    ctx.say("  send the problem and detail lines (the toolkit's messages - no content from the estate) to get a fix")
+
+
 # --------------------------------------------------------------------------
 # main
 # --------------------------------------------------------------------------
@@ -2142,6 +2218,13 @@ def _build(args: argparse.Namespace, progress: Progress, t0: float) -> int:
     run_id = run.lastrowid
     conn.commit()                              # a crash leaves a run with no finished_at: visible in `coverage`
 
+    ctx.problems_file = os.path.join(os.path.dirname(os.path.abspath(args.db)), PROBLEMS_FILE)
+    try:
+        with open(ctx.problems_file, "w", encoding="utf-8") as fh:
+            fh.write(f"# atlas build started {time.strftime('%Y-%m-%d %H:%M:%S')}: every member or file that could "
+                     "not be indexed, one per line (time, problem, path, detail)\n")
+    except OSError:
+        ctx.problems_file = None
     skip_paths, skip_names = load_skip_list(args.skip_list)
     ctx.inventory_skips = load_inventory_skips(args.skip_list)
     roots = [args.root, *(args.also or [])]
@@ -2233,7 +2316,8 @@ def _build(args: argparse.Namespace, progress: Progress, t0: float) -> int:
             conn.execute("UPDATE member SET parse_status='failed', parse_error=? WHERE id=?",
                          ("ParserStuck: froze the parser on an earlier run - skipped (skip list); report its kind, "
                           "size and shape so the parser can be fixed", mem.id))
-            ctx.say(f"{_stamp()}  SKIPPED {label}: froze the parser on an earlier run (skip list)")
+            ctx.problem("skipped: froze the parser on an earlier run", mem.path, "skip list",
+                        f"{_stamp()}  SKIPPED {label}: froze the parser on an earlier run (skip list)")
             failed += 1
             done += 1
             kind_done += 1
@@ -2271,11 +2355,29 @@ def _build(args: argparse.Namespace, progress: Progress, t0: float) -> int:
                     f"command again; then report its kind, size in KB and line count so the parser can be fixed.")
             return 3
         except Exception as e:                                          # noqa: BLE001
+            fatal = fatal_db_error(e)
+            if fatal:
+                progress.stop()
+                try:
+                    conn.rollback()
+                except sqlite3.DatabaseError:
+                    pass
+                ctx.say(f"\n{_stamp()}  STOPPED: the index cannot be written ({fatal}) while parsing {label}.\n"
+                        f"  Nothing more can be parsed until that is fixed: free space on the drive holding "
+                        f"{os.path.abspath(args.db)}, close any other program using it, then run the same command "
+                        f"again - members parsed so far are kept ({done:,}/{n_parse:,}).")
+                ctx.problems.append(("index cannot be written", mem.path, fatal))
+                _problems_report(ctx)
+                return 4
             failed += 1
+            where = toolkit_where(e)
             _clear_facts(conn, mem.id)
             conn.execute("UPDATE member SET parse_status='failed', parse_error=? WHERE id=?",
-                         (f"{type(e).__name__}: {e}"[:500], mem.id))
-            ctx.say(f"{_stamp()}  FAILED {mem.kind} {mem.path}: {type(e).__name__}: {e}")
+                         (f"{type(e).__name__}: {e}"[:480] + (f" [{where}]" if where else ""), mem.id))
+            kind_of_problem = "time limit" if isinstance(e, MemberTimeout) else "parse failed"
+            ctx.problem(kind_of_problem, mem.path, f"{type(e).__name__}: {e}" + (f" [{where}]" if where else ""),
+                        f"{_stamp()}  FAILED {mem.kind} {mem.path}: {type(e).__name__}: {e}"
+                        + (f"  [{where}]" if where and not isinstance(e, MemberTimeout) else ""))
         done += 1
         kind_done += 1
         if i % 500 == 0:
@@ -2295,6 +2397,8 @@ def _build(args: argparse.Namespace, progress: Progress, t0: float) -> int:
     if _FREEZE == "PHASE:post":                    # tests only: a step that goes silent
         progress.stop()
         time.sleep(3600)
+    if _FAULT == "crash:post":                     # tests only: a step that fails outright
+        raise RuntimeError("injected failure in the post pass")
     n = post_open_modes(ctx)
     ctx.say(f"post: {n} DD direction(s) set from OPEN verbs")
     progress.phase("post: DL/I calls mapped to databases through the PSB")
@@ -2305,6 +2409,7 @@ def _build(args: argparse.Namespace, progress: Progress, t0: float) -> int:
     conn.commit()
     progress.phase("summary")
     summary(ctx, args.db, args.root, t0)
+    _problems_report(ctx)
     progress.phase("finished")
     conn.close()
     return 0
@@ -2312,13 +2417,28 @@ def _build(args: argparse.Namespace, progress: Progress, t0: float) -> int:
 
 def main(argv: Optional[List[str]] = None) -> int:
     """Any crash becomes a short, redacted atlas-crash.txt you can share."""
+    args = list(sys.argv[1:] if argv is None else argv)
     try:
         return _main(argv)
     except Exception as e:                                              # noqa: BLE001
         from .diag import write_crash
-        text = write_crash(e, sys.argv)
-        print("\n" + text, file=sys.stderr)
-        print("\nSaved to atlas-crash.txt - paste it to get a fix.", file=sys.stderr)
+        db = "atlas.db"
+        for i, a in enumerate(args):
+            if a == "--db" and i + 1 < len(args):
+                db = args[i + 1]
+        crash_path = os.path.join(os.path.dirname(os.path.abspath(db)), "atlas-crash.txt")
+        text = write_crash(e, [sys.argv[0], *args], path=crash_path)
+        fatal = fatal_db_error(e)
+        print(f"\n{_stamp()}  BUILD STOPPED BY AN ERROR: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+        if fatal:
+            print(f"  The index cannot be written ({fatal}): free space on the drive holding {os.path.abspath(db)}, "
+                  "close any other program using it, then run the same command again - parsed members are kept.",
+                  file=sys.stderr, flush=True)
+        else:
+            print("  Members parsed so far are kept; the same command continues from there once it is fixed.",
+                  file=sys.stderr, flush=True)
+        print("\n" + text, file=sys.stderr, flush=True)
+        print(f"\nSaved to {crash_path} - paste it to get a fix.", file=sys.stderr, flush=True)
         return 2
 
 

@@ -153,8 +153,8 @@ def write_crash(exc: BaseException, argv: List[str], path: str = "atlas-crash.tx
     frames = [f for f in traceback.extract_tb(exc.__traceback__) if os.sep + "atlas" + os.sep in f.filename
               or "/atlas/" in f.filename.replace("\\", "/")]
     lines = ["=== atlas crash ===", time.strftime("%Y-%m-%dT%H:%M:%S"),
-             "command: " + redact(" ".join(os.path.basename(argv[0]) if argv else "" if i == 0 else a
-                                           for i, a in enumerate(argv))),
+             "command: " + redact(" ".join((os.path.basename(a) if i == 0 else a)
+                                           for i, a in enumerate(argv or []))),
              *environment(),
              f"exception: {type(exc).__name__}: {redact(str(exc))[:400]}",
              "where (toolkit frames only):"]

@@ -167,6 +167,16 @@ def run(build_args: List[str], silence: float = SILENCE_SECONDS, max_restarts: i
             continue
         if rc == 0:
             say(f"{_stamp()} supervisor: build finished" + (f" after {restarts} restart(s)" if restarts else ""))
+        elif rc == 130:
+            say(f"{_stamp()} supervisor: the build was stopped by Ctrl+C - run the same command again to continue")
+        elif rc == 4:
+            say(f"{_stamp()} supervisor: the build STOPPED - the index cannot be written (see the STOPPED message "
+                f"above). Not restarting: fix that first, then run the same command again.")
+        else:
+            crash = os.path.join(folder, "atlas-crash.txt")
+            say(f"{_stamp()} supervisor: the build STOPPED BY AN ERROR (exit code {rc}) - the message is above"
+                + (f" and in {crash}" if os.path.exists(crash) else "")
+                + ". Not restarting: send that report (toolkit lines only, nothing from the estate).")
         return rc
 
 

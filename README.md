@@ -474,7 +474,7 @@ with the time (`== inventory`, `== removing the old facts of N member(s)`, `== p
 reports each folder when it is done and each kind of member when it is done, prints every 10 s
 how many members are parsed, the member in hand with its size, the rate and the **time left at that rate**,
 stops cleanly on **Ctrl+C** (what was parsed is kept; the same command
-continues from there), gives up on one member after **15 minutes**
+continues from there), prints every problem with the time (a parse failure with the toolkit line to fix), writes them all to `atlas-problems.txt` and lists them again at the end of the build, stops once with a plain message when the index cannot be written (disk full, locked), gives up on one member after **15 minutes**
 (`--member-limit`; the member is recorded as failed with the reason, its
 half-written facts dropped, and it is not retried until the parser changes)
 and, when a member cannot even be interrupted, stops and names it so the
