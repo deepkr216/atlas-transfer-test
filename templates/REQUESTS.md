@@ -180,6 +180,34 @@ from the UNRESOLVED lists. HUMAN MUST VERIFY.
 <rules>
 ```
 
+## H1 Transition document for a release (Application Operations + Contact Center)
+
+Attach `work/release-facts.md` (copied from `templates/release-facts.md` and filled in), `work/release.md`, every `work/diff-*.md`, `work/walk-*.md`, `work/layout.md`, `work/pack.md`, `work/crud.md`, and the `work/doc*.md` reports for the plan, the stories and the QA workbooks.
+
+```
+Write the transition document for: <release>. Plain working English for the
+people who run and support it, one fact per sentence, names exactly as the
+reports spell them, no filler. Part 1 for everyone: WHAT THIS RELEASE DOES
+(from the release facts, the plan and the stories, cited), CHANGED COMPONENTS
+(the release table with "what changed" per member from the diffs; from the
+plan when no previous copy exists). Part 2 for Application Operations: JOBS
+AND SCHEDULES (crud, job), WHAT CHANGED IN EACH PROGRAM (walk, diff; cited on
+the new copy, and on the old when it exists), FILES AND RECORD LAYOUTS (diff,
+layout, pack: added / changed / shifted fields and every other program that
+expands the copybook), MESSAGES / ABENDS / RESTART, MONITORING FOR THE FIRST
+RUNS. Part 3 for the Contact Center: WHAT CUSTOMERS AND AGENTS WILL NOTICE
+(stories, screens, messages; UNKNOWN if the stories do not say), NEW OR
+CHANGED VALUES AND CODES, WHAT TO TELL A CALLER (only from the facts and the
+release facts; "instruction needed" where they give none), KNOWN ISSUES AND
+OPEN TEST CASES (QA workbook rows not marked passed; changed paragraphs no
+test covers). Part 4: TEST EVIDENCE (workbook sections and screenshot OCR
+sections, cited), UNRESOLVED IN SCOPE, NOT SEARCHED, HUMAN MUST VERIFY (the
+promote list, the QA sign-off, dates and contacts, files already written with
+the old layout, every "instruction needed"). Release facts are cited as
+[[work/release-facts.md <line> "token"]].
+<rules>
+```
+
 ## The gate failed
 
 Attach `work/answer.md`, `work/gate.txt`, `work/pack.md`.

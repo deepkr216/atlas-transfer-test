@@ -324,6 +324,17 @@ class DocTables(unittest.TestCase):
         self.assertEqual(sum(t.count("\n") + 1 for _h, t in parts), 400000)                   # every row, once
         self.assertEqual("\n".join(t for _h, t in parts), rows)                                # nothing lost or altered
 
+    def test_release_facts_file_is_citable_by_path_and_line(self):
+        # the transition document cites work/release-facts.md (not indexed) by path + line
+        work = os.path.join(self.td, "work")
+        os.makedirs(work, exist_ok=True)
+        with open(os.path.join(work, "release-facts.md"), "w", encoding="utf-8") as fh:
+            fh.write("# Release facts\n\n- Go-live date and time: 2026-10-01 06:00\n- On-call: Ops desk\n")
+        res, _u = verify_citations.check_answer('[[work/release-facts.md 3 "2026-10-01 06:00"]]', root=self.td, db_path=self.db)
+        self.assertEqual([r.status for r in res], ["PASS"], res)
+        res, _u = verify_citations.check_answer('[[work/release-facts.md 4 "2026-10-01 06:00"]]', root=self.td, db_path=self.db)
+        self.assertEqual([r.status for r in res], ["FAIL"], res)
+
     def test_big_sheet_is_cut_between_rows(self):
         p = os.path.join(self.td, "BIG.xlsx")
         write_workbook(p, big_rows=400)

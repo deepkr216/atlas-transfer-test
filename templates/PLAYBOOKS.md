@@ -381,11 +381,27 @@ changed lines of both sides with their own numbers. A copy that is not in the
 index yet (a file just downloaded to a scratch folder) can be diffed by path:
 lines only, no facts.
 
-**Pass 2 - narrative (one model call, `/atlas-handover`):** summary; the
-changed-components table from `release` with "what changed" per member from the
-diffs; per program what it does now (cited NEW) and did before (cited OLD); per
-copybook the added, changed and shifted fields and every other program that
-expands it; jobs and CRUD; the QA evidence from the workbook's sections and
-screenshots, mapped to the changed paragraphs, naming the paragraphs no test
-covers; support notes (messages, restart); HUMAN MUST VERIFY seeded with the
-promote list and the files already written with the old layout.
+**Pass 2 - narrative (one model call, `/atlas-handover`):** the document
+has two audiences and says so: Part 2 for Application Operations (jobs and
+schedules from `crud` / `job`, what changed in each program from `walk` /
+`diff`, files and record layouts, messages / abends / restart, what to watch
+in the first runs) and Part 3 for the Contact Center (what customers and
+agents will notice from the stories and the screen / message reports, new or
+changed values and codes, what to tell a caller, known issues and open test
+cases from the QA workbooks). Part 1 is the summary and the changed-components
+table; Part 4 the test evidence and the gaps. What no file holds - go-live
+date, contacts, escalation, schedule changes, what agents may say - goes into
+`work/release-facts.md` (copy `templates/release-facts.md`), attached and
+cited by path; a line left UNKNOWN there surfaces under HUMAN MUST VERIFY
+instead of being written around. Why a chat model alone fails at this
+document: it has none of the facts, so it fills the shape with generic
+advice; the reports give it the names, the rule gives it the discipline,
+the gate catches what it still invents.
+
+**No previous copy of the changed members?** When the changes are already
+in the production PDS and no baseline library exists, `diff` has nothing to
+compare: the changed-components table then comes from the release facts
+(the promote list) and the plan, and the code side shows the programs as
+they are now (`walk`). If a backup or previous-release library exists,
+download it into `estate\<SYSTEM>-PREV\<library>\` and diff PREV against
+current.
