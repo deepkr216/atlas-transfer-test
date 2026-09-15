@@ -159,6 +159,55 @@ class BuildErrors(unittest.TestCase):
         self.assertIsNone(build.fatal_db_error(ValueError("bad")))
 
 
+class CoverageExplainsTheStatuses(unittest.TestCase):
+    """`ok / partial / skipped / failed` on the build's own summary means
+    nothing without the reasons: coverage names the members parsed only in
+    part and why, and says what each status means."""
+
+    def setUp(self):
+        self.td = tempfile.mkdtemp()
+        src = os.path.join(self.td, "estate", "SRC")
+        os.makedirs(src)
+        # SAMPPGM and ERRPGM copy copybooks that are NOT here (partial); WALKPROC.cpy in a
+        # source library is not a program (skipped); the rest parse
+        for fn in ("SAMPPGM.cbl", "ERRPGM.cbl", "WALKPGM.cbl", "WALKREC.cpy", "WALKPROC.cpy", "SAMPJOB.jcl", "RUNCLM.ctl"):
+            shutil.copy(os.path.join(FIX, fn), src)
+        self.db = os.path.join(self.td, "t.db")
+        with contextlib.redirect_stdout(io.StringIO()):
+            build._main([os.path.join(self.td, "estate"), "--db", self.db, "--rebuild"])
+
+    def tearDown(self):
+        shutil.rmtree(self.td, ignore_errors=True)
+
+    def test_coverage_names_the_partial_members_and_their_reason(self):
+        conn = query.connect(self.db)
+        try:
+            cov = query.cmd_coverage(conn)
+        finally:
+            conn.close()
+        self.assertIn("**partial**: a parser ran but could not complete the picture", cov)
+        self.assertIn("not a program (no PROGRAM-ID and no DIVISION header", cov)
+        self.assertIn("### Members parsed only in part (2)", cov)
+        self.assertIn("| cobol | 2 | expand (2) |", cov)
+        for member, copybook in (("SAMPPGM", "PMASTREC"), ("ERRPGM", "POLDCL")):
+            row = [ln for ln in cov.splitlines() if ln.startswith(f"| cobol | {member} |")]
+            self.assertEqual(len(row), 1, cov)
+            self.assertIn(f"COPY {copybook} NOT FOUND", row[0])
+        self.assertIn("usually partial because a copybook it copies is not in the index", cov)
+
+    def test_coverage_says_none_when_every_member_is_complete(self):
+        os.remove(os.path.join(self.td, "estate", "SRC", "SAMPPGM.cbl"))
+        os.remove(os.path.join(self.td, "estate", "SRC", "ERRPGM.cbl"))
+        with contextlib.redirect_stdout(io.StringIO()):
+            build._main([os.path.join(self.td, "estate"), "--db", self.db, "--rebuild"])
+        conn = query.connect(self.db)
+        try:
+            cov = query.cmd_coverage(conn)
+        finally:
+            conn.close()
+        self.assertIn("### Members parsed only in part\n_none_", cov)
+
+
 class SupervisorSaysWhy(unittest.TestCase):
 
     def setUp(self):

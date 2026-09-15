@@ -1398,6 +1398,43 @@ def index_header(conn: sqlite3.Connection) -> str:
     return "; ".join(parts)
 
 
+def _partial_members(conn: sqlite3.Connection) -> str:
+    """Members whose facts are incomplete, with the reason the parser gave -
+    a COBOL member is `partial` mostly because a copybook it copies was not
+    found, and then the fields of that copybook are missing from the index."""
+    rows = conn.execute("""
+        SELECT m.kind, m.name, m.library, m.parse_error,
+               (SELECT u.kind || ': ' || SUBSTR(COALESCE(u.detail, ''), 1, 90) FROM unresolved u
+                WHERE u.member_id = m.id ORDER BY u.id LIMIT 1) AS why
+        FROM member m WHERE m.parse_status = 'partial' ORDER BY m.kind, m.name""").fetchall()
+    if not rows:
+        return "\n### Members parsed only in part\n_none_\n"
+    by_kind: Dict[str, List[sqlite3.Row]] = defaultdict(list)
+    for r in rows:
+        by_kind[r["kind"]].append(r)
+    out = [f"\n### Members parsed only in part ({len(rows)}) - their facts are incomplete to this extent\n"]
+    out.append(table(["kind", "members", "most common reason"],
+                     [(k, len(v), _top_reason(v)) for k, v in sorted(by_kind.items(), key=lambda kv: -len(kv[1]))]))
+    shown = [(r["kind"], r["name"], r["library"], (r["why"] or r["parse_error"] or "")[:110]) for r in rows[:15]]
+    out.append("\n" + table(["kind", "member", "library", "reason"], shown))
+    if len(rows) > 15:
+        out.append(f"_... {len(rows) - 15} more; every one of them: "
+                   "`python -m atlas.query --db atlas.db search \"...\"` or the member's own report_\n")
+    out.append("\n> A COBOL member is usually partial because a copybook it copies is not in the index: fetch that "
+               "copybook library and build again. A document is partial when no text could be extracted (a scan - "
+               "run `OCR images`). A screen member is partial when no map or format macro was recognised.\n")
+    return "".join(out)
+
+
+def _top_reason(rows: List[sqlite3.Row]) -> str:
+    counts: Dict[str, int] = {}
+    for r in rows:
+        key = (r["why"] or r["parse_error"] or "not stated").split(":", 1)[0][:40]
+        counts[key] = counts.get(key, 0) + 1
+    best = max(counts.items(), key=lambda kv: kv[1])
+    return f"{best[0]} ({best[1]})"
+
+
 def cmd_coverage(conn: sqlite3.Connection) -> str:
     out = ["# Coverage - what the index does and does not know\n", f"\n_{index_header(conn)}_\n"]
     libs = conn.execute("SELECT dataset, fetched_at, expected, present, complete, missing, stale FROM library ORDER BY dataset").fetchall()
@@ -1410,6 +1447,14 @@ def cmd_coverage(conn: sqlite3.Connection) -> str:
     out.append("\n### Members\n")
     out.append(table(["kind", "status", "count"], conn.execute(
         "SELECT kind, parse_status, COUNT(*) FROM member GROUP BY 1,2 ORDER BY 1,2").fetchall()))
+    out.append("\n- **ok**: parsed, its facts are in the index. **skipped**: nothing to parse - either the kind has "
+               "no parser of its own (control cards, REXX, SQL scripts, assembler, listings, unrecognised members: "
+               "still indexed and searchable, and a control card is read in full where a job points at it), or the "
+               "member sits in a source library but is not a program (no PROGRAM-ID and no DIVISION header - a "
+               "procedure copybook or a card deck filed there); the member itself says which. **partial**: a parser "
+               "ran but could not complete the picture - the next table says which members and why. **failed**: not "
+               "indexed at all (the build printed it at the time and listed it again at the end).\n")
+    out.append(_partial_members(conn))
     out.append("\n### Call resolution\n")
     out.append(table(["kind", "resolution", "count"], conn.execute(
         "SELECT kind, resolution, COUNT(*) FROM call_edge GROUP BY 1,2").fetchall()))
