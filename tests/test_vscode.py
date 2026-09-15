@@ -39,7 +39,7 @@ INPUTS = {"name": "SAMPPGM", "kind": "program", "budget": "12000", "field": "PM-
           "field2": "PM-POLICY-STATUS", "pattern": "ERROR", "literal": "E001", "job": "SAMPJOB",
           "program": "SAMPPGM", "copybook": "PMASTREC", "member": "SAMPPGM", "range": "1-9999",
           "paragraph": "100-MAIN", "document": "CLAIMSPEC",
-          "old": "SAMPPGM", "new": "", "system": "", "docpattern": ""}
+          "old": "SAMPPGM", "new": "", "system": "", "docpattern": "", "members": "", "docnames": ""}
 USER_WRITTEN = {"abend.txt", "answer.md", "release-facts.md"}      # filled in by hand (templates/release-facts.md)
 
 
@@ -167,7 +167,7 @@ class TasksAndPrompts(unittest.TestCase):
                     self.assertIn("--out", piece, (t["label"], "a report task must use --out"))
                     self.assertNotIn(">", piece, (t["label"], "never the shell's redirection"))
                 elif m:
-                    self.assertIn(m.group(1), ("verify_citations", "ui"), (t["label"], m.group(1)))
+                    self.assertIn(m.group(1), ("verify_citations", "ui", "handover"), (t["label"], m.group(1)))
                 else:
                     self.assertEqual(piece, "python selfcheck.py", (t["label"], piece))
             if ";" in t["command"]:

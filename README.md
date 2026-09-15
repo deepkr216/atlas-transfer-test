@@ -434,6 +434,15 @@ below do the same step by step, when you want to choose the report yourself:
   `interfaces`, `coverage`, `whole member`, `paragraph`) - every report is
   written with `--out` into `work/` as UTF-8. Never use the shell's `>` for
   a report: PowerShell 5.1 writes UTF-16 and the model reads garbage.
+- For a release hand-over, one task does the gathering:
+  `Atlas: handover pack` (`python -m atlas.handover --system GC-DEV --docs
+  PLAN,STORIES,QA...`) writes every report the transition document needs
+  into `work/handover.md` in the right order - release list, a diff per
+  changed member, the walk of each changed program's new copy, copybook
+  users and layouts, crud and jobs, the documents' sections - and creates
+  `work/release-facts.md` from the template for the facts no file holds.
+  Its first lines give the size in tokens. Then `/atlas-handover` in ask
+  mode is a single request, even on a laptop with a small token quota.
 - In Copilot Chat type `/atlas-answer` (or `/atlas-program`, `/atlas-impact`,
   `/atlas-job`, `/atlas-trace`, `/atlas-populate`, `/atlas-abend`,
   `/atlas-values`, `/atlas-tests`, `/atlas-design`, `/atlas-handover`): the prompt attaches

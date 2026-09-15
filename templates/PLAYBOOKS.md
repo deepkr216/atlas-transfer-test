@@ -353,12 +353,28 @@ Question shape: "3 programs and 4 copybooks changed, QA is done, write the
 transition document for the support team". The production copies are in the
 index (`estate\GC\...`); the changed copies live in a lower-environment PDS.
 
-**Pass 1 - facts (no model):**
+**Pass 1 - facts (no model), the one-command way:**
 
 ```
 zowe zos-files download all-members "TEST.GC.SRC" -d estate\GC-TEST\TEST.GC.SRC   # the changed copies (or only the changed members)
 zowe zos-files download all-members "TEST.GC.CPY" -d estate\GC-TEST\TEST.GC.CPY
 python -m atlas.build estate --db atlas.db                                        # incremental: only the new members are parsed
+python -m atlas.handover --db atlas.db --system GC-TEST --docs PLAN12,STORIES12,QAREL12 --out work/handover.md
+```
+
+`atlas.handover` (VS Code: `Atlas: handover pack`) writes every report below
+into ONE file in the right order - the release list, a diff per changed
+member, the walk of each changed program's new copy, each copybook's users
+and layout, crud and program for the jobs, the documents' sections - and
+copies `templates/release-facts.md` to `work/release-facts.md` for the
+facts no file holds. Its first lines say the size in tokens; `--budget`
+and `--doc-budget` shrink it. Without a second system (the changes are
+already in production and no previous copy was indexed) give `--members
+P1,P2,C1` instead of `--system`. Then `/atlas-handover`: one request.
+
+**Pass 1, report by report (the same thing by hand):**
+
+```
 python -m atlas.query --db atlas.db --out work/release.md diff --system GC-TEST    # every member whose copies differ + members new to GC-TEST
 python -m atlas.query --db atlas.db --out work/diff-<PGM>.md diff GC/<PGM> GC-TEST/<PGM>      # per changed program
 python -m atlas.query --db atlas.db --out work/diff-<CPY>.md diff GC/<CPY> GC-TEST/<CPY>      # per changed copybook: fields added / changed / shifted

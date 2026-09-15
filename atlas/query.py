@@ -63,17 +63,34 @@ def _jl(v: Optional[str]) -> list:
 
 def origin(conn: sqlite3.Connection, program_id: int, exp_line: Optional[int]
            ) -> Tuple[Optional[str], Optional[int], int, Optional[str]]:
-    """(member_name, source_line, depth, via_copy) for an expanded line."""
+    """(member_tag, source_line, depth, via_copy) for an expanded line. The
+    tag is the member name, or SYSTEM/NAME when the member belongs to a
+    system - so that with two copies of a program (GC and GC-DEV) a cite
+    and a source lookup reach THIS program's copy, not the first by path."""
     if exp_line is None:
         return None, None, 0, None
     r = conn.execute("""
-        SELECT m.name, r.src_start + (? - r.exp_start) AS src_line, r.depth, r.via_copy
+        SELECT m.name, m.system, r.src_start + (? - r.exp_start) AS src_line, r.depth, r.via_copy
         FROM expand_run r JOIN member m ON m.id = r.src_member
         WHERE r.program_id = ? AND ? BETWEEN r.exp_start AND r.exp_end""",
         (exp_line, program_id, exp_line)).fetchone()
     if not r:
         return None, exp_line, 0, None
-    return r["name"], r["src_line"], r["depth"], r["via_copy"]
+    tag = f"{r['system']}/{r['name']}" if r["system"] else r["name"]
+    return tag, r["src_line"], r["depth"], r["via_copy"]
+
+
+def _tag_member_id(conn: sqlite3.Connection, tag: str) -> Optional[int]:
+    """The member a tag names: SYSTEM/NAME -> that system's copy; NAME -> the
+    production copy first (the order the gate uses)."""
+    if "/" in tag:
+        system, _, name = tag.partition("/")
+        r = conn.execute("SELECT id FROM member WHERE UPPER(COALESCE(system,''))=? AND UPPER(name)=? "
+                         "ORDER BY authoritative DESC, path LIMIT 1", (system.upper(), name.upper())).fetchone()
+    else:
+        r = conn.execute("SELECT id FROM member WHERE UPPER(name)=? ORDER BY authoritative DESC, path LIMIT 1",
+                         (tag.upper(),)).fetchone()
+    return r[0] if r else None
 
 
 def cite(conn: sqlite3.Connection, program_id: int, exp_line: Optional[int]) -> str:
@@ -86,30 +103,47 @@ def cite(conn: sqlite3.Connection, program_id: int, exp_line: Optional[int]) -> 
     return tag
 
 
+def _fts_line(conn: sqlite3.Connection, member_tag: str, line: int) -> Optional[str]:
+    if "/" in member_tag:
+        mid = _tag_member_id(conn, member_tag)
+        if mid is None:
+            return None
+        r = conn.execute("SELECT text FROM src_fts WHERE member_id=? AND line_no=? LIMIT 1", (mid, line)).fetchone()
+    else:
+        r = conn.execute("SELECT text FROM src_fts WHERE member_name=? AND line_no=? LIMIT 1",
+                         (member_tag, line)).fetchone()
+    return r["text"] if r else None
+
+
 def source_line(conn: sqlite3.Connection, member_name: str, line: int) -> str:
-    r = conn.execute("SELECT text FROM src_fts WHERE member_name=? AND line_no=? LIMIT 1",
-                     (member_name, line)).fetchone()
-    return r["text"].strip() if r else ""
+    t = _fts_line(conn, member_name, line)
+    return t.strip() if t else ""
 
 
 def source_line_raw(conn: sqlite3.Connection, member_name: str, line: int) -> str:
     """The code area as written (columns 8-72), indentation kept - the IF /
     ELSE nesting an analyst reads by eye."""
-    r = conn.execute("SELECT text FROM src_fts WHERE member_name=? AND line_no=? LIMIT 1",
-                     (member_name, line)).fetchone()
-    return r["text"].rstrip() if r else ""
+    t = _fts_line(conn, member_name, line)
+    return t.rstrip() if t else ""
 
 
 def programs_named(conn: sqlite3.Connection, name: str) -> List[sqlite3.Row]:
     """Programs called `name`: by PROGRAM-ID, member name, or an ENTRY alias
-    (CALL 'RATEENT' reaches RATECALC)."""
+    (CALL 'RATEENT' reaches RATECALC). `SYSTEM/NAME` picks the copy in that
+    system (GC-DEV/CLMPOST: the changed copy, not production's)."""
+    system = None
+    if "/" in name:
+        system, _, name = name.partition("/")
     n = name.upper()
-    return conn.execute("""
+    rows = conn.execute("""
         SELECT p.*, m.name AS member_name, m.path, m.library, m.authoritative, m.parse_status, m.system
         FROM program p JOIN member m ON m.id = p.member_id
         WHERE UPPER(p.program_id) = ? OR UPPER(m.name) = ?
            OR p.id IN (SELECT program_id FROM program_alias WHERE UPPER(alias) = ?)
         ORDER BY m.authoritative DESC, m.path""", (n, n, n)).fetchall()
+    if system:
+        rows = [r for r in rows if (r["system"] or "").upper() == system.upper()]
+    return rows
 
 
 def _names_of(conn: sqlite3.Connection, name: str) -> List[str]:
@@ -1403,8 +1437,15 @@ def cmd_cite(conn: sqlite3.Connection, member: str, rng: str, program: Optional[
     # SAMPPGM.cbl / SAMPPGM.psb / SAMPPGM.jcl share a name: `--kind` picks,
     # else the program-ish kind wins and the others are named.
     order = {"cobol": 0, "copybook": 1, "jcl": 2, "proc": 3, "psb": 4, "dbd": 5}
-    rows = conn.execute("SELECT path, kind, system FROM member WHERE UPPER(name)=? ORDER BY authoritative DESC",
+    want_sys = None
+    if "/" in member:                                     # GC-DEV/WALKPGM: that system's copy
+        want_sys, _, member = member.partition("/")
+    rows = conn.execute("SELECT path, kind, system FROM member WHERE UPPER(name)=? ORDER BY authoritative DESC, path",
                         (member.upper(),)).fetchall()
+    if want_sys:
+        rows = [r for r in rows if (r["system"] or "").upper() == want_sys.upper()]
+        if not rows:
+            return f"member {member} has no copy in system {want_sys}\n"
     if kind:
         rows = [r for r in rows if (r["kind"] or "").lower() == kind.lower()]
     if not rows:
@@ -1413,11 +1454,14 @@ def cmd_cite(conn: sqlite3.Connection, member: str, rng: str, program: Optional[
     row = rows[0]
     text, data, enc = reader.load(row["path"])
     recs = reader._split_records(text, data, enc)
-    out = [f"{member.upper()}({row['kind']})  {row['path']}\n"]
+    tag = f"{row['system']}/{member.upper()}" if row["system"] else member.upper()
+    out = [f"{tag}({row['kind']})  {row['path']}\n"]
     others = sorted({r["kind"] for r in rows[1:]} - {row["kind"]})
     if others:
         out.append(f"  (other members named {member.upper()}: {', '.join(others)} - use --kind; "
-                   f"cite as [[{member.upper()}({row['kind']}) line \"token\"]])\n")
+                   f"cite as [[{tag}({row['kind']}) line \"token\"]])\n")
+    if row["system"] and len(rows) > 1:
+        out.append(f"  (this is the {row['system']} copy - cite as [[{tag} line \"token\"]])\n")
     for i in range(max(1, s), min(len(recs), e) + 1):
         out.append(f"{i:6d} | {recs[i-1].rstrip()}\n")
     return "".join(out)
@@ -2969,8 +3013,9 @@ def _para_spans(conn: sqlite3.Connection, m) -> List[Tuple[int, int, str]]:
                           (prog["id"],)):
         m1, l1, d1, _v = origin(conn, prog["id"], p["start_line"])
         m2, l2, _d2, _v2 = origin(conn, prog["id"], p["end_line"])
-        if m1 == m["name"] and l1 is not None and not d1:
-            spans.append((l1, l2 if (m2 == m["name"] and l2 is not None) else l1, p["name"]))
+        mine = {m["name"], f"{m['system']}/{m['name']}" if m["system"] else m["name"]}
+        if m1 in mine and l1 is not None and not d1:
+            spans.append((l1, l2 if (m2 in mine and l2 is not None) else l1, p["name"]))
     return spans
 
 
@@ -3152,18 +3197,16 @@ def cmd_diff(conn: sqlite3.Connection, old_ref: Optional[str] = None, new_ref: O
     return "".join(out)
 
 
-def cmd_diff_list(conn: sqlite3.Connection, system: Optional[str] = None) -> str:
-    """Every member that exists in more than one library with different
-    content - the contents of a release when one folder per environment is
-    indexed (estate\\GC = production, estate\\GC-TEST = the changed copies)."""
+def release_pairs(conn: sqlite3.Connection, system: Optional[str] = None) -> Tuple[List[dict], List[dict], int]:
+    """The release as data: (pairs, new_members, identical_pairs). A pair is
+    {name, kind, old, new, added, removed, extra} with old / new as the
+    gate names them (SYSTEM/NAME); new_members exist only in `system`."""
     import difflib
     system = (system or "").strip() or None
     names = conn.execute("SELECT name, kind FROM member WHERE kind IN (%s) GROUP BY name, kind "
                          "HAVING COUNT(*) > 1 AND COUNT(DISTINCT COALESCE(norm_sha, sha256)) > 1 ORDER BY kind, name"
                          % ",".join("?" * len(_DIFF_KINDS)), _DIFF_KINDS).fetchall()
-    title = "# Release contents - members whose copies differ" + (f" (changed copy in {system.upper()})" if system else "")
-    out = [title + "\n\n"]
-    rows_out = []
+    pairs: List[dict] = []
     same = 0
     for nm in names:
         copies = conn.execute("SELECT * FROM member WHERE name=? AND kind=? ORDER BY authoritative DESC, path",
@@ -3178,25 +3221,38 @@ def cmd_diff_list(conn: sqlite3.Connection, system: Optional[str] = None) -> str
         key = _line_key(bool(old["fixed_format"]) and bool(new["fixed_format"]))
         sm = difflib.SequenceMatcher(None, [key(s) for s in a], [key(s) for s in b], autojunk=False)
         ops = [op for op in sm.get_opcodes() if op[0] != "equal"]
-        added = sum(j2 - j1 for _t, _i1, _i2, j1, j2 in ops)
-        removed = sum(i2 - i1 for _t, i1, i2, _j1, _j2 in ops)
-        extra = len(copies) - 2
-        rows_out.append(f"| {nm['name']} | {nm['kind']} | {_ident(old)} | {_ident(new)} | +{added} / -{removed} | "
-                        f"`diff {_ident(old)} {_ident(new)}`" + (f" (+{extra} more copies)" if extra > 0 else "") + " |\n")
-    if rows_out:
+        pairs.append({"name": nm["name"], "kind": nm["kind"], "old": _ident(old), "new": _ident(new),
+                      "added": sum(j2 - j1 for _t, _i1, _i2, j1, j2 in ops),
+                      "removed": sum(i2 - i1 for _t, i1, i2, _j1, _j2 in ops), "extra": len(copies) - 2})
+    fresh: List[dict] = []
+    if system:
+        fresh = [dict(name=f["name"], kind=f["kind"], library=f["library"]) for f in conn.execute(
+            "SELECT m.name, m.kind, m.library FROM member m WHERE UPPER(COALESCE(m.system,''))=? "
+            "AND m.kind IN (%s) AND NOT EXISTS (SELECT 1 FROM member o WHERE o.name=m.name AND o.kind=m.kind "
+            "AND o.id<>m.id) ORDER BY m.kind, m.name" % ",".join("?" * len(_DIFF_KINDS)),
+            (system.upper(), *_DIFF_KINDS)).fetchall()]
+    return pairs, fresh, same
+
+
+def cmd_diff_list(conn: sqlite3.Connection, system: Optional[str] = None) -> str:
+    """Every member that exists in more than one library with different
+    content - the contents of a release when one folder per environment is
+    indexed (estate\\GC = production, estate\\GC-TEST = the changed copies)."""
+    system = (system or "").strip() or None
+    pairs, fresh, same = release_pairs(conn, system)
+    title = "# Release contents - members whose copies differ" + (f" (changed copy in {system.upper()})" if system else "")
+    out = [title + "\n\n"]
+    if pairs:
         out.append("| member | kind | old (production) | new (changed) | lines | command |\n|---|---|---|---|---|---|\n")
-        out.extend(rows_out)
+        out.extend(f"| {p['name']} | {p['kind']} | {p['old']} | {p['new']} | +{p['added']} / -{p['removed']} | "
+                   f"`diff {p['old']} {p['new']}`" + (f" (+{p['extra']} more copies)" if p["extra"] > 0 else "") + " |\n"
+                   for p in pairs)
     else:
         out.append("_no member has two copies with different content_" + (f" involving {system.upper()}" if system else "") + "\n")
-    if system:
-        fresh = conn.execute("SELECT m.name, m.kind, m.library FROM member m WHERE UPPER(COALESCE(m.system,''))=? "
-                             "AND m.kind IN (%s) AND NOT EXISTS (SELECT 1 FROM member o WHERE o.name=m.name AND o.kind=m.kind "
-                             "AND o.id<>m.id) ORDER BY m.kind, m.name" % ",".join("?" * len(_DIFF_KINDS)),
-                             (system.upper(), *_DIFF_KINDS)).fetchall()
-        if fresh:
-            out.append(f"\n## New in {system.upper()} (no copy anywhere else)\n")
-            out.extend(f"- {f['name']} ({f['kind']}) in {f['library']}\n" for f in fresh)
-    out.append(f"\n- {len(rows_out)} member(s) differ" + (f", {same} pair(s) identical apart from sequence numbers" if same else "")
+    if fresh:
+        out.append(f"\n## New in {system.upper()} (no copy anywhere else)\n")
+        out.extend(f"- {f['name']} ({f['kind']}) in {f['library']}\n" for f in fresh)
+    out.append(f"\n- {len(pairs)} member(s) differ" + (f", {same} pair(s) identical apart from sequence numbers" if same else "")
                + "; `diff OLD NEW` for each - the facts that changed, then the lines of both sides\n")
     if not system:
         out.append("- `diff --system GC-TEST` when the changed copies are in one system folder: pairs each with its "
@@ -3348,15 +3404,15 @@ def _walk_data(conn: sqlite3.Connection, pid: int, mid: int, limit: int = 200) -
     order: List[int] = []
     unknown: List[str] = []
     for ref in refs:
-        defs = conn.execute("""SELECT f.*, m.name AS member_name FROM field f JOIN member m ON m.id=f.member_id
+        defs = conn.execute("""SELECT f.*, CASE WHEN m.system IS NULL OR m.system='' THEN m.name ELSE m.system || '/' || m.name END AS member_name FROM field f JOIN member m ON m.id=f.member_id
                                WHERE f.member_id=? AND UPPER(f.name)=?""", (mid, ref["name"])).fetchall()
         if not defs:
-            defs = conn.execute("""SELECT f.*, m.name AS member_name FROM copy_use c
+            defs = conn.execute("""SELECT f.*, CASE WHEN m.system IS NULL OR m.system='' THEN m.name ELSE m.system || '/' || m.name END AS member_name FROM copy_use c
                                    JOIN field f ON f.member_id=c.resolved_member_id JOIN member m ON m.id=f.member_id
                                    WHERE c.member_id=? AND UPPER(f.name)=?""", (mid, ref["name"])).fetchall()
         c88: List[sqlite3.Row] = []
         if not defs:
-            c88 = conn.execute("""SELECT c.name AS c88_name, c.values_lit, f.*, m.name AS member_name FROM cond88 c
+            c88 = conn.execute("""SELECT c.name AS c88_name, c.values_lit, f.*, CASE WHEN m.system IS NULL OR m.system='' THEN m.name ELSE m.system || '/' || m.name END AS member_name FROM cond88 c
                                   JOIN field f ON f.id=c.field_id JOIN member m ON m.id=f.member_id
                                   WHERE UPPER(c.name)=? AND (f.member_id=? OR f.member_id IN
                                         (SELECT resolved_member_id FROM copy_use WHERE member_id=? AND resolved_member_id IS NOT NULL))""",
@@ -3632,10 +3688,13 @@ def cmd_walk(conn: sqlite3.Connection, name: str, start: Optional[str] = None, b
         head.append("- runs in: " + ", ".join([r["r"] for r in runs] + [t["t"] for t in trans]) + "\n")
     else:
         head.append("- runs in: no job step or transaction of the index names it (callers: `callers " + pname + "`)\n")
+    sysrow = conn.execute("SELECT system FROM member WHERE id=?", (mid,)).fetchone()
+    tag = f"{sysrow[0]}/{mname}" if sysrow and sysrow[0] else mname
     head.append("- order: the entry first, then each paragraph the first time control reaches it - PERFORM (returns at the end "
                 "of its target or THRU range), GO TO (no return), fall-through, THRU range, performed SECTION. `>` marks a "
                 "reach of a paragraph already shown. [depth] is PERFORM nesting. Lines are ORIGINAL member lines: cite as "
-                "`[[MEMBER line \"token\"]]`.\n")
+                f"`[[{tag} line \"token\"]]`" + (" (this copy, not another system's)" if sysrow and sysrow[0] else "")
+                + "; copybook lines carry their own tag.\n")
     touch = _walk_touches(conn, pid)
     if touch:
         head.append("\n### Touches\n" + touch)

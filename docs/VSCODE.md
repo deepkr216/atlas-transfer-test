@@ -68,7 +68,7 @@ answer is checked mechanically before you rely on it.
 | A new code value / codes merged | Atlas: value domain | `/atlas-values` |
 | Test conditions and test data | Atlas: conditions, layout, pack | `/atlas-tests` |
 | Change design document | the tasks for each field and job touched | `/atlas-design` |
-| Transition document for a release (Application Operations + Contact Center) | Atlas: release contents, diff per changed member, walk, layout, crud, documents in the index, document sections; fill `work/release-facts.md` from `templates/release-facts.md` | `/atlas-handover` |
+| Transition document for a release (Application Operations + Contact Center) | Atlas: handover pack (one task: give the system holding the changed copies and the plan / stories / QA workbook names), then fill `work/release-facts.md` | `/atlas-handover` (one request) |
 | The gate said FAIL | Atlas: verify | `/atlas-fix` |
 
 `Atlas: coverage` before trusting anything; `Atlas: UI` for fetch and build;

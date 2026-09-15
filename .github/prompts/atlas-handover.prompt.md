@@ -2,18 +2,15 @@
 mode: 'ask'
 description: 'Atlas H1: transition document for a release - Application Operations and Contact Center - from the reports and the release facts'
 ---
-Write the transition document for a release using ONLY the reports attached and the release facts
-file. Run the tasks first: `Atlas: release contents`, then `Atlas: diff` for each changed member
-(keep each under its own name in `work/`), `Atlas: walk` for each changed program, `Atlas: layout`
-and `Atlas: pack (kind: copybook)` for each changed copybook, `Atlas: crud` for the jobs that run
-them, `Atlas: documents in the index` to name the plan, the stories and the QA workbooks, and
-`Atlas: document outline` / `document sections about a term` on each of those. Fill in
-`work/release-facts.md` (copy `templates/release-facts.md`) with what no file holds: dates, names,
-contacts, escalation. Attach here what exists: [release facts](../../work/release-facts.md),
-[release](../../work/release.md), [diff](../../work/diff.md), [walk](../../work/walk.md),
-[layout](../../work/layout.md), [pack](../../work/pack.md), [crud](../../work/crud.md),
-[doc](../../work/doc.md). More than one of a kind: keep the earlier one under another name in
-`work/` and attach it with `#file:`.
+Write the transition document for a release using ONLY the hand-over pack and the release facts
+file attached here: [handover pack](../../work/handover.md), [release facts](../../work/release-facts.md).
+The pack is written by one task, `Atlas: handover pack` (give the system holding the changed copies,
+e.g. GC-DEV, and the documents: the plan, the stories, the QA workbooks). It holds, in order: the
+release list, a `diff` per changed member, the `walk` of each changed program's new copy, each
+changed copybook's users and layout, `crud` and `program` for the jobs, and the documents' sections.
+`work/release-facts.md` is created beside it from `templates/release-facts.md`: fill in what no file
+holds - dates, names, contacts, escalation, what agents may say - before running this prompt.
+(The same reports can also be gathered one task at a time and attached with `#file:`.)
 
 Release: ${input:release:What the release is for, in one or two sentences}
 

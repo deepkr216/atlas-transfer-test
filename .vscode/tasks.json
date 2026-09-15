@@ -19,7 +19,9 @@
     {"id": "paragraph", "type": "promptString", "description": "Paragraph / section name, or a line number"},
     {"id": "old", "type": "promptString", "description": "The production copy: SYSTEM/NAME (GC/CLMPOST), NAME@LIBRARY, a path, or just NAME when the index holds two copies"},
     {"id": "new", "type": "promptString", "description": "The changed copy: SYSTEM/NAME (GC-TEST/CLMPOST), NAME@LIBRARY, or the path of the downloaded file; leave blank to take the other copy in the index", "default": ""},
-    {"id": "system", "type": "promptString", "description": "System folder holding the changed copies (e.g. GC-TEST); blank = every member whose copies differ", "default": ""}
+    {"id": "system", "type": "promptString", "description": "System folder holding the changed copies (e.g. GC-TEST); blank = every member whose copies differ", "default": ""},
+    {"id": "members", "type": "promptString", "description": "Changed members, comma-separated (only when no second system holds the changed copies); blank otherwise", "default": ""},
+    {"id": "docnames", "type": "promptString", "description": "Documents to include, comma-separated, as `doc --list` names them (the plan, the stories, the QA workbooks); blank = none", "default": ""}
   ],
   "tasks": [
     {
@@ -54,6 +56,15 @@
       "detail": "Two versions of a member - the production copy and the changed one: the paragraphs, calls, copybooks, tables, files and fields that changed (fields that only shifted are grouped), then the changed lines of both sides with their own numbers, citable.",
       "type": "shell",
       "command": "python -m atlas.query --db atlas.db --out work/diff.md diff \"${input:old}\" \"${input:new}\" --budget ${input:budget}",
+      "options": {"cwd": "${workspaceFolder}", "env": {"PYTHONUTF8": "1"}},
+      "presentation": {"reveal": "always", "panel": "shared", "showReuseMessage": false},
+      "problemMatcher": []
+    },
+    {
+      "label": "Atlas: handover pack -> work/handover.md",
+      "detail": "Everything the transition document needs in ONE file, no model tokens: the release (changed copies in the system you name), a diff per changed member, the walk of each changed program, copybook users and layouts, crud and jobs, the documents you name. Then fill work/release-facts.md and type /atlas-handover.",
+      "type": "shell",
+      "command": "python -m atlas.handover --db atlas.db --system \"${input:system}\" --members \"${input:members}\" --docs \"${input:docnames}\" --docs-folder \"${input:docpattern}\" --budget ${input:budget} --out work/handover.md",
       "options": {"cwd": "${workspaceFolder}", "env": {"PYTHONUTF8": "1"}},
       "presentation": {"reveal": "always", "panel": "shared", "showReuseMessage": false},
       "problemMatcher": []
