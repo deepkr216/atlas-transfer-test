@@ -28,12 +28,38 @@ def stage(name, ok, detail=""):
     return ok
 
 
+def failure_summary(text: str, limit: int = 12) -> list:
+    """`FAIL: test (module.Class.test)` and the first exception line under it."""
+    import re
+    exc = re.compile(r"^[A-Za-z_][\w.]*(?:Error|Exception|Exit|Interrupt|Failure|Warning)\b")
+    out = []
+    lines = text.splitlines()
+    for i, ln in enumerate(lines):
+        if not ln.startswith(("FAIL: ", "ERROR: ")):
+            continue
+        out.append(ln.strip())
+        for nxt in lines[i + 1:i + 80]:
+            if nxt.startswith(("FAIL: ", "ERROR: ")):
+                break
+            if exc.match(nxt.strip()):
+                out.append("  " + nxt.strip()[:300])
+                break
+        if len(out) >= limit * 2:
+            break
+    return out
+
+
 def main() -> int:
     all_ok = True
 
     r = run(["-m", "unittest", "discover", "-s", "tests"])
     tail = (r.stderr or r.stdout).strip().splitlines()[-1] if (r.stderr or r.stdout).strip() else ""
     all_ok &= stage("regression suite", r.returncode == 0, tail)
+    if r.returncode != 0:
+        # the name of each failing test and the line that says why - test names and toolkit
+        # messages only, nothing from an estate: safe to paste
+        for line in failure_summary((r.stderr or "") + "\n" + (r.stdout or "")):
+            print("      " + line)
 
     with tempfile.TemporaryDirectory() as td:
         db = os.path.join(td, "smoke.db")

@@ -44,10 +44,10 @@ class Supervise(unittest.TestCase):
         said = []
         with mock.patch.dict(os.environ, {"ATLAS_TEST_FREEZE": "WALKPGM.cbl"}):
             rc = supervise.run([os.path.join(self.td, "estate"), "--db", self.db, "--rebuild", "--member-limit", "600"],
-                               silence=3, say=said.append)
+                               silence=6, say=said.append)
         text = "\n".join(said)
         self.assertEqual(rc, 0, text)
-        self.assertIn("supervisor: FROZEN - nothing printed for 3 s while parsing cobol WALKPGM.cbl", text)
+        self.assertIn("supervisor: FROZEN - nothing printed for 6 s while parsing cobol WALKPGM.cbl", text)
         self.assertIn("(restart 1)", text)
         self.assertIn("SKIPPED cobol WALKPGM.cbl: froze the parser on an earlier run (skip list)", text)
         self.assertIn("supervisor: build finished after 1 restart(s)", text)
@@ -92,6 +92,19 @@ class Supervise(unittest.TestCase):
             rc = build._main([os.path.join(self.td, "estate"), "--db", self.db])
         self.assertEqual(rc, 0)
         self.assertRegex(buf.getvalue(), r"== parsing 0 member\(s\)\n  \d+ unchanged and kept; to parse: nothing")
+
+    def test_selfcheck_names_the_failing_test(self):
+        sys.path.insert(0, os.path.dirname(HERE))
+        import selfcheck
+        text = ("..F.\n======================================================================\n"
+                "FAIL: test_x (test_mod.Case.test_x)\n----------------------------------------------------------------------\n"
+                "Traceback (most recent call last):\n  File \"C:\\a\\test_mod.py\", line 5, in test_x\n"
+                "    self.assertLess(took, 2)\nAssertionError: 2.5 not less than 2 : 2.5 s\n\n"
+                "ERROR: test_y (test_mod.Case.test_y)\nTraceback (most recent call last):\n"
+                "  File \"C:\\a\\test_mod.py\", line 9, in test_y\nOSError: [WinError 5] Access is denied\n")
+        out = selfcheck.failure_summary(text)
+        self.assertEqual(out, ["FAIL: test_x (test_mod.Case.test_x)", "  AssertionError: 2.5 not less than 2 : 2.5 s",
+                               "ERROR: test_y (test_mod.Case.test_y)", "  OSError: [WinError 5] Access is denied"])
 
     def test_cli_help_and_usage(self):
         import contextlib

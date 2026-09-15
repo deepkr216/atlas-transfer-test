@@ -28,6 +28,7 @@ import time
 from typing import List, Optional
 
 SILENCE_SECONDS = 180
+STARTUP_SECONDS = 120          # before its first line a build may be slow to start (antivirus scanning Python)
 MAX_RESTARTS = 50
 CURRENT_FILE = "atlas-current.txt"
 SKIP_FILE = "atlas-skip.txt"
@@ -98,18 +99,22 @@ def run(build_args: List[str], silence: float = SILENCE_SECONDS, max_restarts: i
 
         threading.Thread(target=reader, daemon=True).start()
         last = time.time()
+        started = False
         frozen = False
         try:
             while True:
                 try:
                     line = q.get(timeout=1.0)
                 except queue.Empty:
-                    if time.time() - last > silence:
+                    # silence counts from the first line: starting Python and loading the
+                    # toolkit is not a frozen parser, however slow the laptop
+                    if time.time() - last > (silence if started else max(silence, STARTUP_SECONDS)):
                         frozen = True
                         break
                     continue
                 if line is None:
                     break
+                started = True
                 last = time.time()
                 say(line.rstrip("\r\n"))
         except KeyboardInterrupt:

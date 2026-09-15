@@ -244,10 +244,10 @@ class SupervisorAndSteps(unittest.TestCase):
     def test_a_step_that_goes_silent_is_restarted_once_and_never_put_on_the_skip_list(self):
         said = []
         with mock.patch.dict(os.environ, {"ATLAS_TEST_FREEZE": "PHASE:post"}):
-            rc = supervise.run([os.path.join(self.td, "estate"), "--db", self.db, "--rebuild"], silence=3, say=said.append)
+            rc = supervise.run([os.path.join(self.td, "estate"), "--db", self.db, "--rebuild"], silence=6, say=said.append)
         text = "\n".join(said)
         self.assertEqual(rc, 3, text)
-        self.assertIn("FROZEN - nothing printed for 3 s during the step 'post: DD directions from OPEN verbs'", text)
+        self.assertIn("FROZEN - nothing printed for 6 s during the step 'post: DD directions from OPEN verbs'", text)
         self.assertIn("FROZEN twice in the same step (post: DD directions from OPEN verbs) - stopping", text)
         self.assertFalse(os.path.exists(os.path.join(self.td, "atlas-skip.txt")), "a step is not a member")
 
