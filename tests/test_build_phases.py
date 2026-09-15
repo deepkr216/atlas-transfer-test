@@ -153,29 +153,45 @@ class Phases(unittest.TestCase):
         self.assertEqual(counts, ref)
 
     def test_bulk_removal_is_a_fixed_number_of_statements(self):
+        # The property: the statements do not grow with the number of members removed. Counting
+        # statement texts against a fixed number broke on another SQLite version, which traces its
+        # own bookkeeping differently (one statement more on his laptop) - so compare the same
+        # removal for 2 members and for all of them instead.
         rc, _ = self._build("--rebuild")
         self.assertEqual(rc, 0)
-        conn = build.open_db(self.db)
-        try:
-            mids = [r[0] for r in conn.execute("SELECT id FROM member")]
-            seen = []
-            conn.set_trace_callback(seen.append)
-            with mock.patch.object(build, "BULK_FORGET", 0):
-                build._forget_members(conn, mids)
-            conn.set_trace_callback(None)
-            conn.commit()
-            # distinct top-level statements only: SQLite traces its own FTS bookkeeping with a "--" prefix
-            # and repeats the parent statement's text for each cascade it fires; the ids go in through
-            # one executemany. One member at a time this was 5 statements PER member.
-            top = {s for s in seen if not s.startswith(("--", "BEGIN", "COMMIT", "INSERT OR IGNORE INTO forget_ids",
-                                                        "DELETE FROM src_fts WHERE rowid BETWEEN"))}
-            self.assertLessEqual(len(top), 10, top)
-            # the search rows go by rowid range (an index read), never by a scan on member_id
-            self.assertFalse([s for s in seen if "FROM src_fts WHERE member_id" in s], seen)
-            self.assertTrue([s for s in seen if s.startswith("DELETE FROM src_fts WHERE rowid BETWEEN")])
-            self.assertEqual(conn.execute("SELECT COUNT(*) FROM member").fetchone()[0], 0)
-        finally:
-            conn.close()
+        few_db = os.path.join(self.td, "few.db")
+        shutil.copy(self.db, few_db)
+
+        def shapes(db, pick):
+            conn = build.open_db(db)
+            try:
+                mids = pick([r[0] for r in conn.execute("SELECT id FROM member ORDER BY id")])
+                seen = []
+                conn.set_trace_callback(seen.append)
+                with mock.patch.object(build, "BULK_FORGET", 0):
+                    build._forget_members(conn, mids)
+                conn.set_trace_callback(None)
+                conn.commit()
+                left = conn.execute("SELECT COUNT(*) FROM member").fetchone()[0]
+            finally:
+                conn.close()
+            # SQLite's own FTS bookkeeping is traced with a "--" prefix; numbers (ids, rowid ranges)
+            # are normalised, so what is left is the SHAPE of each statement
+            # (older Pythons trace "?" where newer ones show the bound value)
+            top = {re.sub(r"\d+|\?", "N", s) for s in seen if not s.lstrip().startswith("--")}
+            return top, seen, left
+
+        all_shapes, all_seen, left_all = shapes(self.db, lambda mids: mids)
+        few_shapes, _few_seen, left_few = shapes(few_db, lambda mids: mids[:2])
+        self.assertEqual(left_all, 0)
+        self.assertEqual(left_few, 7)
+        self.assertEqual(all_shapes, few_shapes, "removing more members must not add statements")
+        # and no statement is aimed at one member (that is the per-member loop, repeated N times)
+        per_member = [s for s in all_shapes if re.search(r"WHERE\s+(?:id|member_id|src_member|resolved_member_id)\s*=\s*N", s)]
+        self.assertEqual(per_member, [], per_member)
+        # the search rows go by rowid range (an index read), never by a scan on member_id
+        self.assertFalse([s for s in all_seen if "FROM src_fts WHERE member_id" in s], all_seen)
+        self.assertTrue([s for s in all_seen if s.startswith("DELETE FROM src_fts WHERE rowid BETWEEN")])
 
     def test_every_foreign_key_has_an_index(self):
         conn = build.open_db(self.db, rebuild=True)
