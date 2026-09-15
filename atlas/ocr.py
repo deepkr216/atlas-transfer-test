@@ -387,8 +387,8 @@ def run(conn: sqlite3.Connection, out_dir: str, do_ocr: bool = True, member: Opt
         heading = image_heading(img, anchor[0] if anchor else None)
         conn.execute("INSERT INTO doc_section(member_id,heading,text,ordinal) VALUES(?,?,?,?)",
                      (mid, heading, text, ordinal))
-        conn.execute("INSERT INTO src_fts(member_name,kind,member_id,line_no,text) VALUES(?,?,?,?,?)",
-                     (name, "doc", mid, ordinal, (heading + "\n" + text)[:20000]))
+        from .build import fts_insert
+        fts_insert(conn, mid, [(name, "doc", mid, ordinal, (heading + "\n" + text)[:20000])])
         stats["ocr_text"] += 1
     conn.commit()
     log(f"OCR: {stats['ocr_text']} with text, {stats['ocr_empty']} empty, {stats['ocr_failed']} failed")

@@ -57,7 +57,11 @@ BINARY_EXTS = {".pdf", ".docx", ".xlsx", ".pptx", ".vsdx", ".zip", ".gz",
 
 # ---- content signatures ---------------------------------------------------
 
-_SIG_COBOL = re.compile(r"^\s*(IDENTIFICATION|ID)\s+DIVISION", re.I | re.M)
+# Line-anchored signatures use `[ \t]`, never `\s`: with re.M a `\s` runs
+# across blank lines, and a card deck padded with blank 80-column lines
+# made the assembler signature cubic - 101 blank cards held the whole
+# process for 70 s (LESSONS 148).
+_SIG_COBOL = re.compile(r"^[ \t]*(IDENTIFICATION|ID)[ \t]+DIVISION", re.I | re.M)
 _SIG_PROGRAM_ID = re.compile(r"\bPROGRAM-ID\b", re.I)
 _SIG_JOB = re.compile(r"^//\S{1,8}\s+JOB\b", re.M)
 _SIG_PROC = re.compile(r"^//\S{0,8}\s+PROC\b", re.M)
@@ -66,30 +70,30 @@ _SIG_EXEC = re.compile(r"^//\S{0,8}\s+EXEC\b", re.M)
 # HLASM macro format: an optional label in column 1, then the operation. A
 # pattern anchored on leading whitespace misses every labelled statement -
 # which is most of them in DBD/PSB source.
-_SIG_DBD = re.compile(r"^(?:[A-Z0-9@#$]{1,8})?\s+DBD\s+NAME=", re.I | re.M)
-_SIG_SEGM = re.compile(r"^(?:[A-Z0-9@#$]{1,8})?\s+SEGM\s+NAME=", re.I | re.M)
-_SIG_PSB = re.compile(r"^(?:[A-Z0-9@#$]{1,8})?\s+PSBGEN\b|^(?:[A-Z0-9@#$]{1,8})?\s+PCB\s+TYPE=",
+_SIG_DBD = re.compile(r"^(?:[A-Z0-9@#$]{1,8})?[ \t]+DBD[ \t]+NAME=", re.I | re.M)
+_SIG_SEGM = re.compile(r"^(?:[A-Z0-9@#$]{1,8})?[ \t]+SEGM[ \t]+NAME=", re.I | re.M)
+_SIG_PSB = re.compile(r"^(?:[A-Z0-9@#$]{1,8})?[ \t]+PSBGEN\b|^(?:[A-Z0-9@#$]{1,8})?[ \t]+PCB[ \t]+TYPE=",
                       re.I | re.M)
 _SIG_BMS = re.compile(r"\bDFHMSD\b|\bDFHMDI\b|\bDFHMDF\b", re.I)
 # CICS CSD extract/upload deck (DEFINE form) or DFHCSDUP LIST report form.
-_SIG_CSD = re.compile(r"^\s*(?:DEFINE|ALTER|USERDEFINE)\s+(?:TRANSACTION|PROGRAM|FILE|MAPSET|TDQUEUE)\("
-                      r"|^\s*(?:TRANSACTION|PROGRAM|FILE)\([A-Z0-9@#$]+\)\s+GROUP\(", re.I | re.M)
+_SIG_CSD = re.compile(r"^[ \t]*(?:DEFINE|ALTER|USERDEFINE)[ \t]+(?:TRANSACTION|PROGRAM|FILE|MAPSET|TDQUEUE)\("
+                      r"|^[ \t]*(?:TRANSACTION|PROGRAM|FILE)\([A-Z0-9@#$]+\)[ \t]+GROUP\(", re.I | re.M)
 # IMS stage-1 system definition: APPLCTN / TRANSACT macros (label optional in col 1).
-_SIG_IMSGEN = re.compile(r"^(?:[A-Z0-9@#$]{1,8})?\s+(?:APPLCTN|TRANSACT)\s+(?:PSB|GPSB|CODE)=", re.I | re.M)
+_SIG_IMSGEN = re.compile(r"^(?:[A-Z0-9@#$]{1,8})?[ \t]+(?:APPLCTN|TRANSACT)[ \t]+(?:PSB|GPSB|CODE)=", re.I | re.M)
 # MFS statements usually carry a label in column 1 (`MYFMT    FMT`,
 # `GENDER   DFLD  POS=(3,10)`): the label is optional, the operation is not
-_SIG_MFS = re.compile(r"^(?:[A-Z0-9@#$]{1,8})?\s+(MSG|FMT|DEV|DFLD|MFLD)\s", re.I | re.M)
+_SIG_MFS = re.compile(r"^(?:[A-Z0-9@#$]{1,8})?[ \t]+(MSG|FMT|DEV|DFLD|MFLD)[ \t\r\n]", re.I | re.M)
 _SIG_SQL_DDL = re.compile(r"\bCREATE\s+(TABLE|VIEW|INDEX|TABLESPACE|DATABASE)\b", re.I)
 # Any level 01-49 plus 66/77/88. Level 49 is the DCLGEN VARCHAR structure and
 # 02/03/04/06/07/15/20 are all common; testing only 01/05/10 misfiles them.
-_SIG_DATA_LEVEL = re.compile(r"^.{0,6}.?\s*(0[1-9]|[1-4]\d|66|77|88)\s+[A-Z0-9][A-Z0-9\-]*",
+_SIG_DATA_LEVEL = re.compile(r"^.{0,6}.?[ \t]*(0[1-9]|[1-4]\d|66|77|88)[ \t]+[A-Z0-9][A-Z0-9\-]*",
                              re.I | re.M)
-_SIG_ASM = re.compile(r"^\s*\w*\s+(CSECT|DSECT|START|DFHEIENT)\b", re.I | re.M)
+_SIG_ASM = re.compile(r"^(?:[ \t]*\w+)?[ \t]+(CSECT|DSECT|START|DFHEIENT)\b", re.I | re.M)
 _SIG_REXX = re.compile(r"^\s*/\*\s*REXX", re.I)
 # A compiler listing echoes the source: without this it is filed as a
 # second copy of the program, with line-number prefixes as fields.
-_SIG_LISTING = re.compile(r"^1?PP\s+5655-|IBM Enterprise COBOL for z\/OS|^\s+LineID\s+PL\s+SL\b|"
-                          r"CROSS REFERENCE TABLE|\bMODULE MAP\b|^1?\s*DATA DIVISION MAP\b", re.I | re.M)
+_SIG_LISTING = re.compile(r"^1?PP[ \t]+5655-|IBM Enterprise COBOL for z\/OS|^[ \t]+LineID[ \t]+PL[ \t]+SL\b|"
+                          r"CROSS REFERENCE TABLE|\bMODULE MAP\b|^1?[ \t]*DATA DIVISION MAP\b", re.I | re.M)
 # A folder named like a dataset (PROD.CLAIMS.SRC) holds mainframe members:
 # an unrecognised member there is UNKNOWN, never a document.
 _DATASET_FOLDER = re.compile(r"^[A-Z0-9$#@]{1,8}(?:\.[A-Z0-9$#@]{1,8})+$")

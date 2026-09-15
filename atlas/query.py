@@ -103,9 +103,40 @@ def cite(conn: sqlite3.Connection, program_id: int, exp_line: Optional[int]) -> 
     return tag
 
 
+def _spans(conn: sqlite3.Connection, member_id: int) -> Optional[list]:
+    """The rowid ranges of a member's search rows, or None on an index built
+    before they were recorded (then a scan is the only way)."""
+    try:
+        rows = conn.execute("SELECT lo, hi FROM fts_span WHERE member_id=? ORDER BY lo", (member_id,)).fetchall()
+    except sqlite3.OperationalError:
+        return None
+    return [(r[0], r[1]) for r in rows] if rows else None
+
+
+def _code_member_id(conn: sqlite3.Connection, tag: str) -> Optional[int]:
+    """Like _tag_member_id, preferring the COBOL / copybook copy of a name (a
+    program and a job can share one)."""
+    order = "CASE kind WHEN 'cobol' THEN 0 WHEN 'copybook' THEN 1 ELSE 2 END, authoritative DESC, path"
+    if "/" in tag:
+        system, _, name = tag.partition("/")
+        r = conn.execute(f"SELECT id FROM member WHERE UPPER(COALESCE(system,''))=? AND UPPER(name)=? ORDER BY {order} LIMIT 1",
+                         (system.upper(), name.upper())).fetchone()
+    else:
+        r = conn.execute(f"SELECT id FROM member WHERE UPPER(name)=? ORDER BY {order} LIMIT 1", (tag.upper(),)).fetchone()
+    return r[0] if r else None
+
+
 def _fts_line(conn: sqlite3.Connection, member_tag: str, line: int) -> Optional[str]:
+    mid = _code_member_id(conn, member_tag)
+    spans = _spans(conn, mid) if mid is not None else None
+    if spans:
+        for lo, hi in spans:                      # a range read: fast whatever the size of the index
+            r = conn.execute("SELECT text FROM src_fts WHERE rowid BETWEEN ? AND ? AND line_no=? LIMIT 1",
+                             (lo, hi, line)).fetchone()
+            if r:
+                return r["text"]
+        return None
     if "/" in member_tag:
-        mid = _tag_member_id(conn, member_tag)
         if mid is None:
             return None
         r = conn.execute("SELECT text FROM src_fts WHERE member_id=? AND line_no=? LIMIT 1", (mid, line)).fetchone()
@@ -3569,8 +3600,15 @@ def cmd_walk(conn: sqlite3.Connection, name: str, start: Optional[str] = None, b
 
     # DECLARATIVES sections run on a USE condition, never from the entry
     decl_lo = decl_hi = None
-    for r in conn.execute("SELECT line_no, text FROM src_fts WHERE member_name=? AND UPPER(text) LIKE '%DECLARATIVES%' "
-                          "ORDER BY line_no", (mname,)):
+    spans = _spans(conn, mid)
+    if spans:
+        decl_rows = [r for lo, hi in spans for r in conn.execute(
+            "SELECT line_no, text FROM src_fts WHERE rowid BETWEEN ? AND ? AND UPPER(text) LIKE '%DECLARATIVES%'", (lo, hi))]
+        decl_rows.sort(key=lambda r: r["line_no"])
+    else:
+        decl_rows = conn.execute("SELECT line_no, text FROM src_fts WHERE member_name=? AND UPPER(text) LIKE '%DECLARATIVES%' "
+                                 "ORDER BY line_no", (mname,)).fetchall()
+    for r in decl_rows:
         t = r["text"].upper()
         if re.search(r"\bEND\s+DECLARATIVES\b", t):
             decl_hi = r["line_no"]

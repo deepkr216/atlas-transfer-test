@@ -479,10 +479,45 @@ def _vsdx(path: str) -> DocText:
 # PDF - best effort, standard library only
 # --------------------------------------------------------------------------
 
-_STREAM = re.compile(rb"stream\r?\n(.*?)\r?\nendstream", re.S)
+# `(?<!end)`: the tail of `endstream` is not a stream start; the EOL before
+# endstream is optional (requiring it made every such stream scan the rest
+# of the file - quadratic, LESSONS 148)
+_STREAM = re.compile(rb"(?<!end)stream\r?\n(.*?)(?:\r?\n)?endstream", re.S)
 _TJ = re.compile(rb"\[(.*?)\]\s*TJ", re.S)
 _Tj = re.compile(rb"\((.*?)(?<!\\)\)\s*(?:Tj|'|\")", re.S)
 _PDF_STR = re.compile(rb"\((.*?)(?<!\\)\)", re.S)
+# one pass over a content stream: literal strings (escapes, no unescaped
+# nesting), array brackets and operator words
+_PDF_TOKEN = re.compile(rb"\(((?:[^()\\]|\\.)*)\)|(\[)|(\])|([A-Za-z'\"]+)", re.S)
+
+
+def _pdf_text_pieces(content: bytes) -> List[str]:
+    """The strings a content stream shows with Tj, ' and " (the last string
+    before the operator) and TJ (every string of the array), in order. A
+    scanner, not two lazy regexes: `(...) ... Tj` searched per string ran to
+    the end of the stream whenever the text used TJ arrays (quadratic)."""
+    pieces: List[str] = []
+    last: Optional[bytes] = None
+    arr: Optional[List[bytes]] = None
+    done_arr: Optional[List[bytes]] = None
+    for m in _PDF_TOKEN.finditer(content):
+        s, open_b, close_b, word = m.group(1), m.group(2), m.group(3), m.group(4)
+        if s is not None:
+            if arr is not None:
+                arr.append(s)
+            else:
+                last = s
+        elif open_b:
+            arr = []
+        elif close_b:
+            done_arr, arr = arr, None
+        else:
+            if word == b"TJ" and done_arr is not None:
+                pieces.append("".join(_pdf_unescape(x) for x in done_arr))
+            elif word in (b"Tj", b"'", b'"') and last is not None:
+                pieces.append(_pdf_unescape(last))
+            last, done_arr = None, None
+    return pieces
 
 
 def _pdf_unescape(b: bytes) -> str:
@@ -541,11 +576,7 @@ def _pdf(path: str) -> DocText:
                 content = raw
         if b"BT" not in content:
             continue
-        pieces: List[str] = []
-        for tj in _TJ.finditer(content):
-            pieces.append("".join(_pdf_unescape(s) for s in _PDF_STR.findall(tj.group(1))))
-        for t in _Tj.finditer(content):
-            pieces.append(_pdf_unescape(t.group(1)))
+        pieces = _pdf_text_pieces(content)
         page = _clean(" ".join(pieces))
         if page:
             texts.append(page)
@@ -593,11 +624,34 @@ def _plain(path: str) -> DocText:
     return d
 
 
+def _strip_blocks(txt: str, tags: Tuple[str, ...]) -> str:
+    """Remove <script>...</script> / <style>...</style> by searching forward:
+    a lazy regex scanned to the end of the page for every unclosed tag."""
+    low = txt.lower()
+    out: List[str] = []
+    pos = 0
+    while True:
+        starts = [(low.find("<" + t, pos), t) for t in tags]
+        starts = [(k, t) for k, t in starts if k >= 0]
+        if not starts:
+            break
+        k, t = min(starts)
+        end = low.find("</" + t, k)
+        if end < 0:
+            break                                   # unclosed: keep the rest as text, as the browser would show nothing more
+        close = low.find(">", end)
+        out.append(txt[pos:k])
+        out.append(" ")
+        pos = (close + 1) if close >= 0 else len(txt)
+    out.append(txt[pos:])
+    return "".join(out)
+
+
 def _html(path: str) -> DocText:
     d = _plain(path)
     d.kind = "html"
     txt = d.sections[0][1]
-    txt = re.sub(r"(?is)<(script|style).*?</\1>", " ", txt)
+    txt = _strip_blocks(txt, ("script", "style"))
     txt = re.sub(r"(?i)<br\s*/?>|</p>|</div>|</tr>|</h\d>", "\n", txt)
     txt = re.sub(r"<[^>]+>", " ", txt)
     txt = re.sub(r"&nbsp;", " ", txt)

@@ -80,7 +80,7 @@ _FD = re.compile(rf"^(FD|SD)\s+({ID})", re.IGNORECASE)
 #   OPEN INPUT POLICY-IN CLAIM-IN OUTPUT REPORT-OUT
 _FILE_OP = re.compile(
     B + rf"(READ|WRITE|REWRITE|DELETE|START|RELEASE|RETURN)\s+({ID})", re.IGNORECASE)
-_OPEN_CLOSE = re.compile(B + r"(OPEN|CLOSE)\s+(.*?)(?=\s*(?:$|\.|" + B + r"(?:END-|ELSE|WHEN|IF|MOVE|PERFORM|"
+_OPEN_CLOSE = re.compile(B + r"(OPEN|CLOSE)\s+((?:\S|(?=(?P<ws>\s+))(?P=ws))*?)(?=\s*(?:$|\.|" + B + r"(?:END-|ELSE|WHEN|IF|MOVE|PERFORM|"
                          r"READ|WRITE|OPEN|CLOSE|CALL|DISPLAY|GO|GOBACK|STOP)" + E + "))",
                          re.IGNORECASE | re.DOTALL)
 _OPEN_MODE = re.compile(r"\b(INPUT|OUTPUT|I-O|EXTEND)\b", re.IGNORECASE)
@@ -92,7 +92,7 @@ _EXEC_DLI = re.compile(r"\bEXEC\s+DLI\b(.*?)\bEND-EXEC\b", re.IGNORECASE | re.DO
 _CICS_PROG = re.compile(r"\b(LINK|XCTL)\b.*?\bPROGRAM\s*\(\s*([^)]*?)\s*\)",
                         re.IGNORECASE | re.DOTALL)
 _CICS_VERB = re.compile(r"^\s*([A-Z-]+)", re.IGNORECASE)
-_CICS_FILE = re.compile(r"\b(?:FILE|DATASET)\s*\(\s*([^)]*?)\s*\)", re.IGNORECASE)
+_CICS_FILE = re.compile(r"\b(?:FILE|DATASET)\s*\(([^)]*)\)", re.IGNORECASE)          # value stripped by the caller
 
 _DLI_CALL = re.compile(
     rf"\bCALL\s+(['\"])(CBLTDLI|AIBTDLI|PLITDLI)\1\s+USING\b(.*)",
@@ -146,7 +146,7 @@ _SQL_CALL = re.compile(r"^\s*CALL\s+(?:([A-Z0-9_$#@]+)\.)?([A-Z0-9_$#@]+)\s*(?:\
 _SQL_DECLARE_TABLE = re.compile(r"\bDECLARE\s+([A-Z0-9_$#@]+(?:\.[A-Z0-9_$#@]+)?)\s+TABLE\s*\((.*)\)\s*$",
                                 re.IGNORECASE | re.DOTALL)
 _EXEC_ANY = re.compile(r"\bEXEC\s+(CICS|DLI|SQL)\b(.*?)\bEND-EXEC\b", re.IGNORECASE | re.DOTALL)
-_CICS_OPT = re.compile(r"\b([A-Z][A-Z0-9]*)\s*\(\s*([^()]*)\s*\)", re.IGNORECASE)
+_CICS_OPT = re.compile(r"\b([A-Z][A-Z0-9]*)\s*\(([^()]*)\)", re.IGNORECASE)          # value stripped by the callers
 # EXEC CICS options that RETURN data to the program (the program WRITES the
 # field) vs. options the command READS.
 _CICS_WRITE_OPTS = {"INTO", "SET", "RESP", "RESP2", "NUMITEMS", "NUMREC", "ASSIGN", "ABCODE", "TERMID",
@@ -1036,7 +1036,7 @@ def _extract_cics(f: ProgramFacts, st: LogicalLine,
 
         mf = _CICS_FILE.search(inner)
         if mf and verb:
-            val, cands, res = _cics_value(mf.group(1), literal_map)
+            val, cands, res = _cics_value(mf.group(1).strip(), literal_map)
             name = val or mf.group(1).strip().strip("'\"").upper()
             f.io_ops.append((name, "cics", vb, ln))
             f.cics_cmds.append((vb, "file", name, None, ln))
@@ -1475,7 +1475,7 @@ def _exec_refs(f: ProgramFacts, kind: str, inner: str, ln: int) -> None:
         return
     if kind == "DLI":
         for m in _CICS_OPT.finditer(inner):
-            k, v = m.group(1).upper(), m.group(2)
+            k, v = m.group(1).upper(), m.group(2).strip()
             if k == "INTO":
                 _refs(f, _idents(v), "write", "EXEC-DLI", ln)
             elif k == "FROM":

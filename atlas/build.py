@@ -278,6 +278,14 @@ CREATE TABLE IF NOT EXISTS expand_run(
     src_member INTEGER REFERENCES member(id), src_start INTEGER,
     depth INTEGER, via_copy TEXT);
 CREATE INDEX IF NOT EXISTS ix_exprun ON expand_run(program_id, exp_start);
+-- the rowid range of each member's rows in src_fts: its member_id column
+-- cannot be indexed, so without this every delete and every line lookup
+-- scanned the whole search index (LESSONS 148)
+CREATE TABLE IF NOT EXISTS fts_span(
+    member_id INTEGER NOT NULL REFERENCES member(id) ON DELETE CASCADE,
+    lo INTEGER NOT NULL, hi INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS ix_fts_span_mem ON fts_span(member_id);
+CREATE TABLE IF NOT EXISTS atlas_meta(key TEXT PRIMARY KEY, value TEXT);
 """
 
 
@@ -370,8 +378,32 @@ def open_db(path: str, rebuild: bool = False) -> sqlite3.Connection:
         _ensure_column(conn, table, col, decl)
     with open(os.path.join(HERE, "schema.sql"), "r", encoding="utf-8") as fh:
         conn.executescript(fh.read())
+    had_spans = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='fts_span'").fetchone() is not None
+    had_fts = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='src_fts'").fetchone() is not None
     conn.executescript(EXTRA_SCHEMA)
+    if not had_spans and had_fts and conn.execute("SELECT rowid FROM src_fts LIMIT 1").fetchone() is not None:
+        # search rows written before spans were recorded: deletes fall back to a scan until they are gone
+        conn.execute("INSERT OR REPLACE INTO atlas_meta(key, value) VALUES('fts_legacy', '1')")
+        conn.commit()
     return conn
+
+
+def fts_legacy(conn: sqlite3.Connection) -> bool:
+    try:
+        r = conn.execute("SELECT value FROM atlas_meta WHERE key='fts_legacy'").fetchone()
+    except sqlite3.DatabaseError:
+        return True
+    return bool(r and r[0] == "1")
+
+
+def fts_insert(conn: sqlite3.Connection, member_id: int, rows: Sequence[tuple]) -> None:
+    """Rows into the search index, and the rowid range they took (rowids of
+    one insert are contiguous: each new row gets the largest rowid + 1)."""
+    if not rows:
+        return
+    conn.executemany("INSERT INTO src_fts(member_name,kind,member_id,line_no,text) VALUES(?,?,?,?,?)", rows)
+    hi = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    conn.execute("INSERT INTO fts_span(member_id, lo, hi) VALUES(?,?,?)", (member_id, hi - len(rows) + 1, hi))
 
 
 def _ensure_column(conn: sqlite3.Connection, table: str, col: str, decl: str) -> None:
@@ -458,7 +490,11 @@ def _forget_member(conn: sqlite3.Connection, mid: int) -> None:
     conn.execute("DELETE FROM expand_run WHERE src_member=?", (mid,))
     conn.execute("DELETE FROM expand_map WHERE src_member=?", (mid,))
     conn.execute("DELETE FROM db2_object WHERE member_id=?", (mid,))
-    conn.execute("DELETE FROM src_fts WHERE member_id=?", (mid,))
+    if fts_legacy(conn):
+        conn.execute("DELETE FROM src_fts WHERE member_id=?", (mid,))
+    else:
+        conn.executemany("DELETE FROM src_fts WHERE rowid BETWEEN ? AND ?",
+                         conn.execute("SELECT lo, hi FROM fts_span WHERE member_id=?", (mid,)).fetchall())
     conn.execute("DELETE FROM member WHERE id=?", (mid,))
 
 
@@ -471,21 +507,34 @@ def _forget_members(conn: sqlite3.Connection, mids: Sequence[int], progress: Opt
     if len(mids) <= BULK_FORGET:
         for mid in mids:
             _forget_member(conn, mid)
+        if fts_legacy(conn) and conn.execute("SELECT 1 FROM member LIMIT 1").fetchone() is None:
+            conn.execute("DELETE FROM atlas_meta WHERE key='fts_legacy'")     # every old row is gone
         return
     conn.execute("CREATE TEMP TABLE IF NOT EXISTS forget_ids(id INTEGER PRIMARY KEY)")
     conn.execute("DELETE FROM forget_ids")
     conn.executemany("INSERT OR IGNORE INTO forget_ids(id) VALUES(?)", [(m,) for m in mids])
     ids = "(SELECT id FROM forget_ids)"
+    legacy = fts_legacy(conn)
     steps = [("copybook references", f"UPDATE copy_use SET resolved_member_id=NULL WHERE resolved_member_id IN {ids}"),
              ("copybook expansion runs", f"DELETE FROM expand_run WHERE src_member IN {ids}"),
              ("expansion map", f"DELETE FROM expand_map WHERE src_member IN {ids}"),
-             ("DB2 objects", f"DELETE FROM db2_object WHERE member_id IN {ids}"),
-             ("search index", f"DELETE FROM src_fts WHERE member_id IN {ids}"),
-             ("members and every fact derived from them", f"DELETE FROM member WHERE id IN {ids}")]
+             ("DB2 objects", f"DELETE FROM db2_object WHERE member_id IN {ids}")]
     for label, sql in steps:
         if progress:
             progress.now(f"removing {label}")
         conn.execute(sql)
+    if progress:
+        progress.now("removing search index rows")
+    if legacy:
+        conn.execute(f"DELETE FROM src_fts WHERE member_id IN {ids}")          # one scan, rows from before spans
+    else:
+        conn.executemany("DELETE FROM src_fts WHERE rowid BETWEEN ? AND ?",
+                         conn.execute(f"SELECT lo, hi FROM fts_span WHERE member_id IN {ids}").fetchall())
+    if progress:
+        progress.now("removing members and every fact derived from them")
+    conn.execute(f"DELETE FROM member WHERE id IN {ids}")
+    if legacy and conn.execute("SELECT 1 FROM member LIMIT 1").fetchone() is None:
+        conn.execute("DELETE FROM atlas_meta WHERE key='fts_legacy'")         # every old row is gone
     conn.execute("DELETE FROM forget_ids")
     if progress:
         progress.now(None)
@@ -521,6 +570,47 @@ def ensure_fk_indexes(conn: sqlite3.Connection, say=None) -> int:
             conn.execute(f"CREATE INDEX IF NOT EXISTS ix_fk_{t}_{col} ON {t}({col})")
         conn.commit()
     return len(missing)
+
+
+# Lookups the builder and the reports make in loops: an index on the exact
+# expression each one tests (UPPER(name) cannot use an index on name).
+QUERY_INDEXES = [
+    ("io_op", "ix_q_ioop_prog_target", "program_id, target"),
+    ("member", "ix_q_member_uname", "UPPER(name)"),
+    ("program", "ix_q_program_upid", "UPPER(program_id)"),
+    ("program_alias", "ix_q_alias_ualias", "UPPER(alias)"),
+    ("call_edge", "ix_q_call_utarget", "UPPER(target)"),
+    ("copy_use", "ix_q_copy_ubook", "UPPER(copybook)"),
+    ("step", "ix_q_step_upgm", "UPPER(effective_pgm)"),
+    ("job", "ix_q_job_uname", "UPPER(job_name)"),
+    ("transaction_def", "ix_q_tran_uprogram", "UPPER(program)"),
+    ("transaction_def", "ix_q_tran_ucode", "UPPER(tran_code)"),
+    ("ims_psb", "ix_q_psb_uname", "UPPER(name)"),
+    ("ims_dbd", "ix_q_dbd_uname", "UPPER(name)"),
+]
+
+
+def ensure_query_indexes(conn: sqlite3.Connection, say=None) -> int:
+    made = 0
+    existing = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")}
+    for table, name, expr in QUERY_INDEXES:
+        if name in existing:
+            continue
+        cols = {r[1] for r in conn.execute(f"PRAGMA table_info('{table}')")}
+        needed = {c.strip().replace("UPPER(", "").rstrip(")") for c in expr.split(",")}
+        if not cols or not needed <= cols:
+            continue
+        if say and made == 0 and conn.execute("SELECT COUNT(*) FROM member").fetchone()[0] > 5000:
+            say("  adding lookup indexes this index was missing (one time)")
+        conn.execute(f"CREATE INDEX IF NOT EXISTS {name} ON {table}({expr})")
+        made += 1
+    if made:
+        conn.commit()
+    return made
+
+
+# `[ \t]` not `\s`: a `\s+` at every line start ran across a whole block of blank lines (quadratic)
+_IMSGEN_IN_SYSIN = re.compile(r"^(?:[A-Z0-9@#$]{1,8})?[ \t]+(?:APPLCTN|TRANSACT)[ \t]+(?:PSB|GPSB|CODE)=", re.I | re.M)
 
 
 def load_inventory_skips(path: Optional[str]) -> set:
@@ -963,9 +1053,16 @@ def apply_manifest(ctx: Ctx, manifest_path: str) -> None:
                          for s, lst in (man.get("copylib_order") or {}).items()}
     ctx.conn.execute("UPDATE member SET authoritative=0, system=NULL")
     n_auth = n_sys = 0
+    auth_by_dir: Dict[Tuple[str, str], bool] = {}           # members x libraries was quadratic: decide per folder
     for m in ctx.members:
         p = m.path.replace("\\", "/").upper()
-        if any(p.startswith(x) or f"/{x}/" in p or m.library.upper() == x for x in prefixes):
+        folder_up, _, _fname = p.rpartition("/")
+        dkey = (folder_up, m.library.upper())
+        if dkey not in auth_by_dir:
+            # a declared prefix is a folder or a library name: it cannot split one folder's files
+            auth_by_dir[dkey] = any((folder_up + "/").startswith(x.rstrip("/") + "/") or folder_up == x.rstrip("/")
+                                    or f"/{x}/" in (folder_up + "/") or dkey[1] == x for x in prefixes)
+        if auth_by_dir[dkey]:
             m.authoritative = 1
             ctx.conn.execute("UPDATE member SET authoritative=1 WHERE id=?", (m.id,))
             n_auth += 1
@@ -1603,7 +1700,7 @@ def _index_jcl_facts(ctx: Ctx, mem: Mem, facts: jcl.JclFacts) -> None:
                 continue
             if re.search(r"\b(?:DEFINE|ALTER)\s+(?:TRANSACTION|TDQUEUE|DB2ENTRY|URIMAP|FILE)\s*\(", d.sysin_text, re.I):
                 _insert_routing(ctx, mem, txn.parse_csd(d.sysin_text))
-            elif re.search(r"^(?:[A-Z0-9@#$]{1,8})?\s+(?:APPLCTN|TRANSACT)\s+(?:PSB|GPSB|CODE)=", d.sysin_text, re.I | re.M):
+            elif _IMSGEN_IN_SYSIN.search(d.sysin_text):
                 _insert_routing(ctx, mem, txn.parse_imsgen(d.sysin_text))
 
     conn.executemany("INSERT INTO unresolved(member_id,kind,detail,line) VALUES(?,?,?,?)",
@@ -1660,11 +1757,12 @@ def index_doc(ctx: Ctx, mem: Mem) -> None:
     conn = ctx.conn
     d = docs.extract(mem.path)
     # every section small enough to hand to a model whole and to cite precisely
+    fts_rows = []
     for i, (h, t) in enumerate(docs.chunk_sections(d.sections), 1):
         conn.execute("INSERT INTO doc_section(member_id,heading,text,ordinal) VALUES(?,?,?,?)", (mem.id, h, t, i))
         if t:
-            conn.execute("INSERT INTO src_fts(member_name,kind,member_id,line_no,text) VALUES(?,?,?,?,?)",
-                         (mem.name, "doc", mem.id, i, (h + "\n" + t)[:20000]))
+            fts_rows.append((mem.name, "doc", mem.id, i, (h + "\n" + t)[:20000]))
+    fts_insert(conn, mem.id, fts_rows)
     # table rows are part of their section's text (a sheet IS its rows), so
     # they are searched and cited section-precisely - no separate line-0 rows
     conn.executemany("INSERT INTO doc_image(member_id,name,anchor) VALUES(?,?,?)",
@@ -1695,7 +1793,7 @@ def index_fts_code(ctx: Ctx, mem: Mem) -> None:
         text, data, enc = reader.load(mem.path)
         rows = [(mem.name, mem.kind, mem.id, i, r.rstrip())
                 for i, r in enumerate(reader._split_records(text, data, enc), 1) if r.strip()]
-    conn.executemany("INSERT INTO src_fts(member_name,kind,member_id,line_no,text) VALUES(?,?,?,?,?)", rows)
+    fts_insert(conn, mem.id, rows)
 
 
 def _insert_screens(ctx: Ctx, mem: Mem, scr: List[screens.Screen]) -> None:
@@ -2013,6 +2111,7 @@ def _build(args: argparse.Namespace, progress: Progress, t0: float) -> int:
     ctx = Ctx(conn, quiet=args.quiet)
     ctx.progress = progress
     ensure_fk_indexes(conn, ctx.say)
+    ensure_query_indexes(conn, ctx.say)
     ctx.write_expanded = args.write_expanded
     if ctx.write_expanded:
         os.makedirs(ctx.write_expanded, exist_ok=True)

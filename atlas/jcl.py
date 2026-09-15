@@ -809,7 +809,7 @@ def _resolve_effective_pgm(step: StepFact, facts: JclFacts,
             host = (step.parm or "").strip().split()[0].strip("'(") if (step.parm or "").strip() else ""
             if host and not host.startswith("("):
                 step.notes.append(f"FTP host {host}")
-            for m in re.finditer(r"^\s*(m?put|m?get|send|recv)\s+(\S+)(?:\s+(\S+))?", ctl, re.IGNORECASE | re.MULTILINE):
+            for m in re.finditer(r"^[ \t]*(m?put|m?get|send|recv)[ \t]+(\S+)(?:[ \t]+(\S+))?", ctl, re.IGNORECASE | re.MULTILINE):
                 verb = m.group(1).lower()
                 out = verb.endswith("put") or verb == "send"
                 # put 'MVS.DSN' remote  /  get remote 'MVS.DSN'
@@ -908,12 +908,13 @@ def _disp_parts(disp: Optional[str]) -> Tuple[str, str]:
     return status, normal
 
 
-_EZT_FILE = re.compile(r"^\s*FILE\s+([A-Z0-9@#$-]{1,8})\b(.*)$", re.IGNORECASE | re.MULTILINE)
-_EZT_JOBIN = re.compile(r"^\s*JOB\s+INPUT\s*\(?\s*([A-Z0-9@#$-]{1,8})", re.IGNORECASE | re.MULTILINE)
-_EZT_PUT = re.compile(r"^\s*PUT\s+([A-Z0-9@#$-]{1,8})", re.IGNORECASE | re.MULTILINE)
-_EZT_GET = re.compile(r"^\s*GET\s+([A-Z0-9@#$-]{1,8})", re.IGNORECASE | re.MULTILINE)
+# `[ \t]` not `\s` after `^`: with MULTILINE a `\s` runs across blank lines (quadratic - LESSONS 148)
+_EZT_FILE = re.compile(r"^[ \t]*FILE[ \t]+([A-Z0-9@#$-]{1,8})\b(.*)$", re.IGNORECASE | re.MULTILINE)
+_EZT_JOBIN = re.compile(r"^[ \t]*JOB[ \t]+INPUT[ \t]*\(?[ \t]*([A-Z0-9@#$-]{1,8})", re.IGNORECASE | re.MULTILINE)
+_EZT_PUT = re.compile(r"^[ \t]*PUT[ \t]+([A-Z0-9@#$-]{1,8})", re.IGNORECASE | re.MULTILINE)
+_EZT_GET = re.compile(r"^[ \t]*GET[ \t]+([A-Z0-9@#$-]{1,8})", re.IGNORECASE | re.MULTILINE)
 # `  CLM-STAT  25  2  A` : name, start byte, length, type (A/N/P/B/W/K/U)
-_EZT_FIELD = re.compile(r"^\s+([A-Z0-9@#$:-]{1,40})\s+(\d{1,5})\s+(\d{1,5})\s+([ANPBWKU])\b(.*)$",
+_EZT_FIELD = re.compile(r"^[ \t]+([A-Z0-9@#$:-]{1,40})[ \t]+(\d{1,5})[ \t]+(\d{1,5})[ \t]+([ANPBWKU])\b(.*)$",
                         re.IGNORECASE | re.MULTILINE)
 
 
@@ -1093,10 +1094,14 @@ def sort_card_fields(text: str) -> List[Tuple[str, int, int, str, str]]:
     return out
 
 
-_ICETOOL_OP = re.compile(r"\b(?:SORT|COPY|MERGE|SELECT|SPLICE|COUNT|STATS|UNIQUE|OCCUR|DISPLAY|RANGE|VERIFY|RESIZE)\s+"
-                         r"FROM\s*\(\s*([A-Z0-9@#$]+)\s*\)(?:.*?\bTO\s*\(\s*([A-Z0-9@#$ ,]+)\s*\))?", re.IGNORECASE)
-_OUTFIL_NAMES = re.compile(r"\bOUTFIL\b.*?\bFNAMES\s*=\s*\(?([A-Z0-9@#$ ,]+)\)?", re.IGNORECASE)
-_JOINKEYS_F = re.compile(r"\bJOINKEYS\b.*?\bF[12]\s*=\s*([A-Z0-9@#$]+)", re.IGNORECASE)
+# Each lazy scan stops at the next statement of its kind: scanning to the end
+# of the deck for every OUTFIL without FNAMES= was quadratic (LESSONS 148).
+_ICETOOL_OPS = r"(?:SORT|COPY|MERGE|SELECT|SPLICE|COUNT|STATS|UNIQUE|OCCUR|DISPLAY|RANGE|VERIFY|RESIZE)"
+_ICETOOL_OP = re.compile(r"\b" + _ICETOOL_OPS + r"\s+"
+                         r"FROM\s*\(\s*([A-Z0-9@#$]+)\s*\)(?:(?:(?!\b" + _ICETOOL_OPS + r"\s+FROM\b).)*?\bTO\s*\(\s*([A-Z0-9@#$ ,]+)\s*\))?",
+                         re.IGNORECASE)
+_OUTFIL_NAMES = re.compile(r"\bOUTFIL\b(?:(?!\bOUTFIL\b).)*?\bFNAMES\s*=\s*\(?([A-Z0-9@#$ ,]+)\)?", re.IGNORECASE)
+_JOINKEYS_F = re.compile(r"\bJOINKEYS\b(?:(?!\bJOINKEYS\b).)*?\bF[12]\s*=\s*([A-Z0-9@#$]+)", re.IGNORECASE)
 
 
 def sort_dd_roles(text: str) -> Dict[str, str]:
@@ -1312,10 +1317,12 @@ def _resolve_referbacks(steps: List[StepFact], facts: JclFacts, report: bool = T
     decides direction (the source DD's (+1) is NOT inherited: the referback
     reads what was created).
     """
+    dd_index: Dict[int, Dict[str, list]] = {}
     for idx, s in enumerate(steps):
         for i, d in enumerate(s.dds):
             if not d.referback or d.dsn_resolved:
                 continue
+            dd_index.pop(id(s), None)                    # this step's DDs change as referbacks resolve
             parts = d.referback[2:].upper().split(".")
             ddn, path = parts[-1], parts[:-1]
             if not path:
@@ -1331,8 +1338,14 @@ def _resolve_referbacks(steps: List[StepFact], facts: JclFacts, report: bool = T
                     cands = same or cands
             src = None
             for x in reversed(cands):
-                for y in x.dds:
-                    if y.dd_name.upper().split(".")[-1] == ddn and y.dsn_resolved and y is not d:
+                by_name = dd_index.get(id(x))
+                if by_name is None:                      # a step's DDs by name, built once (was a scan per referback)
+                    by_name = {}
+                    for y in x.dds:
+                        by_name.setdefault(y.dd_name.upper().split(".")[-1], []).append(y)
+                    dd_index[id(x)] = by_name
+                for y in by_name.get(ddn, []):
+                    if y.dsn_resolved and y is not d:
                         src = y
                         break
                 if src:
@@ -1353,7 +1366,9 @@ def _resolve_referbacks(steps: List[StepFact], facts: JclFacts, report: bool = T
 # IDCAMS control cards: datasets created, deleted, copied
 # --------------------------------------------------------------------------
 
-_IDC_DEFINE = re.compile(r"\bDEFINE\s+(CLUSTER|AIX|ALTERNATEINDEX|GDG|PATH|NONVSAM)\b[^A-Z]*?\(?\s*NAME\s*\(\s*([^)\s]+)\s*\)",
+# `[^A-Z]*` then NAME: no overlap between the gap and what follows (the lazy
+# gap + `\(?\s*` split every blank run - quadratic on padded card members)
+_IDC_DEFINE = re.compile(r"\bDEFINE\s+(CLUSTER|AIX|ALTERNATEINDEX|GDG|PATH|NONVSAM)\b[^A-Z]*NAME\s*\(\s*([^)\s]+)\s*\)",
                          re.IGNORECASE | re.S)
 _IDC_DELETE = re.compile(r"\bDELETE\s+\(?\s*([A-Z0-9$#@.]+)", re.IGNORECASE)
 _IDC_REPRO = re.compile(r"\bREPRO\b(.*?)(?=\bREPRO\b|\bDEFINE\b|\bDELETE\b|\bPRINT\b|\bLISTCAT\b|$)",
@@ -1440,7 +1455,8 @@ _DB2U_TABLE = re.compile(r"\b(?:INTO|FROM)\s+TABLE\s+([A-Z0-9_$#@]+(?:\.[A-Z0-9_
 _DB2U_OP = re.compile(r"\b(LOAD|UNLOAD|REORG|RUNSTATS|COPY|RECOVER|CHECK|REBUILD|MERGECOPY|QUIESCE)\b", re.IGNORECASE)
 _DB2U_DD = re.compile(r"\b(INDDN|UNLDDN|PUNCHDDN|COPYDDN|DISCARDDN|WORKDDN)\s+\(?\s*([A-Z0-9@#$]+)", re.IGNORECASE)
 _DB2U_TS = re.compile(r"\bTABLESPACE\s+([A-Z0-9_$#@]+(?:\.[A-Z0-9_$#@]+)?)", re.IGNORECASE)
-_SQL_VERB_TABLE = re.compile(r"\b(SELECT|INSERT|UPDATE|DELETE)\b.*?\b(?:FROM|INTO|UPDATE)\s+([A-Z0-9_$#@]+(?:\.[A-Z0-9_$#@]+)?)",
+_SQL_VERB_TABLE = re.compile(r"\b(SELECT|INSERT|UPDATE|DELETE)\b(?:(?!\b(?:SELECT|INSERT|UPDATE|DELETE)\b).)*?"
+                             r"\b(?:FROM|INTO|UPDATE)\s+([A-Z0-9_$#@]+(?:\.[A-Z0-9_$#@]+)?)",
                              re.IGNORECASE | re.S)
 
 

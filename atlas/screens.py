@@ -241,8 +241,9 @@ def parse_mfs(text: str) -> List[Screen]:
                                           literal=f.literal, line=f.line))
                 first = False
             # rename the first occurrence to match MFS's 2-digit suffix convention
+            present = {id(x) for x in cur.fields}        # identity, once (list membership per field was quadratic)
             for f in do_buf:
-                if f.name and f in cur.fields:
+                if f.name and id(f) in present:
                     f.name = f"{f.name}01"
             do_count, do_buf = None, []
         elif op == "MFLD" and cur is not None:

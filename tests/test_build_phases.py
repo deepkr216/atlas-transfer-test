@@ -167,8 +167,12 @@ class Phases(unittest.TestCase):
             # distinct top-level statements only: SQLite traces its own FTS bookkeeping with a "--" prefix
             # and repeats the parent statement's text for each cascade it fires; the ids go in through
             # one executemany. One member at a time this was 5 statements PER member.
-            top = {s for s in seen if not s.startswith(("--", "BEGIN", "COMMIT", "INSERT OR IGNORE INTO forget_ids"))}
+            top = {s for s in seen if not s.startswith(("--", "BEGIN", "COMMIT", "INSERT OR IGNORE INTO forget_ids",
+                                                        "DELETE FROM src_fts WHERE rowid BETWEEN"))}
             self.assertLessEqual(len(top), 10, top)
+            # the search rows go by rowid range (an index read), never by a scan on member_id
+            self.assertFalse([s for s in seen if "FROM src_fts WHERE member_id" in s], seen)
+            self.assertTrue([s for s in seen if s.startswith("DELETE FROM src_fts WHERE rowid BETWEEN")])
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM member").fetchone()[0], 0)
         finally:
             conn.close()

@@ -687,8 +687,9 @@ def read_jcl(text: str, data: bytes = b"", enc: str = "utf-8") -> List[JclStatem
         # a non-blank. The next record must start with '//' and, for a comma
         # continuation, resume in cols 4-16; inside a quote it resumes at
         # column 16 verbatim.
+        quotes = operands.count("'")                 # kept up to date as text is appended (recounting was quadratic)
         while i + 1 < n:
-            in_quote = operands.count("'") % 2 == 1
+            in_quote = quotes % 2 == 1
             col72 = len(rec) > 71 and rec[71] not in " \t"
             if not (in_quote or col72 or operands.rstrip().endswith(",")):
                 break
@@ -698,13 +699,16 @@ def read_jcl(text: str, data: bytes = b"", enc: str = "utf-8") -> List[JclStatem
             if in_quote:
                 if nxt[2:15].strip():
                     break
-                operands = operands + nxt[15:71].rstrip()
+                piece = nxt[15:71].rstrip()
+                operands = operands + piece
+                quotes += piece.count("'")
             else:
                 cont = _JCL_CONT_ONLY.match(nxt[:71])
                 if not cont:
                     break
                 more, c2 = _cut_operands(cont.group("rest").lstrip())
                 operands = operands.rstrip() + more
+                quotes += more.count("'")
                 if c2:
                     comment = (comment + " " + c2).strip()
             i += 1
