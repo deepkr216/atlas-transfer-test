@@ -101,6 +101,9 @@ Every answer has these sections, in this order:
   an INTRDR submit or the scheduler.
 - Documents describe intent; code describes behaviour. Quote both when they
   disagree and say they disagree.
+- A document named `*.VIDEO` is a recording's transcript: `SCREEN:` lines are
+  OCR (0/O and 1/I confused), `SAID:` lines are speech recognition (jargon
+  garbled). Quote it as "said in the recording at 00:12:05", never as fact.
 
 ## 5. Generating code, JCL or test data
 

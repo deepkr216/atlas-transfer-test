@@ -1,0 +1,566 @@
+r"""
+atlas.video - what a recorded session showed and said, as a document the
+build can index.
+
+    python -m atlas.video "C:\Recordings" --out "C:\docs\Video transcripts"
+    python -m atlas.video "C:\Recordings" --dry-run         what would be read
+    python -m atlas.video "C:\docs\KT sessions"             transcripts beside the videos
+
+Keep the recordings OUT of the folders the build reads and write the
+transcripts INTO one (--out): a video in the build's folders is read in full on
+every build only to be skipped, and one over 300 MB is listed as a problem.
+
+For each video (.mp4 .m4v .mov .wmv .avi) it writes `<name>.video.docx`
+(kt-session.mp4 -> kt-session.video.docx, document KT-SESSION.VIDEO) beside it,
+or under --out in the same subfolders;
+the next build indexes that as a document with one section per two minutes,
+found by `docs TERM` and cited like any other document section:
+
+  * SCREEN - a frame every --every seconds (default 10), read by the Windows
+    OCR engine; the same screen shown for a minute is written once, with the
+    time it appeared. Code, JCL, green screens and slides read well.
+  * SAID - the sound track, read by the speech recogniser that ships with
+    Windows. Plain speech reads well; mainframe jargon does not ("step ten
+    abends" came back as "stepped in awe bins") - so where a caption file
+    sits beside the video (`<video>.vtt` or `.srt`, e.g. a Teams or Stream
+    transcript you downloaded), its text is used instead, and it is far
+    better.
+
+Everything runs on the laptop with what Windows already has (Media
+Foundation, Windows.Media.Ocr, System.Speech): no install, no network, no
+model tokens. A transcript is prose - what was said, never a fact about
+what runs - and every answer that uses it must say so.
+"""
+
+from __future__ import annotations
+
+import argparse
+import difflib
+import html
+import json
+import os
+import re
+import shutil
+import sys
+import tempfile
+import time
+import zipfile
+from typing import Dict, List, Optional, Tuple
+
+from . import ocr
+
+VIDEO_EXT = (".mp4", ".m4v", ".mov", ".wmv", ".avi")
+SIDECAR = ".video.docx"
+MARK = "written by atlas.video"
+EVERY_SECONDS = 10
+SECTION_SECONDS = 120
+FRAME_WIDTH = 1600
+
+# Frames and the sound track out of a video with Windows Media Foundation.
+# One JSON object per line; [Console]::Out.WriteLine, never Write-Output inside
+# a function (LESSONS 132).
+_PS_EXTRACT = r'''
+param([string]$Video, [string]$OutDir, [double]$Every, [int]$Width, [int]$NoFrames, [int]$NoAudio)
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+function Say($o) { [Console]::Out.WriteLine(($o | ConvertTo-Json -Compress)) }
+try {
+  [Windows.Storage.StorageFile, Windows.Storage, ContentType = WindowsRuntime] | Out-Null
+  [Windows.Storage.StorageFolder, Windows.Storage, ContentType = WindowsRuntime] | Out-Null
+  [Windows.Media.Editing.MediaComposition, Windows.Media.Editing, ContentType = WindowsRuntime] | Out-Null
+  [Windows.Media.Editing.MediaClip, Windows.Media.Editing, ContentType = WindowsRuntime] | Out-Null
+  [Windows.Media.Transcoding.MediaTranscoder, Windows.Media.Transcoding, ContentType = WindowsRuntime] | Out-Null
+  [Windows.Media.MediaProperties.MediaEncodingProfile, Windows.Media.MediaProperties, ContentType = WindowsRuntime] | Out-Null
+  [Windows.Media.MediaProperties.AudioEncodingProperties, Windows.Media.MediaProperties, ContentType = WindowsRuntime] | Out-Null
+  [Windows.Storage.Streams.DataReader, Windows.Storage.Streams, ContentType = WindowsRuntime] | Out-Null
+  Add-Type -AssemblyName System.Runtime.WindowsRuntime
+} catch { Say @{error="Windows media components unavailable: $_"}; exit 0 }
+$methods = [System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { $_.Name -eq 'AsTask' }
+$asOp = ($methods | Where-Object { $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]
+$asActProg = ($methods | Where-Object { $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncActionWithProgress`1' })[0]
+function Await($op, $T) { $t = $asOp.MakeGenericMethod($T).Invoke($null, @($op)); $t.Wait(-1) | Out-Null; $t.Result }
+function AwaitActProg($op, $P) { $t = $asActProg.MakeGenericMethod($P).Invoke($null, @($op)); $t.Wait(-1) | Out-Null }
+try {
+  $src = Await ([Windows.Storage.StorageFile]::GetFileFromPathAsync($Video)) ([Windows.Storage.StorageFile])
+  $clip = Await ([Windows.Media.Editing.MediaClip]::CreateFromFileAsync($src)) ([Windows.Media.Editing.MediaClip])
+  $comp = New-Object Windows.Media.Editing.MediaComposition
+  [System.Collections.Generic.ICollection[Windows.Media.Editing.MediaClip]].GetMethod("Add").Invoke($comp.Clips, @($clip)) | Out-Null
+} catch { Say @{error="cannot open the video: $_"}; exit 0 }
+$dur = [double]$comp.Duration.TotalSeconds
+Say @{duration=$dur}
+if ($NoFrames -eq 0) {
+  $h = [int]($Width * 9 / 16)
+  $t = [Math]::Min(1.0, $dur / 2)
+  while ($t -lt $dur) {
+    try {
+      $stream = Await ($comp.GetThumbnailAsync([TimeSpan]::FromSeconds($t), $Width, $h, [Windows.Media.Editing.VideoFramePrecision]::NearestFrame)) ([Windows.Graphics.Imaging.ImageStream])
+      $size = [uint32]$stream.Size
+      $reader = New-Object Windows.Storage.Streams.DataReader($stream.GetInputStreamAt(0))
+      Await ($reader.LoadAsync($size)) ([uint32]) | Out-Null
+      $bytes = New-Object byte[] $size
+      $reader.ReadBytes($bytes)
+      $out = [string](Join-Path $OutDir ("frame-{0:d7}.jpg" -f [int]$t))
+      [System.IO.File]::WriteAllBytes($out, $bytes)
+      $reader.Dispose(); $stream.Dispose()
+      Say @{frame=$t; path=$out}
+    } catch { Say @{frame=$t; error="$_"} }
+    $t += $Every
+  }
+}
+if ($NoAudio -eq 0) {
+  try {
+    $folder = Await ([Windows.Storage.StorageFolder]::GetFolderFromPathAsync($OutDir)) ([Windows.Storage.StorageFolder])
+    $wav = Await ($folder.CreateFileAsync("audio.wav", [Windows.Storage.CreationCollisionOption]::ReplaceExisting)) ([Windows.Storage.StorageFile])
+    $tc = New-Object Windows.Media.Transcoding.MediaTranscoder
+    $prof = [Windows.Media.MediaProperties.MediaEncodingProfile]::CreateWav([Windows.Media.MediaProperties.AudioEncodingQuality]::Low)
+    $prof.Audio = [Windows.Media.MediaProperties.AudioEncodingProperties]::CreatePcm(16000, 1, 16)
+    $prep = Await ($tc.PrepareFileTranscodeAsync($src, $wav, $prof)) ([Windows.Media.Transcoding.PrepareTranscodeResult])
+    if ($prep.CanTranscode) { AwaitActProg ($prep.TranscodeAsync()) ([double]); Say @{audio=[string]$wav.Path} }
+    else { Say @{audio_error="no sound track that can be read ($($prep.FailureReason))"} }
+  } catch { Say @{audio_error="$_"} }
+}
+'''
+
+# Speech to text with the recogniser Windows ships (System.Speech). The WAV
+# header Media Foundation writes is refused by it, so the raw 16 kHz mono
+# samples are handed over with their format stated.
+_PS_SPEECH = r'''
+param([string]$Wav)
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+function Say($o) { [Console]::Out.WriteLine(($o | ConvertTo-Json -Compress)) }
+try { Add-Type -AssemblyName System.Speech } catch { Say @{error="System.Speech unavailable: $_"}; exit 0 }
+$recs = [System.Speech.Recognition.SpeechRecognitionEngine]::InstalledRecognizers()
+if ($recs.Count -eq 0) { Say @{error="no speech recogniser installed (Settings > Time & language > Speech)"}; exit 0 }
+$pick = $recs | Where-Object { $_.Culture.Name -like "en-*" } | Select-Object -First 1
+if (-not $pick) { $pick = $recs[0] }
+Say @{recognizer=($pick.Culture.Name + " " + $pick.Description)}
+$all = [System.IO.File]::ReadAllBytes($Wav)
+$pos = 12; $dataAt = -1; $dataLen = 0
+while ($pos + 8 -le $all.Length) {
+  $id = [System.Text.Encoding]::ASCII.GetString($all, $pos, 4)
+  $len = [System.BitConverter]::ToInt32($all, $pos + 4)
+  if ($id -eq "data") { $dataAt = $pos + 8; $dataLen = [Math]::Min($len, $all.Length - $dataAt); break }
+  $pos += 8 + $len + ($len % 2)
+}
+if ($dataAt -lt 0) { Say @{error="no audio samples in the sound track"}; exit 0 }
+$eng = New-Object System.Speech.Recognition.SpeechRecognitionEngine($pick)
+$eng.LoadGrammar((New-Object System.Speech.Recognition.DictationGrammar))
+$ms = New-Object System.IO.MemoryStream($all, $dataAt, $dataLen)
+$fmt = New-Object System.Speech.AudioFormat.SpeechAudioFormatInfo(16000, [System.Speech.AudioFormat.AudioBitsPerSample]::Sixteen, [System.Speech.AudioFormat.AudioChannel]::Mono)
+$eng.SetInputToAudioStream($ms, $fmt)
+Say @{audio_seconds=($dataLen / 32000.0)}
+# Continuous recognition, not Recognize() in a loop: only this mode keeps one
+# clock across the whole track (Recognize() stamps every phrase 0:00).
+Register-ObjectEvent -InputObject $eng -EventName SpeechRecognized -SourceIdentifier atlasSaid | Out-Null
+Register-ObjectEvent -InputObject $eng -EventName RecognizeCompleted -SourceIdentifier atlasDone | Out-Null
+$eng.RecognizeAsync([System.Speech.Recognition.RecognizeMode]::Multiple)
+$last = -1.0; $still = 0
+while ($true) {
+  $e = Wait-Event -Timeout 10
+  if ($e -eq $null) {
+    $at = [double]$eng.RecognizerAudioPosition.TotalSeconds
+    Say @{pos=$at}                                        # a long silent stretch still shows progress
+    if ($at -le $last) { $still++ } else { $still = 0 }
+    $last = $at
+    if ($still -ge 30) { Say @{error="the recogniser stopped moving at $at s"}; break }
+    continue
+  }
+  Remove-Event -EventIdentifier $e.EventIdentifier
+  if ($e.SourceIdentifier -eq "atlasDone") {
+    if ($e.SourceEventArgs.Error) { Say @{error=[string]$e.SourceEventArgs.Error.Message} }
+    break
+  }
+  $r = $e.SourceEventArgs.Result
+  Say @{at=[double]$r.Audio.AudioPosition.TotalSeconds; said=[string]$r.Text; confidence=[double]$r.Confidence}
+}
+try { $eng.RecognizeAsyncCancel() } catch { }
+$eng.Dispose()
+Say @{done=$true}
+'''
+
+
+# --------------------------------------------------------------------------
+# pieces that run anywhere
+# --------------------------------------------------------------------------
+
+def hms(seconds: float) -> str:
+    s = int(max(0, seconds))
+    return f"{s // 3600:02d}:{(s % 3600) // 60:02d}:{s % 60:02d}"
+
+
+def sidecar_of(video: str) -> str:
+    """kt-session.mp4 -> kt-session.video.docx (the build names a document
+    after the file name without its last extension: KT-SESSION.VIDEO). When
+    kt-session.mov sits beside it too, each keeps its own:
+    kt-session.mp4.video.docx."""
+    stem, ext = os.path.splitext(video)
+    folder = os.path.dirname(video) or "."
+    try:
+        twins = [f for f in os.listdir(folder)
+                 if os.path.splitext(f)[0].lower() == os.path.basename(stem).lower() and f.lower().endswith(VIDEO_EXT)]
+    except OSError:
+        twins = []
+    return (video if len(twins) > 1 else stem) + SIDECAR
+
+
+def captions_beside(video: str) -> Optional[str]:
+    stem = os.path.splitext(video)[0]
+    for cand in (stem + ".vtt", stem + ".srt", video + ".vtt", video + ".srt"):
+        if os.path.isfile(cand):
+            return cand
+    return None
+
+
+_CUE_TIME = re.compile(r"(?:(\d+):)?(\d{1,2}):(\d{2})[.,](\d{1,3})\s*-->\s*")
+
+
+def parse_captions(text: str) -> List[Tuple[float, str]]:
+    """(start seconds, text) from WebVTT or SRT - the transcript a meeting or
+    video service can export. Speaker tags (<v Name>) are kept as 'Name: '."""
+    cues: List[Tuple[float, str]] = []
+    start: Optional[float] = None
+    buf: List[str] = []
+
+    def flush() -> None:
+        if start is not None and buf:
+            line = " ".join(buf)
+            line = re.sub(r"<v\s+([^>]+)>", r"\1: ", line)
+            line = re.sub(r"</?[^>]+>", "", line)
+            line = html.unescape(re.sub(r"\s+", " ", line)).strip()
+            if line:
+                cues.append((start, line))
+
+    for raw in text.splitlines():
+        ln = raw.strip("\ufeff").strip()
+        m = _CUE_TIME.search(ln)
+        if m:
+            flush()
+            h, mi, s, ms = m.group(1), m.group(2), m.group(3), m.group(4)
+            start = int(h or 0) * 3600 + int(mi) * 60 + int(s) + int(ms.ljust(3, "0")) / 1000.0
+            buf = []
+        elif not ln:
+            flush()
+            start, buf = (None, []) if start is not None and buf else (start, buf)
+        elif start is None:
+            continue                     # WEBVTT header, NOTE/STYLE blocks, cue numbers: never speech
+        else:
+            buf.append(ln)
+    flush()
+    return cues
+
+
+SAME_SCREEN_CHARS = 6        # this many characters different (or 1% of the screen) is still the same screen
+
+
+def _screen_key(text: str) -> str:
+    return " ".join(re.sub(r"\b\d{1,2}:\d{2}(:\d{2})?\b", " ", text or "").split())
+
+
+def same_screen(a: str, b: str) -> bool:
+    """Two frames of one screen read a character or two differently (video
+    compression, a blinking cursor, a clock): still the same screen. A line
+    typed into it is not."""
+    if a == b:
+        return True
+    if not a or not b:
+        return False
+    allowed = max(SAME_SCREEN_CHARS, len(a) // 100)
+    if abs(len(a) - len(b)) > allowed:
+        return False
+    sm = difflib.SequenceMatcher(None, a, b, autojunk=False)
+    changed = sum(max(i2 - i1, j2 - j1) for op, i1, i2, j1, j2 in sm.get_opcodes() if op != "equal")
+    return changed <= allowed
+
+
+_SPACED_DOT = re.compile(r"(?<=[A-Z0-9#@$])[ \t]+\.[ \t]*(?=[A-Z0-9#@$])")
+
+
+def tidy_screen(text: str) -> str:
+    """The OCR engine reads PROD.CLAIMS.INPUT off a screen as
+    'PROD . CLAIMS . INPUT', and a search for the dataset then misses it. Only
+    a dot with a space BEFORE it, between capitals or digits, is joined: a
+    sentence never puts a space before its full stop."""
+    return _SPACED_DOT.sub(".", text or "")
+
+
+def dedupe_screens(frames: List[Tuple[float, str]]) -> List[Tuple[float, str]]:
+    """The same screen shown for a minute is written once, when it appeared."""
+    out: List[Tuple[float, str]] = []
+    last = ""
+    for t, text in frames:
+        key = _screen_key(text)
+        if not key or same_screen(key, last):
+            continue
+        last = key
+        out.append((t, text.strip()))
+    return out
+
+
+def sections(screens: List[Tuple[float, str]], speech: List[Tuple[float, str]], speech_source: str,
+             window: float = SECTION_SECONDS) -> List[Tuple[str, List[str]]]:
+    """(heading, lines) per time window: what was said and what was on the
+    screen, in time order, each line starting with its time."""
+    events: List[Tuple[float, int, str]] = []
+    for t, text in speech:
+        events.append((t, 0, f"[{hms(t)}] {speech_source}: {text}"))
+    for t, text in screens:
+        rows = [r.strip() for r in text.splitlines() if r.strip()]
+        if rows:
+            # every screen row is prefixed, so no transcript line can look like JCL or COBOL
+            events.append((t, 1, f"[{hms(t)}] SCREEN: {rows[0]}"))
+            events.extend((t, 2 + k, f"[{hms(t)}] SCREEN: {r}") for k, r in enumerate(rows[1:]))
+    events.sort(key=lambda e: (e[0], e[1]))
+    out: List[Tuple[str, List[str]]] = []
+    cur_key = None
+    for t, _k, line in events:
+        key = int(t // window)
+        if key != cur_key:
+            out.append((f"{hms(key * window)} - {hms((key + 1) * window)}", []))
+            cur_key = key
+        out[-1][1].append(line)
+    return out
+
+
+def write_docx(path: str, title: str, intro: List[str], secs: List[Tuple[str, List[str]]]) -> None:
+    """A plain Word file: a title, a note, then one Heading 1 per time window.
+    Opens in Word; read by the build like any document."""
+    W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+
+    def para(text: str, style: Optional[str] = None) -> str:
+        ppr = f'<w:pPr><w:pStyle w:val="{style}"/></w:pPr>' if style else ""
+        return f'<w:p>{ppr}<w:r><w:t xml:space="preserve">{html.escape(text, quote=False)}</w:t></w:r></w:p>'
+
+    body = [para(title, "Title")] + [para(x) for x in intro]
+    for heading, lines in secs:
+        body.append(para(heading, "Heading1"))
+        body.extend(para(x) for x in lines)
+    doc = f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="{W}"><w:body>{"".join(body)}</w:body></w:document>'
+    types = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+             '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+             '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+             '<Default Extension="xml" ContentType="application/xml"/>'
+             '<Override PartName="/word/document.xml" '
+             'ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>')
+    rels = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" '
+            'Target="word/document.xml"/></Relationships>')
+    tmp = path + ".part"
+    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("[Content_Types].xml", types)
+        z.writestr("_rels/.rels", rels)
+        z.writestr("word/document.xml", doc)
+    os.replace(tmp, path)
+
+
+def transcript_path(video: str, root: Optional[str] = None, out: Optional[str] = None) -> str:
+    """Beside the video, or under `out` in the same subfolders the video has
+    under `root` (two session1.mp4 in different folders never collide)."""
+    if not out:
+        return sidecar_of(video)
+    rel = "."
+    if root and os.path.isdir(root):
+        rel = os.path.relpath(os.path.dirname(os.path.abspath(video)), os.path.abspath(root))
+        if rel.startswith(".."):
+            rel = "."
+    return os.path.normpath(os.path.join(os.path.abspath(out), rel, os.path.basename(sidecar_of(video))))
+
+
+def is_current(video: str, side: Optional[str] = None) -> bool:
+    side = side or sidecar_of(video)
+    if not os.path.isfile(side):
+        return False
+    inputs = [video]
+    cap = captions_beside(video)
+    if cap:
+        inputs.append(cap)
+    return os.path.getmtime(side) >= max(os.path.getmtime(x) for x in inputs)
+
+
+def find_videos(roots: List[str]) -> List[Tuple[str, str]]:
+    """(root it was found under, absolute video path), in folder order."""
+    out: List[Tuple[str, str]] = []
+    for root in roots:
+        if os.path.isfile(root) and root.lower().endswith(VIDEO_EXT):
+            out.append((os.path.dirname(os.path.abspath(root)), os.path.abspath(root)))
+            continue
+        for dirpath, dirs, files in os.walk(root):
+            dirs.sort()
+            dirs[:] = [d for d in dirs if not d.startswith(".")]
+            out.extend((root, os.path.abspath(os.path.join(dirpath, f)))
+                       for f in sorted(files) if f.lower().endswith(VIDEO_EXT))
+    return out
+
+
+# --------------------------------------------------------------------------
+# the Windows part
+# --------------------------------------------------------------------------
+
+def _json_lines(out: str) -> List[dict]:
+    rows = []
+    for line in (out or "").splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                rows.append(json.loads(line))
+            except ValueError:
+                pass
+    return rows
+
+
+def read_video(video: str, every: float = EVERY_SECONDS, screens: bool = True, speech: bool = True,
+               log=print) -> Dict[str, object]:
+    """{'duration', 'screens': [(t, text)], 'speech': [(t, text)], 'speech_source', 'notes': [...]}"""
+    video = os.path.abspath(video)      # the Windows media API refuses C:/x/y.mp4 and relative paths
+    result: Dict[str, object] = {"duration": 0.0, "screens": [], "speech": [], "speech_source": "SAID", "notes": []}
+    notes: List[str] = result["notes"]                                   # type: ignore[assignment]
+    ok, why = ocr.ocr_available()
+    captions = captions_beside(video)
+    if captions:
+        with open(captions, encoding="utf-8-sig", errors="replace") as fh:
+            result["speech"] = parse_captions(fh.read())
+        result["speech_source"] = "SAID (captions)"
+        notes.append(f"speech from the caption file {os.path.basename(captions)}")
+        speech = False
+    if not screens and not speech:
+        return result                       # captions only: no need to open the video at all
+    if not ok:
+        notes.append(why)
+        return result
+    work = tempfile.mkdtemp(prefix="atlas-video-")
+    try:
+        t0 = time.time()
+        state = {"frames": 0, "t": time.time()}
+
+        def on_line(line: str) -> None:
+            if '"frame"' in line:
+                state["frames"] += 1
+            if time.time() - state["t"] >= 10:
+                state["t"] = time.time()
+                log(f"  ... {state['frames']} frame(s) taken, {int(time.time() - t0)} s")
+
+        rc, out, err = ocr._run_ps(_PS_EXTRACT, ["-Video", video, "-OutDir", work, "-Every", str(every),
+                                                 "-Width", str(FRAME_WIDTH), "-NoFrames", "0" if screens else "1",
+                                                 "-NoAudio", "0" if speech else "1"],
+                                   timeout=6 * 3600, on_line=on_line)
+        rows = _json_lines(out)
+        for r in rows:
+            if "error" in r and "frame" not in r:
+                notes.append(str(r["error"]))
+            if "duration" in r:
+                result["duration"] = float(r["duration"])
+            if "audio_error" in r:
+                notes.append("sound track: " + str(r["audio_error"]))
+        frames = [(float(r["frame"]), r["path"]) for r in rows if "frame" in r and "path" in r]
+        bad = [r for r in rows if "frame" in r and "error" in r]
+        if bad:
+            notes.append(f"{len(bad)} frame(s) could not be taken")
+        if frames:
+            log(f"  reading {len(frames)} frame(s) with the OCR engine")
+            texts, warns = ocr.ocr_images([p for _t, p in frames], log=log)
+            got = [(t, tidy_screen(texts.get(os.path.normcase(os.path.abspath(p)), ""))) for t, p in frames]
+            result["screens"] = dedupe_screens(got)
+            if warns:
+                notes.append(f"{len(warns)} frame(s) unreadable by the OCR engine")
+        wav = next((r["audio"] for r in rows if "audio" in r), None)
+        if speech and wav and os.path.isfile(wav):
+            state = {"n": 0, "t": time.time(), "secs": 0.0}
+
+            def on_speech(line: str) -> None:
+                if '"said"' in line or '"pos"' in line:
+                    state["n"] += '"said"' in line
+                    try:
+                        row = json.loads(line)
+                        state["secs"] = float(row.get("at", row.get("pos", state["secs"])))
+                    except ValueError:
+                        pass
+                if time.time() - state["t"] >= 10:
+                    state["t"] = time.time()
+                    log(f"  ... speech: {state['n']} phrase(s), up to {hms(state['secs'])} of {hms(float(result['duration']))}")
+
+            log(f"  reading the sound track ({hms(float(result['duration']))}) with the Windows speech recogniser")
+            rc, out, err = ocr._run_ps(_PS_SPEECH, ["-Wav", wav], timeout=6 * 3600, on_line=on_speech)
+            srows = _json_lines(out)
+            for r in srows:
+                if "error" in r:
+                    notes.append("speech: " + str(r["error"]))
+                if "recognizer" in r:
+                    notes.append(f"speech recogniser: {r['recognizer']} - plain speech reads well, jargon does not; "
+                                 "a caption file beside the video is used instead when there is one")
+            result["speech"] = [(float(r["at"]), str(r["said"])) for r in srows if "said" in r]
+        return result
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def process(video: str, every: float = EVERY_SECONDS, screens: bool = True, speech: bool = True,
+            refresh: bool = False, log=print, side: Optional[str] = None) -> Optional[str]:
+    """Write the transcript (`side`, default beside the video); return its
+    path, or None when it is current or nothing in the video was readable."""
+    side = side or sidecar_of(video)
+    if not refresh and is_current(video, side):
+        log(f"  up to date: {side}")
+        return None
+    t0 = time.time()
+    r = read_video(video, every, screens, speech, log)
+    screens_l: List[Tuple[float, str]] = r["screens"]                     # type: ignore[assignment]
+    speech_l: List[Tuple[float, str]] = r["speech"]                       # type: ignore[assignment]
+    notes: List[str] = r["notes"]                                         # type: ignore[assignment]
+    if not screens_l and not speech_l:
+        log(f"  nothing readable in {os.path.basename(video)}: " + ("; ".join(notes) or "no text on screen, no speech"))
+        return None
+    secs = sections(screens_l, speech_l, str(r["speech_source"]))
+    title = f"Video {os.path.basename(video)}"
+    intro = [f"{MARK} on {time.strftime('%Y-%m-%d %H:%M')} from {os.path.basename(video)} "
+             f"({hms(float(r['duration']))}): a frame every {int(every)} s read by OCR (SCREEN), and the sound "
+             f"track ({'caption file' if 'captions' in str(r['speech_source']) else 'Windows speech recogniser'}) (SAID).",
+             "This is what was shown and said, not a fact about what runs: OCR confuses 0/O and 1/I, and speech "
+             "recognition garbles jargon - quote it as such, and check anything important against the source."]
+    intro += [f"Note: {n}" for n in notes]
+    os.makedirs(os.path.dirname(side) or ".", exist_ok=True)
+    write_docx(side, title, intro, secs)
+    log(f"  wrote {side}: {len(screens_l)} distinct screen(s), {len(speech_l)} spoken phrase(s), "
+        f"{len(secs)} section(s), {int(time.time() - t0)} s")
+    return side
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    ap = argparse.ArgumentParser(description="Turn recorded sessions into documents the build indexes: screens by OCR, "
+                                             "speech by the Windows recogniser (or a caption file beside the video).")
+    ap.add_argument("folders", nargs="+", help="folders (searched with their subfolders) or video files")
+    ap.add_argument("--out", metavar="FOLDER", help="write the transcripts here (same subfolders) instead of beside "
+                                                    "the videos - a folder the build reads")
+    ap.add_argument("--every", type=float, default=EVERY_SECONDS, help=f"seconds between frames read (default {EVERY_SECONDS})")
+    ap.add_argument("--no-speech", action="store_true", help="screens only")
+    ap.add_argument("--no-screens", action="store_true", help="speech only")
+    ap.add_argument("--refresh", action="store_true", help="read again even when the transcript is newer than the video")
+    ap.add_argument("--dry-run", action="store_true", help="list what would be read")
+    a = ap.parse_args(argv)
+    videos = find_videos(a.folders)
+    say = lambda s: print(s, flush=True)                                  # noqa: E731
+    say(f"{len(videos)} video(s) found" + (f"; transcripts go to {os.path.abspath(a.out)}" if a.out else
+                                            "; transcripts go beside them"))
+    if a.dry_run:
+        for root, v in videos:
+            side = transcript_path(v, root, a.out)
+            say(f"  {'up to date' if is_current(v, side) else 'to read   '}  {v}  "
+                f"({os.path.getsize(v) // 1024 // 1024} MB{', captions beside it' if captions_beside(v) else ''})"
+                f"  ->  {side}")
+        return 0
+    written = 0
+    for k, (root, v) in enumerate(videos, 1):
+        say(f"{time.strftime('%H:%M:%S')}  [{k}/{len(videos)}] {v} ({os.path.getsize(v) // 1024 // 1024} MB)")
+        try:
+            if process(v, a.every, not a.no_screens, not a.no_speech, a.refresh, say, transcript_path(v, root, a.out)):
+                written += 1
+        except KeyboardInterrupt:
+            say("stopped by Ctrl+C - transcripts already written are kept; run the same command again to continue")
+            return 130
+        except Exception as e:                                            # noqa: BLE001 - one bad video never stops the rest
+            say(f"  FAILED {os.path.basename(v)}: {type(e).__name__}: {e}")
+    say(f"{written} transcript(s) written. Next: run the build (incremental) so they are indexed, then "
+        "`docs TERM` or `doc NAME` finds them.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

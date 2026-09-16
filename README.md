@@ -371,6 +371,26 @@ OCR engine that ships with Windows 10/11
 (hand-drawn diagrams, photos of whiteboards) are listed with their extracted
 path; those are the few worth a vision-model call, chosen by hand.
 
+**Recorded sessions are read too.** A knowledge-transfer or outage
+walkthrough recording holds what nobody wrote down.
+`python -m atlas.video "C:\Recordings" --out "C:\docs\Video transcripts"`
+reads every .mp4/.m4v/.mov/.wmv/.avi under the folder with what Windows
+already has - a frame every 10 seconds through the same OCR engine (a screen
+shown for a minute is written once, at the time it appeared), and the sound
+track through the Windows speech recogniser - and writes
+`<name>.video.docx`: one section per two minutes, every line stamped
+`[00:12:05] SAID:` or `[00:12:10] SCREEN:`. The next build indexes it as
+document `<NAME>.VIDEO`, found by `docs TERM` and cited like any section; no
+parser changes, so no re-parse. A 12-minute 788 MB test recording took 28
+seconds. Screens (JCL, SDSF, green screens, slides) read well; plain speech
+reads well; mainframe jargon does not ("step ten abends" came back as
+"stepped in awe bins"), so when a caption file sits beside the video
+(`<name>.vtt` or `.srt` - the transcript Teams or Stream lets you download)
+its text is used instead. Keep the recordings outside the folders the build
+reads and point `--out` into one: a video inside them is read in full on
+every build only to be skipped, and one over 300 MB is listed as a problem.
+A transcript is what was shown and said, never a fact about what runs.
+
 **Spreadsheets and tables are rows, not counts.** A workbook's tab is a
 section whose text is its rows — `row 12: TC-GEN-01 | Add gender N | PASS`,
 with the sheet's own row numbers — so a QA results workbook is searched

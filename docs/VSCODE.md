@@ -69,6 +69,7 @@ answer is checked mechanically before you rely on it.
 | Test conditions and test data | Atlas: conditions, layout, pack | `/atlas-tests` |
 | Change design document | the tasks for each field and job touched | `/atlas-design` |
 | Transition document for a release (Application Operations + Contact Center) | Atlas: handover pack (one task: give the system holding the changed copies and the plan / stories / QA workbook names), then fill `work/release-facts.md` | `/atlas-handover` (one request) |
+| What a recorded session showed and said | Atlas: read recordings (once per new recording), then the build; then Atlas: document sections about a term | `/atlas-answer` (quote it as a recording, not as fact) |
 | The gate said FAIL | Atlas: verify | `/atlas-fix` |
 
 `Atlas: coverage` before trusting anything; `Atlas: UI` for fetch and build;
