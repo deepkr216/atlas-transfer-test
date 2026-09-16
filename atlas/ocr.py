@@ -33,8 +33,9 @@ import tempfile
 import zipfile
 from typing import Dict, List, Optional, Tuple
 
-IMAGE_EXT = (".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tif", ".tiff")
+IMAGE_EXT = (".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tif", ".tiff", ".emf", ".wmf")
 MIN_BYTES = 2048           # smaller than this is an icon or a bullet, not content
+MIN_VECTOR_BYTES = 400     # ... but a metafile is vector: a whole flow chart of text fits in 2 KB
 OCR_ORDINAL_BASE = 1000    # doc_section ordinals 1001.. are OCR'd images
 
 _MEDIA_PREFIX = {"docx": "word/media/", "dotx": "word/media/", "pptx": "ppt/media/", "potx": "ppt/media/",
@@ -314,7 +315,8 @@ def extract_images(conn: sqlite3.Connection, out_dir: str, member: Optional[str]
                     for n in z.namelist():
                         if n.startswith(_MEDIA_PREFIX[ext]) and n.lower().endswith(IMAGE_EXT):
                             info = z.getinfo(n)
-                            if info.file_size < MIN_BYTES:
+                            floor = MIN_VECTOR_BYTES if n.lower().endswith((".emf", ".wmf")) else MIN_BYTES
+                            if info.file_size < floor:
                                 continue
                             os.makedirs(dest_dir, exist_ok=True)
                             dest = os.path.join(dest_dir, os.path.basename(n))
@@ -324,7 +326,7 @@ def extract_images(conn: sqlite3.Connection, out_dir: str, member: Optional[str]
             except zipfile.BadZipFile:
                 continue
         elif ext in [e.lstrip(".") for e in IMAGE_EXT]:
-            if os.path.getsize(path) >= MIN_BYTES:
+            if os.path.getsize(path) >= (MIN_VECTOR_BYTES if ext in ("emf", "wmf") else MIN_BYTES):
                 out.append((mid, name, os.path.basename(path), path))
         elif ext == "pdf" and pdf_pages != "none" and (pdf_pages == "all" or _pdf_needs_pages(perr)):
             done = conn.execute("SELECT COUNT(*) FROM doc_image WHERE member_id=? AND name LIKE 'page-%' AND ocr_text IS NOT NULL",
@@ -354,6 +356,87 @@ def image_heading(img: str, anchor: Optional[str] = None) -> str:
     return f"image: {os.path.basename(img)}" + (f" ({anchor})" if anchor else "")
 
 
+
+# A picture the OCR engine cannot decode, turned into one it can: a metafile
+# (EMF/WMF - what Word and Visio store a pasted diagram as) is drawn onto a
+# white bitmap at twice its size, and every frame of a multi-page TIFF is
+# written out. One line per result: OK<TAB>source<TAB>png  or  FAIL<TAB>source<TAB>why
+_PS_TO_PNG = r'''
+param([string]$ListFile)
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+Add-Type -AssemblyName System.Drawing
+foreach ($p in Get-Content -LiteralPath $ListFile) {
+  if (-not $p) { continue }
+  try {
+    $img = [System.Drawing.Image]::FromFile($p)
+    $dir = Split-Path -Parent $p
+    $base = [System.IO.Path]::GetFileNameWithoutExtension($p)
+    $frames = 1
+    try {
+      $dim = New-Object System.Drawing.Imaging.FrameDimension $img.FrameDimensionsList[0]
+      $frames = $img.GetFrameCount($dim)
+    } catch { $frames = 1 }
+    for ($i = 0; $i -lt $frames; $i++) {
+      if ($frames -gt 1) { $img.SelectActiveFrame($dim, $i) | Out-Null }
+      $w = [Math]::Min(6000, [Math]::Max(1000, $img.Width * 2))
+      $h = [Math]::Min(6000, [Math]::Max(300, [int]($img.Height * ($w / $img.Width))))
+      $bmp = New-Object System.Drawing.Bitmap($w, $h)
+      $bmp.SetResolution(300, 300)
+      $g = [System.Drawing.Graphics]::FromImage($bmp)
+      $g.Clear([System.Drawing.Color]::White)
+      $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+      $g.DrawImage($img, 0, 0, $w, $h)
+      $g.Dispose()
+      $suffix = if ($frames -gt 1) { "-p{0:d3}" -f ($i + 1) } else { "" }
+      $out = Join-Path $dir ($base + $suffix + ".ocr.png")
+      $bmp.Save($out, [System.Drawing.Imaging.ImageFormat]::Png)
+      $bmp.Dispose()
+      [Console]::Out.WriteLine("OK`t$p`t$out")
+    }
+    $img.Dispose()
+  } catch {
+    [Console]::Out.WriteLine("FAIL`t$p`t" + $_.Exception.Message)
+  }
+}
+'''
+
+CONVERT_EXT = (".emf", ".wmf", ".tif", ".tiff")     # the OCR engine decodes none of these
+
+
+def to_readable_images(paths: List[str], log=None) -> Dict[str, List[str]]:
+    """{original: [png ...]} for pictures the OCR engine cannot decode: EMF and
+    WMF diagrams (what Word and Visio store a pasted drawing as - the engine
+    fails on them outright) and multi-page TIFF scans (it reads only the first
+    page). Anything that cannot be converted is left out and stays unread."""
+    want = [p for p in paths if p.lower().endswith(CONVERT_EXT)]
+    if not want:
+        return {}
+    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as fh:
+        fh.write("\n".join(os.path.abspath(p) for p in want))
+        listfile = fh.name
+    if log:
+        log(f"  converting {len(want)} diagram(s) / multi-page scan(s) the OCR engine cannot decode")
+    try:
+        rc, out, err = _run_ps(_PS_TO_PNG, ["-ListFile", listfile], timeout=max(600, 5 * len(want)))
+    finally:
+        try:
+            os.remove(listfile)
+        except OSError:
+            pass
+    made: Dict[str, List[str]] = {}
+    for line in (out or "").splitlines():
+        parts = line.rstrip("\r").split("\t")
+        if len(parts) == 3 and parts[0] == "OK" and os.path.isfile(parts[2]):
+            made.setdefault(os.path.normcase(os.path.abspath(parts[1])), []).append(parts[2])
+        elif len(parts) == 3 and parts[0] == "FAIL" and log:
+            log(f"  cannot convert {os.path.basename(parts[1])}: {parts[2][:120]}")
+    if rc != 0 and log:
+        log(f"  image conversion ended with {rc}: {(err or '').strip()[:200]}")
+    if log:
+        log(f"  converted {sum(len(v) for v in made.values())} image(s) for the OCR engine")
+    return made
+
+
 def run(conn: sqlite3.Connection, out_dir: str, do_ocr: bool = True, member: Optional[str] = None,
         log=print, pdf_pages: str = "scans") -> Dict[str, int]:
     images = extract_images(conn, out_dir, member, pdf_pages, log)
@@ -368,11 +451,18 @@ def run(conn: sqlite3.Connection, out_dir: str, do_ocr: bool = True, member: Opt
     todo = [(mid, name, img, dest) for (mid, name, img, dest) in images
             if conn.execute("SELECT ocr_text FROM doc_image WHERE member_id=? AND name=?", (mid, img)).fetchone()[0] is None]
     log(f"OCR: {len(todo)} image(s) to read ({len(images) - len(todo)} already done)")
-    texts, warnings = ocr_images([d for (_m, _n, _i, d) in todo], log=log)
+    converted = to_readable_images([d for (_m, _n, _i, d) in todo], log=log)
+    read_paths: List[str] = []
+    for _mid, _name, _img, dest in todo:
+        read_paths.extend(converted.get(os.path.normcase(os.path.abspath(dest)), [dest]))
+    texts, warnings = ocr_images(read_paths, log=log)
     for w in warnings[:20]:
         log("  " + w)
     for mid, name, img, dest in todo:
-        text = texts.get(os.path.normcase(os.path.abspath(dest)))
+        key = os.path.normcase(os.path.abspath(dest))
+        parts = [texts.get(os.path.normcase(os.path.abspath(p))) for p in converted.get(key, [dest])]
+        got = [p for p in parts if p is not None]
+        text = "\n".join(p for p in got if p) if got else None       # several pages of one scan read as one
         if text is None:
             stats["ocr_failed"] += 1
             continue

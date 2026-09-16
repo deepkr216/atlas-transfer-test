@@ -361,7 +361,10 @@ off; 400 pages per document at most).
 
 **Pictures are read, not just counted.** `OCR images` (UI) or
 `python -m atlas.ocr --db atlas.db --out out/images` pulls every image out of
-the documents and runs the OCR engine that ships with Windows 10/11
+the documents - including the metafiles (EMF/WMF) that Word, Excel and Visio
+store a pasted diagram as, which are drawn onto a bitmap first because the
+engine cannot decode them, and every page of a multi-page TIFF - and runs the
+OCR engine that ships with Windows 10/11
 (`Windows.Media.Ocr`, driven through PowerShell) — no install, no network,
 **no model tokens**. The recognised text becomes a section of the document
 (`image 1`, `image 2`…), searchable and citable. Pictures OCR cannot read
