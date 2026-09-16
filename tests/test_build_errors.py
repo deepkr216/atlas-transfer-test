@@ -195,6 +195,33 @@ class CoverageExplainsTheStatuses(unittest.TestCase):
             self.assertIn(f"COPY {copybook} NOT FOUND", row[0])
         self.assertIn("usually partial because a copybook it copies is not in the index", cov)
 
+    def test_coverage_says_what_each_unresolved_kind_means_and_what_closes_it(self):
+        conn = query.connect(self.db)
+        try:
+            cov = query.cmd_coverage(conn)
+            kinds = [r[0] for r in conn.execute("SELECT DISTINCT kind FROM unresolved")]
+        finally:
+            conn.close()
+        self.assertIn("### Unresolved by kind - what the index could NOT work out, and what closes each one", cov)
+        self.assertIn("| kind | count | what it means | what closes it |", cov)
+        self.assertIn("a COPY statement whose copybook is not in the index", cov)
+        self.assertIn("fetch that copybook library and build again", cov)
+        for k in kinds:                                   # every kind this estate produced is explained
+            row = [ln for ln in cov.splitlines() if ln.startswith(f"| {k} |")]
+            self.assertEqual(len(row), 1, (k, cov))
+            self.assertNotIn("(see the members below)", row[0], k)
+        # and every kind the parsers can record has an entry, so none arrives unexplained
+        import glob
+        import re as _re
+        recorded = set()
+        for fn in glob.glob(os.path.join(os.path.dirname(HERE), "atlas", "*.py")):
+            src = io.open(fn, encoding="utf-8").read() if False else open(fn, encoding="utf-8").read()
+            recorded |= set(_re.findall(r'unresolved\.append\(\(\s*"([a-z_]+)"', src))
+            recorded |= set(_re.findall(r'INSERT INTO unresolved[^"]*"[^"]*",\s*\(mem\.id,\s*"([a-z_]+)"', src))
+            recorded |= set(_re.findall(r'\(mem\.id,\s*"([a-z_]+)",\s*(?:w|"|f")', src))
+        missing = sorted(k for k in recorded if k not in query.UNRESOLVED_MEANING)
+        self.assertEqual(missing, [], f"unresolved kinds with no explanation in coverage: {missing}")
+
     def test_coverage_says_none_when_every_member_is_complete(self):
         os.remove(os.path.join(self.td, "estate", "SRC", "SAMPPGM.cbl"))
         os.remove(os.path.join(self.td, "estate", "SRC", "ERRPGM.cbl"))

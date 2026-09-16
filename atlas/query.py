@@ -1398,6 +1398,75 @@ def index_header(conn: sqlite3.Connection) -> str:
     return "; ".join(parts)
 
 
+# What each blind spot in `unresolved` means, and what closes it. The parsers
+# record the kind; a reader should not have to guess what the word implies.
+UNRESOLVED_MEANING = {
+    "expand": ("a COPY statement whose copybook is not in the index",
+               "fetch that copybook library and build again - until then the program's fields are incomplete"),
+    "ambiguous_copybook": ("two copies of one copybook with different content; one was chosen",
+                           "declare the department's copybook order (manifest `copylib_order`) or remove the stale copy"),
+    "include_member": ("a JCL `INCLUDE MEMBER=` whose member is not in the index",
+                       "fetch the JCLLIB / PARMLIB holding it: its DDs, symbols and steps are missing from the job"),
+    "card_member": ("a SYSIN DD naming a control-card member that is not in the index",
+                    "fetch the CNTL / PARMLIB library: sort fields, IDCAMS names and utility cards are unknown"),
+    "sort_symbols": ("a SORT step with a SYMNAMES DD whose member is not in the index",
+                     "fetch that member - the symbolic field positions in its sort cards cannot be resolved"),
+    "intrdr": ("a step that submits a job through the internal reader",
+               "nothing to fetch: the submitted JCL is written at run time, so that job's steps are invisible here"),
+    "sql_cursor": ("a FETCH whose cursor is declared somewhere else (another program, or a copybook not found)",
+                   "fetch the copybook holding the DECLARE CURSOR; otherwise the columns of that FETCH are unknown"),
+    "dynamic_sql": ("PREPARE / EXECUTE IMMEDIATE: the SQL text is built at run time",
+                    "nothing to fetch: the tables touched cannot be known from the source - a human must confirm"),
+    "dynamic_call": ("a CALL through a variable (or EXEC CICS LINK/XCTL) whose target was never a literal here",
+                     "the target may come from a control card, a DB2 table or LINKAGE: `callers` / `crud` are incomplete for it"),
+    "screen": ("a BMS / MFS member in which no map, format or message macro was recognised",
+               "check it really is a map source; if it is, send its first lines (no data) so the parser can be fixed"),
+    "dli_function": ("a DL/I call whose function code is not a literal in this program",
+                     "the function (GU/ISRT/REPL...) comes from a variable: read/update intent for that call is unknown"),
+    "ims_psb": ("a program whose PSB could not be matched",
+                "fetch the PSB source library: PCB order, databases and PROCOPT for its DL/I calls are unknown"),
+    "ims_dbd": ("a DBD referenced but not indexed",
+                "fetch the DBD source library: segments, keys and the database's fields are unknown"),
+    "ims_msw": ("an IMS message switch (CHNG) whose destination is not a literal",
+                "the transaction it switches to cannot be known from the source"),
+    "ims_switch": ("an IMS message switch destination built at run time", "as above - a human must confirm the target"),
+    "layout_warning": ("a record layout the parser could not compute exactly (OCCURS DEPENDING, REDEFINES overlap)",
+                       "check the offsets in `layout` before using them for test data or an interface contract"),
+    "procedure_copybook": ("a copybook that contributes PROCEDURE DIVISION code, not data",
+                           "nothing to fix: its paragraphs belong to every program that copies it"),
+    "missing_proc": ("an EXEC PROC= whose PROC member is not in the index",
+                     "fetch the PROCLIB: that step's real program, DDs and datasets are unknown"),
+    "ambiguous_proc": ("two PROCs of one name; one was chosen",
+                       "declare the department (manifest `system_of`) so a job takes its own PROC"),
+    "proc_synthesised": ("a system PROC (IBM-supplied) referenced but not indexed; its shape was assumed",
+                         "harmless unless your shop overrides it - then fetch the overriding PROCLIB"),
+    "override_target": ("a PROC step override naming a step or DD that is not there",
+                        "usually a typo in the JCL, or the PROC changed since - worth reading"),
+    "referback": ("a DSN=*.STEP.DD referback naming no earlier DD with a dataset",
+                  "usually a typo or a step that was removed: the lineage has a hole there"),
+    "symbolic": ("a JCL symbolic that is never given a value",
+                 "the dataset name it forms is unknown - the value comes from a SET, a PROC default or the scheduler"),
+    "gdg": ("a GDG relative generation that could not be resolved to a real name",
+            "nothing to fix: (+1)/(0) depends on the run - the base name is what the index keeps"),
+    "cics_file_var": ("an EXEC CICS FILE() named by a variable", "the file it touches cannot be known from the source"),
+    "cics_transid": ("an EXEC CICS START/RETURN TRANSID() named by a variable", "the transaction started is unknown"),
+    "cics_tdq": ("a transient-data queue named by a variable", "the queue written or read is unknown"),
+    "routing": ("a CSD / stage-1 routing entry that could not be matched to a program",
+                "fetch the CSD extract or the IMS stage-1 for that region"),
+    "ndm_process": ("a Connect:Direct process member named by a SUBMIT PROC= that is not indexed",
+                    "fetch that process library: the datasets sent or received are unknown"),
+    "mq": ("an MQ queue name built at run time", "the queue cannot be known from the source"),
+    "card_seq_assumed": ("a card deck with no sequence field; the order on disk was assumed",
+                         "harmless for reading, but confirm before regenerating the deck"),
+    "scheduler_format": ("a scheduler export line the loader did not understand",
+                         "send one line of the export (no names) so the loader can be extended"),
+    "copy_replacing": ("a COPY ... REPLACING: the field names in this program differ from the copybook as stored",
+                       "nothing to fetch - ask for the program's own names (`layout X --program PGM`), not the copybook's"),
+    "assign_dataname": ("a SELECT ... ASSIGN TO a data name (dynamic allocation), so the DD name is a guess",
+                        "the real DD is set at run time (a MOVE, a parm or BPXWDYN): confirm it in the job before relying on it"),
+}
+
+
 def _partial_members(conn: sqlite3.Connection) -> str:
     """Members whose facts are incomplete, with the reason the parser gave -
     a COBOL member is `partial` mostly because a copybook it copies was not
@@ -1462,9 +1531,16 @@ def cmd_coverage(conn: sqlite3.Connection) -> str:
     out.append(table(["copybook", "uses"], conn.execute(
         "SELECT copybook, COUNT(*) FROM copy_use WHERE resolved_member_id IS NULL AND copybook NOT IN ('SQLCA','SQLDA') "
         "GROUP BY 1 ORDER BY 2 DESC LIMIT 40").fetchall()))
-    out.append("\n### Unresolved by kind\n")
-    out.append(table(["kind", "count"], conn.execute(
-        "SELECT kind, COUNT(*) FROM unresolved GROUP BY 1 ORDER BY 2 DESC").fetchall()))
+    out.append("\n### Unresolved by kind - what the index could NOT work out, and what closes each one\n")
+    rows = conn.execute("SELECT kind, COUNT(*) FROM unresolved GROUP BY 1 ORDER BY 2 DESC").fetchall()
+    out.append(table(["kind", "count", "what it means", "what closes it"],
+                     [(k, n, *UNRESOLVED_MEANING.get(k, ("(see the members below)", "send this kind's name for a fix")))
+                      for k, n in rows]))
+    if rows:
+        out.append("\n> An answer that depends on one of these is incomplete to that extent - every report repeats "
+                   "the ones in its own scope under `Unresolved in scope`, and the model must copy them into its "
+                   "answer. Most are closed by fetching one more library; the rest are run-time values that no "
+                   "source can tell you.\n")
     out.append("\n### DD direction sources\n")
     out.append(table(["source", "count"], conn.execute(
         "SELECT mode_source, COUNT(*) FROM dd WHERE dsn_resolved IS NOT NULL GROUP BY 1 ORDER BY 2 DESC").fetchall()))
