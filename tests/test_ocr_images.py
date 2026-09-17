@@ -228,13 +228,96 @@ class FolderNames(unittest.TestCase):
                 self.assertEqual(len(made), 1, said)
                 self.assertGreater(os.path.getsize(made[0]), 0)
                 self.assertFalse(os.path.basename(os.path.dirname(made[0])).endswith(" "))
-                # the reports find it without the space nobody types
+                # the reports find it without the space nobody types, with or without the extension
                 self.assertEqual(len(query._doc_members(conn, "DATA MASKING")), 1)
                 self.assertIn("image14.png", query.cmd_images(conn, "DATA MASKING"))
+                self.assertIn("image14.png", query.cmd_images(conn, "Data Masking .docx"))
+                self.assertEqual(len(ocr.extract_images(conn, os.path.join(td, "out"), member="DATA MASKING",
+                                                        log=lambda s: None)), 1, "--member too")
+                # a report path typed with a trailing space lands where it reads
+                query.write_out(os.path.join(td, "work ", "coverage.md "), "hello")
+                self.assertTrue(os.path.isfile(os.path.join(td, "work", "coverage.md")))
             finally:
                 conn.close()
         finally:
             shutil.rmtree(td, ignore_errors=True)
+
+
+class NamesBeyondAscii(unittest.TestCase):
+    """At work, five pictures 'empty file (0 bytes)' - and here, a document
+    named with an en dash gives exactly that (LESSONS 157): the list of
+    picture paths reached PowerShell 5.1 as UTF-8 without a BOM, it read it
+    as ANSI, and the mangled path 'was not found', which the script reported
+    as empty."""
+
+    def setUp(self):
+        ok, why = ocr.ocr_available()
+        if not ok:
+            self.skipTest(why)
+        self.td = tempfile.mkdtemp()
+        self.png = os.path.join(self.td, "pic.png")
+        if not ocr.render_text_png("MASKRULE APPLIES TO MEMBER NUMBER", self.png):
+            self.skipTest("could not render a probe image")
+        texts, _w = ocr.ocr_images([self.png])
+        if not texts or "MASKRULE" not in next(iter(texts.values())).upper():
+            self.skipTest("OCR engine unreadable here")
+
+    def tearDown(self):
+        shutil.rmtree(self.td, ignore_errors=True)
+
+    def _index(self, docs_dir):
+        estate = os.path.join(self.td, "estate", "SRC")
+        os.makedirs(estate, exist_ok=True)
+        shutil.copy(os.path.join(HERE, "fixtures", "SAMPPGM.cbl"), estate)
+        db = os.path.join(self.td, "t.db")
+        with contextlib.redirect_stdout(io.StringIO()):
+            build._main([os.path.join(self.td, "estate"), "--db", db, "--rebuild", "--quiet", "--also", docs_dir])
+        return db
+
+    def test_a_document_named_with_an_en_dash_and_an_accented_picture_name_is_read(self):
+        docs_dir = os.path.join(self.td, "docs")
+        os.makedirs(docs_dir)
+        with open(self.png, "rb") as fh:
+            data = fh.read()
+        docx_with_image(os.path.join(docs_dir, "R\u00e9sum\u00e9 \u2013 Data Masking.docx"), "imag\u00e91.png", data)
+        db = self._index(docs_dir)
+        conn = query.connect(db)
+        try:
+            said = []
+            stats = ocr.run(conn, os.path.join(self.td, "out"), log=said.append)
+            self.assertEqual((stats["ocr_text"], stats["ocr_failed"]), (1, 0), said)
+            self.assertIn("MASKRULE", (conn.execute("SELECT ocr_text FROM doc_image").fetchone()[0] or "").upper())
+        finally:
+            conn.close()
+
+    def test_a_missing_picture_file_is_said_to_be_missing_not_empty(self):
+        texts, warnings = ocr.ocr_images([os.path.join(self.td, "gone.png")])
+        self.assertEqual(texts, {})
+        self.assertEqual(len(warnings), 1, warnings)
+        self.assertIn("not found on disk", warnings[0])
+        self.assertNotIn("empty file", warnings[0])
+
+    def test_two_documents_with_one_name_in_two_folders_keep_their_pictures_apart(self):
+        docs_dir = os.path.join(self.td, "docs")
+        for folder, text in (("projA", "ALPHA ONE RELEASE"), ("projB", "BRAVO TWO RELEASE")):
+            os.makedirs(os.path.join(docs_dir, folder))
+            png = os.path.join(self.td, folder + ".png")
+            self.assertTrue(ocr.render_text_png(text, png))
+            with open(png, "rb") as fh:
+                docx_with_image(os.path.join(docs_dir, folder, "Release Notes.docx"), "image1.png", fh.read())
+        db = self._index(docs_dir)
+        conn = query.connect(db)
+        try:
+            said = []
+            stats = ocr.run(conn, os.path.join(self.td, "out"), log=said.append)
+            self.assertEqual((stats["images"], stats["ocr_text"], stats["ocr_failed"]), (2, 2, 0), said)
+            rows = conn.execute("SELECT m.path, i.extracted_path, i.ocr_text FROM doc_image i JOIN member m ON m.id=i.member_id "
+                                "ORDER BY m.path").fetchall()
+            self.assertNotEqual(rows[0]["extracted_path"], rows[1]["extracted_path"], "separate folders")
+            self.assertIn("ALPHA", (rows[0]["ocr_text"] or "").upper(), rows[0]["path"])
+            self.assertIn("BRAVO", (rows[1]["ocr_text"] or "").upper(), rows[1]["path"])
+        finally:
+            conn.close()
 
 
 class BrokenPictures(unittest.TestCase):

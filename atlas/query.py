@@ -2073,8 +2073,9 @@ def cmd_images(conn: sqlite3.Connection, name: Optional[str] = None) -> str:
            FROM doc_image i JOIN member m ON m.id=i.member_id"""
     args: tuple = ()
     if name:
-        q += " WHERE (UPPER(m.name)=? OR UPPER(TRIM(m.name))=?)"
-        args = (name.upper(), name.strip().upper())
+        stem = os.path.splitext(name)[0]                 # `images CLAIMS PLAN.docx` means the document
+        q += " WHERE (UPPER(m.name) IN (?, ?) OR UPPER(TRIM(m.name)) IN (?, ?))"
+        args = (name.upper(), stem.upper(), name.strip().upper(), stem.strip().upper())
     q += " GROUP BY m.id ORDER BY n DESC"
     rows = conn.execute(q, args).fetchall()
     out = [f"# Pictures inside documents{' - ' + name.upper() if name else ''}\n"]
@@ -2092,8 +2093,9 @@ def cmd_images(conn: sqlite3.Connection, name: Optional[str] = None) -> str:
     if name:
         try:
             rows2 = conn.execute("""SELECT i.name, i.anchor, i.extracted_path, i.ocr_text FROM doc_image i JOIN member m ON m.id=i.member_id
-                                    WHERE UPPER(m.name)=? OR UPPER(TRIM(m.name))=? ORDER BY i.id""",
-                                 (name.upper(), name.strip().upper())).fetchall()
+                                    WHERE UPPER(m.name) IN (?, ?) OR UPPER(TRIM(m.name)) IN (?, ?) ORDER BY i.id""",
+                                 (name.upper(), os.path.splitext(name)[0].upper(), name.strip().upper(),
+                                  os.path.splitext(name)[0].strip().upper())).fetchall()
         except sqlite3.OperationalError:
             return "".join(out) + "\n_the index was built by an older toolkit - run the build once (no --rebuild needed) to see where each picture sits_\n"
         out.append(table(["image", "where it sits", "extracted to", "OCR text (first 80 chars)"],
@@ -4217,6 +4219,9 @@ def write_out(path: str, text: str) -> None:
     redirection is not used because its encoding is the shell's choice
     (PowerShell 5.1 `>` produces UTF-16), which the chat model and the gate
     then misread."""
+    # a folder typed with a trailing space is created without it by Windows, and the file inside it
+    # then 'does not exist': strip it from every part of the path
+    path = os.sep.join(c.rstrip(" ") for c in path.replace("/", os.sep).split(os.sep))
     d = os.path.dirname(path)
     if d:
         os.makedirs(d, exist_ok=True)

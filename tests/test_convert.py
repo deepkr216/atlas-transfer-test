@@ -11,6 +11,7 @@ import os
 import shutil
 import sys
 import tempfile
+import zipfile
 import unittest
 from unittest import mock
 
@@ -204,6 +205,24 @@ class Convert(unittest.TestCase):
             z.writestr("again.txt", "x")
         convert.unzip_tree(self.docs, log=lines.append, dry_run=True)
         self.assertFalse(os.path.exists(os.path.join(top, "again.txt")))
+
+    def test_a_zip_entry_named_the_way_windows_refuses_is_extracted_under_a_safe_name(self):
+        td = tempfile.mkdtemp()
+        try:
+            with zipfile.ZipFile(os.path.join(td, "bundle.zip"), "w") as z:
+                z.writestr("docs /note.txt", "a folder ending with a space")
+                z.writestr("bad|name.txt", "a character a file cannot hold")
+                z.writestr("fine/plain.txt", "ok")
+            said = []
+            done, have, failed = convert.unzip_tree(td, log=said.append)
+            self.assertEqual((done, failed), (1, 0), said)
+            got = sorted(f for _d, _s, fs in os.walk(os.path.join(td, "bundle.unzipped")) for f in fs)
+            self.assertIn("note.txt", got, said)
+            self.assertIn("plain.txt", got)
+            self.assertTrue(any(f.startswith("bad_name") and f.endswith(".txt") for f in got), got)
+            self.assertFalse(any(d.endswith(" ") for d, _s, _f in os.walk(td)), "no folder ends with a space")
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
 
     def test_a_half_written_copy_is_made_again(self):
         """Ctrl+C during a save leaves a truncated .docx beside the .doc: the

@@ -44,12 +44,15 @@ MAX_UNZIP_BYTES = 4 * 1024 ** 3            # per archive
 
 
 def _safe_member(name: str) -> Optional[str]:
-    """A zip entry's relative path, or None when it would escape the folder."""
+    """A zip entry's relative path, or None when it would escape the folder.
+    Every part is a name Windows accepts (a folder ending with a space is
+    created without it, and the file inside it then 'does not exist')."""
+    from .ocr import folder_name
     rel = name.replace("\\", "/").lstrip("/")
     parts = [p for p in rel.split("/") if p not in ("", ".")]
     if not parts or any(p == ".." for p in parts) or (len(rel) > 1 and rel[1] == ":"):
         return None
-    return os.path.join(*parts)
+    return os.path.join(*[folder_name(p) for p in parts])
 
 
 def unzip_tree(root: str, log: Callable[[str], None] = print, dry_run: bool = False,

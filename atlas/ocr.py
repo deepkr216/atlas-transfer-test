@@ -64,12 +64,13 @@ function Await($WinRtTask, $ResultType) { $asTask = $asTaskGeneric.MakeGenericMe
 $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages()
 if ($null -eq $engine) { Write-Output (@{engine="none"; error="no OCR language pack installed"} | ConvertTo-Json -Compress); exit 0 }
 Write-Output (@{engine=$engine.RecognizerLanguage.LanguageTag} | ConvertTo-Json -Compress)
-foreach ($raw in Get-Content -LiteralPath $ListFile) {
+foreach ($raw in Get-Content -LiteralPath $ListFile -Encoding UTF8) {
   # Get-Content strings carry PSPath/ReadCount note properties, which
   # ConvertTo-Json would turn into an object; interpolate to a plain string.
   $p = "$raw".Trim()
   if (-not $p) { continue }
   try {
+    if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { throw "not found on disk: $p" }
     if ((Get-Item -LiteralPath $p).Length -eq 0) { throw "empty file (0 bytes): the page or picture was never written" }
     $file = Await ([Windows.Storage.StorageFile]::GetFileFromPathAsync($p)) ([Windows.Storage.StorageFile])
     $stream = Await ($file.OpenAsync([Windows.Storage.FileAccessMode]::Read)) ([Windows.Storage.Streams.IRandomAccessStream])
@@ -141,7 +142,7 @@ def _run_ps(script: str, args: List[str], timeout: int = 1800,
     same pipe as its output: a separate stderr pipe filled up after 4 KB of
     error records and both sides waited for ever (LESSONS 153). A script
     silent for `timeout` seconds is killed: rc 124."""
-    with tempfile.NamedTemporaryFile("w", suffix=".ps1", delete=False, encoding="utf-8") as fh:
+    with tempfile.NamedTemporaryFile("w", suffix=".ps1", delete=False, encoding="utf-8-sig") as fh:
         fh.write(script)
         path = fh.name
     lines: List[str] = []
@@ -312,7 +313,7 @@ def ocr_images(paths: List[str], log=None) -> Tuple[Dict[str, str], List[str]]:
     ok, why = ocr_available()
     if not ok or not paths:
         return {}, ([] if ok else [why])
-    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as fh:
+    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8-sig") as fh:
         fh.write("\n".join(os.path.abspath(p) for p in paths))
         listfile = fh.name
     if log:
@@ -389,12 +390,13 @@ def extract_images(conn: sqlite3.Connection, out_dir: str, member: Optional[str]
     q = "SELECT id, name, path, ext, parse_error FROM member WHERE kind='doc'"
     args: tuple = ()
     if member:
-        q += " AND UPPER(name)=?"
-        args = (member.upper(),)
+        q += " AND (UPPER(name)=? OR UPPER(TRIM(name))=?)"
+        args = (member.upper(), member.strip().upper())
     out: List[Tuple[int, str, str, str]] = []
     for mid, name, path, ext, perr in conn.execute(q, args).fetchall():
         ext = (ext or "").lower().lstrip(".")
-        dest_dir = os.path.join(out_dir, folder_name(name))
+        shared = conn.execute("SELECT COUNT(*) FROM member WHERE kind='doc' AND UPPER(name)=UPPER(?)", (name,)).fetchone()[0] > 1
+        dest_dir = os.path.join(out_dir, folder_name(name) + (f"~{mid}" if shared else ""))
         marker = os.path.join(out_dir, ".atlas-output")
         if not os.path.exists(marker):
             # the build skips folders carrying this marker: extracted images
@@ -498,7 +500,7 @@ _PS_TO_PNG = r'''
 param([string]$ListFile)
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 Add-Type -AssemblyName System.Drawing
-foreach ($p in Get-Content -LiteralPath $ListFile) {
+foreach ($p in Get-Content -LiteralPath $ListFile -Encoding UTF8) {
   if (-not $p) { continue }
   try {
     $img = [System.Drawing.Image]::FromFile($p)
@@ -546,7 +548,7 @@ def to_readable_images(paths: List[str], log=None) -> Dict[str, List[str]]:
     want = [p for p in paths if p.lower().endswith(CONVERT_EXT)]
     if not want:
         return {}
-    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as fh:
+    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8-sig") as fh:
         fh.write("\n".join(os.path.abspath(p) for p in want))
         listfile = fh.name
     if log:
@@ -648,7 +650,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 1
     conn = sqlite3.connect(a.db)
     try:
-        run(conn, a.out, do_ocr=not a.no_ocr, member=a.member, pdf_pages=a.pdf_pages)
+        run(conn, a.out.rstrip(" ."), do_ocr=not a.no_ocr, member=a.member, pdf_pages=a.pdf_pages)
     finally:
         conn.close()
     return 0
