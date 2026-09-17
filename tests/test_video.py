@@ -264,6 +264,22 @@ class Files(unittest.TestCase):
         self.assertTrue(any("NOT READ empty.mp4: the Windows media step did not finish (exit 1): policy says no" in s
                             for s in said), said)
 
+    def test_a_recording_nothing_could_open_is_not_written_down_and_is_tried_again(self):
+        v = self.touch("locked.mp4", data=b"not a real recording, but not empty either")
+        said = []
+        refused = '{"error":"cannot open the video: The parameter is incorrect."}\n'
+        with mock.patch.object(ocr, "ocr_available", return_value=(True, "test")), \
+             mock.patch.object(ocr, "_run_ps", return_value=(0, refused, "")):
+            self.assertIsNone(video.process(v, log=said.append), said)
+        self.assertFalse(os.path.exists(video.sidecar_of(v)), "an open failure is not a result")
+        self.assertTrue(any("NOT READ locked.mp4: cannot open the video" in s for s in said), said)
+        # a transcript an earlier toolkit wrote for such a failure does not count as done either
+        side = video.sidecar_of(v)
+        video.write_docx(side, "Video locked.mp4", ["written by atlas.video", "Nothing readable: cannot open the video: x"], [])
+        self.assertFalse(video.is_current(v, side))
+        video.write_docx(side, "Video locked.mp4", ["written by atlas.video", "Nothing readable: no text on screen, no speech"], [])
+        self.assertTrue(video.is_current(v, side), "a recording read in full with nothing in it stays done")
+
     def test_a_transcript_survives_characters_xml_forbids(self):
         side = os.path.join(self.td, "odd.video.docx")
         video.write_docx(side, "Video odd.mp4", ["note \x1b[0m with \x0c a form feed"],
@@ -413,7 +429,7 @@ class EndToEnd(unittest.TestCase):
             fh.write(b"this is a text file with a video extension" * 100)
         said = []
         r = video.read_video(fake, log=said.append)
-        self.assertTrue(r.get("ran"), said)
+        self.assertFalse(r.get("ran"), "an open failure is not a result: the file is tried again next time")
         note = "\n".join(r["notes"])
         self.assertIn("cannot open the video", note)
         self.assertIn("Media Player", note, "the next step is spelled out")

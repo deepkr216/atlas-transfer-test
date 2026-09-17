@@ -447,9 +447,26 @@ def transcript_path(video: str, root: Optional[str] = None, out: Optional[str] =
     return os.path.normpath(os.path.join(os.path.abspath(out), rel, os.path.basename(sidecar_of(video))))
 
 
+_OPEN_FAILURE = ("cannot open the video", "cannot reach the file", "Windows media components unavailable")
+
+
+def _recorded_open_failure(side: str) -> bool:
+    """A transcript that only records that nothing could open the recording
+    (written by an earlier toolkit): not a result, so the recording is
+    tried again - a fix may have landed since."""
+    try:
+        with zipfile.ZipFile(side) as z:
+            xml = z.read("word/document.xml").decode("utf-8", "replace")
+    except (OSError, KeyError, zipfile.BadZipFile):
+        return False
+    return any(f"Nothing readable: {why}" in xml for why in _OPEN_FAILURE)
+
+
 def is_current(video: str, side: Optional[str] = None) -> bool:
     side = side or sidecar_of(video)
     if not os.path.isfile(side):
+        return False
+    if _recorded_open_failure(side):
         return False
     inputs = [video]
     cap = captions_beside(video)
@@ -573,7 +590,9 @@ def read_video(video: str, every: float = EVERY_SECONDS, screens: bool = True, s
                                                  "-ForceConvert", "1" if os.environ.get("ATLAS_TEST_FORCE_CONVERT") else "0"],
                                    timeout=6 * 3600, on_line=on_line)
         rows = _json_lines(out)
-        result["ran"] = bool(rows) and rc == 0
+        # a recording nothing could open is not a result: nothing is written, it is tried again next time
+        opened = not any("error" in r and "frame" not in r and str(r["error"]).startswith(_OPEN_FAILURE) for r in rows)
+        result["ran"] = bool(rows) and rc == 0 and opened
         if rc != 0 or not rows:
             notes.append(f"the Windows media step did not finish (exit {rc}): {(err or '').strip()[:200] or 'it printed nothing'}"
                          " - can PowerShell scripts run on this laptop?")
