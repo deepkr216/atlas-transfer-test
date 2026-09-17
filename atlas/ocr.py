@@ -373,7 +373,7 @@ def folder_name(name: str) -> str:
     not exist' (LESSONS 156). Trailing spaces and dots go, the characters a
     folder cannot hold go, a device name (CON, NUL) gets a suffix; a changed
     name carries a short hash, so two documents never share a folder."""
-    safe = _BAD_IN_FOLDER.sub("_", name or "").rstrip(" .")
+    safe = _BAD_IN_FOLDER.sub("_", name or "").rstrip(" .")[:200]     # room for the suffix under the 255 limit
     if not safe or safe.split(".")[0].upper() in _DEVICE_NAMES:
         safe = "_" + (safe or "DOC")             # NUL.docx is still the NUL device: the prefix breaks the spell
     if safe != name:

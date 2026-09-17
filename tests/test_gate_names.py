@@ -36,6 +36,16 @@ class DocumentNames(unittest.TestCase):
                          [("Restart procedure", ["Rerun the posting job from STEP020 after the input file is fixed."])])
         video.write_docx(os.path.join(docs, "Data Masking .docx"), "Masking", ["written for a test"],
                          [("Rules", ["Mask the member number before the extract leaves the mainframe."])])
+        video.write_docx(os.path.join(docs, "R\u00e9sum\u00e9 \u2013 Sinistres.docx"), "Sinistres", ["written for a test"],
+                         [("R\u00e8gles", ["Le d\u00e9lai de carence est de trente jours."])])
+        video.write_docx(os.path.join(docs, "P&C Rules (draft).docx"), "Rules", ["written for a test"],
+                         [("Scope", ["Commercial lines are excluded from the pilot."])])
+        video.write_docx(os.path.join(docs, "Priya\u2019s Plan.docx"), "Plan", ["written for a test"],
+                         [("Week one", ["Freeze the copybooks on Monday."])])
+        # a document named like a code member, plus the trailing space: both must stay reachable
+        shutil.copy(os.path.join(HERE, "fixtures", "SAMPPGM.cbl"), os.path.join(estate, "PAIR.cbl"))
+        video.write_docx(os.path.join(docs, "PAIR .docx"), "Pair", ["written for a test"],
+                         [("Steps", ["Rerun the pairing job after the nightly extract."])])
         secs = video.sections([(1.0, "//STEP010 EXEC PGM=CLMPOST")], [(2.0, "restart from step ten")], "SAID")
         video.write_docx(os.path.join(docs, "kt-session.video.docx"), "Video kt-session.mp4", ["written by atlas.video"], secs)
         cls.db = os.path.join(cls.td, "t.db")
@@ -70,6 +80,23 @@ class DocumentNames(unittest.TestCase):
         conn = query.connect(self.db)
         try:
             self.assertEqual(len(query._doc_members(conn, "DATA MASKING")), 1)
+        finally:
+            conn.close()
+
+    def test_a_document_is_cited_by_whatever_windows_let_its_file_be_called(self):
+        st = self.statuses('[[R\u00c9SUM\u00c9 \u2013 SINISTRES 2 "trente jours"]] [[R\u00e9sum\u00e9 \u2013 Sinistres:2 "carence"]] '
+                           '[[P&C RULES (DRAFT) 2 "Commercial lines"]] [[PRIYA\u2019S PLAN 2 "Freeze the copybooks"]]')
+        self.assertEqual([s for s, _d in st], ["PASS"] * 4, st)
+        st = self.statuses('[[R\u00c9SUM\u00c9 \u2013 SINISTRES 2 "no such words"]]')
+        self.assertEqual(st[0][0], "FAIL", st)
+        self.assertNotIn("unreadable", st[0][1], "the token is checked, the name was read")
+
+    def test_a_document_named_like_a_code_member_plus_a_trailing_space_is_still_a_candidate(self):
+        st = self.statuses('[[PAIR 2 "pairing job"]] [[PAIR 27 "CALL \'VALIDATE\'"]]')
+        self.assertEqual([s for s, _d in st], ["PASS", "PASS"], st)
+        conn = query.connect(self.db)
+        try:
+            self.assertEqual(len(query._doc_members(conn, "PAIR")), 1, "the document is found by its trimmed name")
         finally:
             conn.close()
 

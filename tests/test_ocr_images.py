@@ -203,6 +203,9 @@ class FolderNames(unittest.TestCase):
         self.assertNotEqual(ocr.folder_name("DATA MASKING "), ocr.folder_name("DATA MASKING"),
                             "two documents whose names differ only by the space keep separate folders")
         self.assertEqual(ocr.folder_name("DATA MASKING "), ocr.folder_name("DATA MASKING "), "stable")
+        self.assertLessEqual(len(ocr.folder_name("X" * 254 + " ")), 207, "a name at the 255 limit still fits its suffix")
+        self.assertEqual(ocr.folder_name("bad|name.txt"), "bad_name~" + ocr.folder_name("bad|name.txt")[9:15] + ".txt",
+                         "the suffix goes before the extension")
 
     def test_pictures_of_a_document_whose_name_ends_with_a_space_are_extracted_and_listed(self):
         td = tempfile.mkdtemp()

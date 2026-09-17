@@ -1926,10 +1926,12 @@ def _doc_members(conn: sqlite3.Connection, name: str) -> List[sqlite3.Row]:
     stem = os.path.splitext(n)[0]
     rows = conn.execute("SELECT id, name, path FROM member WHERE kind='doc' AND (UPPER(name)=? OR UPPER(name)=?) "
                         "ORDER BY path", (n, stem)).fetchall()
-    if not rows:
-        # a file named `PLAN .docx` is member `PLAN ` - nobody types the trailing space
-        rows = conn.execute("SELECT id, name, path FROM member WHERE kind='doc' AND "
-                            "(UPPER(TRIM(name))=? OR UPPER(TRIM(name))=?) ORDER BY path", (n.strip(), stem.strip())).fetchall()
+    # a file named `PLAN .docx` is member `PLAN ` - nobody types the trailing space; shown after
+    # an exact PLAN.docx, never instead of it
+    twins = conn.execute("SELECT id, name, path FROM member WHERE kind='doc' AND "
+                         "(UPPER(TRIM(name))=? OR UPPER(TRIM(name))=?) ORDER BY path", (n.strip(), stem.strip())).fetchall()
+    seen = {r["id"] for r in rows}
+    rows = list(rows) + [r for r in twins if r["id"] not in seen]
     if not rows:
         rows = conn.execute("SELECT id, name, path FROM member WHERE kind='doc' AND UPPER(name) LIKE ? ORDER BY path",
                             (f"%{stem}%",)).fetchall()
@@ -3108,7 +3110,7 @@ def _member_by_ref(conn: sqlite3.Connection, ref: str) -> list:
         return [_Loose(id=None, path=p, name=os.path.splitext(os.path.basename(p))[0].upper(), kind=None,
                        library=os.path.basename(os.path.dirname(p)), system=None, authoritative=0,
                        fixed_format=None, sha256=hashlib.sha256(data).hexdigest(), norm_sha=None, lines=None)]
-    m = re.match(r"^(?:([A-Za-z0-9_$#@.\-]+)/)?([A-Za-z0-9_$#@.\- ]+?)(?:\(([a-z]+)\))?(?:@([A-Za-z0-9_$#@.\-]+))?$", r)
+    m = re.match(r"^(?:([\w$#@.\-]+)/)?([^/\\()]+?)(?:\(([a-z]+)\))?(?:@([\w$#@.\-]+))?$", r)
     if not m:
         return []
     system, name, kind, library = m.group(1), m.group(2), m.group(3), m.group(4)

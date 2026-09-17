@@ -156,7 +156,10 @@ worth the night anyway (LESSONS 153):
 10. A file name ending with a space or a dot before its extension gives a
     member name that keeps it (`PLAN `): strip it at inventory (the OCR folder,
     the lookups and the gate tolerate it meanwhile - LESSONS 156).
-11. Parser reach (from his coverage tables): dynamic CALL targets across
+11. An expression index on `UPPER(TRIM(name))` next to the one on
+    `UPPER(name)` (QUERY_INDEXES): the trimmed-name lookups the gate, `doc`
+    and `diff` fall back to scan the member table on a miss (LESSONS 158).
+12. Parser reach (from his coverage tables): dynamic CALL targets across
     members, `sql_cursor` declared in another member, INTRDR-submitted JCL
     through a card member, the MFS macros in his estate.
 

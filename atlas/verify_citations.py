@@ -48,11 +48,15 @@ from . import reader
 # print and the forms a model writes back; all of them must be checkable.
 # A document is named after its file: KT-SESSION.VIDEO, CLAIMS PLAN V1.2 -
 # dots and spaces are part of the name (LESSONS 153).
+# A document is named after its file, so any character Windows accepts in a
+# file name is part of the name (an accent, an en dash, an apostrophe, an
+# ampersand): the name is whatever stands before the section number and its
+# quoted token.
 CITATION = re.compile(
-    r"\[\[\s*([A-Za-z0-9_$#@.\\/:\-() ]+?)(?:\s+|:)(\d+)(?:\s*-\s*(\d+))?\s*(?:\(via\s+COPY\s+[^)]*\)\s*)?"
+    r"\[\[\s*([^\[\]\"]+?)(?:\s+|:)(\d+)(?:\s*-\s*(\d+))?\s*(?:\(via\s+COPY\s+[^)]*\)\s*)?"
     r"\"((?:[^\"\\]|\\.)*)\"\s*\]\]")
-_REF = re.compile(r"^(?:(?P<system>[A-Za-z0-9_$#@\-]+)/)?(?P<name>[A-Za-z0-9_$#@.\- ]+?)"
-                  r"(?:\((?P<kind>[a-z]+)\))?(?:@(?P<library>[A-Za-z0-9.$#@\-]+))?$", re.I)
+_REF = re.compile(r"^(?:(?P<system>[\w$#@\-]+)/)?(?P<name>[^/\\()]+?)"
+                  r"(?:\((?P<kind>[a-z]+)\))?(?:@(?P<library>[\w.$#@\-]+))?$", re.I)
 # the name is non-greedy: `@` is a legal character in a member name AND the
 # NAME@LIBRARY separator; greedy, the name swallowed the library every time
 _ANY_BRACKETS = re.compile(r"\[\[[^\]]*\]\]")
@@ -126,11 +130,21 @@ def _resolve(ref: str, root: Optional[str], db: Optional[sqlite3.Connection],
                 "ORDER BY authoritative DESC, path", (whole,)).fetchall()
             if rows:
                 name, want_lib = whole, None
-        if not rows:
-            # a document named `PLAN .docx` is member `PLAN ` - cited, rightly, without the space
+        if not rows and want_kind:
+            # a document really named PLAN (DRAFT): the "(kind)" was part of the name
+            whole = f"{name}({want_kind.upper()})"
             rows = db.execute(
+                "SELECT path, kind, authoritative, system, library, norm_sha FROM member WHERE UPPER(name)=? "
+                "OR UPPER(TRIM(name))=? ORDER BY authoritative DESC, path", (whole, whole.strip())).fetchall()
+            if rows:
+                name, want_kind = whole, None
+        if not any((r[1] or "") == "doc" for r in rows):
+            # a document named `PLAN .docx` is member `PLAN ` - cited, rightly, without the space;
+            # it stays a candidate even when a code member is named PLAN
+            more = db.execute(
                 "SELECT path, kind, authoritative, system, library, norm_sha FROM member WHERE UPPER(TRIM(name))=? "
                 "ORDER BY authoritative DESC, path", (name.strip(),)).fetchall()
+            rows = list(rows) + [r for r in more if r not in rows]
         if not rows:
             return None, f"member {name} not in index", None
         cands = list(rows)
@@ -152,10 +166,16 @@ def _resolve(ref: str, root: Optional[str], db: Optional[sqlite3.Connection],
             # Several kinds share the name: the one whose text holds the token.
             hits = []
             for r in cands:
-                try:
-                    txt, data, enc = reader.load(r[0])
-                except OSError:
-                    continue
+                if (r[1] or "") == "doc":
+                    # a document's words are its indexed sections, not the bytes of the file
+                    secs = db.execute("SELECT s.text FROM doc_section s JOIN member m ON m.id=s.member_id WHERE m.path=?",
+                                      (r[0],)).fetchall()
+                    txt = "\n".join(s[0] or "" for s in secs)
+                else:
+                    try:
+                        txt, data, enc = reader.load(r[0])
+                    except OSError:
+                        continue
                 if _norm(token) in _norm(txt):
                     hits.append(r)
             hit_kinds = sorted({r[1] for r in hits})
