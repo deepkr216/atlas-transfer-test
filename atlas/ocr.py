@@ -377,7 +377,8 @@ def folder_name(name: str) -> str:
     if not safe or safe.split(".")[0].upper() in _DEVICE_NAMES:
         safe = "_" + (safe or "DOC")             # NUL.docx is still the NUL device: the prefix breaks the spell
     if safe != name:
-        safe += "~" + hashlib.sha1((name or "").encode("utf-8", "replace")).hexdigest()[:6]
+        stem, ext = os.path.splitext(safe)        # the hash goes before an extension: a document keeps its kind
+        safe = stem + "~" + hashlib.sha1((name or "").encode("utf-8", "replace")).hexdigest()[:6] + ext
     return safe
 
 

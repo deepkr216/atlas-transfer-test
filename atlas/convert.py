@@ -112,6 +112,13 @@ def unzip_tree(root: str, log: Callable[[str], None] = print, dry_run: bool = Fa
                         os.makedirs(os.path.dirname(target), exist_ok=True)
                         with z.open(info) as src, open(target, "wb") as out:
                             shutil.copyfileobj(src, out)
+                        try:
+                            # the archive's own date on the file: a zip inside a zip keeps its stamp, so it
+                            # is not extracted again every time its parent is
+                            ts = time.mktime(info.date_time + (0, 0, -1))
+                            os.utime(target, (ts, ts))
+                        except (OverflowError, ValueError, OSError):
+                            pass
                 os.makedirs(dest, exist_ok=True)
                 with open(marker, "w", encoding="utf-8") as fh:
                     json.dump(stamp, fh)
