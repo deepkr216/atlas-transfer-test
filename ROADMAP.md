@@ -124,6 +124,39 @@ only; `no` = not handled.
 13. **RM-13 Rare ops corners**: same PROGRAM-ID in two members, one DSN on
     two LPARs, Windows reserved member names, db lock / UI cancel (P2, small).
 
+## Next re-parse batch (build.py / classify.py - one overnight re-parse for all of them)
+
+Each of these touches a FACT_MODULES file, so each alone would cost a full
+re-parse of the estate; they ship together, when a parser improvement is
+worth the night anyway (LESSONS 153):
+
+1. `load_skip_list` / `load_inventory_skips` cut a line at the first `#`, but
+   `#` is a legal national character in a member name (the watchdog now stops
+   on the second freeze instead of looping).
+2. `fatal_db_error` treats a `MemoryError` inside one member's parser as "the
+   index cannot be written": the build stops with disk-space advice instead of
+   marking that member failed.
+3. A Ctrl+C that lands between two members (status-file write, the 10-second
+   commit) escapes the loop's handler: traceback instead of the clean stop.
+4. The rc-3, rc-4 and crash messages say "run the same command again" - with
+   `--rebuild` in that command it deletes everything (the watchdog's own line
+   says WITHOUT --rebuild; README says so).
+5. `--db=PATH` spelling: the crash report lands in the current folder, not
+   beside the index.
+6. `atlas-problems.txt` opened with "w" on every run (the watchdog keeps the
+   earlier segments' lines meanwhile); the problem list under `--quiet`;
+   library names and raw exception text in the lines the user is asked to send.
+7. `MemberTimeout` carries `run_with_limit` as its toolkit line, not the
+   parser's own.
+8. classify: `.mp4 .m4v .mov .wmv .avi .vtt .srt` inside the build's folders
+   become `unknown` / `doc partial` rows and a caption file is classified by
+   its words; a quiet skip with a plain reason.
+9. `build_run` records only the estate root, not the `--also` folders (the
+   watchdog reads the index instead to refuse a command that drops folders).
+10. Parser reach (from his coverage tables): dynamic CALL targets across
+    members, `sql_cursor` declared in another member, INTRDR-submitted JCL
+    through a card member, the MFS macros in his estate.
+
 ## What stays out of reach, by design
 
 - Anything decided at **run time**: dynamic SQL, dispatch tables held in DB2

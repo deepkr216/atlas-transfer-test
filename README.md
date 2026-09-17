@@ -129,7 +129,7 @@ under a system of their own (`SHARED` in `sources.example.json`).
 ## Quick start
 
 ```bash
-# 1. index the estate (source + documents; minutes for tens of thousands of members)
+# 1. index the estate (source + documents; minutes for a few thousand members, hours for a large estate)
 python -m atlas.build  C:/estate  --db atlas.db  --manifest manifest.json  --write-expanded out/expanded
 #    a big estate: the same arguments under the watchdog - a build that goes silent (a parser
 #    frozen inside a regular expression) is killed, the member in hand is recorded in
@@ -138,7 +138,9 @@ python -m atlas.supervise  C:/estate  --db atlas.db  --manifest manifest.json
 #    build or rebuild: WITHOUT --rebuild only new and changed files are parsed (and a toolkit
 #    or manifest change re-parses everything by itself); WITH --rebuild the index is deleted
 #    and every member parsed from zero - for the very first build only. After a stop, continue
-#    WITHOUT it. The watchdog never passes --rebuild to a restart.
+#    WITHOUT it. The watchdog never passes --rebuild to a restart, and it refuses to start when the
+#    command names fewer folders than the index holds (an --also left out would remove every
+#    document from the index): add the folder, or --allow-prune if the folder really moved.
 
 # 2. read the coverage report FIRST - it lists what the index cannot know
 python -m atlas.query --db atlas.db coverage
@@ -383,17 +385,29 @@ already has - a frame every 10 seconds through the same OCR engine (a screen
 shown for a minute is written once, at the time it appeared), and the sound
 track through the Windows speech recogniser - and writes
 `<name>.video.docx`: one section per two minutes, every line stamped
-`[00:12:05] SAID:` or `[00:12:10] SCREEN:`. The next build indexes it as
-document `<NAME>.VIDEO`, found by `docs TERM` and cited like any section; no
-parser changes, so no re-parse. A 12-minute 788 MB test recording took 28
-seconds. Screens (JCL, SDSF, green screens, slides) read well; plain speech
-reads well; mainframe jargon does not ("step ten abends" came back as
-"stepped in awe bins"), so when a caption file sits beside the video
-(`<name>.vtt` or `.srt` - the transcript Teams or Stream lets you download)
-its text is used instead. Keep the recordings outside the folders the build
-reads and point `--out` into one: a video inside them is read in full on
-every build only to be skipped, and one over 300 MB is listed as a problem.
-A transcript is what was shown and said, never a fact about what runs.
+`[00:12:05] SAID:` or `[00:12:10] SCREEN:`. Then run your usual build
+command - the same one as always, with its `--also` folders, and `--out`
+must be one of those folders - and it is indexed as document `<NAME>.VIDEO`,
+found by `docs TERM` and cited as the report prints it
+(`[[KT-SESSION.VIDEO 3 "CLMPOST"]]`); no parser changes, so no re-parse. A
+12-minute 788 MB test recording took 28 seconds. Screens (JCL, SDSF, green
+screens, slides) read well - a frame is never scaled down, so an emulator
+window inside a 1080p desktop recording stays legible - though a change of a
+few characters on a screen already written is not written again (the SAID
+line carries it). Plain speech reads well; mainframe jargon does not ("step
+ten abends" came back as "stepped in awe bins"), so when a caption file sits
+beside the video (`<name>.vtt` or `.srt` - the transcript Teams or Stream
+lets you download; a Teams download whose name differs from the recording's
+is matched when they are alone in the folder) its text is used instead, and
+a caption file on its own, without its recording, is read too. Keep the
+recordings and caption files outside the folders the build reads: a video
+inside them is read in full on every build only to be skipped, one over 300
+MB is listed as a problem, and a caption file is indexed as whatever its
+words look like. A recording with nothing readable gets a one-line
+transcript saying so, so it is not read again (`--refresh` reads it again);
+one the Windows media step could not open at all is retried next time and
+the message says why. A transcript is what was shown and said, never a fact
+about what runs.
 
 **Spreadsheets and tables are rows, not counts.** A workbook's tab is a
 section whose text is its rows — `row 12: TC-GEN-01 | Add gender N | PASS`,
