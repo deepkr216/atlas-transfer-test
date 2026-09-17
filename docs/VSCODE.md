@@ -129,7 +129,8 @@ fixtures (see `REPORTING.md`).
   file - check the chat's "References" line shows `work/pack.md`; attach it
   by hand with `#file:work/pack.md` if not.
 - The gate says `changed since index`: the source changed after the build;
-  rebuild (`Atlas: UI` > Build), run the query again, then verify again.
+  run the build again (`Atlas: UI` > **Build index** - not *Rebuild from empty*: only the changed
+  members are parsed), run the query again, then verify again.
 - An answer that needed more than three `cite` ranges: the query you needed
   is missing from the toolkit - note the question shape (no real names) for
   the home side; it becomes a query.

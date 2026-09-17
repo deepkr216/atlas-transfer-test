@@ -16,6 +16,7 @@ import sys
 import tempfile
 import unittest
 import zipfile
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
@@ -87,6 +88,41 @@ class Wiring(unittest.TestCase):
         self.assertEqual(ocr.to_readable_images(["a.png", "b.jpg"]), {}, "nothing to do, no PowerShell started")
 
 
+class RunPowerShell(unittest.TestCase):
+    """The runner behind OCR, PDF pages, metafiles and recordings."""
+
+    def setUp(self):
+        ok, why = ocr.ocr_available()
+        if not ok:
+            self.skipTest(why)
+
+    def test_a_silent_script_is_killed_when_its_time_is_up(self):
+        import time
+        t0 = time.time()
+        rc, out, err = ocr._run_ps("[Console]::Out.WriteLine('{\"a\":1}'); Start-Sleep -Seconds 60", [], timeout=3)
+        self.assertEqual(rc, 124, (out, err))
+        self.assertIn("timed out after 3s", err)
+        self.assertIn('{"a":1}', out, "what it printed before the limit is kept")
+        self.assertLess(time.time() - t0, 30, "killed at the limit, not after the sleep")
+
+    def test_a_script_that_floods_the_error_stream_still_finishes(self):
+        script = ("foreach ($i in 1..3000) { [Console]::Error.WriteLine('error record number ' + $i + ' ' + ('x' * 60)) }\n"
+                  "[Console]::Out.WriteLine('{\"done\":true}')")
+        rc, out, err = ocr._run_ps(script, [], timeout=120)
+        self.assertEqual(rc, 0, err[:300])
+        self.assertIn('{"done":true}', out)
+        self.assertIn("error record number 3000", err, "the errors are returned as the 'noise' string")
+
+    def test_a_script_that_dies_before_its_first_result_is_reported(self):
+        rc, out, err = ocr._run_ps("[Console]::Error.WriteLine('policy says no'); exit 7", [], timeout=60)
+        self.assertEqual(rc, 7)
+        self.assertIn("policy says no", err)
+        with mock.patch.object(ocr, "_run_ps", return_value=(7, "policy says no\n", "policy says no")):
+            texts, warnings = ocr.ocr_images([os.path.join(HERE, "fixtures", "SAMPPGM.cbl")])
+        self.assertEqual(texts, {})
+        self.assertEqual(warnings, ["powershell rc 7: policy says no"], "the reason reaches the caller")
+
+
 class Metafiles(unittest.TestCase):
 
     def setUp(self):
@@ -115,6 +151,25 @@ class Metafiles(unittest.TestCase):
         if "CLAIM" not in read:
             self.skipTest("OCR engine unreadable here: " + "; ".join(warnings))
         self.assertIn("CLMPOST", read)
+
+    def test_a_metafile_filed_on_its_own_is_converted_under_the_out_folder_not_beside_itself(self):
+        docs_dir = os.path.join(self.td, "docs")
+        os.makedirs(docs_dir)
+        shutil.copy(self.emf, os.path.join(docs_dir, "flow.emf"))
+        estate = os.path.join(self.td, "estate", "SRC")
+        os.makedirs(estate)
+        shutil.copy(os.path.join(HERE, "fixtures", "SAMPPGM.cbl"), estate)
+        db = os.path.join(self.td, "t.db")
+        with contextlib.redirect_stdout(io.StringIO()):
+            build._main([os.path.join(self.td, "estate"), "--db", db, "--rebuild", "--also", docs_dir])
+        conn = query.connect(db)
+        try:
+            ocr.run(conn, os.path.join(self.td, "out"), log=lambda s: None)
+        finally:
+            conn.close()
+        self.assertEqual(sorted(os.listdir(docs_dir)), ["flow.emf"], "nothing is written into his documents folder")
+        made = [f for _d, _s, fs in os.walk(os.path.join(self.td, "out")) for f in fs if f.endswith(".ocr.png")]
+        self.assertEqual(made, ["flow.ocr.png"], "the converted copy lives under --out, which the build never indexes")
 
     def test_a_diagram_in_a_word_file_is_read_end_to_end(self):
         ok, _why = ocr.ocr_available()

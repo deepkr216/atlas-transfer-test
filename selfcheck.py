@@ -10,7 +10,9 @@ known-bad answer. Exit 0 only if every stage passes. No model calls.
 
 from __future__ import annotations
 
+import collections
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -49,10 +51,20 @@ def failure_summary(text: str, limit: int = 12) -> list:
     return out
 
 
+def skip_summary(text: str) -> list:
+    """Each reason the suite skipped tests for, with how many: a Windows piece
+    missing on this machine (PowerShell, the OCR engine, System.Drawing, the
+    media components, System.Speech) - the index is unaffected, but pictures,
+    scanned PDFs or recordings will not be read here."""
+    counts = collections.Counter(m.group(1).strip() for m in
+                                 re.finditer(r"\.\.\. skipped ['\"](.*?)['\"]\s*$", text or "", re.M))
+    return [f"skipped ({n} test{'s' if n > 1 else ''}): {why[:150]}" for why, n in counts.most_common()]
+
+
 def main() -> int:
     all_ok = True
 
-    r = run(["-m", "unittest", "discover", "-s", "tests"])
+    r = run(["-m", "unittest", "discover", "-s", "tests", "-v"])
     tail = (r.stderr or r.stdout).strip().splitlines()[-1] if (r.stderr or r.stdout).strip() else ""
     all_ok &= stage("regression suite", r.returncode == 0, tail)
     if r.returncode != 0:
@@ -60,6 +72,13 @@ def main() -> int:
         # messages only, nothing from an estate: safe to paste
         for line in failure_summary((r.stderr or "") + "\n" + (r.stdout or "")):
             print("      " + line)
+    skipped = skip_summary(r.stderr or "")
+    if skipped:
+        for line in skipped:
+            print("      " + line)
+        print("      a skipped test means a Windows piece is missing on this machine (PowerShell, the OCR engine, "
+              "System.Drawing, the media components, System.Speech): the index is unaffected, but pictures, "
+              "scanned PDFs or recordings will not be read here")
 
     with tempfile.TemporaryDirectory() as td:
         db = os.path.join(td, "smoke.db")

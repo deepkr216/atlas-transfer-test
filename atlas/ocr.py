@@ -28,10 +28,13 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import threading
 import sys
 import tempfile
 import zipfile
 from typing import Dict, List, Optional, Tuple
+
+from . import docs
 
 IMAGE_EXT = (".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tif", ".tiff", ".emf", ".wmf")
 MIN_BYTES = 2048           # smaller than this is an icon or a bullet, not content
@@ -101,27 +104,51 @@ def _run_ps(script: str, args: List[str], timeout: int = 1800,
             on_line=None) -> Tuple[int, str, str]:
     """Run a PowerShell script; every line it prints is handed to `on_line`
     the moment it appears (a thousand images are minutes of silence
-    otherwise). Returns (rc, everything printed, stderr)."""
+    otherwise). Returns (rc, everything printed, the lines that are not
+    results - PowerShell's own errors). The script's errors come down the
+    same pipe as its output: a separate stderr pipe filled up after 4 KB of
+    error records and both sides waited for ever (LESSONS 153). A script
+    silent for `timeout` seconds is killed: rc 124."""
     with tempfile.NamedTemporaryFile("w", suffix=".ps1", delete=False, encoding="utf-8") as fh:
         fh.write(script)
         path = fh.name
     lines: List[str] = []
+    fired: List[int] = []
     try:
         p = subprocess.Popen(["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-                              "-File", path, *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                              "-File", path, *args], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                              encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL)
         assert p.stdout is not None
-        for raw in p.stdout:
-            line = raw.rstrip("\r\n")
-            lines.append(line)
-            if on_line:
-                on_line(line)
+
+        def expire() -> None:
+            fired.append(1)
+            try:
+                p.kill()                      # closes its end of the pipe: the read loop below ends
+            except OSError:
+                pass
+
+        timer = threading.Timer(timeout, expire)
+        timer.daemon = True
+        timer.start()
         try:
-            err = p.communicate(timeout=timeout)[1] or ""
-        except subprocess.TimeoutExpired:
-            p.kill()
+            for raw in p.stdout:
+                line = raw.rstrip("\r\n")
+                lines.append(line)
+                if on_line:
+                    on_line(line)
+        except BaseException:                 # Ctrl+C or a failing on_line: never leave powershell.exe running
+            try:
+                p.kill()
+            except OSError:
+                pass
+            raise
+        finally:
+            timer.cancel()
+        p.wait()
+        if fired and p.returncode != 0:
             return 124, "\n".join(lines) + "\n", f"timed out after {timeout}s"
-        return p.returncode, "\n".join(lines) + "\n", err
+        noise = "\n".join(ln for ln in lines if ln.strip() and not ln.lstrip().startswith(("{", "OK\t", "FAIL\t")))
+        return p.returncode, "\n".join(lines) + "\n", noise
     finally:
         try:
             os.remove(path)
@@ -253,7 +280,7 @@ def ocr_images(paths: List[str], log=None) -> Tuple[Dict[str, str], List[str]]:
             pass
     texts: Dict[str, str] = {}
     warnings: List[str] = []
-    if rc != 0 and not out.strip():
+    if rc != 0 and not any(ln.lstrip().startswith("{") for ln in out.splitlines()):
         return {}, [f"powershell rc {rc}: {err.strip()[:200]}"]
     for line in out.splitlines():
         line = line.strip()
@@ -311,7 +338,7 @@ def extract_images(conn: sqlite3.Connection, out_dir: str, member: Optional[str]
                 mh.write("written by atlas.ocr; never indexed\n")
         if ext in _MEDIA_PREFIX:
             try:
-                with zipfile.ZipFile(path) as z:
+                with zipfile.ZipFile(docs.long_path(path)) as z:
                     for n in z.namelist():
                         if n.startswith(_MEDIA_PREFIX[ext]) and n.lower().endswith(IMAGE_EXT):
                             info = z.getinfo(n)
@@ -323,11 +350,24 @@ def extract_images(conn: sqlite3.Connection, out_dir: str, member: Optional[str]
                             with z.open(n) as src, open(dest, "wb") as dst:
                                 shutil.copyfileobj(src, dst)
                             out.append((mid, name, n, dest))
-            except zipfile.BadZipFile:
+            except (zipfile.BadZipFile, OSError) as e:
+                log(f"  unreadable: {name} ({str(e)[:120]})")
                 continue
         elif ext in [e.lstrip(".") for e in IMAGE_EXT]:
-            if os.path.getsize(path) >= (MIN_VECTOR_BYTES if ext in ("emf", "wmf") else MIN_BYTES):
-                out.append((mid, name, os.path.basename(path), path))
+            try:
+                size = os.path.getsize(docs.long_path(path))
+            except OSError as e:
+                log(f"  unreadable: {name} ({str(e)[:120]})")
+                continue
+            if size >= (MIN_VECTOR_BYTES if ext in ("emf", "wmf") else MIN_BYTES):
+                dest = path
+                if path.lower().endswith(CONVERT_EXT):
+                    # its .ocr.png is written beside the file it is made from: under
+                    # --out (marked, never indexed), never in his documents folder
+                    os.makedirs(dest_dir, exist_ok=True)
+                    dest = os.path.join(dest_dir, os.path.basename(path))
+                    shutil.copyfile(docs.long_path(path), dest)
+                out.append((mid, name, os.path.basename(path), dest))
         elif ext == "pdf" and pdf_pages != "none" and (pdf_pages == "all" or _pdf_needs_pages(perr)):
             done = conn.execute("SELECT COUNT(*) FROM doc_image WHERE member_id=? AND name LIKE 'page-%' AND ocr_text IS NOT NULL",
                                 (mid,)).fetchone()[0]
@@ -395,7 +435,9 @@ foreach ($p in Get-Content -LiteralPath $ListFile) {
     }
     $img.Dispose()
   } catch {
-    [Console]::Out.WriteLine("FAIL`t$p`t" + $_.Exception.Message)
+    $m = $_.Exception.GetBaseException().Message
+    if ($m -match 'Out of memory') { $m = 'not a picture GDI+ can decode (empty or damaged)' }
+    [Console]::Out.WriteLine("FAIL`t$p`t" + $m)
   }
 }
 '''

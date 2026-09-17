@@ -387,6 +387,13 @@ class App(tk.Tk if tk else object):
         return os.path.join(os.path.dirname(self.config_path), "manifest.json")
 
     def build(self, rebuild: bool) -> None:
+        if rebuild and not messagebox.askyesno(
+                "Rebuild from empty",
+                "This DELETES atlas.db and parses every member from zero - hours for a large estate.\n\n"
+                "After a stop or a git pull, 'Build index' is enough: only new and changed members are parsed, and a "
+                "toolkit change re-parses everything by itself.\n\nDelete the index and start from zero?"):
+            self._log("rebuild cancelled - use Build index")
+            return
         self._sync_cfg()
         self.save()
         man = self._manifest_path()

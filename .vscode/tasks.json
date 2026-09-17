@@ -14,7 +14,7 @@
     {"id": "copybook", "type": "promptString", "description": "Copybook name"},
     {"id": "member", "type": "promptString", "description": "Member name (a program, copybook, job, PROC, PSB, DBD, control card...)"},
     {"id": "document", "type": "promptString", "description": "Document name (the file name without extension, as `docs` shows it)"},
-    {"id": "videofolder", "type": "promptString", "description": "Folder holding the recordings (.mp4 .mov .wmv .avi), searched with its subfolders - keep it OUTSIDE the folders the build reads"},
+    {"id": "videofolder", "type": "promptString", "description": "Folder holding the recordings (.mp4 .m4v .mov .wmv .avi) and any .vtt/.srt caption files, searched with its subfolders - keep it OUTSIDE the folders the build reads; type it as Explorer shows it, no backslash at the end"},
     {"id": "transcriptfolder", "type": "promptString", "description": "Folder the build reads (e.g. your documents folder) where the transcripts go"},
     {"id": "docpattern", "type": "promptString", "description": "Part of a folder or file name to narrow the document list (e.g. QA); blank = all", "default": ""},
     {"id": "range", "type": "promptString", "description": "Line range, e.g. 1-9999 for the whole member or 120-180", "default": "1-9999"},
@@ -176,7 +176,7 @@
     },
     {
       "label": "Atlas: read recordings (screens + speech) -> transcripts",
-      "detail": "Every video in a folder becomes NAME.video.docx: what was on screen (OCR) and said (Windows speech, or a .vtt/.srt caption file beside it), in 2-minute sections. Then run the build so they are indexed.",
+      "detail": "Every video in a folder becomes NAME.video.docx: what was on screen (OCR) and said (Windows speech, or a .vtt/.srt caption file beside it), in 2-minute sections. Then run your usual build command (Atlas: UI > Build index) so they are indexed.",
       "type": "shell",
       "command": "python -m atlas.video \"${input:videofolder}\" --out \"${input:transcriptfolder}\"",
       "options": {"cwd": "${workspaceFolder}", "env": {"PYTHONUTF8": "1"}},

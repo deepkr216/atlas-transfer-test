@@ -21,7 +21,9 @@ import unittest
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 
-from atlas import build, docs, ocr, query, video  # noqa: E402
+from unittest import mock
+
+from atlas import build, docs, ocr, query, verify_citations, video  # noqa: E402
 
 VTT = """WEBVTT
 
@@ -68,6 +70,11 @@ class Captions(unittest.TestCase):
         self.assertEqual(len(cues), 3)
         self.assertFalse(any("exported from" in c[1] or "WEBVTT" in c[1] for c in cues))
 
+    def test_an_empty_cue_does_not_turn_the_next_cue_number_or_note_into_speech(self):
+        text = ("WEBVTT\n\n1\n00:00:01.000 --> 00:00:02.000\n\n2\n00:00:03.000 --> 00:00:04.000\nreal words\n\n"
+                "00:00:05.000 --> 00:00:06.000\n\nNOTE not speech\n")
+        self.assertEqual(video.parse_captions(text), [(3.0, "real words")])
+
     def test_srt_times_with_commas_and_hours(self):
         self.assertEqual(video.parse_captions(SRT), [(3.25, "Posting runs at 2 a.m."), (3600.0, "Call the on-call analyst.")])
 
@@ -100,6 +107,14 @@ class Screens(unittest.TestCase):
         for prose in ("The job failed. Rerun it.", "JOB FAILED. RERUN IT.", "Step 10. Then step 20.",
                       "Total : 5 . end"):
             self.assertEqual(video.tidy_screen(prose), prose, "a sentence is left alone")
+
+    def test_a_few_changed_characters_on_a_full_screen_are_not_told_from_ocr_noise(self):
+        screen = "\n".join(f"//DD{n:02d}     DD DSN=PROD.CLAIMS.FILE{n:02d},DISP=SHR" for n in range(24))
+        edited = screen.replace("FILE07,DISP=SHR", "FILE07,DISP=OLD")
+        self.assertEqual(len(video.dedupe_screens([(0.0, screen), (10.0, edited)])), 1,
+                         "documented: a small edit is not written again - the SAID line carries it")
+        typed = screen + "\n//DD24     DD DSN=PROD.CLAIMS.NEWFILE,DISP=SHR"
+        self.assertEqual(len(video.dedupe_screens([(0.0, screen), (10.0, typed)])), 2, "a new line is a new screen")
 
     def test_returning_to_an_earlier_screen_is_written_again(self):
         got = video.dedupe_screens([(0.0, "SCREEN A TEXT HERE"), (10.0, "SCREEN B IS DIFFERENT"), (20.0, "SCREEN A TEXT HERE")])
@@ -142,6 +157,41 @@ class Files(unittest.TestCase):
         if when is not None:
             os.utime(p, (when, when))
         return p
+
+    def test_a_teams_download_finds_its_caption_file_by_being_alone_with_it(self):
+        v = self.touch("KT", "Weekly KT-20260916_140000-Meeting Recording.mp4")
+        self.assertIsNone(video.captions_beside(v))
+        cap = self.touch("KT", "Weekly KT.vtt", data=VTT.encode())
+        self.assertEqual(video.captions_beside(v), cap, "one recording and one caption file in the folder belong together")
+        self.touch("KT", "Other.vtt", data=VTT.encode())
+        self.assertIsNone(video.captions_beside(v), "two caption files: the names must match")
+        self.assertEqual(video.captions_beside(cap), cap, "a caption file is its own captions")
+
+    def test_a_caption_file_without_its_recording_is_read_on_its_own(self):
+        cap = self.touch("KT", "Weekly KT.vtt", data=VTT.encode())
+        self.touch("KT", "notes.txt")
+        found = video.find_videos([os.path.join(self.td, "KT")])
+        self.assertEqual([p for _r, p in found], [cap])
+        v = self.touch("KT", "session2.mp4")
+        self.touch("KT", "session2.srt", data=SRT.encode())
+        found = video.find_videos([os.path.join(self.td, "KT")])
+        self.assertEqual([os.path.basename(p) for _r, p in found], ["session2.mp4", "Weekly KT.vtt"],
+                         "a caption file beside its recording is not listed twice")
+        said = []
+        side = video.process(cap, log=said.append)
+        self.assertEqual(side, os.path.join(self.td, "KT", "Weekly KT.video.docx"), said)
+        d = docs.extract(side)
+        text = "\n".join(t for _h, t in d.sections)
+        self.assertIn("[00:02:05] SAID (captions): Priya Shah: Note that step ten abends", text)
+        self.assertTrue(video.is_current(cap, side))
+
+    def test_a_caption_file_with_no_cues_is_said_so_and_does_not_silence_the_recogniser(self):
+        v = self.touch("KT", "s.mp4")
+        self.touch("KT", "s.vtt", data="WEBVTT\n\nNOTE nothing here\n".encode())
+        r = video.read_video(v, screens=False, speech=False, log=lambda s: None)
+        self.assertEqual(r["speech"], [])
+        self.assertTrue(any("has no cues that could be read" in n for n in r["notes"]), r["notes"])
+        self.assertNotIn("SAID (captions)", str(r["speech_source"]))
 
     def test_transcript_names_become_clean_document_names(self):
         v = self.touch("KT", "kt-session.mp4")
@@ -196,10 +246,39 @@ class Files(unittest.TestCase):
         self.assertIn("not a fact about what runs", text, "every transcript says what it is")
         self.assertIsNone(video.process(v, screens=False, log=said.append, side=side), "current: not read again")
 
-    def test_nothing_readable_writes_nothing(self):
+    def test_nothing_readable_is_written_down_once_but_a_step_that_never_ran_is_retried(self):
         v = self.touch("empty.mp4", data=b"")
-        self.assertIsNone(video.process(v, screens=False, speech=False, log=lambda s: None))
-        self.assertFalse(os.path.exists(video.sidecar_of(v)))
+        said = []
+        side = video.process(v, screens=False, speech=False, log=said.append)
+        self.assertEqual(side, video.sidecar_of(v), said)
+        d = docs.extract(side)
+        self.assertIn("Nothing readable: no text on screen, no speech", "\n".join(t for _h, t in d.sections))
+        self.assertIsNone(video.process(v, screens=False, speech=False, log=said.append), "current: not read again")
+        os.remove(side)
+        with mock.patch.object(ocr, "ocr_available", return_value=(True, "test")), \
+             mock.patch.object(ocr, "_run_ps", return_value=(1, "policy says no\n", "policy says no")):
+            self.assertIsNone(video.process(v, log=said.append), said)
+        self.assertFalse(os.path.exists(side), "the media step did not run: nothing written, tried again next time")
+        self.assertTrue(any("NOT READ empty.mp4: the Windows media step did not finish (exit 1): policy says no" in s
+                            for s in said), said)
+
+    def test_a_transcript_survives_characters_xml_forbids(self):
+        side = os.path.join(self.td, "odd.video.docx")
+        video.write_docx(side, "Video odd.mp4", ["note \x1b[0m with \x0c a form feed"],
+                         [("00:00:00 - 00:02:00", ["[00:00:01] SCREEN: PGM=CLM\x00POST & <more>"])])
+        d = docs.extract(side)
+        text = "\n".join(t for _h, t in d.sections)
+        self.assertIn("PGM=CLM POST & <more>", text)
+
+    def test_a_mistyped_folder_and_a_bad_interval_are_refused_plainly(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = video.main([os.path.join(self.td, "no such folder")])
+        self.assertEqual(rc, 2)
+        self.assertIn("not found:", out.getvalue())
+        self.assertIn("no backslash at the end", out.getvalue())
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            video.main([self.td, "--every", "0"])
 
     def test_dry_run_lists_each_video_and_where_its_transcript_goes(self):
         self.touch("Recordings", "a.mp4")
@@ -210,7 +289,7 @@ class Files(unittest.TestCase):
             rc = video.main([os.path.join(self.td, "Recordings"), "--out", os.path.join(self.td, "docs"), "--dry-run"])
         self.assertEqual(rc, 0)
         text = out.getvalue()
-        self.assertIn("2 video(s) found", text)
+        self.assertIn("2 recording(s) or caption file(s) found", text)
         self.assertIn(os.path.join(self.td, "docs", "sub", "b.video.docx"), text)
         self.assertNotIn("notes.txt", text)
 
@@ -239,6 +318,10 @@ class Files(unittest.TestCase):
             self.assertIn("[00:00:01] SCREEN: //STEP010 EXEC PGM=CLMPOST", hit)
         finally:
             conn.close()
+        # and the gate accepts the cite exactly as the report prints it
+        res, _u = verify_citations.check_answer('[[KT-SESSION.VIDEO 2 "PGM=CLMPOST"]] [[KT-SESSION.VIDEO:2 "step ten"]]',
+                                                db_path=db)
+        self.assertEqual([r.status for r in res], ["PASS", "PASS"], [(r.status, r.detail) for r in res])
 
 
 MAKE_VIDEO = r"""
