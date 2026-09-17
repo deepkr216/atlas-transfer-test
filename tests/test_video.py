@@ -423,6 +423,20 @@ class EndToEnd(unittest.TestCase):
         r = video.read_video(empty, log=said.append)
         self.assertIn("empty file (0 bytes)", "\n".join(r["notes"]))
 
+    def test_a_recording_the_editor_will_not_open_is_converted_first(self):
+        said = []
+        with mock.patch.dict(os.environ, {"ATLAS_TEST_FORCE_CONVERT": "1"}):
+            side = video.process(self.mp4, every=3, log=said.append, refresh=True)
+        self.assertIsNotNone(side, said)
+        d = docs.extract(side)
+        text = "\n".join(t for _h, t in d.sections).upper()
+        if "CLMNIGHT" not in text:
+            self.skipTest("OCR engine unreadable here: " + " | ".join(said))
+        self.assertIn("SCREEN: //CLMNIGHT JOB", text)
+        self.assertIn("RESTART FROM STEP020", text)
+        self.assertIn("CONVERTED TO A PLAIN MP4 FIRST", text, "the transcript says how it was read")
+        self.assertIn("CONVERSION FORCED FOR A TEST", text)
+
     def test_screens_and_speech_become_a_timed_transcript(self):
         said = []
         side = video.process(self.mp4, every=3, log=said.append, refresh=True)

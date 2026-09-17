@@ -63,7 +63,7 @@ FRAME_WIDTH = 1600
 # One JSON object per line; [Console]::Out.WriteLine, never Write-Output inside
 # a function (LESSONS 132).
 _PS_EXTRACT = r'''
-param([string]$Video, [string]$OutDir, [double]$Every, [int]$Width, [int]$NoFrames, [int]$NoAudio)
+param([string]$Video, [string]$OutDir, [double]$Every, [int]$Width, [int]$NoFrames, [int]$NoAudio, [int]$ForceConvert)
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 function Say($o) { [Console]::Out.WriteLine(($o | ConvertTo-Json -Compress)) }
 try {
@@ -81,34 +81,54 @@ $methods = [System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
 $asOp = ($methods | Where-Object { $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]
 $asActProg = ($methods | Where-Object { $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncActionWithProgress`1' })[0]
 function Await($op, $T) { $t = $asOp.MakeGenericMethod($T).Invoke($null, @($op)); $t.Wait(-1) | Out-Null; $t.Result }
-function AwaitActProg($op, $P) { $t = $asActProg.MakeGenericMethod($P).Invoke($null, @($op)); $t.Wait(-1) | Out-Null }
+# a long transcode says it is alive every 10 s (the Python side prints the progress)
+function AwaitActProg($op, $P) { $t = $asActProg.MakeGenericMethod($P).Invoke($null, @($op)); while (-not $t.Wait(10000)) { Say @{working=$true} } }
+function Convert-Plain($file, $folder) {
+  # The media editor refuses some recordings that play perfectly well (a screen recorder's
+  # MP4, a Teams download): converted to a plain MP4 by the same decoders Media Player uses,
+  # at the source's own size, and read from that (LESSONS 161).
+  $plain = Await ($folder.CreateFileAsync("plain.mp4", [Windows.Storage.CreationCollisionOption]::ReplaceExisting)) ([Windows.Storage.StorageFile])
+  $tc = New-Object Windows.Media.Transcoding.MediaTranscoder
+  $prof = [Windows.Media.MediaProperties.MediaEncodingProfile]::CreateMp4([Windows.Media.MediaProperties.VideoEncodingQuality]::Auto)
+  $prep = Await ($tc.PrepareFileTranscodeAsync($file, $plain, $prof)) ([Windows.Media.Transcoding.PrepareTranscodeResult])
+  if (-not $prep.CanTranscode) { throw "the media pipeline cannot convert it: $($prep.FailureReason)" }
+  $t = $asActProg.MakeGenericMethod([double]).Invoke($null, @($prep.TranscodeAsync()))
+  while (-not $t.Wait(10000)) { Say @{converting=[long](Get-Item -LiteralPath $plain.Path).Length} }
+  return (Await ([Windows.Storage.StorageFile]::GetFileFromPathAsync($plain.Path)) ([Windows.Storage.StorageFile]))
+}
 try {
   $src = Await ([Windows.Storage.StorageFile]::GetFileFromPathAsync($Video)) ([Windows.Storage.StorageFile])
+  $folder = Await ([Windows.Storage.StorageFolder]::GetFolderFromPathAsync($OutDir)) ([Windows.Storage.StorageFolder])
 } catch { Say @{error="cannot reach the file: $($_.Exception.GetBaseException().Message)"}; exit 0 }
+$asrc = $src
+$clip = $null
+$why = ""
+if ($ForceConvert -eq 0) {
+  try { $clip = Await ([Windows.Media.Editing.MediaClip]::CreateFromFileAsync($src)) ([Windows.Media.Editing.MediaClip]) }
+  catch { $why = $_.Exception.GetBaseException().Message }
+} else { $why = "conversion forced for a test" }
+if ($clip -eq $null) {
+  try {
+    Say @{converting_because=$why}
+    $asrc = Convert-Plain $src $folder
+    $clip = Await ([Windows.Media.Editing.MediaClip]::CreateFromFileAsync($asrc)) ([Windows.Media.Editing.MediaClip])
+    Say @{converted=[string]$asrc.Path}
+  } catch {
+    # the media layer's own words hide the reason ("The parameter is incorrect"): ask it two more questions
+    $more = " (converting it did not help: $($_.Exception.GetBaseException().Message))"
+    try {
+      [Windows.Storage.FileProperties.VideoProperties, Windows.Storage.FileProperties, ContentType = WindowsRuntime] | Out-Null
+      $vp = Await ($src.Properties.GetVideoPropertiesAsync()) ([Windows.Storage.FileProperties.VideoProperties])
+      if ([int]$vp.Width -gt 0) { $more += (" - Windows reads it as {0}x{1}, {2:n0} s" -f $vp.Width, $vp.Height, $vp.Duration.TotalSeconds) }
+      else { $more += " - Windows finds no video track in it" }
+    } catch { $more += " - Windows cannot read its properties either" }
+    Say @{error="cannot open the video: $why$more"}; exit 0
+  }
+}
 try {
-  $clip = Await ([Windows.Media.Editing.MediaClip]::CreateFromFileAsync($src)) ([Windows.Media.Editing.MediaClip])
   $comp = New-Object Windows.Media.Editing.MediaComposition
   [System.Collections.Generic.ICollection[Windows.Media.Editing.MediaClip]].GetMethod("Add").Invoke($comp.Clips, @($clip)) | Out-Null
-} catch {
-  # the media layer's own words hide the reason ("The parameter is incorrect"): ask it two more questions
-  $why = $_.Exception.GetBaseException().Message
-  $more = ""
-  try {
-    [Windows.Storage.FileProperties.VideoProperties, Windows.Storage.FileProperties, ContentType = WindowsRuntime] | Out-Null
-    $vp = Await ($src.Properties.GetVideoPropertiesAsync()) ([Windows.Storage.FileProperties.VideoProperties])
-    if ([int]$vp.Width -gt 0) { $more += (" - Windows reads it as {0}x{1}, {2:n0} s" -f $vp.Width, $vp.Height, $vp.Duration.TotalSeconds) }
-    else { $more += " - Windows finds no video track in it" }
-  } catch { $more += " - Windows cannot read its properties either" }
-  try {
-    $folder = Await ([Windows.Storage.StorageFolder]::GetFolderFromPathAsync($OutDir)) ([Windows.Storage.StorageFolder])
-    $probe = Await ($folder.CreateFileAsync("probe.mp4", [Windows.Storage.CreationCollisionOption]::ReplaceExisting)) ([Windows.Storage.StorageFile])
-    $tc = New-Object Windows.Media.Transcoding.MediaTranscoder
-    $prof = [Windows.Media.MediaProperties.MediaEncodingProfile]::CreateMp4([Windows.Media.MediaProperties.VideoEncodingQuality]::HD720p)
-    $prep = Await ($tc.PrepareFileTranscodeAsync($src, $probe, $prof)) ([Windows.Media.Transcoding.PrepareTranscodeResult])
-    if (-not $prep.CanTranscode) { $more += "; the media pipeline says: " + $prep.FailureReason }
-  } catch { }
-  Say @{error="cannot open the video: $why$more"}; exit 0
-}
+} catch { Say @{error="cannot open the video: $($_.Exception.GetBaseException().Message)"}; exit 0 }
 $dur = [double]$comp.Duration.TotalSeconds
 Say @{duration=$dur}
 if ($NoFrames -eq 0) {
@@ -142,12 +162,11 @@ try { $tracks = [int]$clip.EmbeddedAudioTracks.Count } catch { }
 if ($NoAudio -eq 0 -and $tracks -eq 0) { Say @{audio_error="the recording has no sound track"} }
 elseif ($NoAudio -eq 0) {
   try {
-    $folder = Await ([Windows.Storage.StorageFolder]::GetFolderFromPathAsync($OutDir)) ([Windows.Storage.StorageFolder])
     $wav = Await ($folder.CreateFileAsync("audio.wav", [Windows.Storage.CreationCollisionOption]::ReplaceExisting)) ([Windows.Storage.StorageFile])
     $tc = New-Object Windows.Media.Transcoding.MediaTranscoder
     $prof = [Windows.Media.MediaProperties.MediaEncodingProfile]::CreateWav([Windows.Media.MediaProperties.AudioEncodingQuality]::Low)
     $prof.Audio = [Windows.Media.MediaProperties.AudioEncodingProperties]::CreatePcm(16000, 1, 16)
-    $prep = Await ($tc.PrepareFileTranscodeAsync($src, $wav, $prof)) ([Windows.Media.Transcoding.PrepareTranscodeResult])
+    $prep = Await ($tc.PrepareFileTranscodeAsync($asrc, $wav, $prof)) ([Windows.Media.Transcoding.PrepareTranscodeResult])
     if ($prep.CanTranscode) { AwaitActProg ($prep.TranscodeAsync()) ([double]); Say @{audio=[string]$wav.Path} }
     else { Say @{audio_error="no sound track that can be read ($($prep.FailureReason))"} }
   } catch { Say @{audio_error="$($_.Exception.GetBaseException().Message)"} }
@@ -532,13 +551,26 @@ def read_video(video: str, every: float = EVERY_SECONDS, screens: bool = True, s
         def on_line(line: str) -> None:
             if '"frame"' in line:
                 state["frames"] += 1
+            if '"converting"' in line:                    # the media editor's own heartbeat, every 10 s
+                try:
+                    mb = int(json.loads(line).get("converting", 0)) // 1024 // 1024
+                except (ValueError, TypeError):
+                    mb = 0
+                state["t"] = time.time()
+                log(f"  ... converting the recording to a plain MP4 first: {mb} MB written, {int(time.time() - t0)} s")
+                return
+            if '"working"' in line:
+                state["t"] = time.time()
+                log(f"  ... still working on the recording, {int(time.time() - t0)} s")
+                return
             if time.time() - state["t"] >= 10:
                 state["t"] = time.time()
                 log(f"  ... {state['frames']} frame(s) taken, {int(time.time() - t0)} s")
 
         rc, out, err = ocr._run_ps(_PS_EXTRACT, ["-Video", video, "-OutDir", work, "-Every", str(every),
                                                  "-Width", str(FRAME_WIDTH), "-NoFrames", "0" if screens else "1",
-                                                 "-NoAudio", "0" if speech else "1"],
+                                                 "-NoAudio", "0" if speech else "1",
+                                                 "-ForceConvert", "1" if os.environ.get("ATLAS_TEST_FORCE_CONVERT") else "0"],
                                    timeout=6 * 3600, on_line=on_line)
         rows = _json_lines(out)
         result["ran"] = bool(rows) and rc == 0
@@ -548,6 +580,9 @@ def read_video(video: str, every: float = EVERY_SECONDS, screens: bool = True, s
         for r in rows:
             if "error" in r and "frame" not in r:
                 notes.append(str(r["error"]) + _open_hint(str(r["error"])))
+            if "converting_because" in r:
+                notes.append(f"the media editor would not open the recording as it is ({r['converting_because']}): "
+                             "it was converted to a plain MP4 first, by the same decoders Media Player uses")
             if "duration" in r:
                 result["duration"] = float(r["duration"])
             if "audio_error" in r:

@@ -409,8 +409,9 @@ inside them is read in full on every build only to be skipped, one over 300
 MB is listed as a problem, and a caption file is indexed as whatever its
 words look like. A recording with nothing readable gets a one-line
 transcript saying so, so it is not read again (`--refresh` reads it again);
-one the Windows media step could not open at all is retried next time and
-the message says why. A transcript is what was shown and said, never a fact
+one the Windows media editor will not open as it is (some screen recorder
+MP4s, some Teams downloads) is converted to a plain MP4 first and read from
+that; one nothing can open is retried next time and the message says why. A transcript is what was shown and said, never a fact
 about what runs.
 
 **Spreadsheets and tables are rows, not counts.** A workbook's tab is a
