@@ -264,21 +264,36 @@ class Files(unittest.TestCase):
         self.assertTrue(any("NOT READ empty.mp4: the Windows media step did not finish (exit 1): policy says no" in s
                             for s in said), said)
 
-    def test_an_online_only_onedrive_placeholder_is_named_and_tried_again_later(self):
-        v = self.touch("cloud.mp4", data=b"placeholder bytes")
+    def test_an_online_only_onedrive_recording_is_downloaded_read_and_freed_again(self):
+        v = self.touch("cloud.mp4", data=b"placeholder bytes" * 1000)
+        said = []
+        refused = '{"error":"cannot open the video: The parameter is incorrect."}\n'
+        with mock.patch.object(video, "online_only", return_value=True), \
+             mock.patch.object(video, "_dehydrate") as free, \
+             mock.patch.object(ocr, "ocr_available", return_value=(True, "test")), \
+             mock.patch.object(ocr, "_run_ps", return_value=(0, refused, "")) as ps:
+            self.assertIsNone(video.process(v, log=said.append), said)
+        self.assertTrue(ps.called, "downloaded, then handed to the media step")
+        free.assert_called_once_with(v)
+        self.assertTrue(any("downloading from OneDrive" in s for s in said), said)
+        # a download that fails is said, the space is not touched, and the recording is tried again next time
         said = []
         with mock.patch.object(video, "online_only", return_value=True), \
+             mock.patch.object(video, "_hydrate", return_value=False), \
+             mock.patch.object(video, "_dehydrate") as free, \
              mock.patch.object(ocr, "ocr_available", return_value=(True, "test")), \
              mock.patch.object(ocr, "_run_ps") as ps:
             self.assertIsNone(video.process(v, log=said.append), said)
-        self.assertFalse(ps.called, "the media step is not even started")
-        self.assertTrue(any("online-only OneDrive file" in s and "Always keep on this device" in s for s in said), said)
+        self.assertFalse(ps.called)
+        self.assertFalse(free.called)
+        self.assertTrue(any("could not download it from OneDrive" in s for s in said), said)
         self.assertFalse(os.path.exists(video.sidecar_of(v)))
         out = io.StringIO()
         with mock.patch.object(video, "online_only", return_value=True), contextlib.redirect_stdout(out):
             video.main([os.path.dirname(v), "--dry-run"])
-        self.assertIn("ONLINE-ONLY: download it first", out.getvalue())
+        self.assertIn("ONLINE-ONLY: downloaded one at a time and freed again", out.getvalue())
         self.assertFalse(video.online_only(v), "a real local file is not a placeholder")
+        self.assertTrue(video._hydrate(v, log=lambda s: None), "reading a local file through is a no-op download")
 
     def test_a_recording_nothing_could_open_is_not_written_down_and_is_tried_again(self):
         v = self.touch("locked.mp4", data=b"not a real recording, but not empty either")

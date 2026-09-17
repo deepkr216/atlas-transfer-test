@@ -44,6 +44,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -510,9 +511,40 @@ def _json_lines(out: str) -> List[dict]:
     return rows
 
 
-ONLINE_ONLY_NOTE = ("an online-only OneDrive file ('Free up space' left a placeholder on the disk, so nothing can open "
-                    "it): in Explorer right-click the folder, choose 'Always keep on this device', wait for the green "
-                    "ticks, then run again - or move the recordings out of OneDrive")
+ONLINE_ONLY_NOTE = ("an online-only OneDrive file ('Free up space'): downloaded for reading and freed again afterwards, "
+                    "so the folder never needs the disk space")
+
+
+def _hydrate(path: str, log=print) -> bool:
+    """Download an online-only OneDrive file by reading it through - what
+    Media Player does when it plays - with a line every 10 s. True once the
+    bytes are on the disk."""
+    try:
+        total = os.path.getsize(path)
+        done = 0
+        t0 = last = time.time()
+        with open(path, "rb") as fh:
+            while True:
+                chunk = fh.read(8 * 1024 * 1024)
+                if not chunk:
+                    break
+                done += len(chunk)
+                if time.time() - last >= 10:
+                    last = time.time()
+                    log(f"  ... downloading from OneDrive: {done // 1024 // 1024} of {total // 1024 // 1024} MB, "
+                        f"{int(time.time() - t0)} s")
+    except OSError as e:
+        log(f"  could not download it from OneDrive ({str(e)[:120]}) - is OneDrive running and signed in?")
+        return False
+    return True
+
+
+def _dehydrate(path: str) -> None:
+    """Hand the space back ('Free up space'): the file is a placeholder again."""
+    try:
+        subprocess.run(["attrib", "+U", "-P", path], capture_output=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        pass
 
 
 def online_only(path: str) -> bool:
@@ -575,9 +607,13 @@ def read_video(video: str, every: float = EVERY_SECONDS, screens: bool = True, s
     except OSError as e:
         notes.append(f"cannot reach the file: {e}")
         return result
-    if online_only(video):
+    was_online = online_only(video)
+    if was_online:
+        log(f"  downloading from OneDrive ({os.path.getsize(video) // 1024 // 1024} MB) - freed again after reading")
+        if not _hydrate(video, log):
+            notes.append("could not download it from OneDrive - is OneDrive running and signed in? tried again next time")
+            return result                   # not a result: tried again once the bytes can come
         notes.append(ONLINE_ONLY_NOTE)
-        return result                       # not a result: tried again once the bytes are here
     work = tempfile.mkdtemp(prefix="atlas-video-")
     try:
         t0 = time.time()
@@ -668,6 +704,8 @@ def read_video(video: str, every: float = EVERY_SECONDS, screens: bool = True, s
         return result
     finally:
         shutil.rmtree(work, ignore_errors=True)
+        if was_online:
+            _dehydrate(video)
 
 
 def process(video: str, every: float = EVERY_SECONDS, screens: bool = True, speech: bool = True,
@@ -767,7 +805,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             side = transcript_path(v, root, a.out)
             say(f"  {'up to date' if is_current(v, side) else 'to read   '}  {v}  "
                 f"({os.path.getsize(v) // 1024 // 1024} MB{', captions beside it' if captions_beside(v) else ''}"
-                f"{', ONLINE-ONLY: download it first' if online_only(v) else ''})"
+                f"{', ONLINE-ONLY: downloaded one at a time and freed again' if online_only(v) else ''})"
                 f"  ->  {side}")
         return 0
     written = failed = 0
