@@ -255,6 +255,8 @@ class Files(unittest.TestCase):
         self.assertIn("Nothing readable: no text on screen, no speech", "\n".join(t for _h, t in d.sections))
         self.assertIsNone(video.process(v, screens=False, speech=False, log=said.append), "current: not read again")
         os.remove(side)
+        with open(v, "wb") as fh:
+            fh.write(b"not a real recording, but not empty either")      # an empty file has its own explanation now
         with mock.patch.object(ocr, "ocr_available", return_value=(True, "test")), \
              mock.patch.object(ocr, "_run_ps", return_value=(1, "policy says no\n", "policy says no")):
             self.assertIsNone(video.process(v, log=said.append), said)
@@ -404,6 +406,22 @@ class EndToEnd(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         shutil.rmtree(cls.td, ignore_errors=True)
+
+    def test_a_file_that_is_not_a_video_is_explained_not_just_refused(self):
+        fake = os.path.join(self.td, "notes.mp4")
+        with open(fake, "wb") as fh:
+            fh.write(b"this is a text file with a video extension" * 100)
+        said = []
+        r = video.read_video(fake, log=said.append)
+        self.assertTrue(r.get("ran"), said)
+        note = "\n".join(r["notes"])
+        self.assertIn("cannot open the video", note)
+        self.assertIn("Media Player", note, "the next step is spelled out")
+        self.assertTrue("Windows" in note, note)
+        empty = os.path.join(self.td, "empty.mp4")
+        open(empty, "wb").close()
+        r = video.read_video(empty, log=said.append)
+        self.assertIn("empty file (0 bytes)", "\n".join(r["notes"]))
 
     def test_screens_and_speech_become_a_timed_transcript(self):
         said = []

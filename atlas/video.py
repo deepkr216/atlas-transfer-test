@@ -84,10 +84,31 @@ function Await($op, $T) { $t = $asOp.MakeGenericMethod($T).Invoke($null, @($op))
 function AwaitActProg($op, $P) { $t = $asActProg.MakeGenericMethod($P).Invoke($null, @($op)); $t.Wait(-1) | Out-Null }
 try {
   $src = Await ([Windows.Storage.StorageFile]::GetFileFromPathAsync($Video)) ([Windows.Storage.StorageFile])
+} catch { Say @{error="cannot reach the file: $($_.Exception.GetBaseException().Message)"}; exit 0 }
+try {
   $clip = Await ([Windows.Media.Editing.MediaClip]::CreateFromFileAsync($src)) ([Windows.Media.Editing.MediaClip])
   $comp = New-Object Windows.Media.Editing.MediaComposition
   [System.Collections.Generic.ICollection[Windows.Media.Editing.MediaClip]].GetMethod("Add").Invoke($comp.Clips, @($clip)) | Out-Null
-} catch { Say @{error="cannot open the video: $($_.Exception.GetBaseException().Message)"}; exit 0 }
+} catch {
+  # the media layer's own words hide the reason ("The parameter is incorrect"): ask it two more questions
+  $why = $_.Exception.GetBaseException().Message
+  $more = ""
+  try {
+    [Windows.Storage.FileProperties.VideoProperties, Windows.Storage.FileProperties, ContentType = WindowsRuntime] | Out-Null
+    $vp = Await ($src.Properties.GetVideoPropertiesAsync()) ([Windows.Storage.FileProperties.VideoProperties])
+    if ([int]$vp.Width -gt 0) { $more += (" - Windows reads it as {0}x{1}, {2:n0} s" -f $vp.Width, $vp.Height, $vp.Duration.TotalSeconds) }
+    else { $more += " - Windows finds no video track in it" }
+  } catch { $more += " - Windows cannot read its properties either" }
+  try {
+    $folder = Await ([Windows.Storage.StorageFolder]::GetFolderFromPathAsync($OutDir)) ([Windows.Storage.StorageFolder])
+    $probe = Await ($folder.CreateFileAsync("probe.mp4", [Windows.Storage.CreationCollisionOption]::ReplaceExisting)) ([Windows.Storage.StorageFile])
+    $tc = New-Object Windows.Media.Transcoding.MediaTranscoder
+    $prof = [Windows.Media.MediaProperties.MediaEncodingProfile]::CreateMp4([Windows.Media.MediaProperties.VideoEncodingQuality]::HD720p)
+    $prep = Await ($tc.PrepareFileTranscodeAsync($src, $probe, $prof)) ([Windows.Media.Transcoding.PrepareTranscodeResult])
+    if (-not $prep.CanTranscode) { $more += "; the media pipeline says: " + $prep.FailureReason }
+  } catch { }
+  Say @{error="cannot open the video: $why$more"}; exit 0
+}
 $dur = [double]$comp.Duration.TotalSeconds
 Say @{duration=$dur}
 if ($NoFrames -eq 0) {
@@ -453,6 +474,18 @@ def _json_lines(out: str) -> List[dict]:
     return rows
 
 
+def _open_hint(error: str) -> str:
+    """What to do when the media layer will not open a recording."""
+    if "CodecNotFound" in error:
+        return (" => the recording's codec is not installed on this laptop (an H.265/HEVC recording needs the "
+                "'HEVC Video Extensions', which a locked laptop may not allow): ask for it in H.264, or for the "
+                "Teams/Stream download, and put its caption file beside it")
+    if "cannot open the video" in error:
+        return (" => if it does not play in the Media Player app either, the file is incomplete or its codec is missing "
+                "on this laptop; if it plays there, send this line")
+    return ""
+
+
 def read_video(video: str, every: float = EVERY_SECONDS, screens: bool = True, speech: bool = True,
                log=print) -> Dict[str, object]:
     """{'duration', 'screens': [(t, text)], 'speech': [(t, text)], 'speech_source', 'notes': [...]}"""
@@ -483,6 +516,14 @@ def read_video(video: str, every: float = EVERY_SECONDS, screens: bool = True, s
     if not ok:
         notes.append(why)
         return result
+    try:
+        if os.path.getsize(video) == 0:
+            notes.append("empty file (0 bytes): the recording was never written, or its download did not finish")
+            result["ran"] = True
+            return result
+    except OSError as e:
+        notes.append(f"cannot reach the file: {e}")
+        return result
     work = tempfile.mkdtemp(prefix="atlas-video-")
     try:
         t0 = time.time()
@@ -506,7 +547,7 @@ def read_video(video: str, every: float = EVERY_SECONDS, screens: bool = True, s
                          " - can PowerShell scripts run on this laptop?")
         for r in rows:
             if "error" in r and "frame" not in r:
-                notes.append(str(r["error"]))
+                notes.append(str(r["error"]) + _open_hint(str(r["error"])))
             if "duration" in r:
                 result["duration"] = float(r["duration"])
             if "audio_error" in r:
