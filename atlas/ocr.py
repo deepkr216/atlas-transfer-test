@@ -395,6 +395,15 @@ def extract_images(conn: sqlite3.Connection, out_dir: str, member: Optional[str]
                             dest = os.path.join(dest_dir, os.path.basename(n))
                             with z.open(n) as src, open(dest, "wb") as dst:
                                 shutil.copyfileobj(src, dst)
+                            if os.path.getsize(dest) == 0:
+                                # the document declares a size for it but stores no data - a broken
+                                # export, the picture Word shows as a red X (LESSONS 155); said once
+                                prior = conn.execute("SELECT ocr_text FROM doc_image WHERE member_id=? AND name=?",
+                                                     (mid, n)).fetchone()
+                                if prior is None or prior[0] is None:
+                                    log(f"  {name}: {os.path.basename(n)} holds no data inside the document "
+                                        f"({info.file_size:,} bytes declared, none stored) - a broken picture, the kind "
+                                        f"Word shows as a red X; nothing to read")
                             out.append((mid, name, n, dest))
             except (zipfile.BadZipFile, OSError) as e:
                 log(f"  unreadable: {name} ({str(e)[:120]})")
@@ -546,8 +555,22 @@ def to_readable_images(paths: List[str], log=None) -> Dict[str, List[str]]:
 def run(conn: sqlite3.Connection, out_dir: str, do_ocr: bool = True, member: Optional[str] = None,
         log=print, pdf_pages: str = "scans") -> Dict[str, int]:
     images = extract_images(conn, out_dir, member, pdf_pages, log)
-    stats = {"images": len(images), "ocr_text": 0, "ocr_empty": 0, "ocr_failed": 0}
-    log(f"images extracted: {len(images)} -> {out_dir}")
+    stats = {"images": len(images), "ocr_text": 0, "ocr_empty": 0, "ocr_failed": 0, "broken": 0}
+    # a picture the document holds no data for is recorded as read-and-empty:
+    # never handed to the engine, never counted as a failure, never tried again
+    for mid, name, img, dest in images:
+        try:
+            if os.path.getsize(dest) != 0:
+                continue
+        except OSError:
+            continue
+        row = conn.execute("SELECT ocr_text FROM doc_image WHERE member_id=? AND name=?", (mid, img)).fetchone()
+        if row is not None and row[0] is None:
+            conn.execute("UPDATE doc_image SET ocr_text='' WHERE member_id=? AND name=?", (mid, img))
+            stats["broken"] += 1
+    conn.commit()
+    log(f"images extracted: {len(images)} -> {out_dir}"
+        + (f" ({stats['broken']} broken inside their documents: nothing to read)" if stats["broken"] else ""))
     if not do_ocr or not images:
         return stats
     ok, why = ocr_available()

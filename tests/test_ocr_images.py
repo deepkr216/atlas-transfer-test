@@ -167,6 +167,85 @@ def two_page_pdf(text1: str, text2: str) -> bytes:
     return bytes(out)
 
 
+def zip_with_entries(path: str, entries) -> None:
+    """A zip written by hand, so the central directory can declare a size for
+    an entry that stores no data - what a broken export does."""
+    import struct
+    out = bytearray()
+    central = bytearray()
+    for name, data, declared in entries:
+        crc = zipfile.crc32(data) & 0xFFFFFFFF
+        nb = name.encode()
+        off = len(out)
+        out += struct.pack("<IHHHHHIIIHH", 0x04034B50, 20, 0, 0, 0, 0, crc, len(data), declared, len(nb), 0) + nb + data
+        central += struct.pack("<IHHHHHHIIIHHHHHII", 0x02014B50, 20, 20, 0, 0, 0, 0, crc, len(data), declared,
+                               len(nb), 0, 0, 0, 0, 0, off) + nb
+    cd_off = len(out)
+    out += central
+    out += struct.pack("<IHHHHIIH", 0x06054B50, 0, 0, len(entries), len(entries), len(central), cd_off, 0)
+    with open(path, "wb") as fh:
+        fh.write(out)
+
+
+class BrokenPictures(unittest.TestCase):
+    """At work: 5 of 2,057 pictures 'empty file (0 bytes)' - the document
+    declared a size for each and stored nothing (LESSONS 155). The zip reader
+    hands back zero bytes without a word, so the toolkit must notice."""
+
+    def setUp(self):
+        self.td = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.td, ignore_errors=True)
+
+    def test_a_picture_the_document_holds_no_data_for_is_said_once_and_never_retried(self):
+        docs_dir = os.path.join(self.td, "docs")
+        os.makedirs(docs_dir)
+        W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+        doc = (f'<w:document xmlns:w="{W}"><w:body><w:p><w:r><w:t>Scanned claims procedure</w:t></w:r></w:p>'
+               f'</w:body></w:document>').encode()
+        good = b"\x89PNG\r\n\x1a\n" + bytes(4000)
+        zip_with_entries(os.path.join(docs_dir, "SCANPROC.docx"),
+                         [("word/document.xml", doc, len(doc)),
+                          ("word/media/page-001-0001.png", b"", 5000),          # declared, not stored
+                          ("word/media/page-001-0002.png", good, len(good))])
+        estate = os.path.join(self.td, "estate", "SRC")
+        os.makedirs(estate)
+        shutil.copy(os.path.join(HERE, "fixtures", "SAMPPGM.cbl"), estate)
+        db = os.path.join(self.td, "t.db")
+        with contextlib.redirect_stdout(io.StringIO()):
+            build._main([os.path.join(self.td, "estate"), "--db", db, "--rebuild", "--quiet", "--also", docs_dir])
+        conn = query.connect(db)
+        try:
+            said = []
+            key = os.path.normcase(os.path.abspath(os.path.join(self.td, "out", "SCANPROC", "page-001-0002.png")))
+            with mock.patch.object(ocr, "ocr_available", return_value=(True, "test")), \
+                 mock.patch.object(ocr, "ocr_images", return_value=({key: "STEP020 RESTART"}, [])) as engine:
+                stats = ocr.run(conn, os.path.join(self.td, "out"), log=said.append)
+            self.assertEqual((stats["images"], stats["broken"], stats["ocr_text"], stats["ocr_failed"]), (2, 1, 1, 0), said)
+            self.assertEqual([os.path.basename(p) for p in engine.call_args[0][0]], ["page-001-0002.png"],
+                             "the empty one never reaches the engine")
+            line = [s for s in said if "holds no data inside the document" in s]
+            self.assertEqual(len(line), 1, said)
+            self.assertIn("page-001-0001.png", line[0])
+            self.assertIn("5,000 bytes declared, none stored", line[0])
+            self.assertIn("red X", line[0])
+            self.assertTrue(any("(1 broken inside their documents: nothing to read)" in s for s in said), said)
+            rows = dict(conn.execute("SELECT name, ocr_text FROM doc_image").fetchall())
+            self.assertEqual(rows["word/media/page-001-0001.png"], "", "recorded as read and empty")
+            self.assertEqual(rows["word/media/page-001-0002.png"], "STEP020 RESTART")
+            # the next run: the broken one is not mentioned again, not retried, not a failure
+            said = []
+            with mock.patch.object(ocr, "ocr_available", return_value=(True, "test")), \
+                 mock.patch.object(ocr, "ocr_images", return_value=({}, [])) as engine:
+                stats = ocr.run(conn, os.path.join(self.td, "out"), log=said.append)
+            self.assertEqual((stats["broken"], stats["ocr_failed"]), (0, 0), said)
+            self.assertFalse(any("holds no data" in s for s in said), said)
+            self.assertFalse(engine.called and engine.call_args[0][0], "nothing left for the engine")
+        finally:
+            conn.close()
+
+
 class PagesTheEngineRefused(unittest.TestCase):
     """At work: 'page-0001.png: Exception calling "Wait" ... One or more errors
     occurred' - the wrapper hid the reason, a big page lost its small print,

@@ -372,7 +372,9 @@ store a pasted diagram as, which are drawn onto a bitmap first because the
 engine cannot decode them, and every page of a multi-page TIFF - and runs the
 OCR engine that ships with Windows 10/11 (a big scan is read in tiles, so its
 small print is not lost to the engine's own downsampling; a page it refused on
-an earlier run is tried again, and rendered again when its file came out empty)
+an earlier run is tried again, and rendered again when its file came out empty;
+a picture the document declares but stores no data for - the red X Word shows -
+is reported once and counted as empty, not failed)
 (`Windows.Media.Ocr`, driven through PowerShell) — no install, no network,
 **no model tokens**. The recognised text becomes a section of the document
 (`image 1`, `image 2`…), searchable and citable. Pictures OCR cannot read
