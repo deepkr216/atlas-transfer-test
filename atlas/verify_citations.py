@@ -127,6 +127,11 @@ def _resolve(ref: str, root: Optional[str], db: Optional[sqlite3.Connection],
             if rows:
                 name, want_lib = whole, None
         if not rows:
+            # a document named `PLAN .docx` is member `PLAN ` - cited, rightly, without the space
+            rows = db.execute(
+                "SELECT path, kind, authoritative, system, library, norm_sha FROM member WHERE UPPER(TRIM(name))=? "
+                "ORDER BY authoritative DESC, path", (name.strip(),)).fetchall()
+        if not rows:
             return None, f"member {name} not in index", None
         cands = list(rows)
         if want_kind:

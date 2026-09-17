@@ -10,6 +10,7 @@ engine exist; the wiring runs everywhere.
 import contextlib
 import io
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -185,6 +186,55 @@ def zip_with_entries(path: str, entries) -> None:
     out += struct.pack("<IHHHHIIH", 0x06054B50, 0, 0, len(entries), len(entries), len(central), cd_off, 0)
     with open(path, "wb") as fh:
         fh.write(out)
+
+
+class FolderNames(unittest.TestCase):
+    """At work: `unreadable: NAME  ([Error 2] No such file or directory: 'out/images\\NAME \\image14.png')` -
+    the document's file name ends with a space before .docx (LESSONS 156)."""
+
+    def test_a_folder_windows_accepts_for_every_document_name(self):
+        self.assertEqual(ocr.folder_name("CLAIMS PLAN"), "CLAIMS PLAN")
+        for bad in ("DATA MASKING ", "DATA MASKING.", "DATA MASKING . ", "A/B", 'A"B', "CON", "nul.docx", "", "A\x07B"):
+            safe = ocr.folder_name(bad)
+            self.assertNotEqual(safe, bad, bad)
+            self.assertFalse(safe.endswith((" ", ".")), safe)
+            self.assertFalse(re.search(r'[<>:"/\\|?*\x00-\x1f]', safe), safe)
+            self.assertNotIn(safe.split(".")[0].split("~")[0].upper(), ocr._DEVICE_NAMES, safe)
+        self.assertNotEqual(ocr.folder_name("DATA MASKING "), ocr.folder_name("DATA MASKING"),
+                            "two documents whose names differ only by the space keep separate folders")
+        self.assertEqual(ocr.folder_name("DATA MASKING "), ocr.folder_name("DATA MASKING "), "stable")
+
+    def test_pictures_of_a_document_whose_name_ends_with_a_space_are_extracted_and_listed(self):
+        td = tempfile.mkdtemp()
+        try:
+            docs_dir = os.path.join(td, "docs")
+            os.makedirs(docs_dir)
+            docx_with_image(os.path.join(docs_dir, "DATA MASKING .docx"), "image14.png", b"\x89PNG" + bytes(4000))
+            estate = os.path.join(td, "estate", "SRC")
+            os.makedirs(estate)
+            shutil.copy(os.path.join(HERE, "fixtures", "SAMPPGM.cbl"), estate)
+            db = os.path.join(td, "t.db")
+            with contextlib.redirect_stdout(io.StringIO()):
+                build._main([os.path.join(td, "estate"), "--db", db, "--rebuild", "--quiet", "--also", docs_dir])
+            conn = query.connect(db)
+            try:
+                self.assertEqual(conn.execute("SELECT name FROM member WHERE kind='doc'").fetchone()[0], "DATA MASKING ",
+                                 "the build keeps the trailing space in the name (a build.py change waits for the batch)")
+                said = []
+                stats = ocr.run(conn, os.path.join(td, "out"), do_ocr=False, log=said.append)
+                self.assertEqual(stats["images"], 1, said)
+                self.assertFalse(any("unreadable" in s for s in said), said)
+                made = [os.path.join(d, f) for d, _s, fs in os.walk(os.path.join(td, "out")) for f in fs if f == "image14.png"]
+                self.assertEqual(len(made), 1, said)
+                self.assertGreater(os.path.getsize(made[0]), 0)
+                self.assertFalse(os.path.basename(os.path.dirname(made[0])).endswith(" "))
+                # the reports find it without the space nobody types
+                self.assertEqual(len(query._doc_members(conn, "DATA MASKING")), 1)
+                self.assertIn("image14.png", query.cmd_images(conn, "DATA MASKING"))
+            finally:
+                conn.close()
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
 
 
 class BrokenPictures(unittest.TestCase):

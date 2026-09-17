@@ -34,6 +34,8 @@ class DocumentNames(unittest.TestCase):
         os.makedirs(docs)
         video.write_docx(os.path.join(docs, "Claims Implementation Plan v1.2.docx"), "Claims plan", ["written for a test"],
                          [("Restart procedure", ["Rerun the posting job from STEP020 after the input file is fixed."])])
+        video.write_docx(os.path.join(docs, "Data Masking .docx"), "Masking", ["written for a test"],
+                         [("Rules", ["Mask the member number before the extract leaves the mainframe."])])
         secs = video.sections([(1.0, "//STEP010 EXEC PGM=CLMPOST")], [(2.0, "restart from step ten")], "SAID")
         video.write_docx(os.path.join(docs, "kt-session.video.docx"), "Video kt-session.mp4", ["written by atlas.video"], secs)
         cls.db = os.path.join(cls.td, "t.db")
@@ -61,6 +63,15 @@ class DocumentNames(unittest.TestCase):
         self.assertEqual([s for s, _d in st], ["PASS", "PASS"], st)
         st = self.statuses('[[CLAIMS IMPLEMENTATION PLAN V1.2 2 "no such words"]]')
         self.assertEqual(st[0][0], "FAIL", "the token is still checked against the section")
+
+    def test_a_document_whose_file_name_ends_with_a_space_is_cited_without_it(self):
+        st = self.statuses('[[DATA MASKING 2 "member number"]]')
+        self.assertEqual([s for s, _d in st], ["PASS"], st)
+        conn = query.connect(self.db)
+        try:
+            self.assertEqual(len(query._doc_members(conn, "DATA MASKING")), 1)
+        finally:
+            conn.close()
 
     def test_a_citation_the_gate_cannot_read_fails_the_answer_instead_of_slipping_through(self):
         ans = os.path.join(self.td, "answer.md")

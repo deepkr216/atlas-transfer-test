@@ -21,6 +21,7 @@ as a fact, and the section heading says which image it came from.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import platform
@@ -360,6 +361,25 @@ def _pdf_needs_pages(parse_error: Optional[str]) -> bool:
     return "no extractable text" in note or "may be garbled" in note
 
 
+_BAD_IN_FOLDER = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+_DEVICE_NAMES = {"CON", "PRN", "AUX", "NUL"} | {f"COM{i}" for i in range(1, 10)} | {f"LPT{i}" for i in range(1, 10)}
+
+
+def folder_name(name: str) -> str:
+    """A folder Windows accepts for this document's pictures. A document
+    named `PLAN .docx` is member `PLAN ` - and Windows drops the trailing
+    space when it makes the folder, after which every path inside it 'does
+    not exist' (LESSONS 156). Trailing spaces and dots go, the characters a
+    folder cannot hold go, a device name (CON, NUL) gets a suffix; a changed
+    name carries a short hash, so two documents never share a folder."""
+    safe = _BAD_IN_FOLDER.sub("_", name or "").rstrip(" .")
+    if not safe or safe.split(".")[0].upper() in _DEVICE_NAMES:
+        safe = "_" + (safe or "DOC")             # NUL.docx is still the NUL device: the prefix breaks the spell
+    if safe != name:
+        safe += "~" + hashlib.sha1((name or "").encode("utf-8", "replace")).hexdigest()[:6]
+    return safe
+
+
 def extract_images(conn: sqlite3.Connection, out_dir: str, member: Optional[str] = None,
                    pdf_pages: str = "scans", log=print) -> List[Tuple[int, str, str, str]]:
     """Pull images out of the indexed Office documents (and pick up standalone
@@ -374,7 +394,7 @@ def extract_images(conn: sqlite3.Connection, out_dir: str, member: Optional[str]
     out: List[Tuple[int, str, str, str]] = []
     for mid, name, path, ext, perr in conn.execute(q, args).fetchall():
         ext = (ext or "").lower().lstrip(".")
-        dest_dir = os.path.join(out_dir, name)
+        dest_dir = os.path.join(out_dir, folder_name(name))
         marker = os.path.join(out_dir, ".atlas-output")
         if not os.path.exists(marker):
             # the build skips folders carrying this marker: extracted images

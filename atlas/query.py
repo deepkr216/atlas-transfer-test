@@ -1927,6 +1927,10 @@ def _doc_members(conn: sqlite3.Connection, name: str) -> List[sqlite3.Row]:
     rows = conn.execute("SELECT id, name, path FROM member WHERE kind='doc' AND (UPPER(name)=? OR UPPER(name)=?) "
                         "ORDER BY path", (n, stem)).fetchall()
     if not rows:
+        # a file named `PLAN .docx` is member `PLAN ` - nobody types the trailing space
+        rows = conn.execute("SELECT id, name, path FROM member WHERE kind='doc' AND "
+                            "(UPPER(TRIM(name))=? OR UPPER(TRIM(name))=?) ORDER BY path", (n.strip(), stem.strip())).fetchall()
+    if not rows:
         rows = conn.execute("SELECT id, name, path FROM member WHERE kind='doc' AND UPPER(name) LIKE ? ORDER BY path",
                             (f"%{stem}%",)).fetchall()
     return rows
@@ -2069,8 +2073,8 @@ def cmd_images(conn: sqlite3.Connection, name: Optional[str] = None) -> str:
            FROM doc_image i JOIN member m ON m.id=i.member_id"""
     args: tuple = ()
     if name:
-        q += " WHERE UPPER(m.name)=?"
-        args = (name.upper(),)
+        q += " WHERE (UPPER(m.name)=? OR UPPER(TRIM(m.name))=?)"
+        args = (name.upper(), name.strip().upper())
     q += " GROUP BY m.id ORDER BY n DESC"
     rows = conn.execute(q, args).fetchall()
     out = [f"# Pictures inside documents{' - ' + name.upper() if name else ''}\n"]
@@ -2088,7 +2092,8 @@ def cmd_images(conn: sqlite3.Connection, name: Optional[str] = None) -> str:
     if name:
         try:
             rows2 = conn.execute("""SELECT i.name, i.anchor, i.extracted_path, i.ocr_text FROM doc_image i JOIN member m ON m.id=i.member_id
-                                    WHERE UPPER(m.name)=? ORDER BY i.id""", (name.upper(),)).fetchall()
+                                    WHERE UPPER(m.name)=? OR UPPER(TRIM(m.name))=? ORDER BY i.id""",
+                                 (name.upper(), name.strip().upper())).fetchall()
         except sqlite3.OperationalError:
             return "".join(out) + "\n_the index was built by an older toolkit - run the build once (no --rebuild needed) to see where each picture sits_\n"
         out.append(table(["image", "where it sits", "extracted to", "OCR text (first 80 chars)"],
@@ -3108,12 +3113,14 @@ def _member_by_ref(conn: sqlite3.Connection, ref: str) -> list:
     rows = _members_named(conn, system, name, kind, library)
     if not rows and library:                      # a member really named AB@CD
         rows = _members_named(conn, system, f"{name}@{library}", kind, None)
+    if not rows:                                  # a document named `PLAN .docx` is member `PLAN `
+        rows = _members_named(conn, system, name, kind, library, trim=True)
     return rows
 
 
-def _members_named(conn: sqlite3.Connection, system, name, kind, library) -> list:
-    q = "SELECT * FROM member WHERE UPPER(name)=?"
-    args: list = [name.upper()]
+def _members_named(conn: sqlite3.Connection, system, name, kind, library, trim: bool = False) -> list:
+    q = "SELECT * FROM member WHERE UPPER(TRIM(name))=?" if trim else "SELECT * FROM member WHERE UPPER(name)=?"
+    args: list = [name.strip().upper() if trim else name.upper()]
     if system:
         q += " AND UPPER(COALESCE(system,''))=?"
         args.append(system.upper())

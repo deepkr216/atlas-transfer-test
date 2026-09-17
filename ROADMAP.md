@@ -153,7 +153,10 @@ worth the night anyway (LESSONS 153):
    its words; a quiet skip with a plain reason.
 9. `build_run` records only the estate root, not the `--also` folders (the
    watchdog reads the index instead to refuse a command that drops folders).
-10. Parser reach (from his coverage tables): dynamic CALL targets across
+10. A file name ending with a space or a dot before its extension gives a
+    member name that keeps it (`PLAN `): strip it at inventory (the OCR folder,
+    the lookups and the gate tolerate it meanwhile - LESSONS 156).
+11. Parser reach (from his coverage tables): dynamic CALL targets across
     members, `sql_cursor` declared in another member, INTRDR-submitted JCL
     through a card member, the MFS macros in his estate.
 
