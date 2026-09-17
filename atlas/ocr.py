@@ -53,8 +53,11 @@ try {
   [Windows.Media.Ocr.OcrEngine, Windows.Foundation, ContentType = WindowsRuntime] | Out-Null
   [Windows.Storage.StorageFile, Windows.Storage, ContentType = WindowsRuntime] | Out-Null
   [Windows.Graphics.Imaging.BitmapDecoder, Windows.Graphics, ContentType = WindowsRuntime] | Out-Null
+  [Windows.Graphics.Imaging.BitmapTransform, Windows.Graphics, ContentType = WindowsRuntime] | Out-Null
+  [Windows.Graphics.Imaging.BitmapBounds, Windows.Graphics, ContentType = WindowsRuntime] | Out-Null
   Add-Type -AssemblyName System.Runtime.WindowsRuntime
 } catch { Write-Output (@{engine="unavailable"; error="$_"} | ConvertTo-Json -Compress); exit 0 }
+$tileMax = 2500; $overlap = 60      # a bigger picture is read in tiles: the engine downsamples it and loses the small print
 $asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]
 function Await($WinRtTask, $ResultType) { $asTask = $asTaskGeneric.MakeGenericMethod($ResultType); $netTask = $asTask.Invoke($null, @($WinRtTask)); $netTask.Wait(-1) | Out-Null; $netTask.Result }
 $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages()
@@ -66,15 +69,43 @@ foreach ($raw in Get-Content -LiteralPath $ListFile) {
   $p = "$raw".Trim()
   if (-not $p) { continue }
   try {
+    if ((Get-Item -LiteralPath $p).Length -eq 0) { throw "empty file (0 bytes): the page or picture was never written" }
     $file = Await ([Windows.Storage.StorageFile]::GetFileFromPathAsync($p)) ([Windows.Storage.StorageFile])
     $stream = Await ($file.OpenAsync([Windows.Storage.FileAccessMode]::Read)) ([Windows.Storage.Streams.IRandomAccessStream])
     $decoder = Await ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($stream)) ([Windows.Graphics.Imaging.BitmapDecoder])
-    $bitmap = Await ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
-    $result = Await ($engine.RecognizeAsync($bitmap)) ([Windows.Media.Ocr.OcrResult])
-    $lines = @($result.Lines | ForEach-Object { $_.Text })
+    $w = [int]$decoder.PixelWidth; $h = [int]$decoder.PixelHeight
+    $lines = @()
+    if ($w -le $tileMax -and $h -le $tileMax) {
+      $bitmap = Await ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
+      $result = Await ($engine.RecognizeAsync($bitmap)) ([Windows.Media.Ocr.OcrResult])
+      $lines = @($result.Lines | ForEach-Object { $_.Text })
+      $bitmap.Dispose()
+    } else {
+      $last = ""
+      $y = 0
+      while ($y -lt $h) {
+        $th = [Math]::Min($tileMax, $h - $y)
+        $x = 0
+        while ($x -lt $w) {
+          $tw = [Math]::Min($tileMax, $w - $x)
+          $tr = New-Object Windows.Graphics.Imaging.BitmapTransform
+          $b = New-Object Windows.Graphics.Imaging.BitmapBounds
+          $b.X = [uint32]$x; $b.Y = [uint32]$y; $b.Width = [uint32]$tw; $b.Height = [uint32]$th
+          $tr.Bounds = $b
+          $bitmap = Await ($decoder.GetSoftwareBitmapAsync([Windows.Graphics.Imaging.BitmapPixelFormat]::Bgra8, [Windows.Graphics.Imaging.BitmapAlphaMode]::Premultiplied, $tr, [Windows.Graphics.Imaging.ExifOrientationMode]::IgnoreExifOrientation, [Windows.Graphics.Imaging.ColorManagementMode]::DoNotColorManage)) ([Windows.Graphics.Imaging.SoftwareBitmap])
+          $result = Await ($engine.RecognizeAsync($bitmap)) ([Windows.Media.Ocr.OcrResult])
+          foreach ($ln in $result.Lines) { if ($ln.Text -ne $last) { $lines += $ln.Text; $last = $ln.Text } }
+          $bitmap.Dispose()
+          if ($x + $tw -ge $w) { break }
+          $x += $tileMax - $overlap
+        }
+        if ($y + $th -ge $h) { break }
+        $y += $tileMax - $overlap
+      }
+    }
     Write-Output (@{path=$p; text=($lines -join "`n")} | ConvertTo-Json -Compress)
     $stream.Dispose()
-  } catch { Write-Output (@{path=$p; error="$_"} | ConvertTo-Json -Compress) }
+  } catch { Write-Output (@{path=$p; error=$_.Exception.GetBaseException().Message} | ConvertTo-Json -Compress) }
 }
 '''
 
@@ -183,7 +214,7 @@ def render_text_png(text: str, out_path: str) -> bool:
 # Windows 10/11), so a scanned PDF - or one whose fonts defeat the text
 # extractor - can be read by the same OCR engine as the pictures.
 _PS_PDF = r"""
-param([string]$Pdf, [string]$OutDir, [int]$MaxPages, [int]$Width)
+param([string]$Pdf, [string]$OutDir, [int]$MaxPages, [int]$Width, [string]$Only)
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 try {
   [Windows.Data.Pdf.PdfDocument, Windows.Data.Pdf, ContentType = WindowsRuntime] | Out-Null
@@ -201,11 +232,14 @@ try {
   $file = Await ([Windows.Storage.StorageFile]::GetFileFromPathAsync($Pdf)) ([Windows.Storage.StorageFile])
   $doc = Await ([Windows.Data.Pdf.PdfDocument]::LoadFromFileAsync($file)) ([Windows.Data.Pdf.PdfDocument])
   $folder = Await ([Windows.Storage.StorageFolder]::GetFolderFromPathAsync($OutDir)) ([Windows.Storage.StorageFolder])
-} catch { Write-Output (@{error="cannot open: $_"} | ConvertTo-Json -Compress); exit 0 }
+} catch { Write-Output (@{error="cannot open: $($_.Exception.GetBaseException().Message)"} | ConvertTo-Json -Compress); exit 0 }
 $total = [int]$doc.PageCount
 $n = [Math]::Min($total, $MaxPages)
+$want = @()
+if ($Only) { $want = @($Only.Split(",") | ForEach-Object { [int]$_ }) }
 Write-Output (@{pages=$total; rendering=$n} | ConvertTo-Json -Compress)
 for ($i = 0; $i -lt $n; $i++) {
+  if ($want.Count -gt 0 -and -not ($want -contains ($i + 1))) { continue }
   try {
     $page = $doc.GetPage([uint32]$i)
     $name = "page-{0:d4}.png" -f ($i + 1)
@@ -216,7 +250,7 @@ for ($i = 0; $i -lt $n; $i++) {
     AwaitAction ($page.RenderToStreamAsync($stream, $opts))
     $stream.Dispose(); $page.Dispose()
     Write-Output (@{page=($i + 1); path=(Join-Path $OutDir $name)} | ConvertTo-Json -Compress)
-  } catch { Write-Output (@{page=($i + 1); error="$_"} | ConvertTo-Json -Compress) }
+  } catch { Write-Output (@{page=($i + 1); error=$_.Exception.GetBaseException().Message} | ConvertTo-Json -Compress) }
 }
 """
 
@@ -225,16 +259,21 @@ PDF_RENDER_WIDTH = 1700    # pixels across the page: enough for 9-point print
 
 
 def render_pdf_pages(pdf_path: str, out_dir: str, max_pages: int = PDF_MAX_PAGES,
-                     width: int = PDF_RENDER_WIDTH, log=None) -> Tuple[int, List[Tuple[int, str]], List[str]]:
+                     width: int = PDF_RENDER_WIDTH, log=None,
+                     only: Optional[List[int]] = None) -> Tuple[int, List[Tuple[int, str]], List[str]]:
     """Render a PDF's pages to page-NNNN.png under out_dir with the Windows
-    PDF renderer. Returns (pages in the document, [(page, png path)], warnings)."""
+    PDF renderer (`only`: just these page numbers). Returns (pages in the
+    document, [(page, png path)], warnings)."""
     ok, why = ocr_available()
     if not ok:
         return 0, [], [why]
     os.makedirs(out_dir, exist_ok=True)
-    rc, out, err = _run_ps(_PS_PDF, ["-Pdf", os.path.abspath(pdf_path), "-OutDir", os.path.abspath(out_dir),
-                                     "-MaxPages", str(max_pages), "-Width", str(width)], timeout=3600,
-                           on_line=_ticker(log, f"pages of {os.path.basename(pdf_path)} rendered", max_pages))
+    args = ["-Pdf", os.path.abspath(pdf_path), "-OutDir", os.path.abspath(out_dir),
+            "-MaxPages", str(max_pages), "-Width", str(width)]
+    if only:
+        args += ["-Only", ",".join(str(int(p)) for p in only)]
+    rc, out, err = _run_ps(_PS_PDF, args, timeout=3600,
+                           on_line=_ticker(log, f"pages of {os.path.basename(pdf_path)} rendered", len(only or []) or max_pages))
     pages: List[Tuple[int, str]] = []
     warnings: List[str] = []
     total = 0
@@ -252,6 +291,13 @@ def render_pdf_pages(pdf_path: str, out_dir: str, max_pages: int = PDF_MAX_PAGES
             pages.append((int(obj["page"]), obj["path"]))
         elif "error" in obj:
             warnings.append(f"{os.path.basename(pdf_path)}" + (f" page {obj['page']}" if "page" in obj else "") + f": {obj['error']}")
+            if "page" in obj:              # the file was created before the render failed: never hand it to the engine
+                stub = os.path.join(out_dir, f"page-{int(obj['page']):04d}.png")
+                try:
+                    if os.path.isfile(stub) and os.path.getsize(stub) == 0:
+                        os.remove(stub)
+                except OSError:
+                    pass
     if rc != 0 and not pages:
         warnings.append(f"pdf render rc {rc}: {err.strip()[:200]}")
     if total > max_pages:
@@ -372,7 +418,25 @@ def extract_images(conn: sqlite3.Connection, out_dir: str, member: Optional[str]
             done = conn.execute("SELECT COUNT(*) FROM doc_image WHERE member_id=? AND name LIKE 'page-%' AND ocr_text IS NOT NULL",
                                 (mid,)).fetchone()[0]
             if done:
-                continue                                    # pages already read on an earlier run
+                # pages rendered on an earlier run but never read: the engine refused them (tried again -
+                # it reads big pages in tiles now), or their render came out empty (rendered again)
+                redo: List[int] = []
+                for img, dest in conn.execute("SELECT name, extracted_path FROM doc_image WHERE member_id=? AND "
+                                              "name LIKE 'page-%' AND ocr_text IS NULL", (mid,)).fetchall():
+                    if dest and os.path.isfile(dest) and os.path.getsize(dest) > 0:
+                        out.append((mid, name, img, dest))
+                    else:
+                        try:
+                            redo.append(int(img.split("-")[1]))
+                        except (IndexError, ValueError):
+                            continue
+                if redo:
+                    log(f"  {name}: rendering page(s) {', '.join(str(p) for p in redo)} again - the earlier render was empty")
+                    _total, pages, warns = render_pdf_pages(path, dest_dir, log=log, only=redo)
+                    for w in warns[:5]:
+                        log("  " + w)
+                    out += [(mid, name, f"page-{p:04d}", png) for p, png in pages]
+                continue
             log(f"  {name}: rendering PDF pages for OCR ...")
             total, pages, warns = render_pdf_pages(path, dest_dir, log=log)
             for w in warns[:5]:

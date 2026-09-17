@@ -123,6 +123,141 @@ class RunPowerShell(unittest.TestCase):
         self.assertEqual(warnings, ["powershell rc 7: policy says no"], "the reason reaches the caller")
 
 
+BIG_PAGES = r"""
+param([string]$Dir)
+Add-Type -AssemblyName System.Drawing
+function Page($name, $w, $h) {
+  $bmp = New-Object System.Drawing.Bitmap $w, $h
+  $g = [System.Drawing.Graphics]::FromImage($bmp)
+  $g.Clear([System.Drawing.Color]::White)
+  $font = New-Object System.Drawing.Font("Arial", 28)
+  $g.DrawString("TOP LINE ALPHA CLMPOST", $font, [System.Drawing.Brushes]::Black, 40, 40)
+  $g.DrawString("MIDDLE LINE BRAVO", $font, [System.Drawing.Brushes]::Black, 40, [int]($h / 2))
+  $g.DrawString("BOTTOM LINE OMEGA STEP020", $font, [System.Drawing.Brushes]::Black, 40, $h - 90)
+  $g.Dispose(); $bmp.Save((Join-Path $Dir $name), [System.Drawing.Imaging.ImageFormat]::Png); $bmp.Dispose()
+}
+Page "page-tall.png" 1200 3000
+Page "page-huge.png" 4000 6000
+"""
+
+
+def two_page_pdf(text1: str, text2: str) -> bytes:
+    """A two-page PDF, each page one line of 30-point Helvetica, valid xref included."""
+    c1 = f"BT /F1 30 Tf 60 700 Td ({text1}) Tj ET".encode("latin-1")
+    c2 = f"BT /F1 30 Tf 60 700 Td ({text2}) Tj ET".encode("latin-1")
+    objs = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R 6 0 R] /Count 2 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        b"<< /Length " + str(len(c1)).encode() + b" >>\nstream\n" + c1 + b"\nendstream",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 7 0 R >>",
+        b"<< /Length " + str(len(c2)).encode() + b" >>\nstream\n" + c2 + b"\nendstream",
+    ]
+    out = bytearray(b"%PDF-1.4\n")
+    offsets = []
+    for i, body in enumerate(objs, 1):
+        offsets.append(len(out))
+        out += f"{i} 0 obj\n".encode() + body + b"\nendobj\n"
+    xref = len(out)
+    out += f"xref\n0 {len(objs) + 1}\n0000000000 65535 f \n".encode()
+    for off in offsets:
+        out += f"{off:010d} 00000 n \n".encode()
+    out += f"trailer\n<< /Size {len(objs) + 1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode()
+    return bytes(out)
+
+
+class PagesTheEngineRefused(unittest.TestCase):
+    """At work: 'page-0001.png: Exception calling "Wait" ... One or more errors
+    occurred' - the wrapper hid the reason, a big page lost its small print,
+    and a page that failed once was never tried again."""
+
+    def setUp(self):
+        ok, why = ocr.ocr_available()
+        if not ok:
+            self.skipTest(why)
+        self.td = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.td, ignore_errors=True)
+
+    def test_an_empty_page_file_says_so_instead_of_one_or_more_errors_occurred(self):
+        empty = os.path.join(self.td, "page-0001.png")
+        open(empty, "wb").close()
+        texts, warnings = ocr.ocr_images([empty])
+        self.assertEqual(texts, {})
+        self.assertEqual(len(warnings), 1, warnings)
+        self.assertIn("empty file (0 bytes)", warnings[0])
+        self.assertNotIn("One or more errors", warnings[0])
+
+    def test_a_tall_or_huge_page_is_read_whole_in_tiles(self):
+        script = os.path.join(self.td, "make.ps1")
+        with open(script, "w", encoding="utf-8") as fh:
+            fh.write(BIG_PAGES)
+        subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script, "-Dir", self.td],
+                       capture_output=True, timeout=300)
+        tall, huge = os.path.join(self.td, "page-tall.png"), os.path.join(self.td, "page-huge.png")
+        if not (os.path.isfile(tall) and os.path.isfile(huge)):
+            self.skipTest("System.Drawing could not draw the pages here")
+        texts, warnings = ocr.ocr_images([tall, huge])
+        for p in (tall, huge):
+            got = (texts.get(os.path.normcase(os.path.abspath(p))) or "").upper()
+            if "ALPHA" not in got and p == tall:
+                self.skipTest("OCR engine unreadable here: " + "; ".join(warnings))
+            for token in ("TOP LINE ALPHA CLMPOST", "MIDDLE LINE BRAVO", "BOTTOM LINE OMEGA STEP020"):
+                self.assertIn(token, got, (os.path.basename(p), got, warnings))
+
+    def test_a_page_that_failed_on_an_earlier_run_is_tried_again_and_an_empty_one_rendered_again(self):
+        probe = os.path.join(self.td, "probe.png")
+        if not ocr.render_text_png("WAIVER PROBE", probe):
+            self.skipTest("could not render a probe image")
+        texts, _w = ocr.ocr_images([probe])
+        if not texts or "WAIVER" not in next(iter(texts.values())).upper():
+            self.skipTest("OCR engine unreadable here")
+        docs_dir = os.path.join(self.td, "specs")
+        os.makedirs(docs_dir)
+        with open(os.path.join(docs_dir, "TWOPAGE.pdf"), "wb") as fh:
+            fh.write(two_page_pdf("WAIVER OF PREMIUM ON PAGE ONE", "RESTART FROM STEP020 ON PAGE TWO"))
+        estate = os.path.join(self.td, "estate", "SRC")
+        os.makedirs(estate)
+        shutil.copy(os.path.join(HERE, "fixtures", "SAMPPGM.cbl"), estate)
+        db = os.path.join(self.td, "t.db")
+        with contextlib.redirect_stdout(io.StringIO()):
+            build._main([os.path.join(self.td, "estate"), "--db", db, "--rebuild", "--quiet", "--also", docs_dir])
+        conn = query.connect(db)
+        try:
+            log = []
+            out_dir = os.path.join(self.td, "out", "images")
+            stats = ocr.run(conn, out_dir, member="TWOPAGE", log=log.append, pdf_pages="all")
+            if any("renderer unavailable" in ln for ln in log) or stats["images"] < 2:
+                self.skipTest("Windows PDF renderer not available here: " + " | ".join(log))
+            self.assertEqual(stats["ocr_text"], 2, log)
+            rows = conn.execute("SELECT name, extracted_path FROM doc_image WHERE name LIKE 'page-%' ORDER BY name").fetchall()
+            self.assertEqual([r["name"] for r in rows], ["page-0001", "page-0002"])
+            # 1. the engine refused page 2 on an earlier run: the file is fine, the text is missing
+            conn.execute("UPDATE doc_image SET ocr_text=NULL WHERE name='page-0002'")
+            conn.commit()
+            stats = ocr.run(conn, out_dir, member="TWOPAGE", log=log.append, pdf_pages="all")
+            self.assertEqual((stats["images"], stats["ocr_text"]), (1, 1), log)
+            got = conn.execute("SELECT ocr_text FROM doc_image WHERE name='page-0002'").fetchone()[0]
+            self.assertIn("STEP020", (got or "").upper())
+            # 2. its render came out empty: rendered again, then read
+            conn.execute("UPDATE doc_image SET ocr_text=NULL WHERE name='page-0002'")
+            conn.commit()
+            open(rows[1]["extracted_path"], "wb").close()
+            stats = ocr.run(conn, out_dir, member="TWOPAGE", log=log.append, pdf_pages="all")
+            self.assertTrue(any("rendering page(s) 2 again" in ln for ln in log), log)
+            self.assertEqual((stats["images"], stats["ocr_text"], stats["ocr_failed"]), (1, 1, 0), log)
+            self.assertGreater(os.path.getsize(rows[1]["extracted_path"]), 0)
+            # 3. nothing left to do
+            stats = ocr.run(conn, out_dir, member="TWOPAGE", log=log.append, pdf_pages="all")
+            self.assertEqual(stats["images"], 0, log)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM doc_section WHERE ordinal>=1001").fetchone()[0], 4,
+                             "an OCR section per read (the retried page is read twice in this test: twice recorded)")
+        finally:
+            conn.close()
+
+
 class Metafiles(unittest.TestCase):
 
     def setUp(self):
