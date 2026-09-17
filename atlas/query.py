@@ -1464,17 +1464,36 @@ UNRESOLVED_MEANING = {
                        "nothing to fetch - ask for the program's own names (`layout X --program PGM`), not the copybook's"),
     "assign_dataname": ("a SELECT ... ASSIGN TO a data name (dynamic allocation), so the DD name is a guess",
                         "the real DD is set at run time (a MOVE, a parm or BPXWDYN): confirm it in the job before relying on it"),
+    "launcher_parm": ("a utility step (IDCAMS, SORT, ICETOOL, IKJEFT01, DFSRRC00, FTP, Easytrieve, SAS) whose cards or "
+                      "program are not inline and not in the index, so what it does is not known",
+                      "fetch the control-card library its SYSIN / SYSTSIN / TOOLIN points at (or the PARM's PROC member) "
+                      "and build again"),
+    "scheduler_symbol": ("a dataset name holding a scheduler symbol (%%ODATE, #JI, &DATE) that is only filled in at run "
+                         "time, so the real name is not known",
+                         "read the scheduler's own definition of that symbol; the index keeps the name with <VAR> in it"),
+    "no_program_id": ("a program with no PROGRAM-ID paragraph the parser could read - the member name stands in for it",
+                      "check the member: a copybook or a card deck filed in a source library, or a PROGRAM-ID written "
+                      "in a form the parser does not read (report the shape)"),
+    "sql_group_into": ("an EXEC SQL ... INTO :group where the group or its DCLGEN is not in this program, so the "
+                       "column-to-field mapping of that statement is missing",
+                       "fetch the copybook (DCLGEN) the group comes from and build again"),
 }
 
 
-def _partial_members(conn: sqlite3.Connection) -> str:
+COVERAGE_ROWS = 15            # members named per table; `coverage --all` names every one
+
+
+def _partial_members(conn: sqlite3.Connection, limit: int = COVERAGE_ROWS) -> str:
     """Members whose facts are incomplete, with the reason the parser gave -
     a COBOL member is `partial` mostly because a copybook it copies was not
-    found, and then the fields of that copybook are missing from the index."""
+    found, and then the fields of that copybook are missing from the index.
+    The reason shown is the one that MADE it partial (a missing copybook, an
+    unrecognised map), not the first note the parser happened to write."""
     rows = conn.execute("""
         SELECT m.kind, m.name, m.library, m.parse_error,
                (SELECT u.kind || ': ' || SUBSTR(COALESCE(u.detail, ''), 1, 90) FROM unresolved u
-                WHERE u.member_id = m.id ORDER BY u.id LIMIT 1) AS why
+                WHERE u.member_id = m.id
+                ORDER BY CASE WHEN u.kind IN ('expand', 'screen') THEN 0 ELSE 1 END, u.id LIMIT 1) AS why
         FROM member m WHERE m.parse_status = 'partial' ORDER BY m.kind, m.name""").fetchall()
     if not rows:
         return "\n### Members parsed only in part\n_none_\n"
@@ -1484,14 +1503,41 @@ def _partial_members(conn: sqlite3.Connection) -> str:
     out = [f"\n### Members parsed only in part ({len(rows)}) - their facts are incomplete to this extent\n"]
     out.append(table(["kind", "members", "most common reason"],
                      [(k, len(v), _top_reason(v)) for k, v in sorted(by_kind.items(), key=lambda kv: -len(kv[1]))]))
-    shown = [(r["kind"], r["name"], r["library"], (r["why"] or r["parse_error"] or "")[:110]) for r in rows[:15]]
+    shown = [(r["kind"], r["name"], r["library"], (r["why"] or r["parse_error"] or "")[:110]) for r in rows[:limit]]
     out.append("\n" + table(["kind", "member", "library", "reason"], shown))
-    if len(rows) > 15:
-        out.append(f"_... {len(rows) - 15} more; every one of them: "
-                   "`python -m atlas.query --db atlas.db search \"...\"` or the member's own report_\n")
+    if len(rows) > limit:
+        out.append(f"_... {len(rows) - limit} more; every one of them: `coverage --all`; the copybooks they miss "
+                   "are the 'Copybooks not found' table below_\n")
     out.append("\n> A COBOL member is usually partial because a copybook it copies is not in the index: fetch that "
                "copybook library and build again. A document is partial when no text could be extracted (a scan - "
                "run `OCR images`). A screen member is partial when no map or format macro was recognised.\n")
+    return "".join(out)
+
+
+def _failed_members(conn: sqlite3.Connection, limit: int = COVERAGE_ROWS) -> str:
+    """Members not indexed at all. The build printed each one when it happened
+    and lists them at the end of ITS run - but a member that hit a time
+    limit or froze the parser is not parsed again on a later run, so only
+    the index still knows it: this table is the complete list."""
+    rows = conn.execute("""
+        SELECT kind, name, library, COALESCE(parse_error, '') AS parse_error, NULL AS why
+        FROM member WHERE parse_status = 'failed' ORDER BY kind, name""").fetchall()
+    if not rows:
+        return "\n### Members not indexed (failed)\n_none_\n"
+    by_kind: Dict[str, List[sqlite3.Row]] = defaultdict(list)
+    for r in rows:
+        by_kind[r["kind"]].append(r)
+    out = [f"\n### Members not indexed (failed) ({len(rows)}) - nothing of them is in any answer\n"]
+    out.append(table(["kind", "members", "most common reason"],
+                     [(k, len(v), _top_reason(v)) for k, v in sorted(by_kind.items(), key=lambda kv: -len(kv[1]))]))
+    shown = [(r["kind"], r["name"], r["library"], r["parse_error"][:110]) for r in rows[:limit]]
+    out.append("\n" + table(["kind", "member", "library", "reason"], shown))
+    if len(rows) > limit:
+        out.append(f"_... {len(rows) - limit} more; every one of them: `coverage --all`_\n")
+    out.append("\n> A member that hit the time limit or froze the parser (MemberTimeout, ParserStuck, "
+               "InventoryTimeout) is not tried again until the parser changes: report its kind, size and shape "
+               "(never its content) so the parser can be fixed. Any other reason names the toolkit line that failed - "
+               "report that line.\n")
     return "".join(out)
 
 
@@ -1504,7 +1550,8 @@ def _top_reason(rows: List[sqlite3.Row]) -> str:
     return f"{best[0]} ({best[1]})"
 
 
-def cmd_coverage(conn: sqlite3.Connection) -> str:
+def cmd_coverage(conn: sqlite3.Connection, everything: bool = False) -> str:
+    limit = 10 ** 9 if everything else COVERAGE_ROWS
     out = ["# Coverage - what the index does and does not know\n", f"\n_{index_header(conn)}_\n"]
     libs = conn.execute("SELECT dataset, fetched_at, expected, present, complete, missing, stale FROM library ORDER BY dataset").fetchall()
     if libs:
@@ -1517,13 +1564,15 @@ def cmd_coverage(conn: sqlite3.Connection) -> str:
     out.append(table(["kind", "status", "count"], conn.execute(
         "SELECT kind, parse_status, COUNT(*) FROM member GROUP BY 1,2 ORDER BY 1,2").fetchall()))
     out.append("\n- **ok**: parsed, its facts are in the index. **skipped**: nothing to parse - either the kind has "
-               "no parser of its own (control cards, REXX, SQL scripts, assembler, listings, unrecognised members: "
-               "still indexed and searchable, and a control card is read in full where a job points at it), or the "
+               "no parser of its own (control cards, REXX, SQL scripts, assembler: still indexed and searchable, and a "
+               "control card is read in full where a job points at it; listings and unrecognised members are recorded "
+               "by name only - `search` does not see their text), or the "
                "member sits in a source library but is not a program (no PROGRAM-ID and no DIVISION header - a "
                "procedure copybook or a card deck filed there); the member itself says which. **partial**: a parser "
                "ran but could not complete the picture - the next table says which members and why. **failed**: not "
-               "indexed at all (the build printed it at the time and listed it again at the end).\n")
-    out.append(_partial_members(conn))
+               "indexed at all - the table after it names every one, including those given up on before a restart.\n")
+    out.append(_partial_members(conn, limit))
+    out.append(_failed_members(conn, limit))
     out.append("\n### Call resolution\n")
     out.append(table(["kind", "resolution", "count"], conn.execute(
         "SELECT kind, resolution, COUNT(*) FROM call_edge GROUP BY 1,2").fetchall()))
@@ -3052,7 +3101,7 @@ def _member_by_ref(conn: sqlite3.Connection, ref: str) -> list:
         return [_Loose(id=None, path=p, name=os.path.splitext(os.path.basename(p))[0].upper(), kind=None,
                        library=os.path.basename(os.path.dirname(p)), system=None, authoritative=0,
                        fixed_format=None, sha256=hashlib.sha256(data).hexdigest(), norm_sha=None, lines=None)]
-    m = re.match(r"^(?:([A-Za-z0-9_$#@.\-]+)/)?([A-Za-z0-9_$#@\-]+?)(?:\(([a-z]+)\))?(?:@([A-Za-z0-9_$#@.\-]+))?$", r)
+    m = re.match(r"^(?:([A-Za-z0-9_$#@.\-]+)/)?([A-Za-z0-9_$#@.\- ]+?)(?:\(([a-z]+)\))?(?:@([A-Za-z0-9_$#@.\-]+))?$", r)
     if not m:
         return []
     system, name, kind, library = m.group(1), m.group(2), m.group(3), m.group(4)
@@ -4128,7 +4177,8 @@ def _main(argv: Optional[List[str]] = None) -> int:
         s.add_argument("--args", action="store_true", help="every call site with its USING list vs the callee's LINKAGE")
     sub.add_parser("dead")
     sub.add_parser("ambiguous")
-    sub.add_parser("coverage")
+    s = sub.add_parser("coverage")
+    s.add_argument("--all", action="store_true", help="name every partial and failed member, not the first 15")
     s = sub.add_parser("search")
     s.add_argument("term")
     s.add_argument("--kind")
@@ -4231,7 +4281,7 @@ def _run(a: argparse.Namespace) -> int:
         elif a.cmd == "ambiguous":
             print(cmd_ambiguous(conn))
         elif a.cmd == "coverage":
-            print(cmd_coverage(conn))
+            print(cmd_coverage(conn, a.all))
         elif a.cmd == "search":
             print(cmd_search(conn, a.term, a.kind, a.limit))
         elif a.cmd == "cite":

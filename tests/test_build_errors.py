@@ -219,8 +219,34 @@ class CoverageExplainsTheStatuses(unittest.TestCase):
             recorded |= set(_re.findall(r'unresolved\.append\(\(\s*"([a-z_]+)"', src))
             recorded |= set(_re.findall(r'INSERT INTO unresolved[^"]*"[^"]*",\s*\(mem\.id,\s*"([a-z_]+)"', src))
             recorded |= set(_re.findall(r'\(mem\.id,\s*"([a-z_]+)",\s*(?:w|"|f")', src))
+            recorded |= set(_re.findall(r'(?:notes|unresolved|found)\.append\(\s*\(\s*"([a-z_]+)"', src))
         missing = sorted(k for k in recorded if k not in query.UNRESOLVED_MEANING)
         self.assertEqual(missing, [], f"unresolved kinds with no explanation in coverage: {missing}")
+
+    def test_coverage_names_every_failed_member_even_those_given_up_on_before_a_restart(self):
+        skip = os.path.join(self.td, "skip.txt")
+        with open(skip, "w", encoding="utf-8") as fh:
+            fh.write("WALKPGM.cbl\t# froze\n")
+        with contextlib.redirect_stdout(io.StringIO()):
+            build._main([os.path.join(self.td, "estate"), "--db", self.db, "--rebuild", "--skip-list", skip])
+        with contextlib.redirect_stdout(io.StringIO()):
+            build._main([os.path.join(self.td, "estate"), "--db", self.db])       # a later run: WALKPGM is settled, not re-listed
+        conn = query.connect(self.db)
+        try:
+            cov = query.cmd_coverage(conn)
+            everything = query.cmd_coverage(conn, True)
+        finally:
+            conn.close()
+        self.assertIn("### Members not indexed (failed) (1) - nothing of them is in any answer", cov)
+        row = [ln for ln in cov.splitlines() if ln.startswith("| cobol | WALKPGM |")]
+        self.assertEqual(len(row), 1, cov)
+        self.assertIn("ParserStuck", row[0])
+        self.assertIn("not tried again until the parser changes", cov)
+        self.assertIn("including those given up on before a restart", cov)
+        self.assertIn("| cobol | WALKPGM |", everything)
+        self.assertNotIn("still indexed and searchable, and a control card", cov.replace(
+            "assembler: still indexed and searchable, and a control card", ""), "listings are not called searchable")
+        self.assertIn("recorded by name only - `search` does not see their text", cov)
 
     def test_coverage_says_none_when_every_member_is_complete(self):
         os.remove(os.path.join(self.td, "estate", "SRC", "SAMPPGM.cbl"))
@@ -233,6 +259,7 @@ class CoverageExplainsTheStatuses(unittest.TestCase):
         finally:
             conn.close()
         self.assertIn("### Members parsed only in part\n_none_", cov)
+        self.assertIn("### Members not indexed (failed)\n_none_", cov)
 
 
 class SupervisorSaysWhy(unittest.TestCase):

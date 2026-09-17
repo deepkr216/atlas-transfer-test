@@ -13,7 +13,11 @@ For each line of the gate report:
   the claim is not supported: move it to `## UNVERIFIED` or delete it.
 - `FAIL ... member not in index` / `not found` - the member name is wrong or the fact came from
   memory. Same treatment: find it in the pack or drop the claim.
-- `FAIL ... changed since index` - the index is stale; tell the user to rebuild, do not guess.
+- `FAIL ... changed since index` - the index is stale; tell the user to run the build again (Build
+  index, not Rebuild from empty), do not guess.
+- `FAIL ... unreadable citation` - the name is not written as the report prints it (a document is cited
+  by its full name, spaces and dots included: `[[CLAIMS PLAN V1.2 3 "token"]]`); fix the spelling from
+  the report, never invent one.
 - `WARN ... comment line` - the fact is cited to a `//*` or `*` line; cite the statement instead.
 - `WARN ... short token` / `wide range` - cite the exact line with a token of six or more characters.
 - `? <line>` (assertive line with no citation) - add the citation from the pack, or move the

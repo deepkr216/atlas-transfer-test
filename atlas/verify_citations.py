@@ -46,13 +46,16 @@ from . import reader
 # [[POLICY/DUPREC 1 "..."]] (department)  [[SAMPPGM(cobol) 27 "..."]] (kind)
 # [[DUPREC@PROD.POLICY.COPYLIB 1 "..."]] (library) - the forms the reports
 # print and the forms a model writes back; all of them must be checkable.
+# A document is named after its file: KT-SESSION.VIDEO, CLAIMS PLAN V1.2 -
+# dots and spaces are part of the name (LESSONS 153).
 CITATION = re.compile(
-    r"\[\[\s*([A-Za-z0-9_$#@.\\/:\-()]+?)(?:\s+|:)(\d+)(?:\s*-\s*(\d+))?\s*(?:\(via\s+COPY\s+[^)]*\)\s*)?"
+    r"\[\[\s*([A-Za-z0-9_$#@.\\/:\-() ]+?)(?:\s+|:)(\d+)(?:\s*-\s*(\d+))?\s*(?:\(via\s+COPY\s+[^)]*\)\s*)?"
     r"\"((?:[^\"\\]|\\.)*)\"\s*\]\]")
-_REF = re.compile(r"^(?:(?P<system>[A-Za-z0-9_$#@\-]+)/)?(?P<name>[A-Za-z0-9_$#@\-]+?)"
+_REF = re.compile(r"^(?:(?P<system>[A-Za-z0-9_$#@\-]+)/)?(?P<name>[A-Za-z0-9_$#@.\- ]+?)"
                   r"(?:\((?P<kind>[a-z]+)\))?(?:@(?P<library>[A-Za-z0-9.$#@\-]+))?$", re.I)
 # the name is non-greedy: `@` is a legal character in a member name AND the
 # NAME@LIBRARY separator; greedy, the name swallowed the library every time
+_ANY_BRACKETS = re.compile(r"\[\[[^\]]*\]\]")
 # A quoted token this short matches almost anywhere; the gate says so.
 WEAK_TOKEN_CHARS = 6
 WIDE_RANGE_LINES = 20
@@ -305,6 +308,15 @@ def check_answer(text: str, root: Optional[str] = None,
             results.append(Result(m.group(0), ref, s, end, quote, "WARN", "; ".join(warn), path))
             continue
         results.append(Result(m.group(0), ref, s, end, quote, "PASS", how, path))
+
+    # A [[...]] the grammar cannot read is a claim that was NOT checked: it
+    # counts as a failure, or an answer built on it would be certified.
+    readable = {m.start() for m in CITATION.finditer(text)}
+    for m in _ANY_BRACKETS.finditer(text):
+        if m.start() not in readable:
+            results.append(Result(m.group(0), m.group(0)[2:-2].strip()[:60], 0, 0, "", "FAIL",
+                                  'unreadable citation - write [[NAME section "token"]] with the name exactly as '
+                                  'the report prints it'))
 
     uncited: List[str] = []
     for line in text.splitlines():

@@ -103,7 +103,9 @@ Every answer has these sections, in this order:
   disagree and say they disagree.
 - A document named `*.VIDEO` is a recording's transcript: `SCREEN:` lines are
   OCR (0/O and 1/I confused), `SAID:` lines are speech recognition (jargon
-  garbled). Quote it as "said in the recording at 00:12:05", never as fact.
+  garbled), `SAID (captions):` lines come from the meeting's own caption file
+  and are reliable. Quote any of them as "said in the recording at 00:12:05",
+  never as fact.
 
 ## 5. Generating code, JCL or test data
 

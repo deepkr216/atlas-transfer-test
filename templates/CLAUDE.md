@@ -85,7 +85,7 @@ Every factual claim carries a citation in exactly this form:
   characters or a range wider than 20 lines is a WARN: cite the line that
   holds the fact. A `//*` or `*` comment line proves nothing.
 - The gate FAILS a citation when the member changed since the index was
-  built: rebuild, then cite again.
+  built: run the build again (not from empty), then cite again.
 - A claim you cannot cite is written as `UNVERIFIED:` and goes in its own
   section, or is not written at all.
 - When the index has no answer, the answer is `INSUFFICIENT EVIDENCE` plus
