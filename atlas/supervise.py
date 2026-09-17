@@ -56,6 +56,20 @@ def _read_current(path: str) -> tuple:
         return "", ""
 
 
+def restart_args(build_args: List[str]) -> List[str]:
+    """The arguments for a restart: never --rebuild. A restart exists to KEEP
+    what was parsed; --rebuild again would delete the index and throw away
+    every hour already spent (LESSONS 152)."""
+    return [a for a in build_args if a != "--rebuild"]
+
+
+def again_hint(build_args: List[str]) -> str:
+    """What to type to continue after a stop."""
+    if "--rebuild" in build_args:
+        return "run the same command again WITHOUT --rebuild to continue (with it, everything parsed so far is deleted)"
+    return "run the same command again to continue"
+
+
 def _record(skip: str, member: str, label: str, why: str) -> None:
     with open(skip, "a", encoding="utf-8") as fh:
         fh.write(f"{member}\t# {label}: {why} at {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
@@ -74,8 +88,11 @@ def run(build_args: List[str], silence: float = SILENCE_SECONDS, max_restarts: i
     restarts = 0
     last_phase_freeze: Optional[str] = None
     while True:
-        cmd = [python, "-u", "-m", "atlas.build", *build_args, "--skip-list", skip]
-        say(f"{_stamp()} supervisor: build started" + (f" (restart {restarts})" if restarts else "")
+        args_now = restart_args(build_args) if restarts else build_args
+        cmd = [python, "-u", "-m", "atlas.build", *args_now, "--skip-list", skip]
+        say(f"{_stamp()} supervisor: build started"
+            + (f" (restart {restarts}" + (", without --rebuild" if "--rebuild" in build_args else "") + ")"
+               if restarts else "")
             + f" - a build silent for {int(silence)} s is frozen: it is killed, the member in hand is recorded in "
               f"{SKIP_FILE}, the build restarts and keeps what was parsed")
         try:
@@ -118,7 +135,7 @@ def run(build_args: List[str], silence: float = SILENCE_SECONDS, max_restarts: i
                 last = time.time()
                 say(line.rstrip("\r\n"))
         except KeyboardInterrupt:
-            say(f"\n{_stamp()} supervisor: Ctrl+C - stopping the build (run the same command again to continue)")
+            say(f"\n{_stamp()} supervisor: Ctrl+C - stopping the build ({again_hint(build_args)})")
             try:
                 proc.terminate()
                 proc.wait(timeout=30)
@@ -168,10 +185,10 @@ def run(build_args: List[str], silence: float = SILENCE_SECONDS, max_restarts: i
         if rc == 0:
             say(f"{_stamp()} supervisor: build finished" + (f" after {restarts} restart(s)" if restarts else ""))
         elif rc == 130:
-            say(f"{_stamp()} supervisor: the build was stopped by Ctrl+C - run the same command again to continue")
+            say(f"{_stamp()} supervisor: the build was stopped by Ctrl+C - {again_hint(build_args)}")
         elif rc == 4:
             say(f"{_stamp()} supervisor: the build STOPPED - the index cannot be written (see the STOPPED message "
-                f"above). Not restarting: fix that first, then run the same command again.")
+                f"above). Not restarting: fix that first, then {again_hint(build_args)}.")
         else:
             crash = os.path.join(folder, "atlas-crash.txt")
             say(f"{_stamp()} supervisor: the build STOPPED BY AN ERROR (exit code {rc}) - the message is above"

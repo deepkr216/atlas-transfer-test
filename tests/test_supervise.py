@@ -48,9 +48,9 @@ class Supervise(unittest.TestCase):
         text = "\n".join(said)
         self.assertEqual(rc, 0, text)
         self.assertIn("supervisor: FROZEN - nothing printed for 6 s while parsing cobol WALKPGM.cbl", text)
-        self.assertIn("(restart 1)", text)
         self.assertIn("SKIPPED cobol WALKPGM.cbl: froze the parser on an earlier run (skip list)", text)
         self.assertIn("supervisor: build finished after 1 restart(s)", text)
+        self.assertIn("(restart 1, without --rebuild)", text)
         skip = os.path.join(self.td, "atlas-skip.txt")
         with open(skip, encoding="utf-8") as fh:
             entry = fh.read()
@@ -63,12 +63,23 @@ class Supervise(unittest.TestCase):
         self.assertEqual(st["SAMPPGM"][0], "ok")
         self.assertEqual(st["ERRPGM"][0], "partial")
         self.assertIsNotNone(conn.execute("SELECT finished_at FROM build_run ORDER BY id DESC LIMIT 1").fetchone()[0])
+        # the restart kept the index: the frozen run is still recorded beside the one that finished. A restart
+        # that passed --rebuild again would have deleted the db, and with it every hour already parsed.
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM build_run").fetchone()[0], 2,
+                         "the restart must not delete the index")
         conn.close()
         # the clock is on every status and event line (the 10-s status itself never fires in a 1-s build)
         self.assertRegex(text, r"\d\d:\d\d:\d\d  SKIPPED cobol WALKPGM\.cbl")
         self.assertRegex(text, r"\d\d:\d\d:\d\d supervisor: FROZEN")
         # the current-member file names what was in hand
         self.assertTrue(os.path.isfile(os.path.join(self.td, "atlas-current.txt")))
+
+    def test_a_restart_never_passes_rebuild_and_the_stop_messages_say_so(self):
+        args = ["C:\\estate", "--db", "atlas.db", "--rebuild", "--also", "C:\\docs"]
+        self.assertEqual(supervise.restart_args(args), ["C:\\estate", "--db", "atlas.db", "--also", "C:\\docs"])
+        self.assertEqual(supervise.restart_args(["estate", "--db", "x.db"]), ["estate", "--db", "x.db"])
+        self.assertIn("WITHOUT --rebuild", supervise.again_hint(args))
+        self.assertEqual(supervise.again_hint(["estate"]), "run the same command again to continue")
 
     def test_skip_list_by_name_and_settled_on_the_next_run(self):
         skip = os.path.join(self.td, "skip.txt")

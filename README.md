@@ -135,6 +135,10 @@ python -m atlas.build  C:/estate  --db atlas.db  --manifest manifest.json  --wri
 #    frozen inside a regular expression) is killed, the member in hand is recorded in
 #    atlas-skip.txt, and the build restarts keeping what was parsed
 python -m atlas.supervise  C:/estate  --db atlas.db  --manifest manifest.json
+#    build or rebuild: WITHOUT --rebuild only new and changed files are parsed (and a toolkit
+#    or manifest change re-parses everything by itself); WITH --rebuild the index is deleted
+#    and every member parsed from zero - for the very first build only. After a stop, continue
+#    WITHOUT it. The watchdog never passes --rebuild to a restart.
 
 # 2. read the coverage report FIRST - it lists what the index cannot know
 python -m atlas.query --db atlas.db coverage
