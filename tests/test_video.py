@@ -264,6 +264,22 @@ class Files(unittest.TestCase):
         self.assertTrue(any("NOT READ empty.mp4: the Windows media step did not finish (exit 1): policy says no" in s
                             for s in said), said)
 
+    def test_an_online_only_onedrive_placeholder_is_named_and_tried_again_later(self):
+        v = self.touch("cloud.mp4", data=b"placeholder bytes")
+        said = []
+        with mock.patch.object(video, "online_only", return_value=True), \
+             mock.patch.object(ocr, "ocr_available", return_value=(True, "test")), \
+             mock.patch.object(ocr, "_run_ps") as ps:
+            self.assertIsNone(video.process(v, log=said.append), said)
+        self.assertFalse(ps.called, "the media step is not even started")
+        self.assertTrue(any("online-only OneDrive file" in s and "Always keep on this device" in s for s in said), said)
+        self.assertFalse(os.path.exists(video.sidecar_of(v)))
+        out = io.StringIO()
+        with mock.patch.object(video, "online_only", return_value=True), contextlib.redirect_stdout(out):
+            video.main([os.path.dirname(v), "--dry-run"])
+        self.assertIn("ONLINE-ONLY: download it first", out.getvalue())
+        self.assertFalse(video.online_only(v), "a real local file is not a placeholder")
+
     def test_a_recording_nothing_could_open_is_not_written_down_and_is_tried_again(self):
         v = self.touch("locked.mp4", data=b"not a real recording, but not empty either")
         said = []

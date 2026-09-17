@@ -510,6 +510,21 @@ def _json_lines(out: str) -> List[dict]:
     return rows
 
 
+ONLINE_ONLY_NOTE = ("an online-only OneDrive file ('Free up space' left a placeholder on the disk, so nothing can open "
+                    "it): in Explorer right-click the folder, choose 'Always keep on this device', wait for the green "
+                    "ticks, then run again - or move the recordings out of OneDrive")
+
+
+def online_only(path: str) -> bool:
+    """A OneDrive placeholder: the name and size are here, the bytes are not
+    (Media Player fetches them on the fly; the media editor refuses)."""
+    try:
+        attrs = getattr(os.stat(path), "st_file_attributes", 0)
+    except OSError:
+        return False
+    return bool(attrs & 0x400000 or attrs & 0x40000 or attrs & 0x1000)     # recall on data access / on open / offline
+
+
 def _open_hint(error: str) -> str:
     """What to do when the media layer will not open a recording."""
     if "CodecNotFound" in error:
@@ -560,6 +575,9 @@ def read_video(video: str, every: float = EVERY_SECONDS, screens: bool = True, s
     except OSError as e:
         notes.append(f"cannot reach the file: {e}")
         return result
+    if online_only(video):
+        notes.append(ONLINE_ONLY_NOTE)
+        return result                       # not a result: tried again once the bytes are here
     work = tempfile.mkdtemp(prefix="atlas-video-")
     try:
         t0 = time.time()
@@ -748,7 +766,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         for root, v in videos:
             side = transcript_path(v, root, a.out)
             say(f"  {'up to date' if is_current(v, side) else 'to read   '}  {v}  "
-                f"({os.path.getsize(v) // 1024 // 1024} MB{', captions beside it' if captions_beside(v) else ''})"
+                f"({os.path.getsize(v) // 1024 // 1024} MB{', captions beside it' if captions_beside(v) else ''}"
+                f"{', ONLINE-ONLY: download it first' if online_only(v) else ''})"
                 f"  ->  {side}")
         return 0
     written = failed = 0

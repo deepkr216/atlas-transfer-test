@@ -403,7 +403,9 @@ ten abends" came back as "stepped in awe bins"), so when a caption file sits
 beside the video (`<name>.vtt` or `.srt` - the transcript Teams or Stream
 lets you download; a Teams download whose name differs from the recording's
 is matched when they are alone in the folder) its text is used instead, and
-a caption file on its own, without its recording, is read too. Keep the
+a caption file on its own, without its recording, is read too. A recording OneDrive holds only as a placeholder
+('Free up space') cannot be opened: download it first, or move the
+recordings out of OneDrive. Keep the
 recordings and caption files outside the folders the build reads: a video
 inside them is read in full on every build only to be skipped, one over 300
 MB is listed as a problem, and a caption file is indexed as whatever its
