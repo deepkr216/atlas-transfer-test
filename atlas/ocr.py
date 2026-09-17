@@ -340,6 +340,8 @@ def ocr_images(paths: List[str], log=None) -> Tuple[Dict[str, str], List[str]]:
             continue
         if "engine" in obj and obj["engine"] in ("unavailable", "none"):
             return {}, [f"OCR engine {obj['engine']}: {obj.get('error', '')}"]
+        if "engine" in obj and log:
+            log(f"  OCR language: {obj['engine']} (the first language of the Windows user profile that has an OCR pack)")
         if "path" in obj:
             raw = obj["path"]
             if isinstance(raw, dict):                  # PS note-property serialisation

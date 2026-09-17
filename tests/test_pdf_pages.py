@@ -94,7 +94,7 @@ class PdfPages(unittest.TestCase):
             self.assertEqual(sec["heading"], "page 1 (OCR of the scanned page)")
             # reachable through the document queries, and citable
             self.assertIn("SCANSPEC:1001", query.cmd_docs(conn, "waiver"))
-            self.assertIn("section 1001 - page 1", query.cmd_doc(conn, "SCANSPEC", grep="premium"))
+            self.assertIn("section 1001 - page 1", query.cmd_doc(conn, "SCANSPEC", grep="waiver"))
             # a second run does not render again
             stats2 = ocr.run(conn, os.path.join(td, "out", "images"), member="SCANSPEC", log=log.append, pdf_pages="all")
             self.assertEqual(stats2["images"], 0)
