@@ -176,7 +176,7 @@
     },
     {
       "label": "Atlas: read recordings (screens + speech) -> transcripts",
-      "detail": "Every video in a folder becomes NAME.video.docx: what was on screen (OCR) and said (Windows speech, or a .vtt/.srt caption file beside it), in 2-minute sections. Then run your usual build command (Atlas: UI > Build index) so they are indexed.",
+      "detail": "Every video in a folder becomes NAME.video.docx: what was on screen (OCR) and, when the meeting's .vtt/.srt caption file sits beside the recording, what was said - in 2-minute sections. Without a caption file the speech is not transcribed. Then run your usual build command (Atlas: UI > Build index) so they are indexed.",
       "type": "shell",
       "command": "python -m atlas.video \"${input:videofolder}\" --out \"${input:transcriptfolder}\"",
       "options": {"cwd": "${workspaceFolder}", "env": {"PYTHONUTF8": "1"}},

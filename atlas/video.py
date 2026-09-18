@@ -22,12 +22,14 @@ found by `docs TERM` and cited like any other document section:
   * SCREEN - a frame every --every seconds (default 10), read by the Windows
     OCR engine; the same screen shown for a minute is written once, with the
     time it appeared. Code, JCL, green screens and slides read well.
-  * SAID - the sound track, read by the speech recogniser that ships with
-    Windows. Plain speech reads well; mainframe jargon does not ("step ten
-    abends" came back as "stepped in awe bins") - so where a caption file
-    sits beside the video (`<video>.vtt` or `.srt`, e.g. a Teams or Stream
-    transcript you downloaded), its text is used instead, and it is far
-    better.
+  * SAID - what was said, from the caption file beside the video
+    (`<video>.vtt` or `.srt`: the transcript Teams or Stream makes for a
+    recording - download it and put it beside the video). Without one the
+    speech is NOT transcribed and the transcript says so. The speech
+    recogniser Windows ships (--speech-recogniser) reads synthetic speech
+    well and real meetings badly: several voices, room noise, accents and
+    mainframe words come back as fluent sentences nobody said (LESSONS 165).
+    Its lines are labelled unreliable; do not rely on them.
 
 Everything runs on the laptop with what Windows already has (Media
 Foundation, Windows.Media.Ocr, System.Speech): no install, no network, no
@@ -54,6 +56,7 @@ from typing import Dict, List, Optional, Tuple
 from . import ocr
 
 VIDEO_EXT = (".mp4", ".m4v", ".mov", ".wmv", ".avi")
+RECOGNISER_LABEL = "SAID (recogniser - unreliable)"
 SIDECAR = ".video.docx"
 MARK = "written by atlas.video"
 EVERY_SECONDS = 10
@@ -570,13 +573,13 @@ def _open_hint(error: str) -> str:
 
 
 def read_video(video: str, every: float = EVERY_SECONDS, screens: bool = True, speech: bool = True,
-               log=print) -> Dict[str, object]:
+               log=print, captions: bool = True) -> Dict[str, object]:
     """{'duration', 'screens': [(t, text)], 'speech': [(t, text)], 'speech_source', 'notes': [...]}"""
     video = os.path.abspath(video)      # the Windows media API refuses C:/x/y.mp4 and relative paths
-    result: Dict[str, object] = {"duration": 0.0, "screens": [], "speech": [], "speech_source": "SAID", "notes": []}
+    result: Dict[str, object] = {"duration": 0.0, "screens": [], "speech": [], "speech_source": RECOGNISER_LABEL, "notes": []}
     notes: List[str] = result["notes"]                                   # type: ignore[assignment]
     ok, why = ocr.ocr_available()
-    captions = captions_beside(video)
+    captions = captions_beside(video) if captions else None
     cues: List[Tuple[float, str]] = []
     if captions:
         with open(captions, encoding="utf-8-sig", errors="replace") as fh:
@@ -589,6 +592,11 @@ def read_video(video: str, every: float = EVERY_SECONDS, screens: bool = True, s
         else:
             notes.append(f"caption file {os.path.basename(captions)} has no cues that could be read (UTF-8 WebVTT or "
                          f"SRT expected){' - the speech recogniser was used instead' if speech else ''}")
+    if not cues and not speech:
+        notes.append("speech not transcribed: no caption file beside the recording. Download the meeting's own "
+                     "transcript (Teams or Stream: a .vtt file), put it beside the recording, run again. (The Windows "
+                     "speech recogniser can be tried with --speech-recogniser; on real meeting audio it produces "
+                     "fluent sentences nobody said - do not rely on it.)")
     if is_caption(video):                   # the transcript downloaded without its recording
         result["duration"] = cues[-1][0] if cues else 0.0
         result["ran"] = True
@@ -698,8 +706,10 @@ def read_video(video: str, every: float = EVERY_SECONDS, screens: bool = True, s
                 if "error" in r:
                     notes.append("speech: " + str(r["error"]))
                 if "recognizer" in r:
-                    notes.append(f"speech recogniser: {r['recognizer']} - plain speech reads well, jargon does not; "
-                                 "a caption file beside the video is used instead when there is one")
+                    notes.append(f"speech recogniser: {r['recognizer']} - its lines are UNRELIABLE on real meeting "
+                                 "audio (several voices, room noise, accents, mainframe words come back as fluent "
+                                 "sentences nobody said); the meeting's own caption file beside the recording "
+                                 "replaces it")
             result["speech"] = [(float(r["at"]), str(r["said"])) for r in srows if "said" in r]
         return result
     finally:
@@ -709,15 +719,16 @@ def read_video(video: str, every: float = EVERY_SECONDS, screens: bool = True, s
 
 
 def process(video: str, every: float = EVERY_SECONDS, screens: bool = True, speech: bool = True,
-            refresh: bool = False, log=print, side: Optional[str] = None) -> Optional[str]:
+            refresh: bool = False, log=print, side: Optional[str] = None, captions: bool = True) -> Optional[str]:
     """Write the transcript (`side`, default beside the video); return its
-    path, or None when it is current or nothing in the video was readable."""
+    path, or None when it is current or nothing in the video was readable.
+    `speech`: try the Windows recogniser when there is no caption file."""
     side = side or sidecar_of(video)
     if not refresh and is_current(video, side):
         log(f"  up to date: {side}")
         return None
     t0 = time.time()
-    r = read_video(video, every, screens, speech, log)
+    r = read_video(video, every, screens, speech, log, captions=captions)
     screens_l: List[Tuple[float, str]] = r["screens"]                     # type: ignore[assignment]
     speech_l: List[Tuple[float, str]] = r["speech"]                       # type: ignore[assignment]
     notes: List[str] = r["notes"]                                         # type: ignore[assignment]
@@ -728,8 +739,10 @@ def process(video: str, every: float = EVERY_SECONDS, screens: bool = True, spee
     secs = sections(screens_l, speech_l, str(r["speech_source"]))
     title = f"Video {os.path.basename(video)}"
     intro = [f"{MARK} on {time.strftime('%Y-%m-%d %H:%M')} from {os.path.basename(video)} "
-             f"({hms(float(r['duration']))}): a frame every {int(every)} s read by OCR (SCREEN), and the sound "
-             f"track ({'caption file' if 'captions' in str(r['speech_source']) else 'Windows speech recogniser'}) (SAID).",
+             f"({hms(float(r['duration']))}): a frame every {int(every)} s read by OCR (SCREEN)"
+             + (", and what was said from the meeting's caption file (SAID)" if 'captions' in str(r['speech_source'])
+                else (", and the sound track through the Windows speech recogniser - UNRELIABLE" if speech_l else
+                      "; the speech was not transcribed")) + ".",
              "This is what was shown and said, not a fact about what runs: OCR confuses 0/O and 1/I, and speech "
              "recognition garbles jargon - quote it as such, and check anything important against the source."]
     intro += [f"Note: {n}" for n in notes]
@@ -779,7 +792,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                                                     "the videos - a folder the build reads")
     ap.add_argument("--every", type=float, default=EVERY_SECONDS, metavar="SECONDS",
                     help=f"seconds between the frames read (default {EVERY_SECONDS}, at least 1)")
-    ap.add_argument("--no-speech", action="store_true", help="screens only")
+    ap.add_argument("--speech-recogniser", action="store_true",
+                    help="without a caption file, try the speech recogniser Windows ships - it reads synthetic speech "
+                         "well and real meetings badly; its lines are labelled unreliable")
+    ap.add_argument("--no-speech", action="store_true", help="screens only, even with a caption file")
     ap.add_argument("--no-screens", action="store_true", help="speech only")
     ap.add_argument("--refresh", action="store_true", help="read again even when the transcript is newer than the video")
     ap.add_argument("--dry-run", action="store_true", help="list what would be read")
@@ -812,7 +828,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     for k, (root, v) in enumerate(videos, 1):
         say(f"{time.strftime('%H:%M:%S')}  [{k}/{len(videos)}] {v} ({os.path.getsize(v) // 1024 // 1024} MB)")
         try:
-            if process(v, a.every, not a.no_screens, not a.no_speech, a.refresh, say, transcript_path(v, root, a.out)):
+            if process(v, a.every, not a.no_screens, a.speech_recogniser and not a.no_speech, a.refresh, say,
+                       transcript_path(v, root, a.out), captions=not a.no_speech):
                 written += 1
         except KeyboardInterrupt:
             say("stopped by Ctrl+C - transcripts already written are kept; run the same command again to continue")

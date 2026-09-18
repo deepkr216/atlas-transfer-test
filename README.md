@@ -386,8 +386,9 @@ walkthrough recording holds what nobody wrote down.
 `python -m atlas.video "C:\Recordings" --out "C:\docs\Video transcripts"`
 reads every .mp4/.m4v/.mov/.wmv/.avi under the folder with what Windows
 already has - a frame every 10 seconds through the same OCR engine (a screen
-shown for a minute is written once, at the time it appeared), and the sound
-track through the Windows speech recogniser - and writes
+shown for a minute is written once, at the time it appeared), and what was
+said from the meeting's own caption file beside the recording (`<name>.vtt`
+or `.srt`: the transcript Teams or Stream makes - download it) - and writes
 `<name>.video.docx`: one section per two minutes, every line stamped
 `[00:12:05] SAID:` or `[00:12:10] SCREEN:`. Then run your usual build
 command - the same one as always, with its `--also` folders, and `--out`
@@ -398,12 +399,14 @@ found by `docs TERM` and cited as the report prints it
 screens, slides) read well - a frame is never scaled down, so an emulator
 window inside a 1080p desktop recording stays legible - though a change of a
 few characters on a screen already written is not written again (the SAID
-line carries it). Plain speech reads well; mainframe jargon does not ("step
-ten abends" came back as "stepped in awe bins"), so when a caption file sits
-beside the video (`<name>.vtt` or `.srt` - the transcript Teams or Stream
-lets you download; a Teams download whose name differs from the recording's
-is matched when they are alone in the folder) its text is used instead, and
-a caption file on its own, without its recording, is read too. A recording OneDrive holds only as a placeholder
+line carries it). Without a caption file the speech is NOT transcribed and
+the transcript says so: the speech recogniser Windows ships reads synthetic
+speech well and real meetings badly - several voices, room noise, accents and
+mainframe words come back as fluent sentences nobody said - so it runs only
+on request (`--speech-recogniser`) and its lines are labelled unreliable. A
+Teams download whose name differs from the recording's is matched to its
+caption file when they are alone in the folder, and a caption file on its
+own, without its recording, is read too. A recording OneDrive holds only as a placeholder
 ('Free up space') is downloaded on its own, read, and handed back to
 OneDrive, so the folder never needs the disk space. Keep the
 recordings and caption files outside the folders the build reads: a video

@@ -252,7 +252,7 @@ class Files(unittest.TestCase):
         side = video.process(v, screens=False, speech=False, log=said.append)
         self.assertEqual(side, video.sidecar_of(v), said)
         d = docs.extract(side)
-        self.assertIn("Nothing readable: no text on screen, no speech", "\n".join(t for _h, t in d.sections))
+        self.assertIn("Nothing readable:", "\n".join(t for _h, t in d.sections))
         self.assertIsNone(video.process(v, screens=False, speech=False, log=said.append), "current: not read again")
         os.remove(side)
         with open(v, "wb") as fh:
@@ -470,6 +470,22 @@ class EndToEnd(unittest.TestCase):
         r = video.read_video(empty, log=said.append)
         self.assertIn("empty file (0 bytes)", "\n".join(r["notes"]))
 
+    def test_without_a_caption_file_the_speech_is_not_transcribed_unless_asked(self):
+        said = []
+        side = video.process(self.mp4, every=3, speech=False, log=said.append, refresh=True)
+        self.assertIsNotNone(side, said)
+        d = docs.extract(side)
+        text = "\n".join(t for _h, t in d.sections)
+        self.assertIn("speech not transcribed: no caption file beside the recording", text)
+        self.assertNotIn("] SAID", text, "no recogniser lines without --speech-recogniser")
+        self.assertIn("the speech was not transcribed", text)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = video.main([self.mp4, "--refresh", "--every", "3"])
+        self.assertEqual(rc, 0, out.getvalue())
+        d = docs.extract(side)
+        self.assertNotIn("] SAID", "\n".join(t for _h, t in d.sections), "the command line default is captions only")
+
     def test_a_recording_the_editor_will_not_open_is_converted_first(self):
         said = []
         with mock.patch.dict(os.environ, {"ATLAS_TEST_FORCE_CONVERT": "1"}):
@@ -500,7 +516,8 @@ class EndToEnd(unittest.TestCase):
         self.assertGreaterEqual(int(second[7:9]), 5, "the second slide appears at about 6 s: " + second)
         if "NO SPEECH RECOGNISER" in text:
             return
-        spoken = [ln for ln in text.splitlines() if "SAID: THE NIGHTLY CLAIMS JOB" in ln]
+        self.assertIn("UNRELIABLE", text, "recogniser lines are labelled")
+        spoken = [ln for ln in text.splitlines() if "SAID" in ln and "THE NIGHTLY CLAIMS JOB" in ln]
         self.assertEqual(len(spoken), 1, "plain speech reads well:\n" + text)
         self.assertGreaterEqual(int(spoken[0][7:9]), 3,
                                 "speech is stamped where it was said, not 0:00 (Recognize() in a loop does that): "
