@@ -470,6 +470,33 @@ class EndToEnd(unittest.TestCase):
         r = video.read_video(empty, log=said.append)
         self.assertIn("empty file (0 bytes)", "\n".join(r["notes"]))
 
+    def test_screens_are_checked_against_the_index_when_one_is_given(self):
+        said = []
+        vocab = video.screentext.Vocabulary(["CLMNIGHT", "CLMPOST", "STEP010", "STEP020", "CLMEDIT"], from_index=True)
+        side = video.process(self.mp4, every=3, speech=False, log=said.append, refresh=True, vocab=vocab)
+        self.assertIsNotNone(side, said)
+        text = "\n".join(t for _h, t in docs.extract(side).sections)
+        if "CLMNIGHT" not in text.upper():
+            self.skipTest("OCR engine unreadable here: " + " | ".join(said))
+        self.assertIn("screens checked against the index:", text)
+        self.assertIn("screen lines kept", text)
+        self.assertNotIn("CLMNIGHT?", text, "a name the index knows is not marked")
+
+    def test_kept_frames_show_what_the_engine_saw(self):
+        said = []
+        side = video.process(self.mp4, every=3, speech=False, log=said.append, refresh=True, keep=True)
+        self.assertIsNotNone(side, said)
+        folder = os.path.splitext(self.mp4)[0] + ".frames"
+        jpgs = sorted(f for f in os.listdir(folder) if f.endswith(".jpg"))
+        txts = sorted(f for f in os.listdir(folder) if f.endswith(".txt"))
+        self.assertTrue(jpgs, said)
+        self.assertEqual([j[:-4] for j in jpgs], [t[:-4] for t in txts], "a text beside every frame")
+        with open(os.path.join(folder, txts[0]), encoding="utf-8") as fh:
+            body = fh.read()
+        self.assertIn("what the OCR engine read from", body)
+        self.assertIn("after the check against the index", body)
+        self.assertTrue(any("frames read at" in s for s in "\n".join(t for _h, t in docs.extract(side).sections).splitlines()))
+
     def test_without_a_caption_file_the_speech_is_not_transcribed_unless_asked(self):
         said = []
         side = video.process(self.mp4, every=3, speech=False, log=said.append, refresh=True)

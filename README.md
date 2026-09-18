@@ -395,11 +395,20 @@ command - the same one as always, with its `--also` folders, and `--out`
 must be one of those folders - and it is indexed as document `<NAME>.VIDEO`,
 found by `docs TERM` and cited as the report prints it
 (`[[KT-SESSION.VIDEO 3 "CLMPOST"]]`); no parser changes, so no re-parse. A
-12-minute 788 MB test recording took 28 seconds. Screens (JCL, SDSF, green
-screens, slides) read well - a frame is never scaled down, so an emulator
-window inside a 1080p desktop recording stays legible - though a change of a
-few characters on a screen already written is not written again (the SAID
-line carries it). Without a caption file the speech is NOT transcribed and
+12-minute 788 MB test recording took 28 seconds. What the engine reads off a
+recorded screen is checked against the index (`--db atlas.db`, the default
+when the index is in the folder): a shared mainframe screen inside a
+recording is small and blurred, and the engine invents where it cannot read
+- `000100` comes back as `eeeløø`, `WS-RESTART-FLAG` as `KS-RESTART-FLAG` -
+so every name-shaped piece is kept only when the index, a keyword list or a
+word list knows it, a misread name is snapped to the real one, an unknown
+one is marked `?`, and a line with nothing recognisable is dropped; the
+transcript says how many lines were kept and dropped. Expect a full-screen
+emulator in a 1080p recording to read mostly, and a shared window in a 720p
+recording to read in fragments. `--keep-frames` saves a dozen frames beside
+the recording with the text read from each, before and after the check, so
+anyone can see what the toolkit saw. A change of a few characters on a
+screen already written is not written again. Without a caption file the speech is NOT transcribed and
 the transcript says so: the speech recogniser Windows ships reads synthetic
 speech well and real meetings badly - several voices, room noise, accents and
 mainframe words come back as fluent sentences nobody said - so it runs only

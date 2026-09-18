@@ -20,8 +20,15 @@ the next build indexes that as a document with one section per two minutes,
 found by `docs TERM` and cited like any other document section:
 
   * SCREEN - a frame every --every seconds (default 10), read by the Windows
-    OCR engine; the same screen shown for a minute is written once, with the
-    time it appeared. Code, JCL, green screens and slides read well.
+    OCR engine and CHECKED AGAINST THE INDEX (--db atlas.db): a shared
+    mainframe screen inside a recording is small and blurred, and the engine
+    invents where it cannot read - so every name-shaped piece is kept only
+    when the index, a keyword list or a word list knows it, a misread name
+    is snapped to the real one, an unknown one is marked `?`, and a line
+    with nothing recognisable is dropped (LESSONS 166). The same screen shown
+    for a minute is written once, with the time it appeared. A full-screen
+    emulator in a 1080p recording reads mostly; a shared window in a 720p
+    recording reads in fragments.
   * SAID - what was said, from the caption file beside the video
     (`<video>.vtt` or `.srt`: the transcript Teams or Stream makes for a
     recording - download it and put it beside the video). Without one the
@@ -53,7 +60,7 @@ import time
 import zipfile
 from typing import Dict, List, Optional, Tuple
 
-from . import ocr
+from . import ocr, screentext
 
 VIDEO_EXT = (".mp4", ".m4v", ".mov", ".wmv", ".avi")
 RECOGNISER_LABEL = "SAID (recogniser - unreliable)"
@@ -572,8 +579,42 @@ def _open_hint(error: str) -> str:
     return ""
 
 
+KEEP_FRAMES = 12
+
+
+def keep_frames(video: str, frames: List[Tuple[float, str]], texts: Dict[str, str], log=print,
+                checked: Optional[Dict[str, str]] = None) -> Optional[str]:
+    """A dozen frames spread over the recording, saved beside it as pictures
+    with the text the OCR engine read from each - so anyone can open a frame
+    and its text side by side and see what the toolkit saw. Beside the
+    recording, never in a folder the build reads."""
+    if not frames:
+        return None
+    folder = os.path.splitext(video)[0] + ".frames"
+    os.makedirs(folder, exist_ok=True)
+    step = max(1, len(frames) // KEEP_FRAMES)
+    kept = 0
+    for t, path in frames[::step][:KEEP_FRAMES]:
+        stamp = hms(t).replace(":", "")
+        try:
+            shutil.copyfile(path, os.path.join(folder, f"frame-{stamp}.jpg"))
+            with open(os.path.join(folder, f"frame-{stamp}.txt"), "w", encoding="utf-8") as fh:
+                key = os.path.normcase(os.path.abspath(path))
+                fh.write(f"what the OCR engine read from frame-{stamp}.jpg (at {hms(t)}):\n\n")
+                fh.write(texts.get(key, "") or "(nothing)")
+                if checked is not None:
+                    fh.write("\n\n--- what is left after the check against the index ---\n\n")
+                    fh.write(checked.get(key, "") or "(nothing)")
+            kept += 1
+        except OSError:
+            continue
+    log(f"  kept {kept} frame(s) with the text read from each in {folder} - open a .jpg and its .txt side by side")
+    return folder
+
+
 def read_video(video: str, every: float = EVERY_SECONDS, screens: bool = True, speech: bool = True,
-               log=print, captions: bool = True) -> Dict[str, object]:
+               log=print, captions: bool = True, keep: bool = False,
+               vocab: Optional[screentext.Vocabulary] = None) -> Dict[str, object]:
     """{'duration', 'screens': [(t, text)], 'speech': [(t, text)], 'speech_source', 'notes': [...]}"""
     video = os.path.abspath(video)      # the Windows media API refuses C:/x/y.mp4 and relative paths
     result: Dict[str, object] = {"duration": 0.0, "screens": [], "speech": [], "speech_source": RECOGNISER_LABEL, "notes": []}
@@ -672,11 +713,23 @@ def read_video(video: str, every: float = EVERY_SECONDS, screens: bool = True, s
         bad = [r for r in rows if "frame" in r and "error" in r]
         if bad:
             notes.append(f"{len(bad)} frame(s) could not be taken")
+        size = next((str(r["frame_size"]) for r in rows if "frame_size" in r), "")
+        if size:
+            notes.append(f"frames read at {size} pixels" + (" - a shared screen in a 720p recording is too small for the "
+                                                             "OCR engine to read reliably" if size.endswith("x720") else ""))
         if frames:
             log(f"  reading {len(frames)} frame(s) with the OCR engine")
             texts, warns = ocr.ocr_images([p for _t, p in frames], log=log)
-            got = [(t, tidy_screen(texts.get(os.path.normcase(os.path.abspath(p)), ""))) for t, p in frames]
+            vocab = vocab or screentext.Vocabulary()
+            stats = screentext.Stats()
+            checked = {k: screentext.clean_screen(tidy_screen(v), vocab, stats) for k, v in texts.items()}
+            if keep:
+                keep_frames(video, frames, texts, log, checked)
+            got = [(t, checked.get(os.path.normcase(os.path.abspath(p)), "")) for t, p in frames]
             result["screens"] = dedupe_screens(got)
+            notes.append(f"screens checked against {'the index' if vocab.from_index else 'keywords only (no --db)'}: "
+                         f"{stats}")
+            log(f"  {stats}")
             if warns:
                 whole = [w for w in warns if w.startswith(("OCR engine", "powershell rc"))]
                 notes.append(whole[0] if whole else f"{len(warns)} frame(s) unreadable by the OCR engine")
@@ -719,7 +772,8 @@ def read_video(video: str, every: float = EVERY_SECONDS, screens: bool = True, s
 
 
 def process(video: str, every: float = EVERY_SECONDS, screens: bool = True, speech: bool = True,
-            refresh: bool = False, log=print, side: Optional[str] = None, captions: bool = True) -> Optional[str]:
+            refresh: bool = False, log=print, side: Optional[str] = None, captions: bool = True,
+            keep: bool = False, vocab: Optional[screentext.Vocabulary] = None) -> Optional[str]:
     """Write the transcript (`side`, default beside the video); return its
     path, or None when it is current or nothing in the video was readable.
     `speech`: try the Windows recogniser when there is no caption file."""
@@ -728,7 +782,7 @@ def process(video: str, every: float = EVERY_SECONDS, screens: bool = True, spee
         log(f"  up to date: {side}")
         return None
     t0 = time.time()
-    r = read_video(video, every, screens, speech, log, captions=captions)
+    r = read_video(video, every, screens, speech, log, captions=captions, keep=keep, vocab=vocab)
     screens_l: List[Tuple[float, str]] = r["screens"]                     # type: ignore[assignment]
     speech_l: List[Tuple[float, str]] = r["speech"]                       # type: ignore[assignment]
     notes: List[str] = r["notes"]                                         # type: ignore[assignment]
@@ -798,7 +852,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--no-speech", action="store_true", help="screens only, even with a caption file")
     ap.add_argument("--no-screens", action="store_true", help="speech only")
     ap.add_argument("--refresh", action="store_true", help="read again even when the transcript is newer than the video")
+    ap.add_argument("--db", default="atlas.db", metavar="ATLAS.DB",
+                    help="the index whose names the screens are checked against (default atlas.db when it is here; "
+                         "without one, keywords and plain words only)")
     ap.add_argument("--dry-run", action="store_true", help="list what would be read")
+    ap.add_argument("--keep-frames", action="store_true",
+                    help="save a dozen frames beside each recording as pictures, each with the text the OCR engine read "
+                         "from it - to see what the toolkit saw")
     a = ap.parse_args(argv)
     say = lambda s: print(s, flush=True)                                  # noqa: E731
     if a.every < 1:
@@ -810,6 +870,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         say("type the folder as Explorer shows it - no quotes inside the name, no backslash at the end")
         return 2
     sweep_leftovers(say)
+    vocab = None
+    if a.db and os.path.isfile(a.db):
+        vocab = screentext.Vocabulary.from_db(a.db, log=say)
+    elif a.db and a.db != "atlas.db":
+        say(f"not found: {a.db} - screens are checked against keywords and plain words only")
+        return 2
+    else:
+        say("  (no atlas.db here: screens are checked against keywords and plain words only - run from the folder "
+            "holding the index, or give --db, so misread names can be matched to the estate's)")
     videos = find_videos(a.folders)
     say(f"{len(videos)} recording(s) or caption file(s) found"
         + (f"; transcripts go to {os.path.abspath(a.out)}" if a.out else "; transcripts go beside them"))
@@ -829,7 +898,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         say(f"{time.strftime('%H:%M:%S')}  [{k}/{len(videos)}] {v} ({os.path.getsize(v) // 1024 // 1024} MB)")
         try:
             if process(v, a.every, not a.no_screens, a.speech_recogniser and not a.no_speech, a.refresh, say,
-                       transcript_path(v, root, a.out), captions=not a.no_speech):
+                       transcript_path(v, root, a.out), captions=not a.no_speech, keep=a.keep_frames, vocab=vocab):
                 written += 1
         except KeyboardInterrupt:
             say("stopped by Ctrl+C - transcripts already written are kept; run the same command again to continue")
