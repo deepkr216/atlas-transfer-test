@@ -77,7 +77,7 @@ def ibm_listing(program_records, copybooks, ruler=True, flag="C", prefix_lines=0
             for k, crec in enumerate(copybooks[found[0]]):
                 n += 1
                 f = flag_at.get((found[0], k), flag) if flag_at else flag
-                out.append(f"   {n:06d}{f}        {crec.ljust(80)}")
+                out.append(f"   {n:06d}{f.ljust(9)}{crec.ljust(80)}")      # the flags sit in the PL/SL columns
     out.append("")
     out.append("   LineID  Message code  Message text")
     text = "\n".join(out) + "\n"
@@ -132,6 +132,23 @@ class Formats(unittest.TestCase):
         pick, how, why = recover.choose([r])
         self.assertIsNone(pick, "not written on its own")
         self.assertIn("flag 'E'", why)
+
+    def test_ibm_out_of_sequence_asterisks_are_not_a_copy_mark_and_do_not_swallow_a_line(self):
+        # IBM prints ** after the line number of a statement out of sequence - on a program line, and
+        # C** on a copied one; neither may drop the line or merge two blocks
+        text = ibm_listing(self.prog, {"PMASTREC": self.pmast, "POLDCL": self.poldcl},
+                           flag_at={("PMASTREC", 4): "C**"})
+        text = text.replace("   000007         000700 01  WS-POL.", "   000007**       000700 01  WS-POL.")
+        fmt, regions, stats = recover.extract(text, "x.lst", set())
+        self.assertEqual(fmt, "compiler listing")
+        by = {r.name: r for r in regions}
+        self.assertEqual(set(by), {"PMASTREC", "POLDCL"}, stats)
+        self.assertEqual([r.rstrip() for r in by["PMASTREC"].records], [r.rstrip() for r in self.pmast],
+                         "the C** line is still a copied line")
+        self.assertEqual([r.rstrip() for r in by["POLDCL"].records], [r.rstrip() for r in self.poldcl],
+                         "the ** program line closed the first block")
+        self.assertFalse(by["PMASTREC"].suspect)
+        self.assertFalse(any(k.startswith("lines with an unknown flag") for k in stats), stats)
 
     def test_copy_after_code_on_the_same_line_and_a_three_line_sql_include(self):
         prog = [r for r in self.prog if "COPY" not in r]
@@ -380,6 +397,38 @@ class EndToEnd(unittest.TestCase):
             resolved = conn.execute("SELECT m.path FROM copy_use c JOIN member m ON m.id=c.resolved_member_id "
                                     "WHERE c.copybook='PMASTREC'").fetchone()[0]
             self.assertIn("COPYLIB", resolved)
+        finally:
+            conn.close()
+
+    def test_coverage_warns_while_a_recovered_copy_shadows_the_real_member(self):
+        recover.run(self.db, log=lambda s: None, report=self.report)
+        self.build()
+        conn = query.connect(self.db)
+        try:
+            self.assertNotIn("still expand a recovered copybook", query.cmd_coverage(conn))
+            # the real member arrives in a library that sorts after RECOVERED-COPYBOOKS: the build keeps the
+            # recovered copy until atlas.recover runs - and coverage says so
+            late = os.path.join(self.root, "SHARED", "ZCOPYLIB")
+            os.makedirs(late)
+            shutil.copy(os.path.join(FIX, "PMASTREC.cpy"), late)
+        finally:
+            conn.close()
+        self.build()
+        conn = query.connect(self.db)
+        try:
+            cov = query.cmd_coverage(conn)
+        finally:
+            conn.close()
+        self.assertIn("still expand a recovered copybook although the estate now holds the real member", cov)
+        self.assertIn("PMASTREC", cov)
+        recover.run(self.db, log=lambda s: None, report=self.report)
+        self.build()
+        conn = query.connect(self.db)
+        try:
+            self.assertNotIn("still expand a recovered copybook", query.cmd_coverage(conn))
+            resolved = conn.execute("SELECT m.path FROM copy_use c JOIN member m ON m.id=c.resolved_member_id "
+                                    "WHERE c.copybook='PMASTREC'").fetchone()[0]
+            self.assertIn("ZCOPYLIB", resolved)
         finally:
             conn.close()
 

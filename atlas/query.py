@@ -1560,6 +1560,27 @@ def _top_reason(rows: List[sqlite3.Row]) -> str:
     return f"{best[0]} ({best[1]})"
 
 
+def _recovered_shadowing(conn: sqlite3.Connection) -> str:
+    """COPY statements that expand a recovered copybook (atlas.recover) while
+    the estate now holds the real member: the build picks whichever it met
+    first, so until the recovered one is removed a program may carry the
+    recovered layout."""
+    rows = conn.execute("""
+        SELECT r.name, COUNT(*) FROM copy_use c
+        JOIN member r ON r.id = c.resolved_member_id
+        WHERE UPPER(r.library) = 'RECOVERED-COPYBOOKS'
+          AND EXISTS (SELECT 1 FROM member m WHERE UPPER(m.name) = UPPER(r.name) AND m.id != r.id
+                      AND m.kind IN ('copybook', 'cobol', 'sql', 'unknown')
+                      AND UPPER(COALESCE(m.library, '')) != 'RECOVERED-COPYBOOKS')
+        GROUP BY r.name ORDER BY 2 DESC""").fetchall()
+    if not rows:
+        return ""
+    names = ", ".join(r[0] for r in rows[:8]) + (" ..." if len(rows) > 8 else "")
+    return (f"\n> **{sum(r[1] for r in rows)} COPY statement(s) still expand a recovered copybook although the estate now "
+            f"holds the real member** ({len(rows)} copybook(s): {names}). Run `python -m atlas.recover --db atlas.db` - it "
+            "removes the recovered copies whose real member arrived and marks their programs - then your usual build.\n")
+
+
 def cmd_coverage(conn: sqlite3.Connection, everything: bool = False) -> str:
     limit = 10 ** 9 if everything else COVERAGE_ROWS
     out = ["# Coverage - what the index does and does not know\n", f"\n_{index_header(conn)}_\n"]
@@ -1583,6 +1604,7 @@ def cmd_coverage(conn: sqlite3.Connection, everything: bool = False) -> str:
                "indexed at all - the table after it names every one, including those given up on before a restart.\n")
     out.append(_partial_members(conn, limit))
     out.append(_failed_members(conn, limit))
+    out.append(_recovered_shadowing(conn))
     out.append("\n### Call resolution\n")
     out.append(table(["kind", "resolution", "count"], conn.execute(
         "SELECT kind, resolution, COUNT(*) FROM call_edge GROUP BY 1,2").fetchall()))

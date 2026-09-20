@@ -72,10 +72,12 @@ SHAPE_OK = 0.98                                                  # records that 
 _COPY_KW = re.compile(r"(?<![A-Z0-9\-])(?:COPY|\+\+INCLUDE|-INC)\s+([A-Z0-9@#$][A-Z0-9@#$\-_]{0,9})(?![A-Z0-9\-])", re.I)
 _SQL_INCLUDE = re.compile(r"(?<![A-Z0-9\-])EXEC\s+SQL\s+INCLUDE\s+([A-Z0-9@#$][A-Z0-9@#$\-_]{0,9})(?![A-Z0-9\-])", re.I)
 _EXEC_SQL = re.compile(r"(?<![A-Z0-9\-])EXEC\s+SQL\b", re.I)
-_LISTING_LINE = re.compile(r"^[ 01\-+]?\s*(\d{6})([^\s\d])?(?=\s|$)")
+# the flag column after the line number is a run: C for a copied line, ** for a statement out of
+# sequence (IBM prints both, and C** together), anything else this tool does not know
+_LISTING_LINE = re.compile(r"^[ 01\-+]?\s*(\d{6})([^\s\d]*)(?=\s|$)")
 # a listing line: the line number, the blank PL/SL columns, then the source record with its OWN
 # sequence number in columns 1-6 - two numbers, where a plain source record has one
-_LISTING_SHAPE = re.compile(r"^[ 01\-+]?\s*\d{6}[^\s\d]?\s+\d{6}[ *\-/D]")
+_LISTING_SHAPE = re.compile(r"^[ 01\-+]?\s*\d{6}[^\s\d]*\s+\d{6}[ *\-/D]")
 _LISTING_HEAD = re.compile(r"^\s*LineID\s+PL\s+SL\b|IBM Enterprise COBOL|^1?PP\s+5655-", re.I | re.M)
 _RULER = re.compile(r"-{3,}\+-\*A")
 _NAME = re.compile(r"^[A-Z0-9@#$][A-Z0-9@#$\-_]{0,7}$")
@@ -233,6 +235,7 @@ def from_ibm_listing(lines: Sequence[str], source: str, system: Optional[str]) -
     cur: Optional[Region] = None
     for flag, rec in recs:
         code = rec[7:72] if len(rec) > 7 else ""
+        flag = flag.replace("*", "")                                  # ** = out of sequence, not a copy mark
         if not flag:
             if cur is not None:
                 regions.append(cur)
