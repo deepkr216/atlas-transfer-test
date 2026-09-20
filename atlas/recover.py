@@ -254,7 +254,7 @@ def from_ibm_listing(lines: Sequence[str], source: str, system: Optional[str]) -
     cur: Optional[Region] = None
     for flag, rec in recs:
         code = rec[7:72] if len(rec) > 7 else ""
-        flag = flag.replace("*", "")                                  # ** = out of sequence, not a copy mark
+        flag = flag.replace("*", "").upper()                          # ** = out of sequence, not a copy mark
         if not flag:
             if cur is not None:
                 regions.append(cur)
