@@ -175,9 +175,17 @@ def shaped(records: Sequence[str]) -> float:
 # --------------------------------------------------------------------------
 
 FALLBACK_OK = 0.9          # a guessed source column must make this share of the first source lines look like source
-_SOURCE_END = re.compile(r"Data Division Map|Message code|Cross-reference|Cross Reference|Program Statistics|"
-                         r"Nested Program|Options in effect|Diagnostic Messages|End of compilation|"
+# the headings that open the sections after the source. NOT "Cross Reference" with a space: every
+# source page's ruler ends with "Map and Cross Reference", and a page break is not the end
+_SOURCE_END = re.compile(r"Data Division Map|Message code|Cross-reference of|Program Statistics|"
+                         r"Nested Program Map|Diagnostic Messages|End of compilation|"
                          r"COPY/BASIS|Procedure Division Map|Constant Global Table", re.I)
+
+
+def _section_heading(ln: str) -> bool:
+    """A line that opens a section after the source - never a page header,
+    which carries the ruler and the banner."""
+    return bool(_SOURCE_END.search(ln)) and not _RULER.search(ln) and not _LISTING_HEAD.search(ln)
 
 
 def listing_offset(lines: Sequence[str]) -> Optional[int]:
@@ -208,7 +216,7 @@ def listing_offset(lines: Sequence[str]) -> Optional[int]:
         return None
     sample: List[str] = []
     for ln in lines[start:]:
-        if _SOURCE_END.search(ln):
+        if _section_heading(ln):
             break                                                      # the maps and tables after the source
         if _LISTING_LINE.match(ln):
             sample.append(ln)
@@ -241,7 +249,7 @@ def listing_records(lines: Sequence[str]) -> Tuple[List[Tuple[str, str, int]], O
         if m:
             out.append((m.group(2) or "", ln[off:off + 80].rstrip("\r\n"), i))
             seen += 1
-        elif seen >= 20 and _SOURCE_END.search(ln):
+        elif seen >= 20 and _section_heading(ln):
             break                                                      # a heading, not a numbered line: the source is over
     return out, off
 

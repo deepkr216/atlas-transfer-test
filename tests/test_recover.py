@@ -53,18 +53,39 @@ def records_of(path):
         return [ln.rstrip("\r\n") for ln in fh]
 
 
-def ibm_listing(program_records, copybooks, ruler=True, flag="C", prefix_lines=0, strip=False, flag_at=None):
+BANNER = "1PP 5655-EC6 IBM Enterprise COBOL for z/OS  6.3.0 P231102                 SAMPPGM   Date 09/28/2024  Time 14:31:41   Page   {page}"
+RULER = "   LineID  PL SL  ----+-*A-1-B--+----2----+----3----+----4----+----5----+----6----+----7-|--+----8 Map and Cross Reference"
+
+
+def ibm_listing(program_records, copybooks, ruler=True, flag="C", prefix_lines=0, strip=False, flag_at=None, page_lines=0):
     """What Enterprise COBOL prints: a line number per source line, a C after
-    the number on every copied line, the 80-column record after that."""
-    out = ["1PP 5655-S71 IBM Enterprise COBOL for z/OS  6.3.0                    SAMPPGM   Date 09/20/2026  Time 10:00:00   Page   2"]
+    the number on every copied line, the 80-column record after that - and,
+    with `page_lines`, a page break every so many lines, each new page
+    starting with the banner and the ruler again, as the real thing does."""
+    out = [BANNER.format(page=1), "0Invocation parameters:", " TRUNC(BIN),DATA(24),XREF", "0Options in effect:", "    XREF(FULL)"]
     out += [f" some translator output line {i}" for i in range(prefix_lines)]
+    page = 2
+    out.append(BANNER.format(page=page))
     if ruler:
-        out.append("   LineID  PL SL  ----+-*A-1-B--+----2----+----3----+----4----+----5----+----6----+----7-|--+----8 Map and Cross Reference")
+        out.append(RULER)
     n = 0
     sql = []
+    on_page = 0
+
+    def emit(line):
+        nonlocal on_page, page
+        if page_lines and on_page >= page_lines:
+            page += 1
+            out.append(BANNER.format(page=page))
+            if ruler:
+                out.append(RULER)
+            on_page = 0
+        out.append(line)
+        on_page += 1
+
     for rec in program_records:
         n += 1
-        out.append(f"   {n:06d}         {rec.ljust(80)}")
+        emit(f"   {n:06d}         {rec.ljust(80)}")
         code = rec[7:72] if len(rec) > 7 else ""
         found = recover.copy_in(code)
         if sql or ("EXEC SQL" in code.upper() and "END-EXEC" not in code.upper()):
@@ -78,7 +99,7 @@ def ibm_listing(program_records, copybooks, ruler=True, flag="C", prefix_lines=0
             for k, crec in enumerate(copybooks[found[0]]):
                 n += 1
                 f = flag_at.get((found[0], k), flag) if flag_at else flag
-                out.append(f"   {n:06d}{f.ljust(9)}{crec.ljust(80)}")      # the flags sit in the PL/SL columns
+                emit(f"   {n:06d}{f.ljust(9)}{crec.ljust(80)}")           # the flags sit in the PL/SL columns
     out.append("")
     out.append("   LineID  Message code  Message text")
     text = "\n".join(out) + "\n"
@@ -132,6 +153,25 @@ class Formats(unittest.TestCase):
         no_ruler = "\n".join(ln for ln in text.splitlines() if "----+-*A" not in ln) + "\n"
         fmt, regions, stats = recover.extract(no_ruler, "TESTPGM.lst", set())
         self.assertEqual(fmt, "compiler listing", stats)
+        self.assertEqual({r.name for r in regions}, {"PMASTREC", "POLDCL"})
+
+    def test_a_page_break_in_the_source_is_not_the_end_of_the_program(self):
+        # what his photo showed: every source page starts with the banner and the ruler again, and the
+        # ruler ends with the words "Map and Cross Reference"; the COPY sat on page three (line 718)
+        filler = [f"{i:06d}     05  WS-FILLER-{i:03d}          PIC X(10)." for i in range(1, 121)]
+        prog = self.prog[:5] + filler + self.prog[5:]
+        text = ibm_listing(prog, {"PMASTREC": self.pmast, "POLDCL": self.poldcl}, page_lines=50)
+        self.assertGreater(text.count("Map and Cross Reference"), 3, "several pages")
+        self.assertGreater(text.count("Options in effect"), 0)
+        fmt, regions, stats = recover.extract(text, "TESTPGM.lst", set())
+        self.assertEqual(fmt, "compiler listing", stats)
+        by = {r.name: r for r in regions}
+        self.assertEqual(set(by), {"PMASTREC", "POLDCL"}, stats)
+        self.assertEqual([r.rstrip() for r in by["PMASTREC"].records], [r.rstrip() for r in self.pmast])
+        self.assertEqual(stats.get("flagged lines with no COPY before them", 0), 0, stats)
+        # the ASA carriage control the download kept: '0' before the first line of a page
+        text2 = "\n".join(("0" + ln[1:] if ln.startswith("   000001") else ln) for ln in text.splitlines()) + "\n"
+        _fmt, regions, _s = recover.extract(text2, "TESTPGM.lst", set())
         self.assertEqual({r.name for r in regions}, {"PMASTREC", "POLDCL"})
 
     def test_reading_stops_where_the_program_ends(self):
