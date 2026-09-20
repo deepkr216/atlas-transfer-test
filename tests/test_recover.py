@@ -330,6 +330,12 @@ class EndToEnd(unittest.TestCase):
             prog = records_of(os.path.join(FIX, name + ".cbl"))
             with open(os.path.join(self.lst, name + ".lst"), "w", encoding="utf-8") as fh:
                 fh.write(ibm_listing(prog, {"PMASTREC": self.pmast, "POLDCL": POLDCL.splitlines()}))
+        # a program whose copybooks are all in the estate: its listing is not worth reading
+        for fn in ("WALKPGM.cbl", "WALKREC.cpy", "WALKPROC.cpy"):
+            shutil.copy(os.path.join(FIX, fn), self.src)
+        with open(os.path.join(self.lst, "WALKPGM.lst"), "w", encoding="utf-8") as fh:
+            fh.write(ibm_listing(records_of(os.path.join(FIX, "WALKPGM.cbl")),
+                                 {"WALKREC": records_of(os.path.join(FIX, "WALKREC.cpy"))}))
         self.db = os.path.join(self.td, "t.db")
         self.report = os.path.join(self.td, "work", "recover.md")
         self.build(["--rebuild"])
@@ -372,6 +378,8 @@ class EndToEnd(unittest.TestCase):
         self.assertIn("PM-POLICY-STATUS", body)
         self.assertTrue(any(s.startswith("recovered: 2 of 2 missing copybooks") for s in said), said)
         self.assertTrue(any("formats seen: compiler listing in 2" in s for s in said), said)
+        self.assertTrue(any(s.startswith("expanded texts to read: 2 of 3 found") and "only the 2 programs that copy" in s
+                            for s in said), "the listing of a program that needs nothing is not read: " + str(said))
         self.assertTrue(any("used in 2 places" in s for s in said), said)
         with open(self.report, encoding="utf-8") as fh:
             self.assertIn("| PMASTREC | 1 |", fh.read())

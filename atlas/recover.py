@@ -552,6 +552,19 @@ def missing_copybooks(conn: sqlite3.Connection) -> Dict[str, int]:
     return out
 
 
+def needing_programs(conn: sqlite3.Connection, missing: Dict[str, int]) -> Set[str]:
+    """The programs that copy a missing copybook: only their expanded text
+    can hold it, so only theirs is read."""
+    if not missing:
+        return set()
+    names: Set[str] = set()
+    q = ",".join("?" * len(missing))
+    for (name,) in conn.execute(f"SELECT DISTINCT UPPER(m.name) FROM copy_use c JOIN member m ON m.id = c.member_id "
+                                f"WHERE c.resolved_member_id IS NULL AND UPPER(c.copybook) IN ({q})", tuple(missing)):
+        names.add(name)
+    return names
+
+
 def real_copies(conn: sqlite3.Connection, roots: Sequence[str]) -> Set[str]:
     """Names for which the estate now holds a real member outside every
     recovered folder."""
@@ -805,6 +818,7 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
         missing = missing_copybooks(conn)
         sources = listing_sources(conn, folders)
         index = originals(conn)
+        needing = needing_programs(conn, missing)
         roots_out = [out_dir] + ([os.path.join(root, d, FOLDER) for d in os.listdir(root) if os.path.isdir(os.path.join(root, d))]
                                  if root and os.path.isdir(root) else [])
         real = real_copies(conn, roots_out)
@@ -847,7 +861,22 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
             "programs' compiler listings or expanded source")
         return {"missing": len(missing), "sources": 0, "written": 0, "rejected": 0, "not_found": len(missing), "removed": 0,
                 "kept": 0, "formats": {}, "out": out_dir, "unconfirmed": 0}
-    log(f"expanded texts to read: {len(sources):,} ({'compiler listings the index holds' if not folders else 'listings + the folders given'})")
+    found_all = len(sources)
+    if not everything:
+        # only the expanded text of a program that copies a missing copybook can hold it; a text
+        # whose name the index does not know at all is read too, since nothing says it cannot
+        sources = [(p, s) for p, s in sources
+                   if os.path.splitext(os.path.basename(p))[0].upper() in needing
+                   or os.path.splitext(os.path.basename(p))[0].upper() not in index]
+    log(f"expanded texts to read: {len(sources):,} of {found_all:,} found "
+        f"({'compiler listings the index holds' if not folders else 'listings + the folders given'})"
+        + ("" if everything else f" - only the {len(needing):,} programs that copy a missing copybook, and texts the "
+                                  "index cannot place"))
+    if not sources:
+        log("none of the expanded texts belongs to a program that copies a missing copybook: are these the "
+            "listings of the programs the coverage report calls partial?")
+        return {"missing": len(missing), "sources": 0, "written": 0, "rejected": 0, "not_found": len(missing), "removed": len(removed),
+                "kept": 0, "formats": {}, "out": out_dir, "unconfirmed": 0, "per_system": 0}
     wanted = set(missing) if not everything else set()
     formats: Counter = Counter()
     by_name: Dict[str, List[Region]] = defaultdict(list)
