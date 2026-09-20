@@ -748,8 +748,15 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
     try:
         root = estate_root(conn)
         if root and not os.path.isabs(root):
-            raise SystemExit(f"the index recorded the estate as a relative path ({root}): run this from the folder the "
-                             "build ran in, or build once with the full path")
+            # the build was run as `estate` from the toolkit's folder, so every path in the index is
+            # relative to that folder: from the same folder they all resolve
+            if os.path.isdir(root):
+                log(f"the index recorded the estate as `{root}`: found at {os.path.abspath(root)}")
+                root = os.path.abspath(root)
+            else:
+                raise SystemExit(f"the index recorded the estate as a relative path ({root}) and there is no such folder "
+                                 "here: run this from the folder the build ran in (the one holding atlas.db and that "
+                                 "folder), or build once with the full path")
         if out_dir is None:
             if not root:
                 raise SystemExit("the index has no estate root recorded: give --out")

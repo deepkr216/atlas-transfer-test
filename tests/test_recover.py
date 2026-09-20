@@ -498,7 +498,33 @@ class EndToEnd(unittest.TestCase):
         conn.close()
         with self.assertRaises(SystemExit) as cm:
             recover.run(self.db, log=said.append, report=self.report)
-        self.assertIn("relative path", str(cm.exception))
+        self.assertIn("no such folder here", str(cm.exception))
+
+    def test_a_build_run_with_a_relative_root_works_from_the_same_folder(self):
+        # his way at work: `python -m atlas.supervise estate --db atlas.db` from the toolkit's folder
+        cwd = os.getcwd()
+        os.chdir(self.td)
+        try:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                self.assertEqual(build._main(["estate", "--db", "t.db", "--rebuild", "--quiet"]), 0, buf.getvalue())
+            said = []
+            stats = recover.run("t.db", log=said.append, report=self.report)
+            self.assertEqual(stats["written"], 2, said)
+            self.assertTrue(any("recorded the estate as `estate`: found at" in s for s in said), said)
+            out = os.path.join(self.root, "SHARED", recover.FOLDER)
+            self.assertTrue(os.path.isfile(os.path.join(out, "PMASTREC.cpy")), said)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                self.assertEqual(build._main(["estate", "--db", "t.db", "--quiet"]), 0, buf.getvalue())
+            conn = query.connect("t.db")
+            try:
+                self.assertEqual(conn.execute("SELECT parse_status FROM member WHERE name='SAMPPGM' AND kind='cobol'").fetchone()[0], "ok")
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM copy_use WHERE resolved_member_id IS NULL").fetchone()[0], 0)
+            finally:
+                conn.close()
+        finally:
+            os.chdir(cwd)
 
 
 if __name__ == "__main__":
