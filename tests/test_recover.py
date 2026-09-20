@@ -112,6 +112,27 @@ class Formats(unittest.TestCase):
         self.assertEqual(len(r.records), len(pm), "the blank copied record survives trailing-blank stripping")
         self.assertEqual(r.records[3].rstrip(), self.pmast[3].rstrip())
 
+    def test_the_maps_and_cross_reference_after_the_source_do_not_spoil_the_source_column(self):
+        # a real listing goes on after the source: a data division map and cross-reference tables whose
+        # lines start with a line number too but are not source records - thousands of them in a big program
+        text = ibm_listing(self.prog, {"PMASTREC": self.pmast, "POLDCL": self.poldcl})
+        tail = ["   Data Division Map", "   Source   Hierarchy and                          Base       Hex-Displacement"]
+        tail += [f"   {100 + i:06d}   {i % 3 + 1}  WS-FIELD-{i:04d} . . . . . . . . BLW=00000  {i * 8:03X}   DS 0CL55"
+                 for i in range(2000)]
+        tail += ["   Cross-reference of data names   References"]
+        tail += [f"   {200 + i:06d}   FIELD-{i:04d} . . . . . . . . . . . {300 + i} {400 + i}" for i in range(2000)]
+        text += "\n".join(tail) + "\n"
+        fmt, regions, stats = recover.extract(text, "TESTPGM.lst", set())
+        self.assertEqual(fmt, "compiler listing", stats)
+        by = {r.name: r for r in regions}
+        self.assertEqual(set(by), {"PMASTREC", "POLDCL"})
+        self.assertEqual([r.rstrip() for r in by["PMASTREC"].records], [r.rstrip() for r in self.pmast])
+        # the same listing without its ruler: the guess is checked on the source lines only
+        no_ruler = "\n".join(ln for ln in text.splitlines() if "----+-*A" not in ln) + "\n"
+        fmt, regions, stats = recover.extract(no_ruler, "TESTPGM.lst", set())
+        self.assertEqual(fmt, "compiler listing", stats)
+        self.assertEqual({r.name for r in regions}, {"PMASTREC", "POLDCL"})
+
     def test_a_listing_without_the_ruler_still_finds_the_source_column_and_checks_it(self):
         text = ibm_listing(self.prog, {"PMASTREC": self.pmast}, ruler=False)
         fmt, regions, _s = recover.extract(text, "x.lst", set())

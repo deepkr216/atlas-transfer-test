@@ -173,34 +173,53 @@ def shaped(records: Sequence[str]) -> float:
 # 1. a compiler listing with flagged lines
 # --------------------------------------------------------------------------
 
+FALLBACK_OK = 0.9          # a guessed source column must make this share of the first source lines look like source
+_SOURCE_END = re.compile(r"Data Division Map|Message code|Cross-reference|Cross Reference|Program Statistics|"
+                         r"Nested Program|Options in effect|Diagnostic Messages", re.I)
+
+
 def listing_offset(lines: Sequence[str]) -> Optional[int]:
-    """Where the 80-column source record starts on a listing line: the
-    ruler says, else the division header says, and either is checked
-    against the shape of every record before it is believed."""
-    cands: List[int] = []
+    """Where the 80-column source record starts on a listing line. The ruler
+    `----+-*A-1-B` is the compiler's own statement of it and is trusted.
+    Without a ruler the division header gives a guess, tried a few columns
+    either way against the shape of the first source lines - only those:
+    the maps and cross-reference tables after the source carry line numbers
+    too and are not source records. Every recovered block is checked for
+    its shape again on its own before it is written."""
     for ln in lines:
         m = _RULER.search(ln)
         if m:
-            cands.append(m.start())
+            return m.start()
+    base: Optional[int] = None
+    start = 0
+    for i, ln in enumerate(lines):
+        m = _LISTING_LINE.match(ln)
+        if not m:
+            continue
+        rest = ln[m.end():].upper()
+        k = max(rest.find("IDENTIFICATION DIVISION"), rest.find("PROCEDURE DIVISION"))
+        if k >= 0:
+            base = m.end() + k - 7                                         # area A starts at source column 8
+            start = i
             break
-    if not cands:
-        for ln in lines:
-            m = _LISTING_LINE.match(ln)
-            if not m:
-                continue
-            rest = ln[m.end():].upper()
-            k = max(rest.find("IDENTIFICATION DIVISION"), rest.find("PROCEDURE DIVISION"))
-            if k >= 0:
-                cands.append(m.end() + k - 7)                              # area A starts at source column 8
+    if base is None:
+        return None
+    sample: List[str] = []
+    for ln in lines[start:]:
+        if _SOURCE_END.search(ln):
+            break                                                      # the maps and tables after the source
+        if _LISTING_LINE.match(ln):
+            sample.append(ln)
+            if len(sample) >= 300:
                 break
-    for base in cands:
-        for off in (base, base - 1, base + 1, base - 2, base + 2, base - 3, base + 3):
-            if off < 0:
-                continue
-            recs = [ln[off:off + 80] for ln in lines if _LISTING_LINE.match(ln)]
-            if recs and shaped(recs) >= SHAPE_OK:
-                return off
-    return None
+    best, best_score = None, 0.0
+    for off in (base, base - 1, base + 1, base - 2, base + 2, base - 3, base + 3):
+        if off < 0:
+            continue
+        score = shaped([ln[off:off + 80] for ln in sample])
+        if score > best_score:
+            best, best_score = off, score
+    return best if best is not None and best_score >= FALLBACK_OK else None
 
 
 def listing_records(lines: Sequence[str]) -> Tuple[List[Tuple[str, str]], Optional[int]]:
