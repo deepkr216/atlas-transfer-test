@@ -370,16 +370,25 @@ whose copybook is not in the estate is parsed only in part, and the fields
 of that copybook are missing from every answer. When the estate holds the
 programs' compiler listings (or expanded source members),
 `python -m atlas.recover --db atlas.db` reads where each copied block starts
-and ends - a compiler listing flags every copied line, an expander leaves
+and ends - a compiler listing flags every copied line; any expanded text is
+lined up against the original program in the index, so the lines it adds at
+a COPY are that copybook even with no marks at all; an expander may leave
 the copybook's name in columns 73-80 or a comment naming it - and writes
 each missing copybook out as a member under `estate\SHARED\RECOVERED-COPYBOOKS`,
 marked as recovered and saying which program it came from; the next build
-resolves every program that copies it. A copybook seen in several programs
-is compared across them (identical copies confirm it; where they differ the
-copy without a REPLACING clause wins, then the most common, and the report
-`work\recover.md` says so); when the real copybook arrives in the estate the
-recovered one is removed on the next run. `--from FOLDER` adds expanded
-programs the index does not hold; `--dry-run` says what would be written.
+resolves every program that copies it. Every block is checked before it is
+trusted: it must have the shape of 80-column source, the copybook parser
+must read it, and the build must file it as a copybook; a copy whose end
+was guessed, or whose expanded text differs from the program elsewhere too,
+is written only when a second program gives the same text. A copybook seen
+in several programs is compared across them (identical copies confirm it;
+where they differ the copy without a REPLACING clause wins, then the most
+common, and the report `work\recover.md` says so); when two systems hold
+different texts each system gets its own copy under its own folder. When
+the real copybook arrives in the estate the recovered one is removed on the
+next run and the programs that had expanded it are parsed again. `--from
+FOLDER` adds expanded programs the index does not hold; `--dry-run` says
+what would be written.
 
 **Pictures are read, not just counted.** `OCR images` (UI) or
 `python -m atlas.ocr --db atlas.db --out out/images` pulls every image out of
