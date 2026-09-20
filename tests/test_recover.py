@@ -134,6 +134,24 @@ class Formats(unittest.TestCase):
         self.assertEqual(fmt, "compiler listing", stats)
         self.assertEqual({r.name for r in regions}, {"PMASTREC", "POLDCL"})
 
+    def test_reading_stops_where_the_program_ends(self):
+        # what he found: after the source, the cross-reference tables carry line numbers too, some followed
+        # by a letter, and the copybook names appear again - the tool must not read them as copied lines
+        text = ibm_listing(self.prog, {"PMASTREC": self.pmast, "POLDCL": self.poldcl})
+        tail = ["", "Defined   Cross-reference of data names   References"]
+        tail += [f"   {100 + i:06d}D  PM-FIELD-{i:04d} . . . . . . . . . . {300 + i} {400 + i}" for i in range(40)]
+        tail += ["", "Defined   Cross-reference of COPY/BASIS statements   References",
+                 "   000006C  PMASTREC . . . . . . . . . . . . . . 7", "   000021C  POLDCL . . . . . . . . . . . . . . 22",
+                 "", "   LineID  Message code  Message text", "   000020  IGYPS2015-I  A period was assumed."]
+        text += "\n".join(tail) + "\n"
+        fmt, regions, stats = recover.extract(text, "TESTPGM.lst", set())
+        self.assertEqual(fmt, "compiler listing", stats)
+        self.assertEqual(sorted(r.name for r in regions), ["PMASTREC", "POLDCL"])
+        self.assertEqual([r.rstrip() for r in regions[0].records], [r.rstrip() for r in self.pmast])
+        self.assertEqual(stats.get("flagged lines with no COPY before them", 0), 0, stats)
+        self.assertFalse(any(k.startswith("lines with an unknown flag") for k in stats), stats)
+        self.assertEqual(stats["flagged lines"], len(self.pmast) + len(self.poldcl))
+
     def test_a_listing_without_the_ruler_still_finds_the_source_column_and_checks_it(self):
         text = ibm_listing(self.prog, {"PMASTREC": self.pmast}, ruler=False)
         fmt, regions, _s = recover.extract(text, "x.lst", set())

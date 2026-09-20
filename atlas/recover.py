@@ -176,7 +176,8 @@ def shaped(records: Sequence[str]) -> float:
 
 FALLBACK_OK = 0.9          # a guessed source column must make this share of the first source lines look like source
 _SOURCE_END = re.compile(r"Data Division Map|Message code|Cross-reference|Cross Reference|Program Statistics|"
-                         r"Nested Program|Options in effect|Diagnostic Messages", re.I)
+                         r"Nested Program|Options in effect|Diagnostic Messages|End of compilation|"
+                         r"COPY/BASIS|Procedure Division Map|Constant Global Table", re.I)
 
 
 def listing_offset(lines: Sequence[str]) -> Optional[int]:
@@ -224,15 +225,24 @@ def listing_offset(lines: Sequence[str]) -> Optional[int]:
 
 
 def listing_records(lines: Sequence[str]) -> Tuple[List[Tuple[str, str, int]], Optional[int]]:
-    """[(flag, 80-column record, file line number)] for every source line of a listing."""
+    """[(flag, 80-column record, file line number)] for every source line of
+    a listing - and only the source: after the program end the listing goes
+    on with the data division map and the cross-reference tables, whose
+    lines carry line numbers too, some followed by a letter, and where the
+    copybook names appear again (LESSONS 170). A heading that opens one of
+    those sections ends the reading."""
     off = listing_offset(lines)
     if off is None:
         return [], None
     out = []
+    seen = 0
     for i, ln in enumerate(lines, 1):
         m = _LISTING_LINE.match(ln)
         if m:
             out.append((m.group(2) or "", ln[off:off + 80].rstrip("\r\n"), i))
+            seen += 1
+        elif seen >= 20 and _SOURCE_END.search(ln):
+            break                                                      # a heading, not a numbered line: the source is over
     return out, off
 
 
