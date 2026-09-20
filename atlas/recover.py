@@ -98,8 +98,9 @@ class Region:
 
     def __init__(self, name: str, records: List[str], source: str, fmt: str, replacing: bool = False,
                  nested: Optional[List[str]] = None, end_guessed: bool = False, system: Optional[str] = None,
-                 suspect: str = "", trusted: bool = True, statement: str = ""):
+                 suspect: str = "", trusted: bool = True, statement: str = "", line: int = 0):
         self.name = name.upper()
+        self.line = line                  # line of the file where the block starts (1-based), when known
         self.records = records
         self.source = source
         self.fmt = fmt
@@ -222,17 +223,22 @@ def listing_offset(lines: Sequence[str]) -> Optional[int]:
     return best if best is not None and best_score >= FALLBACK_OK else None
 
 
-def listing_records(lines: Sequence[str]) -> Tuple[List[Tuple[str, str]], Optional[int]]:
-    """[(flag, 80-column record)] for every source line of a listing."""
+def listing_records(lines: Sequence[str]) -> Tuple[List[Tuple[str, str, int]], Optional[int]]:
+    """[(flag, 80-column record, file line number)] for every source line of a listing."""
     off = listing_offset(lines)
     if off is None:
         return [], None
     out = []
-    for ln in lines:
+    for i, ln in enumerate(lines, 1):
         m = _LISTING_LINE.match(ln)
         if m:
-            out.append((m.group(2) or "", ln[off:off + 80].rstrip("\r\n")))
+            out.append((m.group(2) or "", ln[off:off + 80].rstrip("\r\n"), i))
     return out, off
+
+
+def masked(text: str) -> str:
+    """A line with its letters and digits masked (A, 9): the shape, nothing from the estate."""
+    return re.sub(r"[A-Za-z]", "A", re.sub(r"\d", "9", (text or "").rstrip()))
 
 
 def from_ibm_listing(lines: Sequence[str], source: str, system: Optional[str]) -> Tuple[List[Region], Dict[str, int]]:
@@ -242,6 +248,11 @@ def from_ibm_listing(lines: Sequence[str], source: str, system: Optional[str]) -
     stats: Dict[str, int] = Counter()
     if off is None:
         return [], {"no ruler": 1}
+    stats["source column"] = off + 1                                   # 1-based, for the report
+    ruler_line = next((i for i, ln in enumerate(lines, 1) if _RULER.search(ln)), 0)
+    stats["ruler line"] = ruler_line
+    last_plain: Tuple[int, str] = (0, "")                              # the last program line seen (line, shape)
+    untied: List[Tuple[int, int, str]] = []                            # (first untied line, previous program line, its shape)
     compiled = ""
     for ln in lines[:60]:
         m = _DATE.search(ln)
@@ -252,7 +263,7 @@ def from_ibm_listing(lines: Sequence[str], source: str, system: Optional[str]) -
     pending: Optional[Tuple[str, str, bool]] = None                   # (name, statement, closed)
     sql_open: List[str] = []                                          # an EXEC SQL statement gathered over lines
     cur: Optional[Region] = None
-    for flag, rec in recs:
+    for flag, rec, lineno in recs:
         code = rec[7:72] if len(rec) > 7 else ""
         flag = flag.replace("*", "").upper()                          # ** = out of sequence, not a copy mark
         if not flag:
@@ -261,6 +272,7 @@ def from_ibm_listing(lines: Sequence[str], source: str, system: Optional[str]) -
                 cur = None
             if _is_comment(rec) or not code.strip():
                 continue
+            last_plain = (lineno, masked(rec))
             if sql_open:
                 sql_open.append(code.strip())
                 if "END-EXEC" in code.upper():
@@ -288,9 +300,11 @@ def from_ibm_listing(lines: Sequence[str], source: str, system: Optional[str]) -
         if cur is None:
             if pending is None:
                 stats["flagged lines with no COPY before them"] += 1
+                if not untied or untied[-1][1] != last_plain[0]:
+                    untied.append((lineno, last_plain[0], last_plain[1]))
                 continue
             cur = Region(pending[0], [], source, "compiler listing", replacing="REPLACING" in pending[1].upper(),
-                         system=system, statement=pending[1])
+                         system=system, statement=pending[1], line=lineno)
             pending = None
         inner = None if _is_comment(rec) else copy_in(code)
         if inner:
@@ -302,7 +316,10 @@ def from_ibm_listing(lines: Sequence[str], source: str, system: Optional[str]) -
         regions.append(cur)
     for r in regions:
         r.compiled = compiled                                          # type: ignore[attr-defined]
-    return regions, dict(stats)
+    out = dict(stats)
+    if untied:
+        out["untied"] = untied                                         # type: ignore[assignment]
+    return regions, out
 
 
 # --------------------------------------------------------------------------
@@ -481,32 +498,37 @@ def extract(text: str, source: str, wanted: Set[str], original: Optional[Sequenc
     head = "\n".join(lines[:400])
     listing = _RULER.search(head) or _LISTING_HEAD.search(head) or sum(1 for ln in lines[:2000] if _LISTING_SHAPE.match(ln)) >= 5
     records: List[str]
+    carried: Dict[str, int] = {}                                       # the listing's own notes, whatever is found later
     if listing:
         regions, stats = from_ibm_listing(lines, source, system)
         if regions:
             return "compiler listing", regions, stats
+        carried = stats
         recs, off = listing_records(lines)
         if off is None:
             return "compiler listing without a readable source column", [], stats
-        records = [r for _f, r in recs]
-        fmt_base = "compiler listing, copied lines not flagged"
+        records = [r for _f, r, _n in recs]
+        fmt_base = ("compiler listing, copied lines not tied to a COPY statement" if stats.get("flagged lines")
+                    else "compiler listing, copied lines not flagged")
     else:
         records = [ln.rstrip("\r\n") for ln in lines]
         fmt_base = "expanded source"
     if original:
         regions, stats = from_alignment(original, records, source, system)
         if regions:
-            return fmt_base + ", lined up with the program", regions, stats
+            return fmt_base + ", lined up with the program", regions, {**carried, **stats}
     regions = from_cols_73_80(records, source, wanted, system)
     if regions:
-        return "columns 73-80", regions, {}
+        return "columns 73-80", regions, carried
     regions = from_markers(records, source, system)
     if regions:
-        return "marker comments", regions, {}
+        return "marker comments", regions, carried
+    if carried.get("flagged lines"):
+        return fmt_base, [], carried
     has_copy = any(not _is_comment(r) and copy_in(r[7:72] if len(r) > 7 else "") for r in records)
     if not has_copy:
-        return "no COPY statements", [], {}
-    return (fmt_base + ", no copy marks" + ("" if original else " and the program is not in the index to line up with")), [], {}
+        return "no COPY statements", [], carried
+    return (fmt_base + ", no copy marks" + ("" if original else " and the program is not in the index to line up with")), [], carried
 
 
 # --------------------------------------------------------------------------
@@ -831,6 +853,8 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
     by_name: Dict[str, List[Region]] = defaultdict(list)
     unattached = 0
     lined_up = 0
+    look_untied: List[Tuple[str, int, int, str]] = []                   # (listing, untied line, program line before, its shape)
+    columns: Counter = Counter()                                         # where the source starts, per listing
     t0 = last = time.time()
     for k, (path, system) in enumerate(sources, 1):
         if time.time() - last >= 10:
@@ -855,6 +879,11 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
         fmt, regions, stats = extract(text, path, wanted or set(), original, system)
         formats[fmt] += 1
         unattached += stats.get("flagged lines with no COPY before them", 0)
+        if stats.get("source column"):
+            columns[(stats["source column"], bool(stats.get("ruler line")))] += 1
+        if stats.get("untied") and len(look_untied) < 2:
+            first = stats["untied"][0]                                  # type: ignore[index]
+            look_untied.append((path, first[0], first[1], first[2]))
         if "lined up" in fmt:
             lined_up += 1
         for r in regions:
@@ -863,9 +892,12 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
     log("formats seen: " + ", ".join(f"{f} in {n:,}" for f, n in formats.most_common()))
     if formats.get("unreadable"):
         log(f"  {formats['unreadable']:,} could not be read from disk - is the estate where the build saw it?")
+    if columns:
+        log("  source column: " + ", ".join(f"{col}{' (ruler)' if ruler else ' (guessed)'} in {n:,}"
+                                             for (col, ruler), n in columns.most_common(4)))
     if unattached:
-        log(f"  {unattached:,} copied line(s) could not be tied to a COPY statement (a COPY split over lines in a way "
-            "this tool does not read) - report it if a copybook you expected is missing")
+        log(f"  {unattached:,} copied line(s) could not be tied to a COPY statement - the report's 'Please look' "
+            "section names a listing and the line to open")
 
     written: List[Tuple[str, str, str]] = []                            # (name, folder, how)
     rejected: List[Tuple[str, str]] = []
@@ -900,13 +932,14 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
                 targets.append((folder, pick, how + f"; the text differs between systems - this is {s}'s"))
         for folder, pick, how in targets:
             shape = looks_like_copybook(pick.records)
+            where = f" [{pick.source_name()} line {pick.line}]" if pick.line else f" [{pick.source_name()}]"
             if not shape:
-                rejected.append((name, "not a copybook the parser can read: " + shape_of(pick.records)))
+                rejected.append((name, "not a copybook the parser can read: " + shape_of(pick.records) + where))
                 continue
             body = render(name, pick, how)
             kind, _why = classify.classify(os.path.join(folder, name + ".cpy"), body[:8192])
             if kind not in ("copybook", "cobol"):
-                rejected.append((name, f"the build would file this as {kind}: " + shape_of(pick.records)))
+                rejected.append((name, f"the build would file this as {kind}: " + shape_of(pick.records) + where))
                 continue
             written.append((name, folder, how + f"; {shape} copybook, {len(pick.records)} lines"))
             if not dry_run:
@@ -949,6 +982,22 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
     if not_found:
         lines.append("\n## Not in any expanded text (fetch these libraries)\n\n| copybook | programs copying it |\n|---|---|\n")
         lines += [f"| {n} | {missing[n]} |\n" for n in not_found]
+    if look_untied or rejected:
+        lines.append("\n## Please look\n\nOpen the listing named below in VS Code and go to the line (Ctrl+G). "
+                     "Answer in words and numbers only - nothing from the file needs to be copied.\n")
+    for path, at, before, shape in look_untied:
+        lines.append(f"\n### Copied lines with no COPY statement found before them\n\n- listing: `{path}`\n"
+                     f"- line {at}: the first copied line (a C after its line number) that nothing claimed\n"
+                     f"- line {before}: the last program line before it; its shape (letters A, digits 9): `{shape}`\n"
+                     "- Questions: (1) is there a COPY statement on line " + str(before) + " or just above it? (2) at what "
+                     "column does the source record start on line " + str(at) + " (the first digit of its sequence number), "
+                     "and at what column does it start on the line with IDENTIFICATION DIVISION? (3) what exactly sits "
+                     "between the 6-digit line number and the record on line " + str(at) + " - the C and spaces, or "
+                     "something more?\n")
+    for name, why in rejected[:2]:
+        lines.append(f"\n### Rejected block {name}\n\n- {why}\n- Questions: open the listing at that line: (1) at what "
+                     "column does the copied record start there, against the column on the IDENTIFICATION DIVISION line? "
+                     "(2) is the first copied line a data item (a level number and a name), a comment, or something else?\n")
     if report:
         os.makedirs(os.path.dirname(report) or ".", exist_ok=True)
         with open(report, "w", encoding="utf-8", newline="\n") as fh:

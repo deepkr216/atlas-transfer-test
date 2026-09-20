@@ -13,6 +13,7 @@ import contextlib
 import io
 import os
 import shutil
+import re
 import sqlite3
 import sys
 import tempfile
@@ -503,6 +504,32 @@ class EndToEnd(unittest.TestCase):
             self.assertTrue(os.path.isfile(os.path.join(self.td, "work", "recover.md")))
         finally:
             os.chdir(cwd)
+
+    def test_the_report_names_a_listing_and_a_line_to_look_at_when_copied_lines_are_untied(self):
+        # a listing whose COPY statements are written in a way the tool cannot read: every copied line is untied
+        text = ibm_listing(records_of(os.path.join(FIX, "SAMPPGM.cbl")), {"PMASTREC": self.pmast, "POLDCL": POLDCL.splitlines()})
+        text = text.replace("COPY PMASTREC.", "COPY 'PMASTREC'.").replace("COPY POLDCL.", "COPY 'POLDCL'.")
+        odd = os.path.join(self.lst, "ODDPGM.lst")
+        with open(odd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        self.build()
+        said = []
+        recover.run(self.db, dry_run=True, log=said.append, report=self.report)
+        self.assertTrue(any("could not be tied to a COPY statement - the report's 'Please look'" in s for s in said), said)
+        self.assertTrue(any(s.startswith("  source column: 19 (ruler) in ") for s in said), said)
+        with open(self.report, encoding="utf-8") as fh:
+            rep = fh.read()
+        self.assertIn("## Please look", rep)
+        self.assertIn("ODDPGM.lst", rep)
+        m = re.search(r"- line (\d+): the first copied line", rep)
+        self.assertIsNotNone(m, rep)
+        with open(odd, encoding="utf-8") as fh:
+            file_lines = fh.read().splitlines()
+        self.assertRegex(file_lines[int(m.group(1)) - 1], r"^\s*\d{6}C\s", "the line named is a copied line")
+        m2 = re.search(r"- line (\d+): the last program line before it; its shape \(letters A, digits 9\): `(.*)`", rep)
+        self.assertIsNotNone(m2, rep)
+        self.assertIn("AAAA 'AAAAAAAA'", m2.group(2), "the COPY line, masked")
+        self.assertNotIn("PMASTREC", m2.group(2))
 
     def test_no_listings_and_a_relative_root_are_explained(self):
         conn = sqlite3.connect(self.db)
