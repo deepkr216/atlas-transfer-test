@@ -1493,7 +1493,9 @@ def _partial_members(conn: sqlite3.Connection, limit: int = COVERAGE_ROWS) -> st
         SELECT m.kind, m.name, m.library, m.parse_error,
                (SELECT u.kind || ': ' || SUBSTR(COALESCE(u.detail, ''), 1, 90) FROM unresolved u
                 WHERE u.member_id = m.id
-                ORDER BY CASE WHEN u.kind IN ('expand', 'screen') THEN 0 ELSE 1 END, u.id LIMIT 1) AS why
+                ORDER BY CASE WHEN u.kind IN ('expand', 'screen') THEN 0 ELSE 1 END, u.id LIMIT 1) AS why,
+               (SELECT COUNT(*) FROM doc_image i WHERE i.member_id = m.id AND i.ocr_text IS NOT NULL
+                AND i.ocr_text <> '') AS ocr_read
         FROM member m WHERE m.parse_status = 'partial' ORDER BY m.kind, m.name""").fetchall()
     if not rows:
         return "\n### Members parsed only in part\n_none_\n"
@@ -1503,14 +1505,22 @@ def _partial_members(conn: sqlite3.Connection, limit: int = COVERAGE_ROWS) -> st
     out = [f"\n### Members parsed only in part ({len(rows)}) - their facts are incomplete to this extent\n"]
     out.append(table(["kind", "members", "most common reason"],
                      [(k, len(v), _top_reason(v)) for k, v in sorted(by_kind.items(), key=lambda kv: -len(kv[1]))]))
-    shown = [(r["kind"], r["name"], r["library"], (r["why"] or r["parse_error"] or "")[:110]) for r in rows[:limit]]
+    shown = [(r["kind"], r["name"], r["library"], (r["why"] or r["parse_error"] or "")[:110]
+              + (f" - {r['ocr_read']} picture(s) read by OCR since: text in sections 1001+" if r["ocr_read"] else ""))
+             for r in rows[:limit]]
     out.append("\n" + table(["kind", "member", "library", "reason"], shown))
+    scanned = sum(1 for r in rows if r["kind"] == "doc" and r["ocr_read"])
+    if scanned:
+        out.append(f"\n_{scanned} of the documents above are scans whose pictures OCR has read since the build: their "
+                   "text is in the index (sections 1001+); the partial mark is only the build's history_\n")
     if len(rows) > limit:
         out.append(f"_... {len(rows) - limit} more; every one of them: `coverage --all`; the copybooks they miss "
                    "are the 'Copybooks not found' table below_\n")
     out.append("\n> A COBOL member is usually partial because a copybook it copies is not in the index: fetch that "
-               "copybook library and build again. A document is partial when no text could be extracted (a scan - "
-               "run `OCR images`). A screen member is partial when no map or format macro was recognised.\n")
+               "copybook library and build again - or, when the estate holds compiler listings or expanded "
+               "programs, `python -m atlas.recover --db atlas.db` rebuilds the missing copybooks from them. A "
+               "document is partial when no text could be extracted (a scan - run `OCR images`). A screen member "
+               "is partial when no map or format macro was recognised.\n")
     return "".join(out)
 
 

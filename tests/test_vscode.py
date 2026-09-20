@@ -167,7 +167,7 @@ class TasksAndPrompts(unittest.TestCase):
                     self.assertIn("--out", piece, (t["label"], "a report task must use --out"))
                     self.assertNotIn(">", piece, (t["label"], "never the shell's redirection"))
                 elif m:
-                    self.assertIn(m.group(1), ("verify_citations", "ui", "handover", "video"), (t["label"], m.group(1)))
+                    self.assertIn(m.group(1), ("verify_citations", "ui", "handover", "video", "recover"), (t["label"], m.group(1)))
                 else:
                     self.assertEqual(piece, "python selfcheck.py", (t["label"], piece))
             if ";" in t["command"]:

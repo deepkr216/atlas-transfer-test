@@ -365,6 +365,22 @@ the same OCR engine as the pictures; each page becomes a citable section
 1001+ of that document (`--pdf-pages all` renders every PDF, `none` turns it
 off; 400 pages per document at most).
 
+**Missing copybooks are rebuilt from the expanded programs.** A program
+whose copybook is not in the estate is parsed only in part, and the fields
+of that copybook are missing from every answer. When the estate holds the
+programs' compiler listings (or expanded source members),
+`python -m atlas.recover --db atlas.db` reads where each copied block starts
+and ends - a compiler listing flags every copied line, an expander leaves
+the copybook's name in columns 73-80 or a comment naming it - and writes
+each missing copybook out as a member under `estate\SHARED\RECOVERED-COPYBOOKS`,
+marked as recovered and saying which program it came from; the next build
+resolves every program that copies it. A copybook seen in several programs
+is compared across them (identical copies confirm it; where they differ the
+copy without a REPLACING clause wins, then the most common, and the report
+`work\recover.md` says so); when the real copybook arrives in the estate the
+recovered one is removed on the next run. `--from FOLDER` adds expanded
+programs the index does not hold; `--dry-run` says what would be written.
+
 **Pictures are read, not just counted.** `OCR images` (UI) or
 `python -m atlas.ocr --db atlas.db --out out/images` pulls every image out of
 the documents - including the metafiles (EMF/WMF) that Word, Excel and Visio

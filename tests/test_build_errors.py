@@ -248,6 +248,25 @@ class CoverageExplainsTheStatuses(unittest.TestCase):
             "assembler: still indexed and searchable, and a control card", ""), "listings are not called searchable")
         self.assertIn("recorded by name only - `search` does not see their text", cov)
 
+    def test_coverage_says_when_a_scanned_documents_pictures_have_been_read_since(self):
+        conn = query.connect(self.db)
+        try:
+            conn.execute("INSERT INTO member(path,name,kind,library,ext,sha256,norm_sha,parse_status,parse_error) "
+                         "VALUES('C:\\docs\\SCAN.pdf','SCAN','doc','docs','.pdf','x','x','partial',"
+                         "'no extractable text; 3 embedded images - likely a scan, needs OCR')")
+            mid = conn.execute("SELECT id FROM member WHERE name='SCAN'").fetchone()[0]
+            conn.execute("INSERT INTO doc_image(member_id,name,ocr_text) VALUES(?,?,?)", (mid, "page-0001", "WAIVER APPLIES"))
+            conn.execute("INSERT INTO doc_image(member_id,name,ocr_text) VALUES(?,?,?)", (mid, "page-0002", "STEP020"))
+            conn.commit()
+            cov = query.cmd_coverage(conn)
+        finally:
+            conn.close()
+        row = [ln for ln in cov.splitlines() if ln.startswith("| doc | SCAN |")]
+        self.assertEqual(len(row), 1, cov)
+        self.assertIn("2 picture(s) read by OCR since: text in sections 1001+", row[0])
+        self.assertIn("1 of the documents above are scans whose pictures OCR has read since the build", cov)
+        self.assertIn("atlas.recover", cov, "the way to close missing copybooks without the library")
+
     def test_coverage_says_none_when_every_member_is_complete(self):
         os.remove(os.path.join(self.td, "estate", "SRC", "SAMPPGM.cbl"))
         os.remove(os.path.join(self.td, "estate", "SRC", "ERRPGM.cbl"))

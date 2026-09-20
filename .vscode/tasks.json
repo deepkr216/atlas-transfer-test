@@ -175,6 +175,15 @@
       "problemMatcher": []
     },
     {
+      "label": "Atlas: recover missing copybooks from listings -> work/recover.md",
+      "detail": "Rebuilds the copybooks the estate lacks from the programs' compiler listings (or expanded source), into estate\\SHARED\\RECOVERED-COPYBOOKS; then run your usual build (Atlas: UI > Build index). The report names every copybook and how it was chosen.",
+      "type": "shell",
+      "command": "python -m atlas.recover --db atlas.db",
+      "options": {"cwd": "${workspaceFolder}", "env": {"PYTHONUTF8": "1"}},
+      "presentation": {"reveal": "always", "panel": "shared", "showReuseMessage": false},
+      "problemMatcher": []
+    },
+    {
       "label": "Atlas: read recordings (screens + speech) -> transcripts",
       "detail": "Every video in a folder becomes NAME.video.docx: what was on screen (OCR, every name checked against the index - a misread name is snapped to the real one, an unknown one marked ?, an unreadable line dropped) and, when the meeting's .vtt/.srt caption file sits beside the recording, what was said - in 2-minute sections. Without a caption file the speech is not transcribed. Then run your usual build command (Atlas: UI > Build index) so they are indexed.",
       "type": "shell",
