@@ -597,6 +597,26 @@ class EndToEnd(unittest.TestCase):
         self.assertIn("AAAA 'AAAAAAAA'", m2.group(2), "the COPY line, masked")
         self.assertNotIn("PMASTREC", m2.group(2))
 
+    def test_trace_shows_what_the_tool_sees_in_one_listing_as_numbers_only(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = recover.main(["--db", self.db, "--trace", "sampPGM"])
+        text = out.getvalue()
+        self.assertEqual(rc, 0, text)
+        self.assertIn("program in the index: yes; copies a missing copybook: yes", text)
+        self.assertIn("listing banner in the first 400 lines: yes; ruler in the first 400 lines: yes", text)
+        self.assertRegex(text, r"ruler: line \d+; source column: 19")
+        self.assertRegex(text, r"COPY statements found: 1 \(first at file lines \d+\); lines with a mark after the line number: \d+ \(marks: 'C' x")
+        self.assertIn("result: compiler listing; blocks: 1 - PMASTREC (", text)
+        self.assertIn("block PMASTREC: missing in the index; parses as data; trusted", text)
+        self.assertNotIn("PM-POLICY", text, "nothing from the estate")
+        self.assertIn("first source record, masked: `999999 AAAAAAAAAAAAAA AAAAAAAA.", text)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = recover.main(["--db", self.db, "--trace", "NOSUCH"])
+        self.assertEqual(rc, 2)
+        self.assertIn("no expanded text named NOSUCH", out.getvalue())
+
     def test_no_listings_and_a_relative_root_are_explained(self):
         conn = sqlite3.connect(self.db)
         conn.execute("DELETE FROM member WHERE kind='listing'")

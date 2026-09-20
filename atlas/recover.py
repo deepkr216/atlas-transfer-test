@@ -1076,6 +1076,86 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
             "out": out_dir, "unconfirmed": len(unconfirmed), "per_system": per_system}
 
 
+def trace(db: str, name: str, folders: Sequence[str] = (), log=print) -> int:
+    """What the tool sees in ONE expanded text, as line numbers and counts -
+    nothing from the estate - so a reader of the file can say where it goes
+    wrong (LESSONS 172)."""
+    conn = sqlite3.connect(db)
+    try:
+        root = estate_root(conn)
+        if root and not os.path.isabs(root) and os.path.isdir(root):
+            root = os.path.abspath(root)
+        sources = listing_sources(conn, folders)
+        index = originals(conn)
+        missing = missing_copybooks(conn)
+        needing = needing_programs(conn, missing)
+    finally:
+        conn.close()
+    want = name.upper()
+    hits = [(p, s) for p, s in sources if os.path.splitext(os.path.basename(p))[0].upper() == want]
+    if not hits:
+        log(f"no expanded text named {want} among the {len(sources):,} found (listings in the index + the --from folders)")
+        return 2
+    for path, system in hits:
+        log(f"== {path}")
+        log(f"   program in the index: {'yes' if want in index else 'no'}; copies a missing copybook: "
+            f"{'yes' if want in needing else 'no'}; system: {system or '-'}")
+        try:
+            text, _data, enc = reader.load(path)
+        except OSError as e:
+            log(f"   cannot read: {e}")
+            continue
+        lines = split_lines(text)
+        log(f"   {len(lines):,} lines, decoded as {enc}, {os.path.getsize(path):,} bytes")
+        head = "\n".join(lines[:400])
+        log(f"   listing banner in the first 400 lines: {'yes' if _LISTING_HEAD.search(head) else 'no'}; "
+            f"ruler in the first 400 lines: {'yes' if _RULER.search(head) else 'no'}; "
+            f"numbered lines in the first 2,000: {sum(1 for ln in lines[:2000] if _LISTING_SHAPE.match(ln)):,}")
+        ruler_line = next((i for i, ln in enumerate(lines, 1) if _RULER.search(ln)), 0)
+        off = listing_offset(lines)
+        log(f"   ruler: {'line ' + str(ruler_line) if ruler_line else 'none'}; source column: "
+            f"{off + 1 if off is not None else 'not found'}")
+        if off is None:
+            continue
+        recs, _off = listing_records(lines)
+        numbered_all = sum(1 for ln in lines if _LISTING_LINE.match(ln))
+        first_l = recs[0][2] if recs else 0
+        last_l = recs[-1][2] if recs else 0
+        stop = next((i for i, ln in enumerate(lines[last_l:], last_l + 1) if _section_heading(ln)), 0) if recs else 0
+        log(f"   numbered lines in the file: {numbered_all:,}; taken as source: {len(recs):,} (file lines {first_l}-{last_l})"
+            + (f"; reading stopped at line {stop}: `{masked(lines[stop - 1])[:60]}`" if stop else "; read to the end of the file"))
+        flagged = [(n, f) for f, r, n in recs if f.replace('*', '')]
+        copies = [n for f, r, n in recs if not f.replace('*', '') and not _is_comment(r) and copy_in(r[7:72] if len(r) > 7 else "")]
+        flags = Counter(f.replace('*', '').upper() for f, r, n in recs if f.replace('*', ''))
+        log(f"   COPY statements found: {len(copies):,}" + (f" (first at file lines {', '.join(str(n) for n in copies[:5])})" if copies else "")
+            + f"; lines with a mark after the line number: {len(flagged):,}"
+            + (f" (marks: {', '.join(f'{k!r} x{v:,}' for k, v in flags.most_common(4))}; first at line {flagged[0][0]})" if flagged else ""))
+        sample = next((r for f, r, n in recs if not _is_comment(r) and r.strip()), "")
+        log(f"   first source record, masked: `{masked(sample)[:72]}` (columns 1-6 `{masked(sample[:6])}`, column 7 `{sample[6:7] or ' '}`)")
+        if flagged:
+            frec = next(r for f, r, n in recs if f.replace('*', ''))
+            log(f"   first marked record, masked: `{masked(frec)[:72]}`")
+        original = None
+        orig_path = pick_original(want, path, system, index)
+        if orig_path:
+            try:
+                original = split_lines(reader.load(orig_path)[0])
+            except OSError:
+                original = None
+        fmt, regions, stats = extract(text, path, set(missing), original, system)
+        log(f"   result: {fmt}; blocks: {len(regions)}"
+            + (" - " + ", ".join(f"{r.name} ({len(r.records)} lines, from file line {r.line})" if r.line else f"{r.name} ({len(r.records)} lines)"
+                                 for r in regions[:6]) if regions else ""))
+        for r in regions[:6]:
+            shape = looks_like_copybook(r.records)
+            log(f"   block {r.name}: {'missing in the index' if r.name in missing else 'the index has it'}; parses as "
+                f"{shape or 'nothing a copybook could be'}; {'trusted' if r.trusted and not r.suspect else 'needs a second program: ' + (r.suspect or 'end guessed')}")
+        notes = {k: v for k, v in stats.items() if k not in ("untied",) and not isinstance(v, list)}
+        if notes:
+            log("   notes: " + ", ".join(f"{k} {v}" for k, v in notes.items()))
+    return 0
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Rebuild the copybooks the estate lacks from the expanded text of the "
                                              "programs that copy them (compiler listings, expanded source).")
@@ -1088,6 +1168,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--dry-run", action="store_true", help="say what would be written; write nothing")
     ap.add_argument("--refresh", action="store_true", help="write again the copybooks recovered on an earlier run")
     ap.add_argument("--all", action="store_true", help="recover every copybook seen, not only the missing ones")
+    ap.add_argument("--trace", metavar="PROGRAM", help="show, as line numbers and counts, what the tool sees in one "
+                                                       "program's expanded text - nothing from the estate is printed")
     a = ap.parse_args(argv)
     say = lambda s: print(s, flush=True)                                  # noqa: E731
     if not os.path.isfile(a.db):
@@ -1099,6 +1181,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             say(f"not found: {f} - type the folder as Explorer shows it")
             return 2
     out = os.path.normpath(a.out.strip()) if a.out and a.out.strip() else None
+    if a.trace:
+        return trace(a.db, a.trace.strip(), folders, log=say)
     try:
         run(a.db, folders, out, a.dry_run, a.refresh, a.all, log=say)
     except SystemExit as e:
