@@ -156,16 +156,30 @@ def _comment_out(rec: str) -> str:
     return rec[:6] + "*" + rec[7:]
 
 
+INDICATORS = (" ", "*", "-", "D", "d", "/", "$")
+
+
+def unshaped(rec: str) -> str:
+    """Why a record is not 80-column COBOL source, or ''. The compiler
+    ignores columns 1-6, so anything printable may sit there (a sequence
+    number, a change tag, a date); column 7 is the indicator and must be one
+    of the few the compiler knows - a shifted record fails there."""
+    seq, ind = rec[:6], rec[6:7] if len(rec) > 6 else " "
+    if any(ord(ch) < 32 for ch in seq):
+        return "a control character in columns 1-6"
+    if ind not in INDICATORS:
+        return f"column 7 is `{ind}`, not blank / * / - / D"
+    return ""
+
+
 def shaped(records: Sequence[str]) -> float:
-    """The share of records that look like 80-column COBOL source: sequence
-    area digits or blank, indicator column blank / * / - / D / /."""
+    """The share of records that look like 80-column COBOL source."""
     n = ok = 0
     for r in records:
         if not r.strip():
             continue
         n += 1
-        seq, ind = r[:6], r[6:7] if len(r) > 6 else " "
-        if (seq.isdigit() or not seq.strip() or seq.isalnum()) and ind in (" ", "*", "-", "D", "d", "/", "$"):
+        if not unshaped(r):
             ok += 1
     return ok / n if n else 1.0
 
@@ -668,27 +682,38 @@ def pick_original(name: str, path: str, system: Optional[str], index: Dict[str, 
 # choosing and checking
 # --------------------------------------------------------------------------
 
-def looks_like_copybook(records: Sequence[str]) -> str:
-    """'data', 'procedure', 'comments' or '' (nothing a copybook could be)."""
-    if shaped(records) < SHAPE_OK:
-        return ""
+def copybook_check(records: Sequence[str]) -> Tuple[str, str]:
+    """('data' | 'procedure' | 'comments' | '', why) - what the block is, or
+    why it is nothing a copybook could be, in numbers and masked lines."""
+    score = shaped(records)
+    if score < SHAPE_OK:
+        bad = next((r for r in records if r.strip() and unshaped(r)), "")
+        return "", (f"shape check {score:.0%} (needs {SHAPE_OK:.0%}): first failing record `{masked(bad)[:40]}` - "
+                    f"{unshaped(bad)}")
     text = "\n".join(records)
     try:
-        lines, _fixed = reader.read_cobol_lines(text)
+        lines, fixed = reader.read_cobol_lines(text)
         logical = reader.join_cobol_continuations(lines)
         roots, _w = copybook.parse_data_division(logical)
         fields = [f for f in copybook.flatten(roots) if f.name != copybook.SYNTHETIC_ROOT]
-    except Exception:                                                  # noqa: BLE001 - a block that breaks the parser is not a copybook
-        return ""
+    except Exception as e:                                             # noqa: BLE001 - a block that breaks the parser is not a copybook
+        return "", f"the copybook parser failed: {type(e).__name__}"
     if fields:
-        return "data"
+        return "data", f"{len(fields)} data item(s)"
     code = [r[7:72] for r in records if len(r) > 7 and not _is_comment(r) and r[7:72].strip()]
     joined = "\n".join(code)
     if not code:
-        return "comments" if any(_is_comment(r) for r in records) else ""
+        return ("comments", "comment lines only") if any(_is_comment(r) for r in records) else ("", "no code, no comments")
     if _VERB.search(expand._mask_literals(joined)) or any(_PARAGRAPH.match(c) for c in code):
-        return "procedure"
-    return ""
+        return "procedure", "procedure code"
+    first = next((c for c in code), "")
+    return "", (f"the parser found no data items and no verbs in {len(code)} code line(s) (read as "
+                f"{'fixed' if fixed else 'free'} format); first code line masked `{masked(first)[:50]}`")
+
+
+def looks_like_copybook(records: Sequence[str]) -> str:
+    """'data', 'procedure', 'comments' or '' (nothing a copybook could be)."""
+    return copybook_check(records)[0]
 
 
 def resolve_replacing(region: Region) -> None:
@@ -981,7 +1006,8 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
             shape = looks_like_copybook(pick.records)
             where = f" [{pick.source_name()} line {pick.line}]" if pick.line else f" [{pick.source_name()}]"
             if not shape:
-                rejected.append((name, "not a copybook the parser can read: " + shape_of(pick.records) + where))
+                rejected.append((name, "not a copybook the parser can read: " + copybook_check(pick.records)[1] + "; "
+                                 + shape_of(pick.records) + where))
                 continue
             body = render(name, pick, how)
             kind, _why = classify.classify(os.path.join(folder, name + ".cpy"), body[:8192])
@@ -1147,9 +1173,12 @@ def trace(db: str, name: str, folders: Sequence[str] = (), log=print) -> int:
             + (" - " + ", ".join(f"{r.name} ({len(r.records)} lines, from file line {r.line})" if r.line else f"{r.name} ({len(r.records)} lines)"
                                  for r in regions[:6]) if regions else ""))
         for r in regions[:6]:
-            shape = looks_like_copybook(r.records)
+            shape, why = copybook_check(r.records)
             log(f"   block {r.name}: {'missing in the index' if r.name in missing else 'the index has it'}; parses as "
-                f"{shape or 'nothing a copybook could be'}; {'trusted' if r.trusted and not r.suspect else 'needs a second program: ' + (r.suspect or 'end guessed')}")
+                f"{shape or 'nothing a copybook could be'} ({why}); "
+                f"{'trusted' if r.trusted and not r.suspect else 'needs a second program: ' + (r.suspect or 'end guessed')}")
+            for k, rec in enumerate(r.records[:3], 1):
+                log(f"      record {k} masked: `{masked(rec)[:72]}`")
         notes = {k: v for k, v in stats.items() if k not in ("untied",) and not isinstance(v, list)}
         if notes:
             log("   notes: " + ", ".join(f"{k} {v}" for k, v in notes.items()))

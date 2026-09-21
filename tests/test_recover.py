@@ -355,6 +355,10 @@ class Formats(unittest.TestCase):
         self.assertEqual(recover.looks_like_copybook(["                              "]), "")
         shifted = [" " + r for r in self.pmast]                          # every record one column to the right
         self.assertEqual(recover.looks_like_copybook(shifted), "", "a shifted block fails the shape check")
+        self.assertIn("column 7 is", recover.copybook_check(shifted)[1])
+        tagged = ["FR-1.2" + r[6:] for r in self.pmast]                  # anything printable may sit in columns 1-6
+        self.assertEqual(recover.looks_like_copybook(tagged), "data", "the compiler ignores columns 1-6")
+        self.assertIn("data item(s)", recover.copybook_check(self.pmast)[1])
         self.assertIn("first code line looks like", recover.shape_of(self.pmast))
         self.assertNotIn("PM-POLICY", recover.shape_of(self.pmast), "nothing from the estate in the shape")
 
@@ -608,7 +612,8 @@ class EndToEnd(unittest.TestCase):
         self.assertRegex(text, r"ruler: line \d+; source column: 19")
         self.assertRegex(text, r"COPY statements found: 1 \(first at file lines \d+\); lines with a mark after the line number: \d+ \(marks: 'C' x")
         self.assertIn("result: compiler listing; blocks: 1 - PMASTREC (", text)
-        self.assertIn("block PMASTREC: missing in the index; parses as data; trusted", text)
+        self.assertRegex(text, r"block PMASTREC: missing in the index; parses as data \(\d+ data item\(s\)\); trusted")
+        self.assertIn("record 1 masked: `999999*====", text)
         self.assertNotIn("PM-POLICY", text, "nothing from the estate")
         self.assertIn("first source record, masked: `999999 AAAAAAAAAAAAAA AAAAAAAA.", text)
         out = io.StringIO()
