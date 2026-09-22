@@ -83,7 +83,7 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as td:
         db = os.path.join(td, "smoke.db")
         r = run(["-m", "atlas.build", os.path.join(HERE, "tests", "fixtures"), "--db", db, "--rebuild", "--quiet"])
-        all_ok &= stage("smoke build", r.returncode == 0 and "programs 7" in r.stdout,
+        all_ok &= stage("smoke build", r.returncode == 0 and "programs 12" in r.stdout,
                         "" if r.returncode == 0 else (r.stderr.strip().splitlines() or ["?"])[-1])
 
         checks = [

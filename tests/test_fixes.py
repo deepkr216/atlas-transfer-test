@@ -150,6 +150,39 @@ class QuotedCopyNames(unittest.TestCase):
         self.assertEqual([c[0] for c in f.copies], [], f.copies)
 
 
+class GivingTargetIsAWrite(unittest.TestCase):
+    """`ADD WS-I 1 GIVING WS-Y` recorded WS-Y as READ (LESSONS 174): _ARITH
+    wanted TO/FROM/BY/INTO before it looked for GIVING, and a fragment without
+    one fell to the every-name-is-a-read branch. `field WS-Y` then never showed
+    the statement as a setter."""
+
+    def test_add_giving_without_to_is_a_write(self):
+        f = cobol.parse_program("\n".join([
+            "       IDENTIFICATION DIVISION.",
+            "       PROGRAM-ID. GIVPGM.",
+            "       DATA DIVISION.",
+            "       WORKING-STORAGE SECTION.",
+            "       01  WS-I                 PIC S9(04) COMP.",
+            "       01  WS-J                 PIC S9(04) COMP.",
+            "       01  WS-Y                 PIC S9(04) COMP.",
+            "       01  WS-Z                 PIC S9(04) COMP.",
+            "       PROCEDURE DIVISION.",
+            "           ADD WS-I 1 GIVING WS-Y.",
+            "           ADD WS-I WS-J GIVING WS-Z ROUNDED.",
+            "           ADD WS-I TO WS-J GIVING WS-Y.",
+            "           GOBACK.",
+        ]) + "\n")
+        refs = set(f.field_refs)
+        self.assertIn(("WS-Y", "write", "ADD", 10), refs)
+        self.assertNotIn(("WS-Y", "read", "ADD", 10), refs)
+        self.assertIn(("WS-I", "read", "ADD", 10), refs)
+        self.assertIn(("WS-Z", "write", "ADD", 11), refs)
+        self.assertNotIn(("WS-Z", "read", "ADD", 11), refs)
+        self.assertIn(("WS-Y", "write", "ADD", 12), refs)        # `TO b GIVING c` reads b, writes c
+        self.assertIn(("WS-J", "read", "ADD", 12), refs)
+        self.assertNotIn(("WS-J", "write", "ADD", 12), refs)
+
+
 class JclDirection(unittest.TestCase):
     JCL = "\n".join([
         "//T1       JOB (A),'X'",

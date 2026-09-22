@@ -1,0 +1,18 @@
+000100*================================================================*
+000200* FLOW TEST RECORD - FRAGMENT (THE 01 AND A PREFIX BYTE ARE IN  *
+000300* THE INCLUDING PROGRAM, SO EVERY OFFSET HERE IS ONE BYTE SHORT)*
+000400*================================================================*
+000500 05  FR-POLICY-NO            PIC X(12).
+000600 05  FR-STATUS               PIC X(02).
+000700     88  FR-LAPSED           VALUE 'LP'.
+000800 05  FR-AGENT-DATA.
+000900     10  FR-AGENT-ID         PIC X(06).
+001000     10  FR-AGENT-PCT        PIC S9(03)V99  COMP-3.
+001100 05  FR-LEGACY-AREA          REDEFINES FR-AGENT-DATA.
+001200     10  FR-OLD-AGENT-KEY    PIC X(09).
+001300 05  FR-COV-CODE             PIC X(01) OCCURS 3 TIMES.
+001400 05  FR-COV-COUNT            PIC S9(03)     COMP-3.
+001500 05  FR-COV-TBL              OCCURS 1 TO 2 TIMES
+001600                             DEPENDING ON FR-COV-COUNT.
+001700     10  FR-COV-LIMIT        PIC S9(05)V99  COMP-3.
+001800 05  FR-FILLER               PIC X(03).
