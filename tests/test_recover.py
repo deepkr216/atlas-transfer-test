@@ -541,6 +541,12 @@ class EndToEnd(unittest.TestCase):
         stats = recover.run(self.db, log=said.append, report=self.report)
         self.assertEqual((stats["written"], stats["kept"]), (0, 2), said)
         self.assertTrue(any("nothing new to write: 2 of 2" in s for s in said), said)
+        # his k=4 (2026-09-21): recovered earlier, still missing - the report names the file and says why
+        self.assertTrue(any("2 recovered on an earlier run are still missing in the index" in s for s in said), said)
+        with open(self.report, encoding="utf-8") as fh:
+            rep = fh.read()
+        self.assertIn("## Recovered on an earlier run, still missing in the index", rep)
+        self.assertIn("PMASTREC.cpy", rep)
         # the next build, without --rebuild, re-expands the programs that copy them
         out_text = self.build()
         self.assertEqual((self.status("SAMPPGM"), self.status("ERRPGM")), ("ok", "ok"), out_text)
@@ -614,6 +620,42 @@ class EndToEnd(unittest.TestCase):
             self.assertIn("ZCOPYLIB", resolved)
         finally:
             conn.close()
+
+    def test_a_copybook_copied_only_from_inside_another_copybook_is_named_as_such(self):
+        # his z=71 (2026-09-21): after the re-parse, 71 of 80 missing copybooks were 'not in any expanded text'.
+        # A copybook that only another copybook copies has no COPY statement in any program; in the listing its
+        # lines sit inside the outer copybook's block. The tool reads the programs that copy the OUTER copybook,
+        # and the report says where the inner one's lines are
+        outer = ["000100 01  OUT-REC.", "000200     05  OUT-A                 PIC X(5).", "000300     COPY 'INNER'.",
+                 "000400     05  OUT-Z                 PIC X(1)."]
+        inner = ["000100     05  IN-B                  PIC X(3).", "000200     05  IN-C                  PIC 9(2)."]
+        with open(os.path.join(self.root, "SHARED", "COPYLIB", "OUTER.cpy"), "w", encoding="utf-8") as fh:
+            fh.write("\n".join(outer) + "\n")
+        prog = ["000100 IDENTIFICATION DIVISION.", "000200 PROGRAM-ID. NESTPGM.", "000300 DATA DIVISION.",
+                "000400 WORKING-STORAGE SECTION.", "000500     COPY OUTER.", "000600 PROCEDURE DIVISION.",
+                "000700     MOVE 'X' TO OUT-A.", "000800     GOBACK."]
+        with open(os.path.join(self.src, "NESTPGM.cbl"), "w", encoding="utf-8") as fh:
+            fh.write("\n".join(prog) + "\n")
+        with open(os.path.join(self.lst, "NESTPGM.lst"), "w", encoding="utf-8") as fh:
+            fh.write(ibm_listing(prog, {"OUTER": outer[:3] + inner + outer[3:]}))     # the compiler prints INNER inline
+        self.build(["--rebuild"])
+        conn = query.connect(self.db)
+        try:
+            missing = recover.missing_copybooks(conn)
+            # the expander records the nested COPY under the program too, so INNER has two copiers: the program
+            # (through OUTER) and the copybook OUTER itself
+            self.assertEqual(missing.get("INNER"), 2, missing)
+            self.assertIn("NESTPGM", recover.needing_programs(conn, missing), "the program copying the OUTER copybook is read")
+            self.assertEqual(recover.copiers_by_kind(conn, missing)["INNER"], (1, 1))
+            self.assertEqual(recover.copier_names(conn, missing)["INNER"], "NESTPGM, OUTER (copybook)")
+        finally:
+            conn.close()
+        said = []
+        recover.run(self.db, dry_run=True, log=said.append, report=self.report)
+        self.assertTrue(any("1 of the 1 not found are copied from INSIDE another copybook" in s for s in said), said)
+        with open(self.report, encoding="utf-8") as fh:
+            rep = fh.read()
+        self.assertIn("| INNER | 1 program, 1 copybook | NESTPGM, OUTER (copybook) | OUTER (1 listing) |", rep)
 
     def test_two_systems_with_different_texts_each_get_their_own_copy(self):
         test_src = os.path.join(self.root, "GC-TEST", "PDS.SRC")

@@ -616,15 +616,57 @@ def missing_copybooks(conn: sqlite3.Connection) -> Dict[str, int]:
 
 def needing_programs(conn: sqlite3.Connection, missing: Dict[str, int]) -> Set[str]:
     """The programs that copy a missing copybook: only their expanded text
-    can hold it, so only theirs is read."""
+    can hold it, so only theirs is read. A copybook that copies the missing
+    one has no expanded text of its own: the programs that copy THAT
+    copybook are read instead (through as many levels as it takes)."""
     if not missing:
         return set()
     names: Set[str] = set()
-    q = ",".join("?" * len(missing))
-    for (name,) in conn.execute(f"SELECT DISTINCT UPPER(m.name) FROM copy_use c JOIN member m ON m.id = c.member_id "
-                                f"WHERE c.resolved_member_id IS NULL AND UPPER(c.copybook) IN ({q})", tuple(missing)):
-        names.add(name)
+    wanted = {n.upper() for n in missing}
+    for _level in range(6):
+        q = ",".join("?" * len(wanted))
+        copybooks: Set[str] = set()
+        for name, kind in conn.execute(f"SELECT DISTINCT UPPER(m.name), m.kind FROM copy_use c JOIN member m ON m.id = c.member_id "
+                                       f"WHERE UPPER(c.copybook) IN ({q})", tuple(wanted)):
+            if kind == "copybook":
+                copybooks.add(name)
+            else:
+                names.add(name)
+        wanted = copybooks - names
+        if not wanted:
+            break
     return names
+
+
+def copiers_by_kind(conn: sqlite3.Connection, missing: Dict[str, int]) -> Dict[str, Tuple[int, int]]:
+    """{copybook: (programs copying it, copybooks copying it)}: a copybook
+    copied only from inside other copybooks has no COPY statement in any
+    program - its lines sit inside the outer copybook's block in a listing."""
+    if not missing:
+        return {}
+    out: Dict[str, Tuple[int, int]] = {}
+    q = ",".join("?" * len(missing))
+    for name, kind, n in conn.execute(f"SELECT UPPER(c.copybook), m.kind, COUNT(DISTINCT c.member_id) FROM copy_use c "
+                                      f"JOIN member m ON m.id = c.member_id WHERE UPPER(c.copybook) IN ({q}) GROUP BY 1, 2",
+                                      tuple(missing)):
+        p, b = out.get(name, (0, 0))
+        out[name] = (p + n, b) if kind != "copybook" else (p, b + n)
+    return out
+
+
+def copier_names(conn: sqlite3.Connection, missing: Dict[str, int], limit: int = 8) -> Dict[str, str]:
+    """{copybook: 'PGM1, PGM2, OUTER (copybook), +3 more'} - where each missing
+    copybook is used, for the report's table ('list the copybooks you could
+    not find anywhere and the programs where they are used')."""
+    if not missing:
+        return {}
+    users: Dict[str, List[str]] = defaultdict(list)
+    q = ",".join("?" * len(missing))
+    for name, user, kind in conn.execute(f"SELECT DISTINCT UPPER(c.copybook), UPPER(m.name), m.kind FROM copy_use c "
+                                         f"JOIN member m ON m.id = c.member_id WHERE UPPER(c.copybook) IN ({q}) ORDER BY 2",
+                                         tuple(missing)):
+        users[name].append(user + (" (copybook)" if kind == "copybook" else ""))
+    return {n: ", ".join(u[:limit]) + (f", +{len(u) - limit:,} more" if len(u) > limit else "") for n, u in users.items()}
 
 
 def real_copies(conn: sqlite3.Connection, roots: Sequence[str]) -> Set[str]:
@@ -889,6 +931,8 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
                 raise SystemExit("the index has no estate root recorded: give --out")
             out_dir = shared_out(root)
         missing = missing_copybooks(conn)
+        copiers = copiers_by_kind(conn, missing)
+        users = copier_names(conn, missing)
         sources = listing_sources(conn, folders)
         index = originals(conn)
         needing = needing_programs(conn, missing)
@@ -953,6 +997,7 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
     wanted = set(missing) if not everything else set()
     formats: Counter = Counter()
     by_name: Dict[str, List[Region]] = defaultdict(list)
+    nested_in: Dict[str, Counter] = defaultdict(Counter)                 # inner copybook -> {outer copybook: listings}
     unattached = 0
     lined_up = 0
     look_untied: List[Tuple[str, int, int, str, list, str]] = []        # (listing, untied line, program line before, its shape, lines before, why)
@@ -989,6 +1034,8 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
         if "lined up" in fmt:
             lined_up += 1
         for r in regions:
+            for inner in r.nested:                                       # a COPY inside the block: the inner copybook's
+                nested_in[inner.upper()][r.name] += 1                    # lines sit inside this block, unmarked as its own
             if everything or r.name in missing:
                 by_name[r.name].append(r)
     log("formats seen: " + ", ".join(f"{f} in {n:,}" for f, n in formats.most_common()))
@@ -1005,12 +1052,14 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
     rejected: List[Tuple[str, str]] = []
     unconfirmed: List[Tuple[str, str]] = []
     kept = 0
+    kept_names: List[str] = []
     have_now = {n for ents in entries.values() for n in ents}
     for name in sorted(by_name):
         if name in real and not everything:
             continue
         if name in have_now and not refresh:
             kept += 1
+            kept_names.append(name)
             continue
         # one copy for the whole estate, or one per system when the systems disagree
         by_sys: Dict[str, List[Region]] = defaultdict(list)
@@ -1082,9 +1131,25 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
     if rejected:
         lines.append("\n## Rejected\n\n| copybook | why |\n|---|---|\n")
         lines += [f"| {n} | {why} |\n" for n, why in rejected]
+    nested_only = [n for n in not_found if nested_in.get(n)]
+    stale = [n for n in kept_names if n in missing]                      # recovered earlier, the index still lacks it
     if not_found:
-        lines.append("\n## Not in any expanded text (fetch these libraries)\n\n| copybook | programs copying it |\n|---|---|\n")
-        lines += [f"| {n} | {missing[n]} |\n" for n in not_found]
+        lines.append("\n## Not in any expanded text (fetch these libraries)\n\n"
+                     "A copybook copied only from inside another copybook has no COPY statement in any program: its lines "
+                     "sit inside the outer copybook's block in the listing, which this tool does not cut apart.\n\n"
+                     "| copybook | copied by | used in | seen inside another copybook's block |\n|---|---|---|---|\n")
+        for n in not_found:
+            p, b = copiers.get(n, (missing[n], 0))
+            inside = ", ".join(f"{o} ({k} listing{'s' if k != 1 else ''})" for o, k in nested_in[n].most_common(3)) if nested_in.get(n) else "-"
+            lines.append(f"| {n} | {p} program{'s' if p != 1 else ''}, {b} copybook{'s' if b != 1 else ''} | "
+                         f"{users.get(n, '?')} | {inside} |\n")
+    if stale:
+        lines.append("\n## Recovered on an earlier run, still missing in the index\n\nThe file exists but the index does not "
+                     "list it: either the build has not run since, or the build did not see the folder (it must sit under the "
+                     "estate root the build command names).\n\n| copybook | file |\n|---|---|\n")
+        for n in stale:
+            where = next((os.path.join(d, n + ".cpy") for d, ents in entries.items() if n in ents), "?")
+            lines.append(f"| {n} | {os.path.relpath(where, root) if root and where != '?' else where} |\n")
     if look_untied or rejected:
         lines.append("\n## Please look\n\nOpen the listing named below in VS Code and go to the line (Ctrl+G). "
                      "Answer in words and numbers only - nothing from the file needs to be copied.\n")
@@ -1120,6 +1185,13 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
             + f", {len(unconfirmed):,} unconfirmed, {len(rejected):,} rejected, {len(not_found):,} in no expanded text"
             + (f"; {lined_up:,} text(s) read by lining up with the program" if lined_up else "")
             + (f"; {kept:,} already recovered earlier" if kept else ""))
+    if nested_only:
+        log(f"  {len(nested_only):,} of the {len(not_found):,} not found are copied from INSIDE another copybook: their lines sit "
+            "inside that copybook's block in the listings, which this tool does not cut apart yet - the report's table names the "
+            "outer copybook")
+    if stale:
+        log(f"  {len(stale):,} recovered on an earlier run are still missing in the index: if the build has run since, it did not "
+            "see the file - the report lists each file; the recovered folder must sit under the estate root the build names")
     if no_marks and not_found:
         log(f"  {no_marks:,} expanded text(s) show the COPY statements but not the copied lines and could not be lined up "
             "with a program in the index: listings compiled with the copybook text, or the programs themselves, would close more")
