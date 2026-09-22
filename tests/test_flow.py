@@ -18,7 +18,10 @@ FLOWJOB sorts and FLOWRDR reads (through a DIFFERENT copybook, one prefix
 byte off), calls FLOWSUB by name, by ENTRY alias with the parameters swapped
 and through a variable with two candidates, and updates POLICY_TBL; FLOWCICS
 LINKs to FLOWCOMM with a COMMAREA, which answers through a TS queue; FLOWJOB2
-re-arranges the bytes with OUTREC on the way to the same reader.
+re-arranges the bytes with OUTREC on the way to the same reader. FLOWSRC also
+calls FLOWSUB with a third argument the callee never declares and moves a
+COMP item to a DISPLAY one; ERRPGM (already a fixture) has a COPY nobody can
+find, so its facts are partial.
 """
 
 import contextlib
@@ -551,6 +554,24 @@ class FlowIndex(unittest.TestCase):
         self.assertIn("RETURNING", ret)
         self.assertIn("FLOWSUB", ret)
 
+        # a third argument where the callee declares two: position 3 has no param,
+        # so the hop ends and says a human must look - never "arg 3 -> LK-x" (guard 12)
+        ext = self.flow("WS-EXTRA", "--program", "FLOWSRC")
+        x_line = L("CALL 'FLOWSUB' USING WS-RC WS-Y WS-EXTRA")
+        hop = _lines_of(ext, "CALL FLOWSUB arg 3")
+        self.assertRegex(hop, rf"""CALL FLOWSUB arg 3\b.*FLOWSRC:{x_line} "CALL 'FLOWSUB' USING WS-RC[^"]*".*"""
+                              r"\[end: LINKAGE position out of range / count mismatch - HUMAN MUST VERIFY\]")
+        self.assertNotRegex(ext, r"-> FLOWSUB\.LK-")
+        self.assertIn("LINKAGE position out of range / count mismatch - HUMAN MUST VERIFY", ext.split("## Ends", 1)[1])
+
+        # a numeric MOVE converts: S9(04) COMP (2 bytes) into 9(04) (4 bytes) is not a byte copy (guard 16)
+        num = self.flow("WS-I", "--program", "FLOWSRC")
+        n_line = L("MOVE WS-I TO WS-Y")
+        hop = _lines_of(num, "MOVE -> WS-Y")
+        self.assertRegex(hop, rf'MOVE -> WS-Y\b.*converted S9\(04\)(?: COMP)? -> 9\(04\).*FLOWSRC:{n_line} "MOVE WS-I TO WS-Y"')
+        self.assertNotIn("truncated", hop)
+        self.assertNotIn("bytes", hop)
+
         # CICS: LINK COMMAREA -> the callee's DFHCOMMAREA by convention, the copybook's field by bytes,
         # WRITEQ -> READQ on the same queue, SEND MAP ends at the screen
         cx = self.flow("WC-STATUS", "--program", "FLOWCICS", "--hops", "6")
@@ -589,11 +610,31 @@ class FlowIndex(unittest.TestCase):
         self.assertIn("WS-PONG", ping)
         self.assertEqual(ping.count("(shown as "), 1, ping)
 
+    def test_flow_partial_program_is_labelled(self):
+        # ERRPGM's COPY POLDCL is not in the fixtures (parse_status partial, an
+        # `expand` row): a report on one of its fields says so in the node header
+        # and lists the missing copybook in scope, never a complete-looking chain (guard 23)
+        out = self.flow("WS-ERR-CD", "--program", "ERRPGM")
+        self.assertIn("# Flow of ERRPGM.WS-ERR-CD", out)
+        self.assertRegex(out, r"\[program partial: [^\]]*POLDCL[^\]]*\]")
+        first_hop = re.search(r"^1\s", out, re.M)
+        self.assertIsNotNone(first_hop, out)
+        self.assertLess(out.index("[program partial:"), first_hop.start())
+        self.assertIn("Unresolved in scope", out)
+        unres = out.split("Unresolved in scope", 1)[1].split(FOOTER, 1)[0]
+        self.assertRegex(unres, r"ERRPGM.*COPY POLDCL NOT FOUND")
+        # what the index does hold still ends with its fixed reason
+        self.assertRegex(out, r"CALL ERRLOG arg 1\b.*\[end: callee not in index\]")
+        self.assertRegex(out, r"AUDIT_TBL.*COL1.*\[end: DB2 column: no static reader\]")
+        self.assertEqual(out.rstrip().splitlines()[-1], FOOTER)
+
     def test_every_flow_cite_passes_the_gate(self):
         texts = [self.flow("WS-STATUS", "--program", "FLOWSRC"),
                  self.flow("WS-RC", "--program", "FLOWSRC"),
                  self.flow("IR-STAT", "--program", "FLOWRDR", "--up", "--hops", "5"),
-                 self.flow("WC-STATUS", "--program", "FLOWCICS", "--hops", "6")]
+                 self.flow("WC-STATUS", "--program", "FLOWCICS", "--hops", "6"),
+                 self.flow("WS-EXTRA", "--program", "FLOWSRC"),
+                 self.flow("WS-I", "--program", "FLOWSRC")]
         cites = [m for t in texts for m in CITE.finditer(t)]
         self.assertGreaterEqual(len(cites), 12)
         call_line = _line("FLOWSRC.cbl", "CALL 'FLOWSUB' USING WS-STATUS")
