@@ -662,10 +662,11 @@ def copier_names(conn: sqlite3.Connection, missing: Dict[str, int], limit: int =
         return {}
     users: Dict[str, List[str]] = defaultdict(list)
     q = ",".join("?" * len(missing))
-    for name, user, kind in conn.execute(f"SELECT DISTINCT UPPER(c.copybook), UPPER(m.name), m.kind FROM copy_use c "
-                                         f"JOIN member m ON m.id = c.member_id WHERE UPPER(c.copybook) IN ({q}) ORDER BY 2",
-                                         tuple(missing)):
-        users[name].append(user + (" (copybook)" if kind == "copybook" else ""))
+    for name, user, kind, line in conn.execute(f"SELECT UPPER(c.copybook), UPPER(m.name), m.kind, MIN(c.line) FROM copy_use c "
+                                               f"JOIN member m ON m.id = c.member_id WHERE UPPER(c.copybook) IN ({q}) "
+                                               f"GROUP BY 1, 2, 3 ORDER BY 2", tuple(missing)):
+        users[name].append(user + (" (copybook)" if kind == "copybook" else "") + (f":{line}" if line else ""))
+        # NAME:line - the line of the COPY statement, so a name that is not a copybook at all can be looked at
     return {n: ", ".join(u[:limit]) + (f", +{len(u) - limit:,} more" if len(u) > limit else "") for n, u in users.items()}
 
 

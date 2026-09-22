@@ -647,7 +647,8 @@ class EndToEnd(unittest.TestCase):
             self.assertEqual(missing.get("INNER"), 2, missing)
             self.assertIn("NESTPGM", recover.needing_programs(conn, missing), "the program copying the OUTER copybook is read")
             self.assertEqual(recover.copiers_by_kind(conn, missing)["INNER"], (1, 1))
-            self.assertEqual(recover.copier_names(conn, missing)["INNER"], "NESTPGM, OUTER (copybook)")
+            self.assertRegex(recover.copier_names(conn, missing)["INNER"], r"^NESTPGM:\d+, OUTER \(copybook\):\d+$",
+                             "each user with the line of its COPY statement, so a name that is no copybook can be looked at")
         finally:
             conn.close()
         said = []
@@ -655,7 +656,7 @@ class EndToEnd(unittest.TestCase):
         self.assertTrue(any("1 of the 1 not found are copied from INSIDE another copybook" in s for s in said), said)
         with open(self.report, encoding="utf-8") as fh:
             rep = fh.read()
-        self.assertIn("| INNER | 1 program, 1 copybook | NESTPGM, OUTER (copybook) | OUTER (1 listing) |", rep)
+        self.assertRegex(rep, r"\| INNER \| 1 program, 1 copybook \| NESTPGM:\d+, OUTER \(copybook\):\d+ \| OUTER \(1 listing\) \|")
 
     def test_two_systems_with_different_texts_each_get_their_own_copy(self):
         test_src = os.path.join(self.root, "GC-TEST", "PDS.SRC")
