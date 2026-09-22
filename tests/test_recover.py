@@ -174,6 +174,63 @@ class Formats(unittest.TestCase):
         _fmt, regions, _s = recover.extract(text2, "TESTPGM.lst", set())
         self.assertEqual({r.name for r in regions}, {"PMASTREC", "POLDCL"})
 
+    def test_a_blank_or_comment_line_printed_inside_a_block_without_the_mark_does_not_split_it(self):
+        # his listing (2026-09-21): a copybook that opens with two hundred comment lines, page headers among
+        # them - and somewhere a numbered blank or comment line without the C. The block must run on to the
+        # fields after it; before, that line closed the block and every copied line after it was untied
+        book = ["000100*  DESCRIPTION : DIS", "000200*", "000300", "000400*", "000500 01  WS-DIS.",
+                "000600     05  WS-DIS-A          PIC X(10).", "000700     05  WS-DIS-B          PIC 9(05)."]
+        text = ibm_listing(self.prog, {"PMASTREC": self.pmast, "POLDCL": book},
+                           flag_at={("POLDCL", 1): " ", ("POLDCL", 2): " ", ("POLDCL", 3): " "}, page_lines=12)
+        self.assertRegex(text, r"\n   \d{6}         000300\s*\n", "the blank line is printed without the mark")
+        fmt, regions, stats = recover.extract(text, "TESTPGM.lst", set())
+        self.assertEqual(fmt, "compiler listing", stats)
+        by = {r.name: r for r in regions}
+        self.assertEqual(set(by), {"PMASTREC", "POLDCL"}, stats)
+        self.assertEqual(stats.get("flagged lines with no COPY before them", 0), 0, stats)
+        self.assertEqual([r.rstrip() for r in by["POLDCL"].records], [book[0]] + book[4:], "the unmarked lines are not kept")
+        self.assertEqual([r.rstrip() for r in by["PMASTREC"].records], [r.rstrip() for r in self.pmast])
+
+    def test_a_copy_statement_after_an_exec_sql_that_never_closed_is_still_a_copy(self):
+        # an EXEC SQL whose END-EXEC the tool never sees (here: on a comment line) must not swallow every
+        # COPY statement after it
+        prog = self.prog[:5] + ["000510     EXEC SQL", "000520*      END-EXEC"] + self.prog[5:]
+        text = ibm_listing(prog, {"PMASTREC": self.pmast, "POLDCL": self.poldcl})
+        _fmt, regions, stats = recover.extract(text, "TESTPGM.lst", set())
+        self.assertEqual({r.name for r in regions}, {"PMASTREC", "POLDCL"}, stats)
+        self.assertEqual(stats.get("flagged lines with no COPY before them", 0), 0, stats)
+        # and an INCLUDE whose copied lines are printed before its END-EXEC is tied to them
+        lines = [BANNER.format(page=1), RULER,
+                 "   000001         000100 IDENTIFICATION DIVISION.",
+                 "   000002         000200 PROGRAM-ID. TESTPGM.",
+                 "   000003         000300 DATA DIVISION.",
+                 "   000004         000400 WORKING-STORAGE SECTION.",
+                 "   000005         000500     EXEC SQL INCLUDE POLDCL",
+                 "   000006C        000100 01  POLICY-DCL.",
+                 "   000007C        000200     05  POL-NUMBER              PIC X(12).",
+                 "   000008         000600     END-EXEC.",
+                 "   000009         000700 PROCEDURE DIVISION."]
+        regions, stats = recover.from_ibm_listing(lines, "X.lst", None)
+        self.assertEqual([(r.name, len(r.records)) for r in regions], [("POLDCL", 2)], stats)
+
+    def test_an_untied_line_says_why_the_tool_had_no_copy_in_hand(self):
+        lines = [BANNER.format(page=1), RULER,
+                 "   000001         000100 IDENTIFICATION DIVISION.",
+                 "   000002         000200 PROGRAM-ID. TESTPGM.",
+                 "   000003         000300 DATA DIVISION.",
+                 "   000004         000400 WORKING-STORAGE SECTION.",
+                 "   000005                    COPY POLDCL.",
+                 "   000006C        000100 01  POLICY-DCL.",
+                 "   000007         000500 01  WS-X                        PIC X.",
+                 "   000008C        000200     05  POL-NUMBER              PIC X(12).",
+                 "   000009         000700 PROCEDURE DIVISION."]
+        regions, stats = recover.from_ibm_listing(lines, "X.lst", None)
+        self.assertEqual([(r.name, len(r.records)) for r in regions], [("POLDCL", 1)], stats)
+        (at, before, _shape, _recent, why), = stats["untied"]
+        self.assertEqual((at, before), (10, 9))
+        self.assertEqual(why, "the last program line, 9, holds no COPY statement the tool recognises; the copied block "
+                              "before it was closed by program line 9, shape `999999 99  AA-A                        AAA A.`")
+
     def test_reading_stops_where_the_program_ends(self):
         # what he found: after the source, the cross-reference tables carry line numbers too, some followed
         # by a letter, and the copybook names appear again - the tool must not read them as copied lines
@@ -601,6 +658,7 @@ class EndToEnd(unittest.TestCase):
         self.assertIn("AAAA 'AAAAAAAA'", m2.group(2), "the COPY line, masked")
         self.assertNotIn("PMASTREC", m2.group(2))
         self.assertIn("the numbered lines just before it, as the tool read them", rep)
+        self.assertRegex(rep, r"- why the tool had no COPY in hand: the last program line, \d+, holds no COPY statement the tool recognises")
         marks = re.findall(r"    - line \d+: mark `(.*?)`  record `(.*?)`", rep)
         self.assertGreaterEqual(len(marks), 1, rep)
         self.assertIn(("(none)", "999999     AAAA 'AAAAAAAA'."), [(m, r.rstrip()) for m, r in marks], marks)

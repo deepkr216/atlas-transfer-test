@@ -284,8 +284,10 @@ def from_ibm_listing(lines: Sequence[str], source: str, system: Optional[str]) -
     ruler_line = next((i for i, ln in enumerate(lines, 1) if _RULER.search(ln)), 0)
     stats["ruler line"] = ruler_line
     last_plain: Tuple[int, str] = (0, "")                              # the last program line seen (line, shape)
-    untied: List[Tuple[int, int, str, list]] = []                      # (first untied line, previous program line, its shape, the lines before)
+    closer: Tuple[int, str, str] = (0, "", "")                          # the program line that closed the last block: (line, copybook, shape)
+    untied: List[Tuple[int, int, str, list, str]] = []                 # (first untied line, previous program line, its shape, the lines before, why)
     recent: List[Tuple[int, str, str]] = []                             # the last numbered lines seen: (line, raw mark, masked record)
+    sql_line = 0                                                       # where the open EXEC SQL statement started
     compiled = ""
     for ln in lines[:60]:
         m = _DATE.search(ln)
@@ -301,12 +303,17 @@ def from_ibm_listing(lines: Sequence[str], source: str, system: Optional[str]) -
         recent = (recent + [(lineno, flag, masked(rec)[:60])])[-4:]
         flag = flag.replace("*", "").upper()                          # ** = out of sequence, not a copy mark
         if not flag:
+            if _is_comment(rec) or not code.strip():
+                continue                                               # a blank or a comment without the mark closes nothing:
+                                                                       # one printed inside a copybook must not split the block
             if cur is not None:
                 regions.append(cur)
+                closer = (lineno, cur.name, masked(rec))
                 cur = None
-            if _is_comment(rec) or not code.strip():
-                continue
             last_plain = (lineno, masked(rec))
+            found = copy_in(code)
+            if sql_open and found and not _SQL_INCLUDE.search(expand._mask_literals(code)):
+                sql_open = []                                          # a COPY statement: the EXEC SQL before it never closed
             if sql_open:
                 sql_open.append(code.strip())
                 if "END-EXEC" in code.upper():
@@ -314,14 +321,14 @@ def from_ibm_listing(lines: Sequence[str], source: str, system: Optional[str]) -
                     pending = (found[0], found[1], True) if found else None
                     sql_open = []
                 continue
-            if pending and not pending[2]:                           # a COPY statement continued on the next line
+            if pending and not pending[2] and not found:               # a COPY statement continued on the next line
                 pending = (pending[0], pending[1] + " " + code.strip(), "." in code)
                 continue
-            found = copy_in(code)
             if found:
                 pending = (found[0], found[1], "." in found[1])
             elif _EXEC_SQL.search(expand._mask_literals(code)) and "END-EXEC" not in code.upper():
                 sql_open = [code.strip()]
+                sql_line = lineno
             else:
                 pending = None
             continue
@@ -332,10 +339,23 @@ def from_ibm_listing(lines: Sequence[str], source: str, system: Optional[str]) -
             continue
         stats["flagged lines"] += 1
         if cur is None:
+            if pending is None and sql_open:
+                found = copy_in(" ".join(sql_open))                    # an INCLUDE whose END-EXEC comes after the copied lines
+                if found:
+                    pending = (found[0], found[1], True)
+                    sql_open = []
             if pending is None:
                 stats["flagged lines with no COPY before them"] += 1
                 if not untied or untied[-1][1] != last_plain[0]:
-                    untied.append((lineno, last_plain[0], last_plain[1], list(recent[:-1])))
+                    if sql_open:
+                        why = f"an EXEC SQL statement that opened at line {sql_line} had not reached END-EXEC"
+                    elif not last_plain[0]:
+                        why = "no program line was read before it"
+                    else:
+                        why = f"the last program line, {last_plain[0]}, holds no COPY statement the tool recognises"
+                    if closer[0]:
+                        why += f"; the copied block before it was closed by program line {closer[0]}, shape `{closer[2]}`"
+                    untied.append((lineno, last_plain[0], last_plain[1], list(recent[:-1]), why))
                 continue
             cur = Region(pending[0], [], source, "compiler listing", replacing="REPLACING" in pending[1].upper(),
                          system=system, statement=pending[1], line=lineno)
@@ -927,7 +947,7 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
     by_name: Dict[str, List[Region]] = defaultdict(list)
     unattached = 0
     lined_up = 0
-    look_untied: List[Tuple[str, int, int, str, list]] = []             # (listing, untied line, program line before, its shape, lines before)
+    look_untied: List[Tuple[str, int, int, str, list, str]] = []        # (listing, untied line, program line before, its shape, lines before, why)
     columns: Counter = Counter()                                         # where the source starts, per listing
     t0 = last = time.time()
     for k, (path, system) in enumerate(sources, 1):
@@ -957,7 +977,7 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
             columns[(stats["source column"], bool(stats.get("ruler line")))] += 1
         if stats.get("untied") and len(look_untied) < 2:
             first = stats["untied"][0]                                  # type: ignore[index]
-            look_untied.append((path, first[0], first[1], first[2], first[3]))
+            look_untied.append((path, first[0], first[1], first[2], first[3], first[4]))
         if "lined up" in fmt:
             lined_up += 1
         for r in regions:
@@ -1060,10 +1080,11 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
     if look_untied or rejected:
         lines.append("\n## Please look\n\nOpen the listing named below in VS Code and go to the line (Ctrl+G). "
                      "Answer in words and numbers only - nothing from the file needs to be copied.\n")
-    for path, at, before, shape, recent in look_untied:
+    for path, at, before, shape, recent, why in look_untied:
         lines.append(f"\n### Copied lines with no COPY statement found before them\n\n- listing: `{path}`\n"
                      f"- line {at}: the first copied line (a C after its line number) that nothing claimed\n"
                      f"- line {before}: the last program line before it; its shape (letters A, digits 9): `{shape}`\n"
+                     f"- why the tool had no COPY in hand: {why}\n"
                      "- the numbered lines just before it, as the tool read them (mark after the line number, then the "
                      "record with letters A and digits 9):\n")
         lines += [f"    - line {ln}: mark `{mark or '(none)'}`  record `{rec}`\n" for ln, mark, rec in recent]
