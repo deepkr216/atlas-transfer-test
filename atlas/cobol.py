@@ -153,6 +153,9 @@ _SQL_DECLARE_TABLE = re.compile(r"\bDECLARE\s+([A-Z0-9_$#@]+(?:\.[A-Z0-9_$#@]+)?
                                 re.IGNORECASE | re.DOTALL)
 _EXEC_ANY = re.compile(r"\bEXEC\s+(CICS|DLI|SQL)\b(.*?)\bEND-EXEC\b", re.IGNORECASE | re.DOTALL)
 _CICS_OPT = re.compile(r"\b([A-Z][A-Z0-9]*)\s*\(([^()]*)\)", re.IGNORECASE)          # value stripped by the callers
+# SET(ADDRESS OF x): locate mode - x is the area the command fills. ADDRESS
+# is reserved and OF would eat x as a qualifier, so _operands saw nothing.
+_CICS_SET_ADDR = re.compile(r"^\s*ADDRESS\s+OF\s+", re.IGNORECASE)
 # EXEC CICS options that RETURN data to the program (the program WRITES the
 # field) vs. options the command READS.
 _CICS_WRITE_OPTS = {"INTO", "SET", "RESP", "RESP2", "NUMITEMS", "NUMREC", "ASSIGN", "ABCODE", "TERMID",
@@ -1244,6 +1247,8 @@ def _extract_cics(f: ProgramFacts, st: LogicalLine,
                 v = opts.get(opt)
                 if not v or v[:1] in ("'", '"'):
                     continue
+                if opt == "SET":
+                    v = _CICS_SET_ADDR.sub("", v)       # the area, not the pointer
                 for op in _operands(v)[:1]:
                     if op.name:
                         f.flows.append(_flow(ln, "EXEC-CICS-" + vb, fkind,

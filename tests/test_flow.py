@@ -153,6 +153,12 @@ SHAPES = [
     "           EXEC CICS SEND MAP('M1') MAPSET('S1') FROM(WS-MAP-AREA)",
     "           END-EXEC.",
     "           EXEC CICS LINK PROGRAM('SUBP') COMMAREA(WS-COMM) END-EXEC.",
+    "           EXEC CICS READ FILE('F1') SET(ADDRESS OF LK-AREA)",
+    "               RIDFLD(WS-X) END-EXEC.",
+    "           EXEC CICS GETMAIN SET(ADDRESS OF LK-AREA) LENGTH(40)",
+    "           END-EXEC.",
+    "           EXEC CICS READNEXT FILE('F1') SET(WS-PTR) RIDFLD(WS-X)",
+    "           END-EXEC.",
     "           GOBACK.",
 ]
 
@@ -314,6 +320,18 @@ class FlowParser(unittest.TestCase):
             self.assertIn("M1", m[0].note)
             link = [c for c in self.f.calls if c.kind == "cics_link"][0]
             self.assertEqual([(a.pos, a.name, a.how) for a in link.args], [(1, "WS-COMM", "commarea")])
+        with self.subTest("EXEC CICS SET(ADDRESS OF x): locate mode fills x, not nothing"):
+            # ADDRESS is reserved and OF ate LK-AREA as a qualifier: every
+            # locate-mode READ / GETMAIN vanished from data_flow.
+            rd = self.rows(_ln("READ FILE('F1') SET(ADDRESS OF LK-AREA)"), "cics_in")
+            self.assertEqual([(r.dst_name, r.src_name) for r in rd], [("LK-AREA", None)])
+            self.assertEqual(rd[0].note, "READ file F1")
+            gm = self.rows(_ln("GETMAIN SET(ADDRESS OF LK-AREA)"), "cics_in")
+            self.assertEqual([r.dst_name for r in gm], ["LK-AREA"])
+            self.assertEqual(gm[0].note, "GETMAIN")
+            self.assertNotIn("ADDRESS", {r.dst_name for r in self.rows()})
+            ptr = self.rows(_ln("READNEXT FILE('F1') SET(WS-PTR)"), "cics_in")
+            self.assertEqual([(r.dst_name, r.note) for r in ptr], [("WS-PTR", "READNEXT file F1")])
         with self.subTest("section marks and PROCEDURE DIVISION RETURNING"):
             marks = list(self.f.section_marks)
             self.assertEqual([(s, fd) for (_ln_, s, fd) in marks],
