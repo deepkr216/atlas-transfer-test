@@ -600,6 +600,10 @@ class EndToEnd(unittest.TestCase):
         self.assertIsNotNone(m2, rep)
         self.assertIn("AAAA 'AAAAAAAA'", m2.group(2), "the COPY line, masked")
         self.assertNotIn("PMASTREC", m2.group(2))
+        self.assertIn("the numbered lines just before it, as the tool read them", rep)
+        marks = re.findall(r"    - line \d+: mark `(.*?)`  record `(.*?)`", rep)
+        self.assertGreaterEqual(len(marks), 1, rep)
+        self.assertIn(("(none)", "999999     AAAA 'AAAAAAAA'."), [(m, r.rstrip()) for m, r in marks], marks)
 
     def test_trace_shows_what_the_tool_sees_in_one_listing_as_numbers_only(self):
         out = io.StringIO()

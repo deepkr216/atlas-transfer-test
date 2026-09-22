@@ -284,7 +284,8 @@ def from_ibm_listing(lines: Sequence[str], source: str, system: Optional[str]) -
     ruler_line = next((i for i, ln in enumerate(lines, 1) if _RULER.search(ln)), 0)
     stats["ruler line"] = ruler_line
     last_plain: Tuple[int, str] = (0, "")                              # the last program line seen (line, shape)
-    untied: List[Tuple[int, int, str]] = []                            # (first untied line, previous program line, its shape)
+    untied: List[Tuple[int, int, str, list]] = []                      # (first untied line, previous program line, its shape, the lines before)
+    recent: List[Tuple[int, str, str]] = []                             # the last numbered lines seen: (line, raw mark, masked record)
     compiled = ""
     for ln in lines[:60]:
         m = _DATE.search(ln)
@@ -297,6 +298,7 @@ def from_ibm_listing(lines: Sequence[str], source: str, system: Optional[str]) -
     cur: Optional[Region] = None
     for flag, rec, lineno in recs:
         code = rec[7:72] if len(rec) > 7 else ""
+        recent = (recent + [(lineno, flag, masked(rec)[:60])])[-4:]
         flag = flag.replace("*", "").upper()                          # ** = out of sequence, not a copy mark
         if not flag:
             if cur is not None:
@@ -333,7 +335,7 @@ def from_ibm_listing(lines: Sequence[str], source: str, system: Optional[str]) -
             if pending is None:
                 stats["flagged lines with no COPY before them"] += 1
                 if not untied or untied[-1][1] != last_plain[0]:
-                    untied.append((lineno, last_plain[0], last_plain[1]))
+                    untied.append((lineno, last_plain[0], last_plain[1], list(recent[:-1])))
                 continue
             cur = Region(pending[0], [], source, "compiler listing", replacing="REPLACING" in pending[1].upper(),
                          system=system, statement=pending[1], line=lineno)
@@ -925,7 +927,7 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
     by_name: Dict[str, List[Region]] = defaultdict(list)
     unattached = 0
     lined_up = 0
-    look_untied: List[Tuple[str, int, int, str]] = []                   # (listing, untied line, program line before, its shape)
+    look_untied: List[Tuple[str, int, int, str, list]] = []             # (listing, untied line, program line before, its shape, lines before)
     columns: Counter = Counter()                                         # where the source starts, per listing
     t0 = last = time.time()
     for k, (path, system) in enumerate(sources, 1):
@@ -955,7 +957,7 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
             columns[(stats["source column"], bool(stats.get("ruler line")))] += 1
         if stats.get("untied") and len(look_untied) < 2:
             first = stats["untied"][0]                                  # type: ignore[index]
-            look_untied.append((path, first[0], first[1], first[2]))
+            look_untied.append((path, first[0], first[1], first[2], first[3]))
         if "lined up" in fmt:
             lined_up += 1
         for r in regions:
@@ -1058,15 +1060,14 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
     if look_untied or rejected:
         lines.append("\n## Please look\n\nOpen the listing named below in VS Code and go to the line (Ctrl+G). "
                      "Answer in words and numbers only - nothing from the file needs to be copied.\n")
-    for path, at, before, shape in look_untied:
+    for path, at, before, shape, recent in look_untied:
         lines.append(f"\n### Copied lines with no COPY statement found before them\n\n- listing: `{path}`\n"
                      f"- line {at}: the first copied line (a C after its line number) that nothing claimed\n"
                      f"- line {before}: the last program line before it; its shape (letters A, digits 9): `{shape}`\n"
-                     "- Questions: (1) is there a COPY statement on line " + str(before) + " or just above it? (2) at what "
-                     "column does the source record start on line " + str(at) + " (the first digit of its sequence number), "
-                     "and at what column does it start on the line with IDENTIFICATION DIVISION? (3) what exactly sits "
-                     "between the 6-digit line number and the record on line " + str(at) + " - the C and spaces, or "
-                     "something more?\n")
+                     "- the numbered lines just before it, as the tool read them (mark after the line number, then the "
+                     "record with letters A and digits 9):\n")
+        lines += [f"    - line {ln}: mark `{mark or '(none)'}`  record `{rec}`\n" for ln, mark, rec in recent]
+        lines.append("- Please paste these lines back as they are: they carry no names.\n")
     for name, why in rejected[:2]:
         lines.append(f"\n### Rejected block {name}\n\n- {why}\n- Questions: open the listing at that line: (1) at what "
                      "column does the copied record start there, against the column on the IDENTIFICATION DIVISION line? "
