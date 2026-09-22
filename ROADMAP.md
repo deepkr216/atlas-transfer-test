@@ -166,6 +166,34 @@ shipped alone and cost one such night; these still wait for the next one:
 13. Parser reach (from his coverage tables): dynamic CALL targets across
     members, `sql_cursor` declared in another member, INTRDR-submitted JCL
     through a card member, the MFS macros in his estate.
+14. **Value flow** - `flow FIELD`: one `data_flow` row per (source, target) a MOVE / COMPUTE /
+   STRING / CALL USING / WRITE FROM / SQL INTO moves data between, per-program field offsets
+   (`pfield`), `call_arg` / `param` tables, and a walk that labels every widening (group MOVE,
+   REDEFINES, subscripts, truncation at the landing field) and every stop instead of following
+   silently. Full plan: docs/PLAN-value-flow.md. His example: 'if I change a MOVE statement it
+   could have business impact through the calling tree - the tool cannot identify those'.
+15. **`ADD A B GIVING C` records C as read, not written** (also SUBTRACT / MULTIPLY / DIVIDE
+   ... GIVING, and RETURNING on a CALL is lost): `_ARITH` in cobol.py stops at TO/FROM/BY/INTO and
+   never sees GIVING, so `field C` lists the statement under 'read' and an impact search for who
+   sets C misses it. Found by the value-flow review (LESSONS 174); the fix is in the plan, step 2.4.
+
+## What the tool was not built for - scenario audit (2026-09-21)
+
+docs/AUDIT-scenarios-2026-09-21.md lists the scenarios a month of real analysis asks (change impact, abends,
+data fixes, audits) and marks each full / partial / none against the tool as it is, ranked by value for
+change-impact work. Three families are open: following a VALUE across renames (item 14 above closes most of
+it), ORDER IN TIME (which write is live at the CALL, which job ran before this one), and OVERLAP judgement
+(REDEFINES, group moves, truncation). Pick from that table; do not add to it from guesswork.
+14. **Value flow** - `flow FIELD`: one `data_flow` row per (source, target) a MOVE / COMPUTE /
+   STRING / CALL USING / WRITE FROM / SQL INTO moves data between, per-program field offsets
+   (`pfield`), `call_arg` / `param` tables, and a walk that labels every widening (group MOVE,
+   REDEFINES, subscripts, truncation at the landing field) and every stop instead of following
+   silently. Full plan: docs/PLAN-value-flow.md. His example: 'if I change a MOVE statement it
+   could have business impact through the calling tree - the tool cannot identify those'.
+15. **`ADD A B GIVING C` records C as read, not written** (also SUBTRACT / MULTIPLY / DIVIDE
+   ... GIVING, and RETURNING on a CALL is lost): `_ARITH` in cobol.py stops at TO/FROM/BY/INTO and
+   never sees GIVING, so `field C` lists the statement under 'read' and an impact search for who
+   sets C misses it. Found by the value-flow review (LESSONS 174); the fix is in the plan, step 2.4.
 
 ## What stays out of reach, by design
 
