@@ -128,7 +128,8 @@ only; `no` = not handled.
 
 Each of these touches a FACT_MODULES file, so each alone would cost a full
 re-parse of the estate; they ship together, when a parser improvement is
-worth the night anyway (LESSONS 153):
+worth the night anyway (LESSONS 153). The quoted-COPY fix of 2026-09-21 (LESSONS 173)
+shipped alone and cost one such night; these still wait for the next one:
 
 1. `load_skip_list` / `load_inventory_skips` cut a line at the first `#`, but
    `#` is a legal national character in a member name (the watchdog now stops

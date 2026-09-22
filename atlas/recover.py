@@ -69,7 +69,8 @@ RESOLVER_KINDS = ("copybook", "cobol", "sql", "unknown")          # what the bui
 MAX_SOURCE_BYTES = 64 * 1024 * 1024
 SHAPE_OK = 0.98                                                  # records that must look like 80-column source
 
-_COPY_KW = re.compile(r"(?<![A-Z0-9\-])(?:COPY|\+\+INCLUDE|-INC)\s+([A-Z0-9@#$][A-Z0-9@#$\-_]{0,9})(?![A-Z0-9\-])", re.I)
+# the name may be a literal (COPY 'NAME' - LESSONS 173): groups are (quote, name); the quote, if any, must close
+_COPY_KW = re.compile(r"(?<![A-Z0-9\-])(?:COPY|\+\+INCLUDE|-INC)\s+(['\"]?)([A-Z0-9@#$][A-Z0-9@#$\-_]{0,9})\1(?![A-Z0-9\-])", re.I)
 _SQL_INCLUDE = re.compile(r"(?<![A-Z0-9\-])EXEC\s+SQL\s+INCLUDE\s+([A-Z0-9@#$][A-Z0-9@#$\-_]{0,9})(?![A-Z0-9\-])", re.I)
 _EXEC_SQL = re.compile(r"(?<![A-Z0-9\-])EXEC\s+SQL\b", re.I)
 # the flag column after the line number is a run: C for a copied line, ** for a statement out of
@@ -81,9 +82,10 @@ _LISTING_SHAPE = re.compile(r"^[ 01\-+]?\s*\d{6}[^\s\d]*\s+\d{6}[ *\-/D]")
 _LISTING_HEAD = re.compile(r"^\s*LineID\s+PL\s+SL\b|IBM Enterprise COBOL|^1?PP\s+5655-", re.I | re.M)
 _RULER = re.compile(r"-{3,}\+-\*A")
 _NAME = re.compile(r"^[A-Z0-9@#$][A-Z0-9@#$\-_]{0,7}$")
+# marker comments: groups are (quote, name) - a commented-out COPY 'NAME'. is a marker too
 _START_MARK = re.compile(r"^\s*\*?\s*(?:\+\+INCLUDE|-INC|BEGIN(?:NING)?\s+(?:OF\s+)?COPY(?:BOOK)?|COPY(?:BOOK)?)\s+"
-                         r"([A-Z0-9@#$][A-Z0-9@#$\-_]{0,9})\b", re.I)
-_END_MARK = re.compile(r"^\s*\*?\s*END(?:\s+OF)?\s+(?:COPY(?:BOOK)?|INCLUDE)\b(?:\s+([A-Z0-9@#$][A-Z0-9@#$\-_]{0,9}))?", re.I)
+                         r"(['\"]?)([A-Z0-9@#$][A-Z0-9@#$\-_]{0,9})\1(?![A-Z0-9@#$\-_])", re.I)
+_END_MARK = re.compile(r"^\s*\*?\s*END(?:\s+OF)?\s+(?:COPY(?:BOOK)?|INCLUDE)\b(?:\s+(['\"]?)([A-Z0-9@#$][A-Z0-9@#$\-_]{0,9})\1)?", re.I)
 _HEADER = re.compile(r"^\s*(IDENTIFICATION|ID|ENVIRONMENT|DATA|PROCEDURE)\s+DIVISION\b|^\s*[A-Z0-9\-]+\s+SECTION\s*\.", re.I)
 _LEVEL = re.compile(r"^\s*(0[1-9]|[1-4]\d|66|77|88)\s+(?::[A-Z0-9]+:)?-?[A-Z0-9][A-Z0-9\-]*", re.I)
 _VERB = re.compile(r"\b(MOVE|PERFORM|IF|EVALUATE|CALL|READ|WRITE|REWRITE|DELETE|START|OPEN|CLOSE|COMPUTE|ADD|SUBTRACT|"
@@ -131,10 +133,16 @@ def copy_in(code: str) -> Optional[Tuple[str, str]]:
     """(name, statement text) when a COPY / INCLUDE statement starts in
     `code` - anywhere on the line, outside literals."""
     masked = expand._mask_literals(code)
-    m = _SQL_INCLUDE.search(masked) or _COPY_KW.search(masked)
-    if not m:
-        return None
-    return m.group(1).upper(), code[m.start():]
+    m = _SQL_INCLUDE.search(masked)
+    if m:
+        return m.group(1).upper(), code[m.start():]
+    for m in _COPY_KW.finditer(code):                                  # on the text itself: COPY 'NAME' is a literal
+        if masked[m.start():m.start() + 4].upper() != code[m.start():m.start() + 4].upper():
+            continue                                                   # the keyword sits inside a literal
+        if not m.group(1) and masked[m.start(2):m.end(2)].upper() != m.group(2).upper():
+            continue                                                   # a bare "name" that is the inside of a literal
+        return m.group(2).upper(), code[m.start():]
+    return None
 
 
 def _is_comment(rec: str) -> bool:
@@ -512,7 +520,7 @@ def from_markers(records: Sequence[str], source: str, system: Optional[str]) -> 
             if m_start:
                 if cur is not None:
                     regions.append(cur)
-                cur = Region(m_start.group(1), [], source, "marker comments", end_guessed=True, trusted=False,
+                cur = Region(m_start.group(2), [], source, "marker comments", end_guessed=True, trusted=False,
                              system=system, suspect="the end of the block was guessed (no END marker)")
                 continue
             if cur is not None:

@@ -213,6 +213,38 @@ class Formats(unittest.TestCase):
         regions, stats = recover.from_ibm_listing(lines, "X.lst", None)
         self.assertEqual([(r.name, len(r.records)) for r in regions], [("POLDCL", 2)], stats)
 
+    def test_a_commented_out_copy_with_a_quoted_name_is_a_marker(self):
+        # found in review: the marker-comment method bypassed copy_in and still took only a bare name
+        for echo in ("000200*          COPY PMASTREC.", "000200*          COPY 'PMASTREC'.", '000200*          COPY "PMASTREC".',
+                     "000200*          BEGIN COPY 'PMASTREC'"):
+            records = ["000100 01  WS-REC.", echo,
+                       "000300     05  PM-POLICY-NO            PIC X(12).",
+                       "000400     05  PM-POLICY-STATUS        PIC X(02).",
+                       "000500* END COPY 'PMASTREC'",
+                       "000600 01  WS-AFTER                   PIC X."]
+            regions = recover.from_markers(records, "X.exp", None)
+            self.assertEqual([(r.name, len(r.records), r.end_guessed) for r in regions], [("PMASTREC", 2, False)], echo)
+
+    def test_a_lone_carriage_control_line_before_or_after_the_copy_is_ignored(self):
+        # 'in some cases the line just before the COPY statement has only a number like 1 or 0 in the first
+        # column' (2026-09-21): the ASA carriage control the download kept, printed on a line of its own
+        for before, after in (("0", "0"), ("1", "1"), ("1", "0"), ("0", "")):
+            lines = [BANNER.format(page=1), RULER,
+                     "   000001         000100 IDENTIFICATION DIVISION.",
+                     "   000002         000200 PROGRAM-ID. TESTPGM.",
+                     "   000003         000300 DATA DIVISION.",
+                     "   000004         000400 WORKING-STORAGE SECTION.",
+                     before,
+                     "   000005  FRAUDM        COPY 'POLDCL'.",                 # a change tag in columns 1-6, the name in quotes
+                     after,
+                     "   000006C        000100 01  POLICY-DCL.",
+                     "0",
+                     "   000007C        000200     05  POL-NUMBER              PIC X(12).",
+                     "   000008         000700 PROCEDURE DIVISION."]
+            regions, stats = recover.from_ibm_listing(lines, "X.lst", None)
+            self.assertEqual([(r.name, len(r.records)) for r in regions], [("POLDCL", 2)], (before, after, stats))
+            self.assertEqual(stats.get("flagged lines with no COPY before them", 0), 0, (before, after, stats))
+
     def test_an_untied_line_says_why_the_tool_had_no_copy_in_hand(self):
         lines = [BANNER.format(page=1), RULER,
                  "   000001         000100 IDENTIFICATION DIVISION.",
@@ -633,9 +665,9 @@ class EndToEnd(unittest.TestCase):
             os.chdir(cwd)
 
     def test_the_report_names_a_listing_and_a_line_to_look_at_when_copied_lines_are_untied(self):
-        # a listing whose COPY statements are written in a way the tool cannot read: every copied line is untied
+        # a listing where the copied lines follow no COPY statement the tool can read: every copied line is untied
         text = ibm_listing(records_of(os.path.join(FIX, "SAMPPGM.cbl")), {"PMASTREC": self.pmast, "POLDCL": POLDCL.splitlines()})
-        text = text.replace("COPY PMASTREC.", "COPY 'PMASTREC'.").replace("COPY POLDCL.", "COPY 'POLDCL'.")
+        text = text.replace("COPY PMASTREC.", "CONTINUE.     ").replace("COPY POLDCL.", "CONTINUE.   ")
         odd = os.path.join(self.lst, "ODDPGM.lst")
         with open(odd, "w", encoding="utf-8") as fh:
             fh.write(text)
@@ -655,13 +687,32 @@ class EndToEnd(unittest.TestCase):
         self.assertRegex(file_lines[int(m.group(1)) - 1], r"^\s*\d{6}C\s", "the line named is a copied line")
         m2 = re.search(r"- line (\d+): the last program line before it; its shape \(letters A, digits 9\): `(.*)`", rep)
         self.assertIsNotNone(m2, rep)
-        self.assertIn("AAAA 'AAAAAAAA'", m2.group(2), "the COPY line, masked")
+        self.assertIn("AAAAAAAA.", m2.group(2), "the line before the block, masked")
         self.assertNotIn("PMASTREC", m2.group(2))
         self.assertIn("the numbered lines just before it, as the tool read them", rep)
         self.assertRegex(rep, r"- why the tool had no COPY in hand: the last program line, \d+, holds no COPY statement the tool recognises")
         marks = re.findall(r"    - line \d+: mark `(.*?)`  record `(.*?)`", rep)
         self.assertGreaterEqual(len(marks), 1, rep)
-        self.assertIn(("(none)", "999999     AAAA 'AAAAAAAA'."), [(m, r.rstrip()) for m, r in marks], marks)
+        self.assertIn(("(none)", "999999     AAAAAAAA."), [(m, r.rstrip()) for m, r in marks], marks)
+
+    def test_a_copybook_name_in_quotes_ties_the_copied_lines(self):
+        # 'If the copybook after the COPY statement is in single quotes, are you handling that?' (2026-09-21) - no,
+        # and that was his 40,797 untied lines: the literal mask blanked the name and no COPY was seen
+        pmast = records_of(os.path.join(FIX, "PMASTREC.cpy"))
+        text = ibm_listing(list(PROG), {"PMASTREC": pmast, "POLDCL": POLDCL.splitlines()})
+        text = text.replace("COPY PMASTREC.", "COPY 'PMASTREC'.").replace("COPY POLDCL.", 'COPY "POLDCL".')
+        self.assertIn("COPY 'PMASTREC'.", text)
+        fmt, regions, stats = recover.extract(text, "TESTPGM.lst", set())
+        self.assertEqual(fmt, "compiler listing", stats)
+        by = {r.name: r for r in regions}
+        self.assertEqual(set(by), {"PMASTREC", "POLDCL"}, stats)
+        self.assertEqual(stats.get("flagged lines with no COPY before them", 0), 0, stats)
+        self.assertEqual([r.rstrip() for r in by["PMASTREC"].records], [r.rstrip() for r in pmast])
+        self.assertEqual(by["POLDCL"].statement.strip(), 'COPY "POLDCL".')
+        # the keyword inside a literal is still text; an unclosed quote is not a name
+        self.assertIsNone(recover.copy_in("           DISPLAY 'COPY PMASTREC FAILED'."))
+        self.assertIsNone(recover.copy_in("           COPY 'PMASTREC."))
+        self.assertEqual(recover.copy_in("           DISPLAY 'X' COPY 'PMASTREC'."), ("PMASTREC", "COPY 'PMASTREC'."))
 
     def test_trace_shows_what_the_tool_sees_in_one_listing_as_numbers_only(self):
         out = io.StringIO()

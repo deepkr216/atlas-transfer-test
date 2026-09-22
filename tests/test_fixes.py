@@ -92,6 +92,64 @@ class ErrorCodeTracing(unittest.TestCase):
         self.assertEqual(call.using_args, ["WS-ERR-CD", "WS-AMT"])
 
 
+class QuotedCopyNames(unittest.TestCase):
+    """COPY 'NAME' is legal COBOL and some shops write every COPY that way
+    (LESSONS 173). The parser saw only bare names: no copy_use row, so the
+    copybook was never resolved, never expanded and never reported missing."""
+
+    def test_the_parser_records_a_quoted_copy_like_a_bare_one(self):
+        f = cobol.parse_program("\n".join([
+            "       IDENTIFICATION DIVISION.",
+            "       PROGRAM-ID. QPGM.",
+            "       DATA DIVISION.",
+            "       WORKING-STORAGE SECTION.",
+            "       01  WS-A.",
+            "           COPY 'QREC1'.",
+            "       01  WS-B.",
+            '           COPY "QREC2" OF \'QLIB\'.',
+            "       01  WS-C.",
+            "           COPY 'QREC3' REPLACING ==:P:== BY ==WS==.",
+            "       01  WS-D.",
+            "           COPY QREC4.",
+            "       PROCEDURE DIVISION.",
+            "           DISPLAY 'COPY NOPE FAILED'.",
+            "           GOBACK.",
+        ]) + "\n")
+        by = {c[0]: c for c in f.copies}
+        self.assertEqual(set(by), {"QREC1", "QREC2", "QREC3", "QREC4"}, f.copies)
+        self.assertEqual(by["QREC2"][1], "QLIB")
+        self.assertIn("REPLACING", by["QREC3"][2] or "")
+        self.assertTrue(any(u[0] == "copy_replacing" and "QREC3" in u[1] for u in f.unresolved), f.unresolved)
+
+    def test_national_characters_suppress_and_a_literal_that_swallows_the_sentence(self):
+        # found in review: the parser's data-name class has no @ # $, so COPY '#REC'. was still invisible and
+        # COPY A@REC. was truncated to A; SUPPRESS before REPLACING lost the REPLACING; and a rejected match
+        # inside a literal, with a REPLACING tail running to the end of the sentence, hid a real COPY after it
+        f = cobol.parse_program("\n".join([
+            "       IDENTIFICATION DIVISION.",
+            "       PROGRAM-ID. QPGM.",
+            "       DATA DIVISION.",
+            "       WORKING-STORAGE SECTION.",
+            "           COPY '#REC1'.",
+            "           COPY $REC2.",
+            "           COPY 'A@REC3' OF '#LIB'.",
+            "           COPY REC4 SUPPRESS REPLACING ==A== BY ==B==.",
+            "       PROCEDURE DIVISION.",
+            "           DISPLAY 'COPY X REPLACING' COPY 'REC5'.",
+            "           DISPLAY 'COPY Y REPLACING' COPY REC6.",
+            "           GOBACK.",
+        ]) + "\n")
+        by = {c[0]: c for c in f.copies}
+        self.assertEqual(set(by), {"#REC1", "$REC2", "A@REC3", "REC4", "REC5", "REC6"}, f.copies)
+        self.assertEqual(by["A@REC3"][1], "#LIB")
+        self.assertIn("REPLACING", by["REC4"][2] or "")
+
+    def test_an_unclosed_quote_is_not_a_copy_name(self):
+        f = cobol.parse_program("       IDENTIFICATION DIVISION.\n       PROGRAM-ID. QPGM.\n       DATA DIVISION.\n"
+                                "       WORKING-STORAGE SECTION.\n           COPY 'QREC1.\n")
+        self.assertEqual([c[0] for c in f.copies], [], f.copies)
+
+
 class JclDirection(unittest.TestCase):
     JCL = "\n".join([
         "//T1       JOB (A),'X'",
@@ -221,6 +279,31 @@ class CopybookExpansion(unittest.TestCase):
         self.assertEqual(res.origin(after)[:2], (1, 3))        # program line 3, despite the shift
         self.assertEqual(res.copies[0][:2], ("REC1", None))
         self.assertEqual(res.copies[0][4], 2)
+
+    def test_a_copybook_name_in_quotes_is_expanded_like_a_bare_one(self):
+        # his shop writes COPY 'NAME'. (LESSONS 173): the name is a literal and the literal mask blanked it,
+        # so the whole index was blind to those copybooks - no copy_use row, no fields, no warning
+        cb = self._lines("\n".join([
+            "           05  :X:-FIELD-A   PIC X(5).",
+            "           05  :X:-FIELD-B   PIC 9(3).",
+        ]))
+        resolver = lambda name, lib: (2, cb, None) if name == "REC1" else None  # noqa: E731
+        for stmt in ("           COPY 'REC1'.", '           COPY "REC1".', "           COPY 'REC1' OF 'MYLIB'.",
+                     "           COPY 'REC1' REPLACING ==:X:== BY ==WS==."):
+            res = expand.expand(self._lines("       01  WS-REC.\n" + stmt + "\n       01  WS-AFTER PIC X.\n"), 1, resolver)
+            text = expand.expanded_text(res)
+            self.assertIn("FIELD-A", text, stmt)
+            self.assertEqual(res.copies[0][0], "REC1", stmt)
+            self.assertEqual(res.copies[0][4], 2, stmt)
+            self.assertFalse(res.warnings, (stmt, res.warnings))
+        self.assertTrue((res.copies[0][2] or "").startswith("==:X:== BY ==WS=="), res.copies[0])
+        self.assertIn("WS-FIELD-A", text)
+        res = expand.expand(self._lines("           COPY 'REC1' OF 'MYLIB'.\n"), 1, resolver)
+        self.assertEqual(res.copies[0][1], "MYLIB")
+        # a COPY inside a literal is still text
+        res = expand.expand(self._lines("           DISPLAY 'COPY REC1 FAILED'.\n           DISPLAY 'X' COPY 'REC1'.\n"), 1, resolver)
+        self.assertEqual([c[0] for c in res.copies], ["REC1"])
+        self.assertEqual(res.copies[0][3], 2, "the second line, not the DISPLAY")
 
     def test_missing_copybook_is_a_warning_not_silence(self):
         prog = self._lines("           COPY NOPE.\n")

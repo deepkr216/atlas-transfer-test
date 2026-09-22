@@ -29,11 +29,28 @@ from .reader import Line, find_terminator
 
 B = r"(?<![A-Z0-9\-])"
 E = r"(?![A-Z0-9\-])"
-_COPY_START = re.compile(B + r"(COPY|\+\+INCLUDE|-INC)\s+([A-Z0-9@#$][A-Z0-9@#$\-_]{0,9})", re.I)
+# the text-name may be a literal - COPY 'NAME' is legal and some shops write every COPY that way
+# (LESSONS 173): groups are (keyword, quote, name); the quote, if any, must close
+_COPY_START = re.compile(B + r"(COPY|\+\+INCLUDE|-INC)\s+(['\"]?)([A-Z0-9@#$][A-Z0-9@#$\-_]{0,9})\2", re.I)
 _SQL_INCLUDE_START = re.compile(B + r"EXEC\s+SQL\s+INCLUDE\s+([A-Z0-9@#$][A-Z0-9@#$\-_]{0,9})", re.I)
 _COPY_FULL = re.compile(
-    B + r"COPY\s+([A-Z0-9@#$][A-Z0-9@#$\-_]{0,9})(?:\s+(?:OF|IN)\s+([A-Z0-9@#$\-_]+))?"
+    B + r"COPY\s+(['\"]?)([A-Z0-9@#$][A-Z0-9@#$\-_]{0,9})\1(?:\s+(?:OF|IN)\s+(['\"]?)([A-Z0-9@#$\-_]+)\3)?"
     r"(?:\s+SUPPRESS)?(?:\s+REPLACING\s+(.*))?\s*\.?\s*$", re.I | re.S)
+
+
+def find_copy_start(code: str, masked: str):
+    """The COPY / ++INCLUDE / -INC statement in `code`, its name bare or in
+    quotes. `masked` is `code` with its literals blanked: a bare name is found
+    there (DISPLAY 'COPY FAILED' is text, not a statement); a quoted name is a
+    literal and is blanked too, so it is looked for in `code` itself - and
+    taken only when the keyword before it was not inside a literal."""
+    for m in _COPY_START.finditer(code):
+        if masked[m.start(1):m.end(1)].upper() != m.group(1).upper():
+            continue                                                   # the keyword sits inside a literal
+        if not m.group(2) and masked[m.start(3):m.end(3)].upper() != m.group(3).upper():
+            continue                                                   # a bare "name" that is the inside of a literal
+        return m
+    return None
 _PSEUDO = re.compile(r"==(.*?)==", re.S)
 _SYSTEM_INCLUDES = {"SQLCA", "SQLDA"}
 
@@ -216,7 +233,7 @@ def expand(lines: Sequence[Line], member_id: int, resolver: Resolver,
             continue
 
         masked = _mask_literals(code)
-        m = _COPY_START.search(masked)
+        m = find_copy_start(code, masked)
         msql = _SQL_INCLUDE_START.search(masked)
         if not m and not msql:
             emit(ln, code, member_id, ln.no, depth)
@@ -243,9 +260,9 @@ def expand(lines: Sequence[Line], member_id: int, resolver: Resolver,
         else:
             mf = _COPY_FULL.search(stmt)
             if mf:
-                name, lib, rep_text = mf.group(1).upper(), (mf.group(2) or None), (mf.group(3) or None)
+                name, lib, rep_text = mf.group(2).upper(), (mf.group(4) or None), (mf.group(5) or None)
             else:
-                name, lib, rep_text = m.group(2).upper(), None, None
+                name, lib, rep_text = m.group(3).upper(), None, None
 
         # The COPY statement itself stays in the output as a comment line so
         # that line accounting for the including member is preserved.

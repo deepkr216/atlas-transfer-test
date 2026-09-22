@@ -56,8 +56,13 @@ _CANCEL = re.compile(B + r"CANCEL\s+(['\"])([^'\"]+)\1", re.IGNORECASE)
 _USING = re.compile(r"\bUSING\b(.*?)(?:\bRETURNING\b|\bON\s+EXCEPTION\b|$)",
                     re.IGNORECASE | re.DOTALL)
 
+# the text-name may be a literal: COPY 'NAME' and COPY "NAME" OF 'LIB' are legal and some shops
+# write every COPY that way (LESSONS 173) - the quote, if any, must close. A member name may hold
+# the national characters @ # $ (like _LIB_INCLUDE below), which a data-name (ID) may not
+TEXT_NAME = r"[A-Z0-9@#$][A-Z0-9@#$\-_]*"
 _COPY = re.compile(
-    B + rf"COPY\s+({ID})(?:\s+(?:OF|IN)\s+({ID}))?(?P<rep>\s+REPLACING" + E + r".*)?",
+    B + rf"COPY\s+(?P<q>['\"]?)(?P<name>{TEXT_NAME})(?P=q)(?:\s+(?:OF|IN)\s+(?P<q2>['\"]?)(?P<lib>{TEXT_NAME})(?P=q2))?"
+    r"(?:\s+SUPPRESS)?(?P<rep>\s+REPLACING" + E + r".*)?",
     re.IGNORECASE)
 # EXEC SQL INCLUDE is how every DCLGEN host structure arrives; a COPY-only
 # pattern misses all of them and the DB2 column-to-field mapping goes dark.
@@ -561,19 +566,35 @@ def _parse_using(body: str) -> List[str]:
 # other extractors
 # --------------------------------------------------------------------------
 
+_LIT_MASK = re.compile(r"'(?:[^']|'')*'|\"(?:[^\"]|\"\")*\"")
+
+
 def _extract_copy(f: ProgramFacts, st: LogicalLine) -> None:
     for m in _SQL_INCLUDE.finditer(st.text):
         f.copies.append((m.group(1).upper(), None, None, st.start))
-    for m in _COPY.finditer(st.text):
+    # literals blanked, same length: DISPLAY 'COPY FAILED' is text, not a COPY - but the name itself may be a
+    # literal (COPY 'NAME'), so the statement is matched on the text and checked against the mask
+    masked = _LIT_MASK.sub(lambda mm: " " * len(mm.group(0)), st.text)
+    pos = 0
+    while True:
+        m = _COPY.search(st.text, pos)
+        if not m:
+            break
+        pos = m.end()
+        if masked[m.start():m.start() + 4].upper() != st.text[m.start():m.start() + 4].upper() or (
+                not m.group("q") and masked[m.start("name"):m.end("name")].upper() != m.group("name").upper()):
+            pos = m.start() + 4                                    # the keyword or the bare name sits inside a literal:
+            continue                                               # look again right after it (its REPLACING tail may
+                                                                   # have swallowed a real COPY later in the sentence)
         rep = m.group("rep")
-        f.copies.append((m.group(1).upper(),
-                         m.group(2).upper() if m.group(2) else None,
+        f.copies.append((m.group("name").upper(),
+                         m.group("lib").upper() if m.group("lib") else None,
                          rep.strip() if rep else None,
                          st.start))
         if rep:
             f.unresolved.append((
                 "copy_replacing",
-                f"COPY {m.group(1).upper()} REPLACING - field names in this "
+                f"COPY {m.group('name').upper()} REPLACING - field names in this "
                 f"program differ from the copybook as stored; expand before "
                 f"trusting field-level results",
                 st.start))
