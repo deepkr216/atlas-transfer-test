@@ -20,6 +20,7 @@ trusting any answer built on the index.
 from __future__ import annotations
 
 import argparse
+import bisect
 import ctypes
 import faulthandler
 import hashlib
@@ -31,7 +32,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass, replace
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from . import classify, cobol, copybook, docs, expand, ims, jcl, reader, screens, txn
 from .reader import Line
@@ -423,7 +424,9 @@ def open_db(path: str, rebuild: bool = False) -> sqlite3.Connection:
                              ("dataset", "recordsize_max", "INTEGER"), ("dataset", "key_len", "INTEGER"),
                              ("dataset", "key_off", "INTEGER"), ("dataset", "gdg_limit", "INTEGER"),
                              ("dataset", "relates_to", "TEXT"), ("build_run", "fingerprint", "TEXT"),
-                             ("build_run", "manifest_sha", "TEXT")):
+                             ("build_run", "manifest_sha", "TEXT"),
+                             ("field_ref", "pfield_id", "INTEGER"), ("call_edge", "returning_item", "TEXT"),
+                             ("sql_col_ref", "pfield_id", "INTEGER")):
         _ensure_column(conn, table, col, decl)
     with open(os.path.join(HERE, "schema.sql"), "r", encoding="utf-8") as fh:
         conn.executescript(fh.read())
@@ -537,7 +540,6 @@ def _forget_member(conn: sqlite3.Connection, mid: int) -> None:
     OTHER members that only reference it, which a cascade cannot reach."""
     conn.execute("UPDATE copy_use SET resolved_member_id=NULL WHERE resolved_member_id=?", (mid,))
     conn.execute("DELETE FROM expand_run WHERE src_member=?", (mid,))
-    conn.execute("DELETE FROM expand_map WHERE src_member=?", (mid,))
     conn.execute("DELETE FROM db2_object WHERE member_id=?", (mid,))
     if fts_legacy(conn):
         conn.execute("DELETE FROM src_fts WHERE member_id=?", (mid,))
@@ -566,7 +568,6 @@ def _forget_members(conn: sqlite3.Connection, mids: Sequence[int], progress: Opt
     legacy = fts_legacy(conn)
     steps = [("copybook references", f"UPDATE copy_use SET resolved_member_id=NULL WHERE resolved_member_id IN {ids}"),
              ("copybook expansion runs", f"DELETE FROM expand_run WHERE src_member IN {ids}"),
-             ("expansion map", f"DELETE FROM expand_map WHERE src_member IN {ids}"),
              ("DB2 objects", f"DELETE FROM db2_object WHERE member_id IN {ids}")]
     for label, sql in steps:
         if progress:
@@ -1318,6 +1319,29 @@ def index_cobol(ctx: Ctx, mem: Mem) -> None:
         "VALUES(?,?,?,?,?,?,?)",
         [(pid, r.exp_start, r.exp_end, r.src_member, r.src_start, r.depth, r.via_copy) for r in exp.runs])
 
+    # Fields: keep this program's own data items, plus any copybook brought in
+    # with REPLACING (its names are program-specific). Plain copybook fields
+    # are reached through copy_use -> the copybook's own field rows.
+    replaced = {name for (name, _l, rep, _ln, _r) in exp.copies if rep}
+    logical = reader.join_cobol_continuations(exp.lines)
+    roots, warns = copybook.parse_data_division(logical)
+    keep: List[copybook.Field] = []
+    for fld in copybook.flatten(roots):
+        if fld.name == copybook.SYNTHETIC_ROOT:
+            continue
+        run = exp.run_at(fld.line)
+        depth = run.depth if run else 0
+        if depth == 0 or (run and run.via_copy in replaced):
+            keep.append(fld)
+    _insert_fields(conn, mem.id, keep)
+    conn.executemany(
+        "INSERT INTO literal_ref(member_id,program_id,literal,context,field,line) VALUES(?,?,?,?,?,?)",
+        [(mem.id, pid, lit, ctxt, fld, ln) for (lit, ctxt, fld, ln)
+         in _group_value_literals(copybook.flatten(roots))])
+    # The same tree at THIS program's offsets, so every reference below can
+    # link to the item it names (docs/PLAN-value-flow.md section 3).
+    scope = _index_pfields(conn, pid, exp, facts, roots, _flow_names(facts))
+
     conn.executemany(
         "INSERT INTO paragraph(program_id,section,name,start_line,end_line,ordinal,kind) VALUES(?,?,?,?,?,?,?)",
         [(pid, p.section, p.name, p.start_line, p.end_line, p.ordinal, p.kind) for p in facts.paragraphs])
@@ -1344,24 +1368,70 @@ def index_cobol(ctx: Ctx, mem: Mem) -> None:
         if not conn.execute("SELECT 1 FROM db2_column WHERE object_id=? LIMIT 1", (oid,)).fetchone():
             conn.executemany("INSERT INTO db2_column(object_id,ordinal,name,type) VALUES(?,?,?,?)",
                              [(oid, i, c, t) for i, (c, t) in enumerate(cols, 1)])
-    conn.executemany(
-        "INSERT INTO call_edge(program_id,kind,target,via_var,resolved,resolution,using_args,line) "
-        "VALUES(?,?,?,?,?,?,?,?)",
-        [(pid, c.kind, c.target, c.via_var, _j(c.resolved), c.resolution, _j(c.using_args), c.line)
-         for c in facts.calls])
+    # field_ref keeps no qualifier (its names come from the OF/IN-blanked text):
+    # a twice-declared name it holds is picked by the data_flow / call_arg row
+    # of the same line and mode, which was resolved WITH the qualifier
+    picked: Dict[Tuple[int, str, str], int] = {}
     for c in facts.calls:
+        cur = conn.execute(
+            "INSERT INTO call_edge(program_id,kind,target,via_var,resolved,resolution,using_args,line,returning_item) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
+            (pid, c.kind, c.target, c.via_var, _j(c.resolved), c.resolution, _j(c.using_args), c.line, c.returning))
+        if c.args:
+            # the caller side of each argument: position, how it is passed, the item
+            rows = []
+            for a in c.args:
+                pf = scope.resolve(a.name, a.quals, c.line)
+                if pf is not None and a.quals:
+                    picked.setdefault((c.line, a.name, "read"), pf)
+                    picked.setdefault((c.line, a.name, "write"), pf)
+                rows.append((cur.lastrowid, pid, a.pos, a.name, " OF ".join(a.quals) or None, pf, a.sub, a.how))
+            conn.executemany(
+                "INSERT INTO call_arg(call_id,program_id,pos,name,qual,pfield,sub,how) VALUES(?,?,?,?,?,?,?,?)", rows)
         ctx.bump("calls:" + ("unresolved" if c.resolution == "unresolved" else c.kind))
+    # the callee side: PROCEDURE DIVISION USING (entry NULL), RETURNING at pos 0,
+    # each ENTRY under its alias, and a LINKAGE 01 DFHCOMMAREA as the CICS convention
+    params: List[Tuple[Optional[str], int, str]] = [(None, i, n) for i, n in enumerate(facts.linkage_using, 1)]
+    if facts.returning:
+        params.append((None, 0, facts.returning))
+    for (alias, using, _ln) in facts.entries:
+        params.extend((alias, i, n) for i, n in enumerate(using, 1))
+    if facts.uses_cics and "DFHCOMMAREA" in scope.linkage_roots:
+        params.append(("DFHCOMMAREA", 1, "DFHCOMMAREA"))
+    conn.executemany(
+        "INSERT INTO param(program_id,entry,pos,name,pfield) VALUES(?,?,?,?,?)",
+        [(pid, entry, pos, n, scope.resolve(n)) for (entry, pos, n) in params])
+    flow_rows = []
+    for fl in facts.flows:
+        src = scope.resolve(fl.src_name, fl.src_qual, fl.line)
+        dst = scope.resolve(fl.dst_name, fl.dst_qual, fl.line)
+        if src is not None and fl.src_qual:
+            picked.setdefault((fl.line, fl.src_name, "read"), src)
+        if dst is not None and fl.dst_qual:
+            picked.setdefault((fl.line, fl.dst_name, "write"), dst)
+        flow_rows.append((pid, fl.line, fl.verb, fl.kind, fl.src_name, fl.src_qual, src, fl.src_sub, fl.src_refmod,
+                          fl.src_lit, fl.dst_name, fl.dst_qual, dst, fl.dst_sub, fl.dst_refmod, fl.ordinal, fl.note,
+                          fl.guard))
+    conn.executemany(
+        "INSERT INTO data_flow(program_id,line,verb,kind,src_name,src_qual,src_pfield,src_sub,src_refmod,src_lit,"
+        "dst_name,dst_qual,dst_pfield,dst_sub,dst_refmod,ordinal,note,guard) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", flow_rows)
 
     conn.executemany(
         "INSERT INTO copy_use(member_id,copybook,of_library,replacing,line,resolved_member_id) "
         "VALUES(?,?,?,?,?,?)",
         [(mem.id, name, lib, rep, ln, rid) for (name, lib, rep, ln, rid) in exp.copies])
 
-    conn.executemany(
-        "INSERT INTO file_decl(program_id,select_name,assign_dd,organization,access_mode,record_key,"
-        "alt_keys,fd_record,line) VALUES(?,?,?,?,?,?,?,?,?)",
-        [(pid, f.select_name, f.assign_dd, f.organization, f.access_mode, f.record_key,
-          _j(f.alt_keys), f.fd_record, f.line) for f in facts.files])
+    for f in facts.files:
+        cur = conn.execute(
+            "INSERT INTO file_decl(program_id,select_name,assign_dd,organization,access_mode,record_key,"
+            "alt_keys,fd_record,line) VALUES(?,?,?,?,?,?,?,?,?)",
+            (pid, f.select_name, f.assign_dd, f.organization, f.access_mode, f.record_key,
+             _j(f.alt_keys), f.fd_record, f.line))
+        # every 01 under the FD, in order - fd_record keeps only the first
+        conn.executemany(
+            "INSERT INTO file_record(file_id,program_id,ordinal,name,pfield) VALUES(?,?,?,?,?)",
+            [(cur.lastrowid, pid, i, n, scope.resolve(n, None, f.line)) for i, n in enumerate(f.fd_records, 1)])
     conn.executemany(
         "INSERT INTO io_op(program_id,target,target_kind,op,line) VALUES(?,?,?,?,?)",
         [(pid, t, k, op, ln) for (t, k, op, ln) in facts.io_ops])
@@ -1388,34 +1458,15 @@ def index_cobol(ctx: Ctx, mem: Mem) -> None:
         "INSERT INTO interface_edge(member_id,kind,detail,direction,line) VALUES(?,?,?,?,?)",
         [(mem.id, "ims_msw", f"CHNG destination {d.dest}", "out", d.line) for d in facts.dli if d.dest])
     conn.executemany(
-        "INSERT INTO field_ref(program_id,name,mode,stmt,line) VALUES(?,?,?,?,?)",
-        [(pid, n, mode, stmt, ln) for (n, mode, stmt, ln) in facts.field_refs])
+        "INSERT INTO field_ref(program_id,name,mode,stmt,line,pfield_id) VALUES(?,?,?,?,?,?)",
+        [(pid, n, mode, stmt, ln, picked.get((ln, n, mode)) or scope.resolve(n, None, ln))
+         for (n, mode, stmt, ln) in facts.field_refs])
     conn.executemany(
         "INSERT INTO literal_ref(member_id,program_id,literal,context,field,line) VALUES(?,?,?,?,?,?)",
         [(mem.id, pid, lit, ctxt, fld, ln) for (lit, ctxt, fld, ln) in facts.literal_refs])
     conn.executemany(
-        "INSERT INTO sql_col_ref(program_id,tbl,col,host_var,mode,stmt,line) VALUES(?,?,?,?,?,?,?)",
-        [(pid, t, c, h, m, s, ln) for (t, c, h, m, s, ln) in facts.sql_cols])
-
-    # Fields: keep this program's own data items, plus any copybook brought in
-    # with REPLACING (its names are program-specific). Plain copybook fields
-    # are reached through copy_use -> the copybook's own field rows.
-    replaced = {name for (name, _l, rep, _ln, _r) in exp.copies if rep}
-    logical = reader.join_cobol_continuations(exp.lines)
-    roots, warns = copybook.parse_data_division(logical)
-    keep: List[copybook.Field] = []
-    for fld in copybook.flatten(roots):
-        if fld.name == copybook.SYNTHETIC_ROOT:
-            continue
-        run = exp.run_at(fld.line)
-        depth = run.depth if run else 0
-        if depth == 0 or (run and run.via_copy in replaced):
-            keep.append(fld)
-    _insert_fields(conn, mem.id, keep)
-    conn.executemany(
-        "INSERT INTO literal_ref(member_id,program_id,literal,context,field,line) VALUES(?,?,?,?,?,?)",
-        [(mem.id, pid, lit, ctxt, fld, ln) for (lit, ctxt, fld, ln)
-         in _group_value_literals(copybook.flatten(roots))])
+        "INSERT INTO sql_col_ref(program_id,tbl,col,host_var,mode,stmt,line,pfield_id) VALUES(?,?,?,?,?,?,?,?)",
+        [(pid, t, c, h, m, s, ln, scope.resolve_host(h, ln)) for (t, c, h, m, s, ln) in facts.sql_cols])
 
     # SELECT * INTO :DCLPOLICY / SELECT a,b,c INTO :GROUP: the columns land in
     # the group's elementary children in order (the DCLGEN idiom). Without
@@ -1455,12 +1506,28 @@ def index_cobol(ctx: Ctx, mem: Mem) -> None:
                 if cc:
                     pairs.append((cc, h))
         conn.executemany(
-            "INSERT INTO sql_col_ref(program_id,tbl,col,host_var,mode,stmt,line) VALUES(?,?,?,?,?,?,?)",
-            [(pid, t, c, h, "read", stmt + " (positional via group)", ln) for ((t, c), h) in pairs])
+            "INSERT INTO sql_col_ref(program_id,tbl,col,host_var,mode,stmt,line,pfield_id) VALUES(?,?,?,?,?,?,?,?)",
+            [(pid, t, c, h, "read", stmt + " (positional via group)", ln, scope.resolve(h, None, ln))
+             for ((t, c), h) in pairs])
         conn.executemany(
-            "INSERT INTO field_ref(program_id,name,mode,stmt,line) VALUES(?,?,?,?,?)",
-            [(pid, h, "write", "EXEC-SQL", ln) for (_tc, h) in pairs])
+            "INSERT INTO field_ref(program_id,name,mode,stmt,line,pfield_id) VALUES(?,?,?,?,?,?)",
+            [(pid, h, "write", "EXEC-SQL", ln, scope.resolve(h, None, ln)) for (_tc, h) in pairs])
 
+    for name, (ln, decls) in scope.ambiguous.items():
+        notes.append(("ambiguous_field",
+                      f"{name} is declared {len(decls)} times in this program ({', '.join(decls)}); a reference "
+                      f"without a qualifier that picks one gets no pfield link and `flow` does not follow it", ln))
+    hit = scope.used & scope.pruned
+    if hit:
+        # a reference resolved into a root stored without its children: the
+        # pruning rule and _flow_names disagree, and `flow` would stop there
+        names = sorted(scope.name_of[i] for i in hit)
+        notes.append(("flow_pruned", f"{len(hit)} pruned root(s) are referenced ({', '.join(names[:8])}): "
+                                     "the pruning rule missed a reference source - fix _flow_names", 0))
+    if facts.uses_cics and "DFHCOMMAREA" not in scope.linkage_roots \
+            and any(n in ("DFHCOMMAREA", "EIBCALEN") for (n, _m, _s, _l) in facts.field_refs):
+        notes.append(("no_commarea", "CICS program tests EIBCALEN / DFHCOMMAREA but declares no 01 DFHCOMMAREA in "
+                                     "LINKAGE: a LINK or XCTL into it cannot be followed by bytes", 0))
     for w in warns:
         if "SYNC" in w or "not compile" in w:
             notes.append(("layout_warning", w, 0))
@@ -1526,6 +1593,191 @@ def _insert_fields(conn: sqlite3.Connection, member_id: int, fields: List[copybo
         for (name, vals, ln) in f.conds:
             conn.execute("INSERT INTO cond88(field_id,name,values_lit,line) VALUES(?,?,?,?)",
                          (cur.lastrowid, name, _j(vals), ln))
+
+
+_QUAL_SPLIT = re.compile(r"\s+(?:OF|IN)\s+", re.IGNORECASE)
+
+
+def _chain_has(chain: List[str], quals: List[str]) -> bool:
+    """Every qualifier, in order, somewhere up the ancestor chain (nearest first)."""
+    i = 0
+    for q in quals:
+        try:
+            i = chain.index(q, i) + 1
+        except ValueError:
+            return False
+    return True
+
+
+class _PfieldScope:
+    """This program's stored pfield rows by name, so a reference (data_flow,
+    call_arg, param, file_record, field_ref, sql_col_ref) links to ONE of
+    them. One row: it. Several: the OF/IN chain must pick one, else nobody
+    is picked and the name is noted once as ambiguous_field - an unqualified
+    twice-declared name is never guessed (guard 4). An 88 name is its parent."""
+
+    def __init__(self) -> None:
+        self.rows: Dict[str, List[Tuple[int, List[str], str]]] = {}   # name -> [(id, ancestors nearest first, path)]
+        self.name_of: Dict[int, str] = {}
+        self.linkage_roots: Dict[str, int] = {}
+        self.pruned: Set[int] = set()
+        self.used: Set[int] = set()
+        self.ambiguous: Dict[str, Tuple[int, List[str]]] = {}           # name -> (first line, declared paths)
+
+    def add(self, name: str, pf_id: int, ancestors: List[str], path: str) -> None:
+        self.rows.setdefault(name.upper(), []).append((pf_id, ancestors, path))
+        self.name_of.setdefault(pf_id, name.upper())
+
+    def resolve(self, name: Optional[str], quals=None, line: int = 0) -> Optional[int]:
+        if not name:
+            return None
+        key = name.upper()
+        cands = self.rows.get(key)
+        if not cands:
+            return None
+        if isinstance(quals, str):
+            quals = _QUAL_SPLIT.split(quals.strip())
+        quals = [q.upper() for q in (quals or []) if q]
+        if len(cands) > 1 and quals:
+            cands = [c for c in cands if _chain_has(c[1], quals)]
+        if len(cands) == 1:
+            self.used.add(cands[0][0])
+            return cands[0][0]
+        if len(cands) > 1 and key not in self.ambiguous:
+            self.ambiguous[key] = (line, [c[2] for c in cands])
+        return None
+
+    def resolve_host(self, host_var: Optional[str], line: int = 0) -> Optional[int]:
+        """`:GRP.ITEM` is ITEM OF GRP in SQL host-variable syntax."""
+        if not host_var:
+            return None
+        parts = host_var.lstrip(":").split(".")
+        return self.resolve(parts[-1], list(reversed(parts[:-1])), line)
+
+
+def _flow_names(facts: cobol.ProgramFacts) -> Set[str]:
+    """Every data name the program's facts refer to. A WORKING-STORAGE root
+    holding none of them is stored pruned: no reference can lead the walk
+    into it, and unused copybooks are most of a large program's bytes."""
+    named: Set[str] = {"DFHCOMMAREA"}
+    named.update(n for (n, _m, _s, _l) in facts.field_refs)
+    for fl in facts.flows:
+        for n in (fl.src_name, fl.dst_name):
+            if n:
+                named.add(n)
+    for c in facts.calls:
+        named.update(c.using_args)
+        named.update(a.name for a in c.args if a.name)
+        if c.returning:
+            named.add(c.returning)
+    named.update(facts.linkage_using)
+    if facts.returning:
+        named.add(facts.returning)
+    for (_alias, using, _ln) in facts.entries:
+        named.update(using)
+    for fd in facts.files:
+        named.update(fd.fd_records)
+    for d in facts.dli:
+        if d.io_area:
+            named.add(d.io_area)
+        named.update(d.ssa_args)
+    for (_call, _queue, _direction, layout, _ln) in facts.mq:
+        if layout:
+            named.add(layout.strip())
+    for s in facts.sql:
+        named.update(h.lstrip(":").split(".")[-1] for h in s.host_vars)
+    for (_t, _c, h, _m, _s, _ln) in facts.sql_cols:
+        if h:
+            named.add(h.lstrip(":").split(".")[-1])
+    for (hv, _tables, _cols, _stmt, _ln) in facts.sql_group_intos:
+        named.add(hv)
+    named.update(t for (t, _k, _op, _ln) in facts.io_ops)
+    return {n.upper() for n in named if n}
+
+
+def _index_pfields(conn: sqlite3.Connection, pid: int, exp: expand.Expansion, facts: cobol.ProgramFacts,
+                   roots: List[copybook.Field], named: Set[str]) -> _PfieldScope:
+    """pfield rows for one program: every 01/77 of the expanded program at
+    THIS program's offsets (a byte before a COPY moves every copied item by
+    one), placed in its section and FD by the parser's section marks, with
+    the copybook's own `field` row beside it (version skew shows as a
+    different offset there). FILE and LINKAGE roots are the program's
+    interfaces and are stored whole; a WORKING-STORAGE / LOCAL-STORAGE root
+    none of `named` falls in is stored as its root row alone, pruned=1."""
+    scope = _PfieldScope()
+    marks = sorted(facts.section_marks)
+    mark_lines = [m[0] for m in marks]
+    copy_rows: Dict[int, Tuple[Dict[Tuple[int, str], int], Dict[int, List[int]]]] = {}
+
+    def copy_field_id(member_id: int, line: int, name: str) -> Optional[int]:
+        got = copy_rows.get(member_id)
+        if got is None:
+            by_key: Dict[Tuple[int, str], int] = {}
+            by_line: Dict[int, List[int]] = {}
+            for (fid, ln, nm) in conn.execute("SELECT id, line, name FROM field WHERE member_id=?", (member_id,)):
+                by_key[(ln, nm)] = fid
+                by_line.setdefault(ln, []).append(fid)
+            got = copy_rows[member_id] = (by_key, by_line)
+        fid = got[0].get((line, name))
+        if fid is None and len(got[1].get(line, ())) == 1:       # REPLACING renamed it: same line, one item
+            fid = got[1][line][0]
+        return fid
+
+    ins = ("INSERT INTO pfield(program_id,parent_id,root_id,section,fd_select,level,name,qualified,pic,usage,"
+           "occurs_max,odo_on,redefines,offset,length,digits,scale,is_group,after_odo,exp_line,src_member,src_line,"
+           "copy_field_id,pruned) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+    tops: List[copybook.Field] = []
+    for r in roots:
+        tops.extend(r.children if r.name == copybook.SYNTHETIC_ROOT else [r])
+    for root in tops:
+        k = bisect.bisect_right(mark_lines, root.line) - 1
+        section, fd = (marks[k][1], marks[k][2]) if k >= 0 else ("UNKNOWN", None)
+        items = copybook.flatten([root])
+        whole = section in ("FILE", "LINKAGE") or any(
+            f.name in named or any(c[0] in named for c in f.conds) for f in items)
+        if not whole:
+            items = [root]
+        ids: Dict[int, int] = {}
+        root_id: Optional[int] = None
+        odo_seen: List[copybook.Field] = []
+        for f in items:
+            chain: List[str] = []
+            p = f.parent
+            while p is not None and id(p) in ids:
+                chain.append(p.name)
+                p = p.parent
+            parent_id = ids.get(id(f.parent)) if f.parent is not None else None
+            after_odo = 0
+            for o in odo_seen:
+                # an earlier OCCURS DEPENDING ON that is not this item's own
+                # table: the offset holds only for the maximum count
+                a = f.parent
+                while a is not None and a is not o:
+                    a = a.parent
+                if a is None:
+                    after_odo = 1
+                    break
+            src_member, src_line, depth = exp.origin(f.line)
+            cfid = copy_field_id(src_member, src_line, f.name) if depth > 0 and src_member is not None else None
+            cur = conn.execute(ins, (pid, parent_id, root_id, section, fd, f.level, f.name, f.qualified, f.pic,
+                                     f.usage, f.occurs_max, f.odo_on, f.redefines, f.offset, f.length, f.digits,
+                                     f.scale, int(f.is_group), after_odo, f.line, src_member, src_line, cfid,
+                                     int(not whole)))
+            rid = cur.lastrowid
+            ids[id(f)] = rid
+            if root_id is None:
+                root_id = rid
+                conn.execute("UPDATE pfield SET root_id=? WHERE id=?", (rid, rid))
+                if section == "LINKAGE":
+                    scope.linkage_roots[f.name] = rid
+                if not whole:
+                    scope.pruned.add(rid)
+            scope.add(f.name, rid, chain, f.qualified)
+            for (cname, _vals, _ln) in f.conds:
+                scope.add(cname, rid, [f.name] + chain, f.qualified + "." + cname)
+            if f.odo_on:
+                odo_seen.append(f)
+    return scope
 
 
 def index_copybook(ctx: Ctx, mem: Mem) -> None:

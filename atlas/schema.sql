@@ -109,7 +109,8 @@ CREATE TABLE IF NOT EXISTS call_edge (
     resolved    TEXT,                     -- JSON array of candidate targets
     resolution  TEXT,                     -- how: move_literal|value_clause|unresolved
     using_args  TEXT,                     -- JSON array, positional
-    line        INTEGER
+    line        INTEGER,
+    returning_item TEXT                   -- CALL ... RETURNING x (`returning` itself is an SQLite keyword)
 );
 CREATE INDEX IF NOT EXISTS ix_call_target ON call_edge(target);
 CREATE INDEX IF NOT EXISTS ix_call_prog   ON call_edge(program_id);
@@ -172,10 +173,124 @@ CREATE TABLE IF NOT EXISTS field_ref (
     name        TEXT NOT NULL,
     mode        TEXT,                     -- read|write|test|display
     stmt        TEXT,                     -- MOVE|COMPUTE|CALL-USING|EXEC-SQL|READ|...
-    line        INTEGER
+    line        INTEGER,
+    pfield_id   INTEGER                   -- the pfield this name is in this program; NULL: ambiguous or undeclared
 );
 CREATE INDEX IF NOT EXISTS ix_fieldref_name ON field_ref(name);
 CREATE INDEX IF NOT EXISTS ix_fieldref_mode ON field_ref(name, mode);
+CREATE INDEX IF NOT EXISTS ix_fieldref_pfield ON field_ref(pfield_id);
+
+-- Value flow (docs/PLAN-value-flow.md). `field` keeps a copybook's items at the
+-- COPYBOOK's offsets; a program that puts a byte before the COPY sees every
+-- item one byte further on. pfield is THIS program's data items at THIS
+-- program's offsets, one tree per 01/77, with the section and FD it sits in.
+-- A WORKING-STORAGE / LOCAL-STORAGE root nothing in the program names is
+-- stored as its root row alone (pruned=1); FILE and LINKAGE roots are the
+-- program's interfaces and are always stored whole.
+CREATE TABLE IF NOT EXISTS pfield (
+    id          INTEGER PRIMARY KEY,
+    program_id  INTEGER NOT NULL REFERENCES program(id) ON DELETE CASCADE,
+    parent_id   INTEGER,
+    root_id     INTEGER,
+    section     TEXT NOT NULL,            -- FILE|WORKING-STORAGE|LOCAL-STORAGE|LINKAGE
+    fd_select   TEXT,                     -- the FD/SD in force (FILE only)
+    level       INTEGER NOT NULL,
+    name        TEXT NOT NULL,
+    qualified   TEXT,
+    pic         TEXT,
+    usage       TEXT,
+    occurs_max  INTEGER,
+    odo_on      TEXT,
+    redefines   TEXT,
+    offset      INTEGER NOT NULL,         -- 0-based, in THIS program's 01
+    length      INTEGER NOT NULL,
+    digits      INTEGER,
+    scale       INTEGER,
+    is_group    INTEGER DEFAULT 0,
+    after_odo   INTEGER DEFAULT 0,        -- 1: an OCCURS DEPENDING ON precedes it, so offset is a MAXIMUM
+    exp_line    INTEGER NOT NULL,         -- expanded line, as field_ref.line
+    src_member  INTEGER,                  -- the member the line came from (the copybook for a copied item)
+    src_line    INTEGER,
+    copy_field_id INTEGER REFERENCES field(id) ON DELETE SET NULL,   -- the copybook's own row (version skew)
+    pruned      INTEGER DEFAULT 0         -- root stored without children
+);
+CREATE INDEX IF NOT EXISTS ix_pfield_prog_name ON pfield(program_id, name);
+CREATE INDEX IF NOT EXISTS ix_pfield_root ON pfield(root_id, offset);
+CREATE INDEX IF NOT EXISTS ix_pfield_copy ON pfield(copy_field_id);
+
+-- One row per (source, target) the compiler moves data between: the fact
+-- behind "I changed this MOVE - where does the value go". field_ref says a
+-- name was read or written on a line; only this says which read fed which
+-- write when a line holds several (IF .. MOVE .. ELSE MOVE .. END-IF).
+CREATE TABLE IF NOT EXISTS data_flow (
+    id          INTEGER PRIMARY KEY,
+    program_id  INTEGER NOT NULL REFERENCES program(id) ON DELETE CASCADE,
+    line        INTEGER NOT NULL,         -- expanded line of the VERB, as field_ref
+    verb        TEXT NOT NULL,
+    kind        TEXT NOT NULL,            -- move|move_corr|literal|figurative|function|arith|string|unstring|
+                                          -- initialize|set|set_address|accept|read_into|write_from|io_in|io_out|
+                                          -- inspect|returning|cics_in|cics_out|dli_in|dli_out|mq_in|mq_out
+    src_name    TEXT,
+    src_qual    TEXT,                     -- OF/IN chain as written
+    src_pfield  INTEGER,
+    src_sub     TEXT,                     -- subscript text, '(WS-I)'
+    src_refmod  TEXT,                     -- reference modification, '(1:2)'
+    src_lit     TEXT,                     -- literal / figurative source
+    dst_name    TEXT,
+    dst_qual    TEXT,
+    dst_pfield  INTEGER,
+    dst_sub     TEXT,
+    dst_refmod  TEXT,
+    ordinal     INTEGER DEFAULT 0,        -- n-th target of one verb
+    note        TEXT,                     -- 'WRITEQ TS Q1'|'file POL-IN'|'GU'|'UPPER-CASE'|'queue Q'
+    guard       TEXT                      -- the enclosing IF/WHEN condition; NOT (..) under ELSE; NULL outside
+);
+CREATE INDEX IF NOT EXISTS ix_dflow_src ON data_flow(src_pfield);
+CREATE INDEX IF NOT EXISTS ix_dflow_dst ON data_flow(dst_pfield);
+CREATE INDEX IF NOT EXISTS ix_dflow_line ON data_flow(program_id, line);
+
+-- Caller side of a CALL / LINK / XCTL / START: one row per argument, with
+-- HOW it is passed. BY CONTENT never returns a value; LENGTH OF passes a
+-- number, not the bytes.
+CREATE TABLE IF NOT EXISTS call_arg (
+    id          INTEGER PRIMARY KEY,
+    call_id     INTEGER NOT NULL REFERENCES call_edge(id) ON DELETE CASCADE,
+    program_id  INTEGER NOT NULL REFERENCES program(id) ON DELETE CASCADE,
+    pos         INTEGER NOT NULL,
+    name        TEXT,                     -- NULL for a literal / OMITTED argument
+    qual        TEXT,
+    pfield      INTEGER,
+    sub         TEXT,
+    how         TEXT NOT NULL             -- reference|content|value|length_of|address_of|commarea|start_from
+);
+CREATE INDEX IF NOT EXISTS ix_callarg_call ON call_arg(call_id);
+CREATE INDEX IF NOT EXISTS ix_callarg_prog ON call_arg(program_id);
+
+-- Callee side: PROCEDURE DIVISION USING (entry NULL), each ENTRY under its
+-- alias (its own order), the RETURNING item at pos 0, and the CICS
+-- convention: a LINKAGE 01 named DFHCOMMAREA is position 1 of entry
+-- 'DFHCOMMAREA'.
+CREATE TABLE IF NOT EXISTS param (
+    id          INTEGER PRIMARY KEY,
+    program_id  INTEGER NOT NULL REFERENCES program(id) ON DELETE CASCADE,
+    entry       TEXT,
+    pos         INTEGER NOT NULL,
+    name        TEXT NOT NULL,
+    pfield      INTEGER
+);
+CREATE INDEX IF NOT EXISTS ix_param_prog ON param(program_id);
+
+-- Every 01 under an FD/SD, in order (file_decl.fd_record keeps only the first).
+CREATE TABLE IF NOT EXISTS file_record (
+    id          INTEGER PRIMARY KEY,
+    file_id     INTEGER NOT NULL REFERENCES file_decl(id) ON DELETE CASCADE,
+    program_id  INTEGER NOT NULL REFERENCES program(id) ON DELETE CASCADE,
+    ordinal     INTEGER NOT NULL,
+    name        TEXT NOT NULL,
+    pfield      INTEGER
+);
+CREATE INDEX IF NOT EXISTS ix_filerec_file ON file_record(file_id);
+CREATE INDEX IF NOT EXISTS ix_filerec_prog ON file_record(program_id);
 
 -- Literals are facts. An error code is 'E123' long before it is a field name:
 -- defined by an 88-level or VALUE in a copybook, MOVEd to a field in one
@@ -250,10 +365,12 @@ CREATE TABLE IF NOT EXISTS sql_col_ref (
     host_var    TEXT,                     -- COBOL field (no colon)
     mode        TEXT NOT NULL,            -- read (col -> host var) | write (host var -> col) | predicate
     stmt        TEXT,                     -- SELECT|FETCH|INSERT|UPDATE|DELETE|DECLARE
-    line        INTEGER
+    line        INTEGER,
+    pfield_id   INTEGER                   -- the host variable's pfield in this program
 );
 CREATE INDEX IF NOT EXISTS ix_sqlcol_col ON sql_col_ref(col);
 CREATE INDEX IF NOT EXISTS ix_sqlcol_hv  ON sql_col_ref(host_var);
+CREATE INDEX IF NOT EXISTS ix_sqlcol_pfield ON sql_col_ref(pfield_id);
 
 CREATE TABLE IF NOT EXISTS db2_object (
     id          INTEGER PRIMARY KEY,
@@ -676,23 +793,16 @@ CREATE TABLE IF NOT EXISTS unresolved (
     id          INTEGER PRIMARY KEY,
     member_id   INTEGER REFERENCES member(id) ON DELETE CASCADE,
     kind        TEXT NOT NULL,            -- dynamic_call|missing_copybook|missing_proc|
-                                          -- unparsed_stmt|symbolic|missing_pgm|launcher_parm
+                                          -- unparsed_stmt|symbolic|missing_pgm|launcher_parm|
+                                          -- ambiguous_field|flow_pruned|no_commarea
     detail      TEXT,
     line        INTEGER
 );
 CREATE INDEX IF NOT EXISTS ix_unres_kind ON unresolved(kind);
 
--- Line map from expanded source back to (member, line) so every citation
--- points at a real line in a real member, not at an expansion artefact.
-CREATE TABLE IF NOT EXISTS expand_map (
-    id          INTEGER PRIMARY KEY,
-    program_id  INTEGER NOT NULL REFERENCES program(id) ON DELETE CASCADE,
-    exp_line    INTEGER NOT NULL,
-    src_member  INTEGER NOT NULL REFERENCES member(id),
-    src_line    INTEGER NOT NULL,
-    depth       INTEGER DEFAULT 0
-);
-CREATE INDEX IF NOT EXISTS ix_expmap ON expand_map(program_id, exp_line);
+-- expand_map (a per-line expansion map) was never written: expand_run holds
+-- the runs and pfield the items. An older index drops it on open.
+DROP TABLE IF EXISTS expand_map;
 
 -- LLM-written prose. Quarantined on purpose: never joined into a fact query,
 -- always rendered with an "unverified" banner.

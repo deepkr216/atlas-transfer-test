@@ -445,8 +445,10 @@ class FlowIndex(unittest.TestCase):
         self.assertEqual([tuple(r) for r in recs], [("POL-IN", 1, "POL-REC"), ("STAT-OUT", 1, "OUT-REC"), ("STAT-OUT", 2, "OUT-TRL")])
         # the caller side, and the new columns on the old tables
         wst = self.pfield("FLOWSRC", "WS-STATUS")[0]["id"]
-        edge = c.execute("SELECT id, returning FROM call_edge WHERE program_id=? AND returning IS NOT NULL", (self.pid("FLOWSRC"),)).fetchall()
-        self.assertEqual([r["returning"] for r in edge], ["WS-R"])
+        # `returning` is an SQLite keyword (the RETURNING clause): the column is returning_item
+        edge = c.execute("SELECT id, returning_item FROM call_edge WHERE program_id=? AND returning_item IS NOT NULL",
+                         (self.pid("FLOWSRC"),)).fetchall()
+        self.assertEqual([r["returning_item"] for r in edge], ["WS-R"])
         args = c.execute("SELECT pos, name, how FROM call_arg WHERE call_id=? ORDER BY pos", (edge[0]["id"],)).fetchall()
         self.assertEqual([tuple(r) for r in args], [(1, "WS-NOTE", "content"), (2, "WS-NOTE", "length_of")])
         link = c.execute("""SELECT a.pos, a.name, a.how FROM call_arg a JOIN call_edge e ON e.id=a.call_id
@@ -529,8 +531,10 @@ class FlowIndex(unittest.TestCase):
         self.assertLess(out.index("EXEC SQL UPDATE POLICY_TBL"), out.index("MOVE -> WS-RC"))
         # not followed, each with its reason
         self.assertIn("## Not followed", out)
-        self.assertRegex(out, rf"MOVE -> WS-STAT-ENT \(subscripted: any of 3 elements\)\s+FLOWSRC:{L('TO WS-STAT-ENT (WS-I)')}")
+        self.assertRegex(out, rf"MOVE -> WS-STAT-ENT \(subscripted: any of 3 elements\)\s+FLOWSRC:{L('TO WS-STAT-ENT (WS-I)')}"
+                              r".*\[end: no further use in FLOWSRC\]")                  # nothing reads the table
         self.assertRegex(out, r"derived edges \(COMPUTE/STRING/FUNCTION\): 1 \(--derived follows them\)")
+        self.assertIn("derived - value not preserved (--derived)", out.split("## Ends", 1)[1])   # the STRING
         self.assertNotIn("WS-MSG", out)
         # a subscript is not a source anywhere in the report
         for ln in out.splitlines():
@@ -551,6 +555,11 @@ class FlowIndex(unittest.TestCase):
         self.assertIn("unnamed bytes of WS-SAVE (X(30))", src)
         self.assertIn("truncated 40 -> 30", src)
         self.assertIn("-> WS-STATUS", src)
+        self.assertIn("group MOVE into unnamed bytes", src.split("## Ends", 1)[1])
+
+        # past an OCCURS DEPENDING ON the offset holds only for the maximum count: the node says so
+        odo = self.flow("FR-FILLER", "--program", "FLOWSRC")
+        self.assertIn("offset is a maximum (ODO)", odo)
 
         # the overlay closure is printed with its reasons before any edge
         ov = self.flow("FR-AGENT-ID", "--program", "FLOWSRC")
@@ -572,6 +581,7 @@ class FlowIndex(unittest.TestCase):
         self.assertRegex(rm, r"-> .*WS-CODE")
         self.assertIn("WS-CORR-B", rm)
         self.assertNotIn("whole item", rm)
+        self.assertIn("no further use in FLOWSRC", _lines_of(rm, "WS-CODE"))     # nothing reads WS-CORR-B
 
         # BY CONTENT is one-way, LENGTH OF is a number not the bytes, RETURNING comes back
         bc = self.flow("WS-NOTE", "--program", "FLOWSRC")
@@ -631,8 +641,11 @@ class FlowIndex(unittest.TestCase):
         self.assertNotIn("WS-HOLD", one)
         narrow = self.flow("WS-STATUS", "--program", "FLOWSRC", "--width", "1")
         drop = [ln for ln in narrow.splitlines() if "(--all)" in ln]
-        self.assertEqual(len(drop), 1, narrow)
-        self.assertRegex(drop[0], r"\d+ more .*FLOWSRC \d+")              # every dropped program, with its count
+        # the cap is per node (plan section 4): the root's collapse line names every dropped program with
+        # its count; a child that has two children of its own (OR-STAT: FLOWJOB and FLOWJOB2) prints one too
+        self.assertGreaterEqual(len(drop), 1, narrow)
+        self.assertTrue(any(re.search(r"\d+ more .*FLOWSRC \d+", ln) for ln in drop), drop)
+        self.assertIn("width cap", narrow.split("## Ends", 1)[1])
         self.assertNotIn("(--all)", self.flow("WS-STATUS", "--program", "FLOWSRC", "--width", "1", "--all"))
         self.assertIn("node cap", self.flow("WS-STATUS", "--program", "FLOWSRC", "--nodes", "1"))
         ping = self.flow("WS-PING", "--program", "FLOWSRC")
