@@ -34,6 +34,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
@@ -364,6 +365,94 @@ class FlowParser(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # index and query
 # ---------------------------------------------------------------------------
+
+class FlowPrunedSelfCheck(unittest.TestCase):
+    """Guard 21: a WORKING-STORAGE root is stored without its children when
+    _flow_names sees no reference into it. If a later edit of that rule misses
+    a reference source, the reference lands in a pruned root and `flow` would
+    stop there with no signal - so the build's self-check must raise
+    flow_pruned for it. The realistic miss is a reference to a CHILD of the
+    root (the child has no pfield row at all, so resolve() finds nothing), not
+    to the root by name; both, and a dropped 88, must be caught. The rule is
+    patched to miss everything; the fixtures are inline and fictional."""
+
+    COPY = ("           05  CP-A            PIC X(4).\n"
+            "           05  CP-B            PIC 9(3).\n")
+    REPL = """       IDENTIFICATION DIVISION.
+       PROGRAM-ID. TSTREPL.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01  WS-REC.
+           COPY TSTCOPY REPLACING ==CP-== BY ==WR-==.
+       PROCEDURE DIVISION.
+           MOVE 'ABCD' TO WR-A.
+           MOVE WR-A TO WR-B.
+           GOBACK.
+"""
+    ROOT = """       IDENTIFICATION DIVISION.
+       PROGRAM-ID. TSTROOT.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01  WS-A                PIC X.
+       PROCEDURE DIVISION.
+           MOVE 'Y' TO WS-A.
+           GOBACK.
+"""
+    COND = """       IDENTIFICATION DIVISION.
+       PROGRAM-ID. TST88.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01  WS-FLAGS.
+           05  WS-F            PIC X.
+               88  WS-F-ON     VALUE 'Y'.
+       PROCEDURE DIVISION.
+           IF WS-F-ON DISPLAY 'ON' END-IF.
+           GOBACK.
+"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.td = tempfile.mkdtemp()
+        for name, text in (("TSTCOPY.cpy", cls.COPY), ("TSTREPL.cbl", cls.REPL),
+                           ("TSTROOT.cbl", cls.ROOT), ("TST88.cbl", cls.COND)):
+            with open(os.path.join(cls.td, name), "w", encoding="utf-8") as fh:
+                fh.write(text)
+        cls.db = os.path.join(cls.td, "t.db")
+        with mock.patch.object(build, "_flow_names", lambda facts: set()):
+            build._main([cls.td, "--db", cls.db, "--rebuild", "--quiet"])
+        cls.conn = query.connect(cls.db)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.conn.close()
+        shutil.rmtree(cls.td, ignore_errors=True)
+
+    def notes(self, member: str):
+        return [r["detail"] for r in self.conn.execute(
+            """SELECT u.detail FROM unresolved u JOIN member m ON m.id=u.member_id
+               WHERE m.name=? AND u.kind='flow_pruned'""", (member,))]
+
+    def test_reference_into_a_pruned_root_raises_flow_pruned(self):
+        c = self.conn
+        # the patched rule pruned every WORKING-STORAGE root: root rows only
+        self.assertEqual({r[0] for r in c.execute("SELECT name FROM pfield WHERE pruned=1")},
+                         {"WS-REC", "WS-A", "WS-FLAGS"})
+        self.assertEqual(c.execute("SELECT COUNT(*) FROM pfield WHERE pruned=0").fetchone()[0], 0)
+        self.assertEqual(c.execute("SELECT COUNT(*) FROM pfield WHERE name IN ('WR-A','WR-B','WS-F')").fetchone()[0], 0)
+        # the root named by its own reference (it has a row, so resolve() links it)
+        self.assertEqual(len(self.notes("TSTROOT")), 1, self.notes("TSTROOT"))
+        self.assertIn("(WS-A)", self.notes("TSTROOT")[0])
+        # a dropped child named (through the REPLACING rename): no row to link, still a note naming the ROOT
+        self.assertEqual(len(self.notes("TSTREPL")), 1, self.notes("TSTREPL"))
+        self.assertIn("(WS-REC)", self.notes("TSTREPL")[0])
+        # a dropped 88 named
+        self.assertEqual(len(self.notes("TST88")), 1, self.notes("TST88"))
+        self.assertIn("(WS-FLAGS)", self.notes("TST88")[0])
+        # and the rows themselves still carry no link - the note is the only signal
+        self.assertEqual([tuple(r) for r in c.execute(
+            """SELECT src_pfield, dst_pfield FROM data_flow d JOIN program p ON p.id=d.program_id
+               WHERE p.program_id='TSTREPL' AND d.kind='move'""")], [(None, None)])
+
 
 class FlowIndex(unittest.TestCase):
 

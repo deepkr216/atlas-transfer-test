@@ -1517,10 +1517,11 @@ def index_cobol(ctx: Ctx, mem: Mem) -> None:
         notes.append(("ambiguous_field",
                       f"{name} is declared {len(decls)} times in this program ({', '.join(decls)}); a reference "
                       f"without a qualifier that picks one gets no pfield link and `flow` does not follow it", ln))
-    hit = scope.used & scope.pruned
+    hit = scope.pruned_hits | (scope.used & scope.pruned)
     if hit:
-        # a reference resolved into a root stored without its children: the
-        # pruning rule and _flow_names disagree, and `flow` would stop there
+        # a reference named a root stored without its children, or one of the
+        # children it was stored without: the pruning rule and _flow_names
+        # disagree, and `flow` would stop there
         names = sorted(scope.name_of[i] for i in hit)
         notes.append(("flow_pruned", f"{len(hit)} pruned root(s) are referenced ({', '.join(names[:8])}): "
                                      "the pruning rule missed a reference source - fix _flow_names", 0))
@@ -1614,13 +1615,17 @@ class _PfieldScope:
     call_arg, param, file_record, field_ref, sql_col_ref) links to ONE of
     them. One row: it. Several: the OF/IN chain must pick one, else nobody
     is picked and the name is noted once as ambiguous_field - an unqualified
-    twice-declared name is never guessed (guard 4). An 88 name is its parent."""
+    twice-declared name is never guessed (guard 4). An 88 name is its parent.
+    A name dropped with its pruned root has no row; a reference to it is a
+    miss of the pruning rule and is collected in pruned_hits (guard 21)."""
 
     def __init__(self) -> None:
         self.rows: Dict[str, List[Tuple[int, List[str], str]]] = {}   # name -> [(id, ancestors nearest first, path)]
         self.name_of: Dict[int, str] = {}
         self.linkage_roots: Dict[str, int] = {}
         self.pruned: Set[int] = set()
+        self.pruned_names: Dict[str, Set[int]] = {}                     # dropped item / 88 name -> pruned root ids
+        self.pruned_hits: Set[int] = set()                               # pruned roots a reference named a child of
         self.used: Set[int] = set()
         self.ambiguous: Dict[str, Tuple[int, List[str]]] = {}           # name -> (first line, declared paths)
 
@@ -1632,6 +1637,10 @@ class _PfieldScope:
         if not name:
             return None
         key = name.upper()
+        if key in self.pruned_names:
+            # the name was dropped with its root, yet something refers to it:
+            # the pruning rule missed this reference source
+            self.pruned_hits.update(self.pruned_names[key])
         cands = self.rows.get(key)
         if not cands:
             return None
@@ -1735,7 +1744,9 @@ def _index_pfields(conn: sqlite3.Connection, pid: int, exp: expand.Expansion, fa
         items = copybook.flatten([root])
         whole = section in ("FILE", "LINKAGE") or any(
             f.name in named or any(c[0] in named for c in f.conds) for f in items)
+        dropped: List[copybook.Field] = []
         if not whole:
+            dropped = items[1:]                 # flatten is pre-order: the root first, then its subtree
             items = [root]
         ids: Dict[int, int] = {}
         root_id: Optional[int] = None
@@ -1772,6 +1783,12 @@ def _index_pfields(conn: sqlite3.Connection, pid: int, exp: expand.Expansion, fa
                     scope.linkage_roots[f.name] = rid
                 if not whole:
                     scope.pruned.add(rid)
+                    for d in dropped:
+                        # the children have no rows; remember their names so a
+                        # reference to one is caught by the self-check
+                        scope.pruned_names.setdefault(d.name.upper(), set()).add(rid)
+                        for (cname, _vals, _ln) in d.conds:
+                            scope.pruned_names.setdefault(cname.upper(), set()).add(rid)
             scope.add(f.name, rid, chain, f.qualified)
             for (cname, _vals, _ln) in f.conds:
                 scope.add(cname, rid, [f.name] + chain, f.qualified + "." + cname)
