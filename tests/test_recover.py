@@ -227,8 +227,10 @@ class Formats(unittest.TestCase):
 
     def test_a_lone_carriage_control_line_before_or_after_the_copy_is_ignored(self):
         # 'in some cases the line just before the COPY statement has only a number like 1 or 0 in the first
-        # column' (2026-09-21): the ASA carriage control the download kept, printed on a line of its own
-        for before, after in (("0", "0"), ("1", "1"), ("1", "0"), ("0", "")):
+        # column' (2026-09-21): the ASA carriage control the download kept, printed on a line of its own - and
+        # a page header of another shape he saw between the copied lines: page number, program, time, date
+        header = "1  17        PROGANNM        14.31.19        FEB  5,1923"
+        for before, after in (("0", "0"), ("1", "1"), ("1", "0"), ("0", ""), (header, header)):
             lines = [BANNER.format(page=1), RULER,
                      "   000001         000100 IDENTIFICATION DIVISION.",
                      "   000002         000200 PROGRAM-ID. TESTPGM.",
@@ -238,7 +240,7 @@ class Formats(unittest.TestCase):
                      "   000005  FRAUDM        COPY 'POLDCL'.",                 # a change tag in columns 1-6, the name in quotes
                      after,
                      "   000006C        000100 01  POLICY-DCL.",
-                     "0",
+                     "0" if before != header else header,
                      "   000007C        000200     05  POL-NUMBER              PIC X(12).",
                      "   000008         000700 PROCEDURE DIVISION."]
             regions, stats = recover.from_ibm_listing(lines, "X.lst", None)
