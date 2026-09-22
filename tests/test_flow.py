@@ -438,7 +438,16 @@ class FlowIndex(unittest.TestCase):
                                                   (self.pid("FLOWSRC"),))}, {wst})
         mv = c.execute("""SELECT line, src_pfield, dst_pfield FROM data_flow WHERE program_id=? AND kind='move'
                           AND src_name='WS-STATUS' AND dst_name='OR-STAT'""", (self.pid("FLOWSRC"),)).fetchall()
-        self.assertEqual([r["line"] for r in mv], [_line("FLOWSRC.cbl", "MOVE WS-STATUS TO OR-STAT")])
+        self.assertEqual(len(mv), 1, mv)
+        # data_flow.line is the EXPANDED line of the verb, as field_ref stores it (plan section 1): the two
+        # COPYs above the PROCEDURE DIVISION push it past the physical line, and origin() maps it back for
+        # the cite. A build that stored the physical line would agree with _line and break every cite.
+        fr_line = c.execute("""SELECT line FROM field_ref WHERE program_id=? AND name='OR-STAT' AND mode='write'
+                               AND stmt='MOVE'""", (self.pid("FLOWSRC"),)).fetchall()
+        self.assertEqual([r["line"] for r in fr_line], [mv[0]["line"]])
+        src_line = _line("FLOWSRC.cbl", "MOVE WS-STATUS TO OR-STAT")
+        self.assertNotEqual(mv[0]["line"], src_line)
+        self.assertEqual(query.origin(c, self.pid("FLOWSRC"), mv[0]["line"])[1], src_line)
         self.assertEqual((mv[0]["src_pfield"], mv[0]["dst_pfield"]), (wst, self.pfield("FLOWSRC", "OR-STAT")[0]["id"]))
         self.assertIsNone(c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='expand_map'").fetchone())
 
