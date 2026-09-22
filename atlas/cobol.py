@@ -80,6 +80,7 @@ _ACCESS = re.compile(r"\bACCESS\s+(?:MODE\s+)?(?:IS\s+)?(\w+)", re.IGNORECASE)
 _RECORD_KEY = re.compile(rf"\bRECORD\s+KEY\s+(?:IS\s+)?({ID})", re.IGNORECASE)
 _ALT_KEY = re.compile(rf"\bALTERNATE\s+RECORD\s+KEY\s+(?:IS\s+)?({ID})", re.IGNORECASE)
 _FD = re.compile(rf"^(FD|SD)\s+({ID})", re.IGNORECASE)
+_DATA_SECTION = re.compile(r"^(FILE|WORKING-STORAGE|LOCAL-STORAGE|LINKAGE)\s+SECTION", re.IGNORECASE)
 
 # READ/WRITE/... name ONE file (or record); OPEN/CLOSE take a LIST per mode:
 #   OPEN INPUT POLICY-IN CLAIM-IN OUTPUT REPORT-OUT
@@ -183,6 +184,19 @@ _SQL_CURSOR = re.compile(rf"\bDECLARE\s+({ID})\s+(?:\w+\s+)?CURSOR", re.IGNORECA
 # --------------------------------------------------------------------------
 
 @dataclass
+class ArgFact:
+    """One CALL argument as written: its position, how it is passed
+    (reference | content | value | length_of | address_of | commarea |
+    start_from), and the name with its OF/IN chain and subscript. A literal
+    argument keeps its position with name None."""
+    pos: int
+    name: Optional[str]
+    quals: List[str] = dc_field(default_factory=list)
+    sub: Optional[str] = None
+    how: str = "reference"
+
+
+@dataclass
 class CallFact:
     kind: str               # static | dynamic | cics_link | cics_xctl | cancel
     target: Optional[str]
@@ -191,6 +205,47 @@ class CallFact:
     resolution: str         # literal | move_literal | value_clause | unresolved
     using_args: List[str]
     line: int
+    args: List[ArgFact] = dc_field(default_factory=list)    # USING detail; COMMAREA / START FROM for CICS
+    returning: Optional[str] = None                          # CALL ... RETURNING x
+
+
+@dataclass
+class Operand:
+    """One operand of a data-moving verb: a data-name with its OF/IN chain
+    (as written, outermost last), subscript and ref-mod text, or a literal /
+    figurative constant (`lit`), or an identifier inside FUNCTION f(...)
+    (`func` = f). A subscript name is never an operand of its own."""
+    name: Optional[str] = None
+    quals: List[str] = dc_field(default_factory=list)
+    sub: Optional[str] = None
+    refmod: Optional[str] = None
+    lit: Optional[str] = None
+    func: Optional[str] = None
+
+
+@dataclass
+class FlowFact:
+    """One (source, target) pair the compiler moves data between - a data_flow
+    row. `line` is the verb's expanded line as field_refs stores it; `kind`
+    is the verb shape (move | move_corr | literal | figurative | function |
+    arith | string | unstring | initialize | set | set_address | accept |
+    read_into | write_from | io_in | io_out | inspect | returning | cics_in |
+    cics_out | dli_in | dli_out | mq_in | mq_out); `guard` the enclosing IF."""
+    line: int
+    verb: str
+    kind: str
+    src_name: Optional[str] = None
+    src_qual: Optional[str] = None      # 'REC-A' or 'REC-A OF REC-X', as written
+    src_sub: Optional[str] = None
+    src_refmod: Optional[str] = None
+    src_lit: Optional[str] = None
+    dst_name: Optional[str] = None
+    dst_qual: Optional[str] = None
+    dst_sub: Optional[str] = None
+    dst_refmod: Optional[str] = None
+    ordinal: int = 0
+    note: Optional[str] = None
+    guard: Optional[str] = None
 
 
 @dataclass
@@ -286,6 +341,11 @@ class ProgramFacts:
     # cursor name -> (tables/aliases, select columns) so FETCH INTO can be paired positionally
     cursors: Dict[str, Tuple[List[Tuple[str, Optional[str]]], List[str]]] = dc_field(default_factory=dict)
     unresolved: List[Tuple[str, str, int]] = dc_field(default_factory=list)
+    # value flow: one row per (source, target) a verb moves data between
+    flows: List[FlowFact] = dc_field(default_factory=list)
+    # (expanded line, FILE|WORKING-STORAGE|LOCAL-STORAGE|LINKAGE, FD/SD name or None) - every section header and FD
+    section_marks: List[Tuple[int, str, Optional[str]]] = dc_field(default_factory=list)
+    returning: Optional[str] = None                                    # PROCEDURE DIVISION ... RETURNING y
 
 
 # --------------------------------------------------------------------------
@@ -342,6 +402,7 @@ def parse_program(text: str, data: bytes = b"", enc: str = "utf-8") -> ProgramFa
             current_section = None
             if current_division == "PROCEDURE":
                 f.linkage_using = _parse_using(body)
+                f.returning = _returning_of(body)
             if para_open:
                 para_open.end_line = st.start - 1
                 para_open = None
@@ -384,8 +445,13 @@ def parse_program(text: str, data: bytes = b"", enc: str = "utf-8") -> ProgramFa
             _extract_file_decl(f, st, body)
         if current_division == "DATA":
             fd = _extract_fd(f, st, body)
+            msec = _DATA_SECTION.match(up)
+            if msec:
+                # where each 01 lives: build places every pfield by these marks
+                f.section_marks.append((st.start, msec.group(1).upper(), None))
             if fd is not None:
                 cur_fd = fd
+                f.section_marks.append((st.start, "FILE", fd.select_name))
             elif re.match(r"^(?:WORKING-STORAGE|LINKAGE|LOCAL-STORAGE)\s+SECTION", up):
                 cur_fd = None
             elif cur_fd is not None:
@@ -395,18 +461,19 @@ def parse_program(text: str, data: bytes = b"", enc: str = "utf-8") -> ProgramFa
                     cur_fd.fd_records.append(ml.group(2).upper())
                     if cur_fd.fd_record is None:
                         cur_fd.fd_record = ml.group(2).upper()
+        guards: List[Tuple[int, Optional[str]]] = []
         if current_division == "PROCEDURE":
             _extract_entry(f, st)
             _extract_calls(f, st, literal_map)
             _extract_performs(f, st, here)
             _extract_file_ops(f, st)
-            _extract_field_and_literal_refs(f, st)
+            guards = _extract_field_and_literal_refs(f, st)
         elif current_division in ("DATA", None):
             _extract_value_literals(f, st)
         _extract_sql(f, st)
-        _extract_cics(f, st, literal_map)
-        _extract_dli(f, st, literal_map)
-        _extract_mq(f, st, literal_map)
+        _extract_cics(f, st, literal_map, guards)
+        _extract_dli(f, st, literal_map, guards)
+        _extract_mq(f, st, literal_map, guards)
 
     if para_open:
         para_open.end_line = len(lines)
@@ -496,12 +563,13 @@ def _extract_calls(f: ProgramFacts, st: LogicalLine,
             continue
         line = st.line_at(off)
         using = _parse_using("CALL " + frag)
+        args, returning = _parse_using_detail("CALL " + frag)
         ml = re.match(r"\s*(['\"])([^'\"]+)\1", frag)
         if ml:
             target = ml.group(2).strip().upper()
             f.calls.append(CallFact(kind="static", target=target, via_var=None,
                                     resolved=[target], resolution="literal",
-                                    using_args=using, line=line))
+                                    using_args=using, line=line, args=args, returning=returning))
             continue
         mv = re.match(rf"\s*({ID})", frag, re.IGNORECASE)
         if mv:
@@ -516,7 +584,7 @@ def _extract_calls(f: ProgramFacts, st: LogicalLine,
                 kind="dynamic", target=None, via_var=var,
                 resolved=cands,
                 resolution="move_literal" if cands else "unresolved",
-                using_args=using, line=line))
+                using_args=using, line=line, args=args, returning=returning))
             if not cands:
                 f.unresolved.append((
                     "dynamic_call",
@@ -560,6 +628,73 @@ def _parse_using(body: str) -> List[str]:
         if re.fullmatch(ID, tok, re.IGNORECASE):
             out.append(tok)
     return out
+
+
+_RETURNING = re.compile(r"\bRETURNING\s+([A-Z0-9][A-Z0-9\-]*)", re.IGNORECASE)
+
+
+def _returning_of(body: str) -> Optional[str]:
+    """`... RETURNING x` on a CALL or on the PROCEDURE DIVISION header."""
+    m = _RETURNING.search(body)
+    return m.group(1).upper() if m else None
+
+
+def _parse_using_detail(body: str) -> Tuple[List[ArgFact], Optional[str]]:
+    """The USING list with HOW each argument is passed: BY REFERENCE (the
+    default) / CONTENT / VALUE carries to the arguments after it, `LENGTH OF x`
+    -> length_of and `ADDRESS OF x` -> address_of for that one argument, `A OF
+    B` keeps its qualifier chain, a subscript stays with its argument, a
+    literal or OMITTED keeps its position with name None. Same span and cut
+    as _parse_using, which still feeds using_args. Returns (args, RETURNING)."""
+    m = _USING.search(body)
+    if not m:
+        return [], _returning_of(body)
+    raw = m.group(1)
+    raw = re.split(r"\bEND-CALL\b|\.(?=\s|$)", raw)[0]
+    ms = _USING_STOP.search(raw)
+    if ms:
+        raw = raw[:ms.start()]
+    args: List[ArgFact] = []
+    how = "reference"
+    one_shot: Optional[str] = None                     # LENGTH OF / ADDRESS OF: this argument only
+    toks = list(_OPTOKEN.finditer(raw))
+    i = 0
+    while i < len(toks):
+        t = toks[i].group(0)
+        i += 1
+        if t[0] in ("'", '"'):
+            args.append(ArgFact(pos=len(args) + 1, name=None, how=one_shot or how))
+            one_shot = None
+            continue
+        head, groups = _split_groups(t)
+        up = head.upper()
+        if up == "BY":
+            continue
+        if up in ("REFERENCE", "CONTENT", "VALUE"):
+            how = up.lower()
+            continue
+        if up in ("LENGTH", "ADDRESS") and i < len(toks) and toks[i].group(0).upper() == "OF":
+            one_shot = "length_of" if up == "LENGTH" else "address_of"
+            i += 1
+            continue
+        if up in ("OF", "IN"):
+            # qualifier of the argument before it; a subscript written after the qualifier is the argument's
+            if i < len(toks) and args and args[-1].name:
+                qh, qg = _split_groups(toks[i].group(0))
+                i += 1
+                args[-1].quals.append(qh.upper())
+                if qg and not args[-1].sub:
+                    args[-1].sub = qg[0]
+            continue
+        if up == "OMITTED" or re.fullmatch(r"[+\-\d.]+", up):
+            args.append(ArgFact(pos=len(args) + 1, name=None, how=one_shot or how))
+            one_shot = None
+            continue
+        if not re.fullmatch(ID, up, re.IGNORECASE):
+            continue
+        args.append(ArgFact(pos=len(args) + 1, name=up, sub=groups[0] if groups else None, how=one_shot or how))
+        one_shot = None
+    return args, _returning_of(body)
 
 
 # --------------------------------------------------------------------------
@@ -1006,10 +1141,12 @@ def _cics_value(arg: str, literal_map: Dict[str, Set[str]]) -> Tuple[Optional[st
 
 
 def _extract_cics(f: ProgramFacts, st: LogicalLine,
-                  literal_map: Dict[str, Set[str]]) -> None:
+                  literal_map: Dict[str, Set[str]],
+                  guards: Optional[List[Tuple[int, Optional[str]]]] = None) -> None:
     for m in _EXEC_CICS.finditer(st.text):
         inner = " ".join(m.group(1).split())
         ln = st.line_at(m.start())
+        guard = _guard_at(guards, m.start())
         verb = _CICS_VERB.match(inner)
         vb = verb.group(1).upper() if verb else "?"
         f.cics.append((vb, inner, ln))
@@ -1017,8 +1154,12 @@ def _extract_cics(f: ProgramFacts, st: LogicalLine,
         for mo in _CICS_OPT.finditer(inner):
             opts.setdefault(mo.group(1).upper(), mo.group(2).strip())
         commarea = _idents(opts["COMMAREA"])[:1] if opts.get("COMMAREA") and opts["COMMAREA"][:1] not in ("'", '"') else []
+        arg_how = "commarea"
         if not commarea and vb == "START" and opts.get("FROM") and opts["FROM"][:1] not in ("'", '"'):
             commarea = _idents(opts["FROM"])[:1]          # START TRANSID ... FROM(data): the started task RETRIEVEs it
+            arg_how = "start_from"
+        # the COMMAREA / START FROM item is the call's one positional argument
+        cics_args = [ArgFact(pos=1, name=commarea[0], how=arg_how)] if commarea else []
 
         mp = _CICS_PROG.search(inner)
         if mp:
@@ -1027,7 +1168,7 @@ def _extract_cics(f: ProgramFacts, st: LogicalLine,
             # COMMAREA is the positional argument of a LINK/XCTL: the callee
             # sees it as DFHCOMMAREA, so a value flows through it.
             f.calls.append(CallFact(kind=kind, target=val, via_var=None if res == "literal" else mp.group(2).strip().upper(),
-                                    resolved=cands, resolution=res, using_args=commarea, line=ln))
+                                    resolved=cands, resolution=res, using_args=commarea, line=ln, args=cics_args))
             if res == "unresolved":
                 f.unresolved.append((
                     "dynamic_call",
@@ -1042,7 +1183,7 @@ def _extract_cics(f: ProgramFacts, st: LogicalLine,
             val, cands, res = _cics_value(opts["TRANSID"], literal_map)
             kind = "cics_start" if vb == "START" else "cics_return"
             f.calls.append(CallFact(kind=kind, target=val, via_var=None if res == "literal" else opts["TRANSID"].upper(),
-                                    resolved=cands, resolution=res, using_args=commarea, line=ln))
+                                    resolved=cands, resolution=res, using_args=commarea, line=ln, args=cics_args))
             f.cics_cmds.append((vb, "transid", val or opts["TRANSID"].upper(), "out", ln))
             if res == "unresolved":
                 f.unresolved.append(("cics_transid", f"EXEC CICS {vb} TRANSID({opts['TRANSID'].upper()}) - "
@@ -1084,14 +1225,64 @@ def _extract_cics(f: ProgramFacts, st: LogicalLine,
         if vb == "WEB":
             f.cics_cmds.append((vb, "web", inner.split()[1].upper() if len(inner.split()) > 1 else "?", None, ln))
 
+        # the data carrier: FROM(x) leaves the program (cics_out), INTO(x) / SET(p) arrive (cics_in),
+        # noted "{verb} {resource kind} {resource}" so the walker can pair a WRITEQ with its READQ.
+        # START FROM(x) is the started task's argument (above), not a carrier row.
+        carried = [(vb, k, r) for (vb_, k, r, _d, ln_) in f.cics_cmds
+                   if ln_ == ln and vb_ == vb and k in ("map", "file", "tsq", "tdq", "queue", "container")]
+        if carried:
+            ckind, cres = carried[0][1], carried[0][2]
+        elif vb == "RETRIEVE":
+            ckind, cres = "start", ""
+        elif vb in ("SEND", "RECEIVE"):
+            ckind, cres = "terminal", ""
+        else:
+            ckind, cres = "", ""
+        note = " ".join(x for x in (vb, ckind, cres) if x)
+        if vb != "START":
+            for opt, fkind in (("FROM", "cics_out"), ("INTO", "cics_in"), ("SET", "cics_in")):
+                v = opts.get(opt)
+                if not v or v[:1] in ("'", '"'):
+                    continue
+                for op in _operands(v)[:1]:
+                    if op.name:
+                        f.flows.append(_flow(ln, "EXEC-CICS-" + vb, fkind,
+                                             src=op if fkind == "cics_out" else None,
+                                             dst=op if fkind == "cics_in" else None, note=note, guard=guard))
 
-def _extract_dli(f: ProgramFacts, st: LogicalLine, literal_map: Optional[Dict[str, Set[str]]] = None) -> None:
+
+_DLI_IN_FUNCS = {"GU", "GN", "GHU", "GHN", "GNP", "GHNP"}
+_DLI_OUT_FUNCS = {"ISRT", "REPL"}
+
+
+def _dli_flow(f: ProgramFacts, ln: int, verb: str, func: Optional[str], io_area: Optional[str],
+              guard: Optional[str], into: Optional[str] = None, frm: Optional[str] = None) -> None:
+    """The I/O area of a DL/I call: a get fills it (dli_in), ISRT/REPL send it
+    (dli_out); a function nobody resolved is recorded as a get and says so."""
+    if func in _DLI_OUT_FUNCS:
+        name, kind, note = frm or io_area, "dli_out", func
+    elif func in _DLI_IN_FUNCS:
+        name, kind, note = into or io_area, "dli_in", func
+    elif func is None or func.startswith("*"):
+        name, kind, note = into or io_area, "dli_in", "function unresolved"
+    else:
+        return                                              # DLET, CHKP, PCB ... move no data into the program
+    if not name:
+        return
+    op = _operands(name)[:1]
+    if op and op[0].name:
+        f.flows.append(_flow(ln, verb, kind, src=op[0] if kind == "dli_out" else None,
+                             dst=op[0] if kind == "dli_in" else None, note=note, guard=guard))
+
+
+def _extract_dli(f: ProgramFacts, st: LogicalLine, literal_map: Optional[Dict[str, Set[str]]] = None,
+                 guards: Optional[List[Tuple[int, Optional[str]]]] = None) -> None:
     literal_map = literal_map or {}
     m = _DLI_CALL.search(st.text)
     if m:
         iface = m.group(2).upper()
         args = _split_call_args(m.group(3))
-        _record_dli(f, st, iface, args, literal_map)
+        _record_dli(f, st, iface, args, literal_map, _guard_at(guards, m.start()))
         return
 
     for m2 in _EXEC_DLI.finditer(st.text):
@@ -1114,6 +1305,8 @@ def _extract_dli(f: ProgramFacts, st: LogicalLine, literal_map: Optional[Dict[st
                              resolution="literal"))
         if seg:
             f.io_ops.append((seg, "ims", func or "?", st.line_at(m2.start())))
+        _dli_flow(f, st.line_at(m2.start()), "EXEC-DLI", func, io, _guard_at(guards, m2.start()),
+                  into=opts.get("INTO"), frm=opts.get("FROM"))
 
 
 def _is_dli_func(tok: str, literal_map: Dict[str, Set[str]]) -> bool:
@@ -1121,7 +1314,7 @@ def _is_dli_func(tok: str, literal_map: Dict[str, Set[str]]) -> bool:
 
 
 def _record_dli(f: ProgramFacts, st: LogicalLine, iface: str,
-                args: List[str], literal_map: Dict[str, Set[str]]) -> None:
+                args: List[str], literal_map: Dict[str, Set[str]], guard: Optional[str] = None) -> None:
     """CALL 'CBLTDLI' USING [parmcount] func, pcb, io-area, ssa...
 
     The PCB argument is positional in the PSB, which is why it is captured
@@ -1193,6 +1386,7 @@ def _record_dli(f: ProgramFacts, st: LogicalLine, iface: str,
                          resolution=resolution, dest=dest or (f"*{io_area}*" if func == "CHNG" else None)))
     if pcb:
         f.io_ops.append((pcb, "ims", func or "?", st.start))
+    _dli_flow(f, st.start, "CALL-" + iface, func, io_area, guard)
 
 
 def _split_call_args(raw: str) -> List[str]:
@@ -1221,7 +1415,8 @@ def _mq_queue(struct: Optional[str], literal_map: Dict[str, Set[str]]) -> Option
     return None
 
 
-def _extract_mq(f: ProgramFacts, st: LogicalLine, literal_map: Optional[Dict[str, Set[str]]] = None) -> None:
+def _extract_mq(f: ProgramFacts, st: LogicalLine, literal_map: Optional[Dict[str, Set[str]]] = None,
+                guards: Optional[List[Tuple[int, Optional[str]]]] = None) -> None:
     """MQOPEN/MQPUT/MQPUT1/MQGET with the queue name and the message layout.
 
     USING positions (MQI): MQOPEN hconn, MQOD, options, hobj, cc, rc
@@ -1250,6 +1445,15 @@ def _extract_mq(f: ProgramFacts, st: LogicalLine, literal_map: Optional[Dict[str
             layout = args[5] if len(args) > 5 else None
             direction = "out" if call == "MQPUT" else "in"
         f.mq.append((call, queue, direction, layout, st.start))
+        if direction and layout:
+            # the BUFFER argument carries the message: MQPUT/MQPUT1 send it (mq_out), MQGET fills it (mq_in)
+            op = _operands(layout)[:1]
+            if op and op[0].name:
+                kind = "mq_out" if direction == "out" else "mq_in"
+                f.flows.append(_flow(st.start, "CALL-" + call, kind,
+                                     src=op[0] if kind == "mq_out" else None, dst=op[0] if kind == "mq_in" else None,
+                                     note=f"queue {queue}" if queue else "(queue not resolvable)",
+                                     guard=_guard_at(guards, m.start())))
 
 
 def _extract_entry(f: ProgramFacts, st: LogicalLine) -> None:
@@ -1385,7 +1589,9 @@ _SPLIT = re.compile(r"'(?:[^']|'')*'|\"(?:[^\"]|\"\")*\"|" + B + "(" + _VERBS + 
 _MOVE_TO = re.compile(r"^(?:CORR(?:ESPONDING)?\s+)?(.+?)\s+" + B + "TO" + E + r"\s+(.+)$", re.I | re.S)
 _LEADING_LIT = re.compile(r"^(?:" + LIT + r")$", re.I)
 _COMPUTE = re.compile(r"^(.+?)\s*=\s*(.+)$", re.I | re.S)
-_ARITH = re.compile(r"^(.+?)\s+" + B + r"(TO|FROM|BY|INTO)" + E + r"\s+(.+?)"
+# ADD a b GIVING c has no TO: the keyword group is optional, so the GIVING
+# target is a write and not one more read (LESSONS 174).
+_ARITH = re.compile(r"^(.+?)(?:\s+" + B + r"(TO|FROM|BY|INTO)" + E + r"\s+(.+?))?"
                     r"(?:\s+GIVING\s+(.+?))?(?:\s+REMAINDER\s+(\S+))?"
                     r"(?:\s+(?:NOT\s+)?(?:ON\s+)?SIZE\s+ERROR.*)?$", re.I | re.S)
 _INTO_TGT = re.compile(B + r"INTO\s+(.+?)(?:\s+(?:WITH\s+)?POINTER|\s+(?:NOT\s+)?(?:ON\s+)?OVERFLOW"
@@ -1432,6 +1638,197 @@ def _idents(text: str) -> List[str]:
                 if s.upper() not in _RESERVED:
                     out.append(s.upper())
     return out
+
+
+# ---- operands, as written, for the flow rows ------------------------------
+#
+# _idents answers "which names does this fragment touch"; the flow rows need
+# the operands themselves: `WS-Q OF REC-A` is not `WS-Q OF REC-B`, `WS-X (WS-I)`
+# reads WS-X and WS-I is only the subscript, `WS-BUF(1:2)` is two bytes of
+# WS-BUF. So a second tokenizer keeps up to two paren groups on a name.
+
+_PAREN = r"\((?:[^()]|\([^()]*\))*\)"
+_OPTOKEN = re.compile(r"'(?:[^']|'')*'|\"(?:[^\"]|\"\")*\"|[A-Z0-9][A-Z0-9\-]*(?:\s*" + _PAREN + r")?(?:\s*" + _PAREN + r")?",
+                      re.I)
+_FIGURATIVE = {"SPACE", "SPACES", "ZERO", "ZEROS", "ZEROES", "LOW-VALUE", "LOW-VALUES", "HIGH-VALUE",
+               "HIGH-VALUES", "QUOTE", "QUOTES", "NULL", "NULLS"}
+
+
+def _split_groups(tok: str) -> Tuple[str, List[str]]:
+    """'WS-X (1) (2:3)' -> ('WS-X', ['(1)', '(2:3)'])."""
+    i = tok.find("(")
+    if i < 0:
+        return tok, []
+    return tok[:i].strip(), re.findall(_PAREN, tok[i:])
+
+
+def _attach_groups(op: Operand, groups: List[str]) -> None:
+    """A group with a top-level ':' is a ref-mod; the first other one the subscript."""
+    for g in groups:
+        depth, colon = 0, False
+        for ch in g:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+            elif ch == ":" and depth == 1:
+                colon = True
+        if colon:
+            op.refmod = g
+        elif op.sub is None:
+            op.sub = g
+
+
+def _operands(text: str) -> List[Operand]:
+    """The operands of a fragment, in order: data-names with their OF/IN chain,
+    subscript and ref-mod; literals, figurative constants and `ALL 'x'` as
+    `lit`; the identifiers inside FUNCTION f(...) with `func` = f (a function
+    without an identifier argument is one operand with only `func`). Reserved
+    words are skipped and a subscript name is never an operand."""
+    out: List[Operand] = []
+    toks = list(_OPTOKEN.finditer(text or ""))
+    i = 0
+    while i < len(toks):
+        t = toks[i].group(0)
+        i += 1
+        if t[0] in ("'", '"'):
+            out.append(Operand(lit=t))
+            continue
+        head, groups = _split_groups(t)
+        up = head.upper()
+        if re.fullmatch(r"[+\-\d.]+", up):
+            out.append(Operand(lit=up))
+            continue
+        if up in ("OF", "IN"):
+            # qualifier of the operand before it; a subscript written after the qualifier is that operand's
+            if i < len(toks):
+                qh, qg = _split_groups(toks[i].group(0))
+                i += 1
+                if out and out[-1].name and re.fullmatch(ID, qh, re.I):
+                    out[-1].quals.append(qh.upper())
+                    if qg and out[-1].sub is None and out[-1].refmod is None:
+                        _attach_groups(out[-1], qg)
+            continue
+        if up == "ALL":
+            if i < len(toks) and (toks[i].group(0)[0] in ("'", '"') or toks[i].group(0).upper() in _FIGURATIVE):
+                out.append(Operand(lit="ALL " + toks[i].group(0)))
+                i += 1
+            continue
+        if up in _FIGURATIVE:
+            out.append(Operand(lit=up))
+            continue
+        if up == "FUNCTION":
+            if i < len(toks):
+                fh, fg = _split_groups(toks[i].group(0))
+                i += 1
+                inner = [o for g in fg for o in _operands(g[1:-1]) if o.name]
+                for o in inner:
+                    o.func = fh.upper()
+                out.extend(inner or [Operand(func=fh.upper())])
+            continue
+        if up in _RESERVED or not re.fullmatch(ID, up, re.I):
+            continue
+        op = Operand(name=up)
+        _attach_groups(op, groups)
+        out.append(op)
+    return out
+
+
+def _named(text: str) -> List[Operand]:
+    return [o for o in _operands(text) if o.name]
+
+
+def _lit_kind(op: Operand) -> str:
+    """MOVE 'AB' / MOVE 1 are `literal`; SPACES, ZEROS, ALL 'x' are `figurative`."""
+    return "literal" if op.lit and (op.lit[0] in ("'", '"') or op.lit[0] in "+-.0123456789") else "figurative"
+
+
+def _flow(ln: int, verb: str, kind: str, src: Optional[Operand] = None, dst: Optional[Operand] = None,
+          ordinal: int = 0, note: Optional[str] = None, guard: Optional[str] = None) -> FlowFact:
+    return FlowFact(line=ln, verb=verb, kind=kind,
+                    src_name=src.name if src else None,
+                    src_qual=(" OF ".join(src.quals) or None) if src else None,
+                    src_sub=src.sub if src else None, src_refmod=src.refmod if src else None,
+                    src_lit=src.lit if src else None,
+                    dst_name=dst.name if dst else None,
+                    dst_qual=(" OF ".join(dst.quals) or None) if dst else None,
+                    dst_sub=dst.sub if dst else None, dst_refmod=dst.refmod if dst else None,
+                    ordinal=ordinal, note=note, guard=guard)
+
+
+def _pair_flows(f: ProgramFacts, ln: int, verb: str, kind: str, srcs: List[Operand], dsts: List[Operand],
+                guard: Optional[str], note: Optional[str] = None) -> None:
+    """One row per source x target; the ordinal is the target's position."""
+    for i, d in enumerate(dsts):
+        for s in srcs:
+            f.flows.append(_flow(ln, verb, kind, src=s, dst=d, ordinal=i, note=note or s.func, guard=guard))
+
+
+def _cond_text(frag: str) -> Optional[str]:
+    """An IF / WHEN condition as the guard stores it: one line, no THEN, 120 chars."""
+    s = re.sub(r"\s+THEN$", "", " ".join((frag or "").split()), flags=re.I)
+    return s[:120] or None
+
+
+def _pop_to(stack: List[List], kind: str) -> None:
+    """END-IF / END-EVALUATE closes the nearest open block of its kind and everything opened inside it."""
+    if any(e[0] == kind for e in stack):
+        while stack.pop()[0] != kind:
+            pass
+
+
+def _guard_at(guards: Optional[List[Tuple[int, Optional[str]]]], off: int) -> Optional[str]:
+    """The guard in force at `off` of the statement: the state after the last verb before it."""
+    g = None
+    for o, cond in guards or ():
+        if o >= off:
+            break
+        g = cond
+    return g
+
+
+_DELIM_BY = re.compile(B + r"DELIMITED\s+BY\s+(?:ALL\s+)?(?:" + LIT + r"|[A-Z0-9][A-Z0-9\-]*(?:\s*" + _PAREN + r")?)", re.I)
+_DELIM_COUNT_IN = re.compile(B + r"(?:DELIMITER|COUNT)\s+IN\s+[A-Z0-9][A-Z0-9\-]*(?:\s*" + _PAREN + r")?", re.I)
+_UNSTRING_END = re.compile(B + r"(?:WITH\s+POINTER|POINTER|TALLYING|(?:NOT\s+)?(?:ON\s+)?OVERFLOW)" + E, re.I)
+_SET_ADDR_OF = re.compile(r"^ADDRESS\s+OF\s+(.+?)\s+TO\s+(.+)$", re.I | re.S)
+_SET_TO_ADDR = re.compile(r"^(.+?)\s+TO\s+ADDRESS\s+OF\s+(.+)$", re.I | re.S)
+_VARYING_FROM = re.compile(B + r"VARYING\s+(.+?)\s+FROM\s+(.+?)(?:\s+BY\s+|\s+UNTIL\s+|$)", re.I | re.S)
+_FIRST_NAME = re.compile(r"([A-Z0-9][A-Z0-9\-]*)", re.I)
+
+
+def _move_flows(f: ProgramFacts, raw: str, ln: int, guard: Optional[str]) -> None:
+    m = _MOVE_TO.match(raw)
+    if not m:
+        return
+    srcs, dsts = _operands(m.group(1)), _named(m.group(2))
+    if re.match(r"CORR(?:ESPONDING)?" + E, raw, re.I):
+        _pair_flows(f, ln, "MOVE", "move_corr", [s for s in srcs if s.name][:1], dsts, guard)
+        return
+    for i, d in enumerate(dsts):
+        for s in srcs:
+            kind = "function" if s.func else "move" if s.name else _lit_kind(s)
+            f.flows.append(_flow(ln, "MOVE", kind, src=s, dst=d, ordinal=i, note=s.func, guard=guard))
+
+
+def _set_flows(f: ProgramFacts, raw: str, ln: int, guard: Optional[str]) -> None:
+    ma = _SET_ADDR_OF.match(raw)
+    if ma:                      # SET ADDRESS OF a TO p: p's value becomes a's address
+        _pair_flows(f, ln, "SET", "set_address", _named(ma.group(2))[:1], _named(ma.group(1)), guard)
+        return
+    mp = _SET_TO_ADDR.match(raw)
+    if mp:                      # SET p TO ADDRESS OF x
+        _pair_flows(f, ln, "SET", "set_address", _named(mp.group(2))[:1], _named(mp.group(1)), guard)
+        return
+    m = _SET.match(raw)
+    if not m or re.fullmatch(r"TRUE|FALSE", m.group(2).strip(), re.I):
+        return
+    srcs, dsts = _operands(m.group(2))[:1], _named(m.group(1))
+    if re.search(B + r"(?:UP|DOWN)\s+BY" + E, raw, re.I):
+        _pair_flows(f, ln, "SET", "arith", [s for s in srcs if s.name], dsts, guard)
+        return
+    for i, d in enumerate(dsts):
+        for s in srcs:
+            f.flows.append(_flow(ln, "SET", "set" if s.name else _lit_kind(s), src=s, dst=d, ordinal=i, guard=guard))
 
 
 def _split_verbs(text: str) -> List[Tuple[str, str]]:
@@ -1520,7 +1917,12 @@ def _exec_refs(f: ProgramFacts, kind: str, inner: str, ln: int) -> None:
             _refs(f, names, "read", stmt, ln)
 
 
-def _extract_field_and_literal_refs(f: ProgramFacts, st: LogicalLine) -> None:
+def _extract_field_and_literal_refs(f: ProgramFacts, st: LogicalLine) -> List[Tuple[int, Optional[str]]]:
+    """field_refs / literal_refs from the qualifier-blanked text (unchanged),
+    and one FlowFact per (source, target) from the text as written, each with
+    the IF / WHEN that encloses it as its guard. Returns (offset, guard) after
+    every verb, so the EXEC CICS / DLI / MQ rows of the same statement - blanked
+    here - get their guard too."""
     body = st.text.strip().rstrip(".")
     # EXEC CICS/DLI/SQL text is not COBOL: READ FILE('X') INTO(Y) is not a
     # COBOL READ, WHERE(POLNO = K) is not a WHEN. Their host fields are taken
@@ -1529,6 +1931,9 @@ def _extract_field_and_literal_refs(f: ProgramFacts, st: LogicalLine) -> None:
     for m in _EXEC_ANY.finditer(body):
         _exec_refs(f, m.group(1).upper(), " ".join(m.group(2).split()), st.line_at(m.start()))
     body = _EXEC_ANY.sub(lambda m: " " * len(m.group(0)), body)
+    # the flow rows need the operands as written (`WS-Q OF REC-A` is not `WS-Q
+    # OF REC-B`): this text is kept, the refs go on reading the blanked one
+    body_raw = body
     # `WS-KEY OF WS-REC = 'B'` tests WS-KEY; the qualifier is blanked (same
     # length, so line attribution is unchanged) before verbs are read.
     body = re.sub(r"\b(?:OF|IN)\s+[A-Z0-9][A-Z0-9\-]*", lambda m: " " * len(m.group(0)), body, flags=re.IGNORECASE)
@@ -1536,8 +1941,26 @@ def _extract_field_and_literal_refs(f: ProgramFacts, st: LogicalLine) -> None:
     # each WHEN literal attaches to the subject at ITS position.
     eval_subjects: List[Optional[str]] = []
 
-    for verb, frag, off in _split_verbs(body):
+    verbs = _split_verbs(body)
+    raws = _split_verbs(body_raw)
+    if [(v, o) for v, _fr, o in verbs] != [(v, o) for v, _fr, o in raws]:
+        # blanking a qualifier changed the verb split (not seen on any fixture): both from the blanked text
+        raws = verbs
+        f.unresolved.append(("operand_parse", "statement splits differently with its OF/IN qualifiers blanked; "
+                                              "flow operands taken from the blanked text", st.start))
+    # open IF / EVALUATE / SEARCH / WHEN blocks of this statement: [kind, text, negated]
+    stack: List[List] = []
+    guards: List[Tuple[int, Optional[str]]] = []
+
+    def guard() -> Optional[str]:
+        for kind, text, neg in reversed(stack):
+            if kind in ("if", "when"):
+                return f"NOT ({text})" if neg else text
+        return None
+
+    for (verb, frag, off), (_v, raw, _o) in zip(verbs, raws):
         ln = st.line_at(off)          # the verb's own physical line, not the IF's
+        g = guard()
         if verb == "MOVE":
             m = _MOVE_TO.match(frag)
             if not m:
@@ -1549,25 +1972,37 @@ def _extract_field_and_literal_refs(f: ProgramFacts, st: LogicalLine) -> None:
             if _LEADING_LIT.match(src.strip()):
                 for t in targets:
                     f.literal_refs.append((_norm_lit(src), "move_to", t, ln))
+            _move_flows(f, raw, ln, g)
 
         elif verb == "COMPUTE":
             m = _COMPUTE.match(frag)
             if m:
                 _refs(f, _idents(m.group(1)), "write", verb, ln)
                 _refs(f, _idents(m.group(2)), "read", verb, ln)
+                mr = _COMPUTE.match(raw)
+                if mr:
+                    _pair_flows(f, ln, verb, "arith", _named(mr.group(2)), _named(mr.group(1)), g)
 
         elif verb in ("ADD", "SUBTRACT", "MULTIPLY", "DIVIDE"):
             m = _ARITH.match(frag)
-            if m:
+            if m and (m.group(2) or m.group(4)):
                 operands, target, giving, rem = m.group(1), m.group(3), m.group(4), m.group(5)
                 _refs(f, _idents(operands), "read", verb, ln)
                 if giving:
-                    _refs(f, _idents(target), "read", verb, ln)
+                    if target:
+                        _refs(f, _idents(target), "read", verb, ln)
                     _refs(f, _idents(giving), "write", verb, ln)
                 else:
                     _refs(f, _idents(target), "write", verb, ln)
                 if rem:
                     _refs(f, _idents(rem), "write", verb, ln)
+                mr = _ARITH.match(raw)
+                if mr and (mr.group(2) or mr.group(4)):
+                    # GIVING: every operand feeds each GIVING target (and the REMAINDER); else the
+                    # operands feed the TO/FROM/BY/INTO target
+                    srcs = _named(mr.group(1)) + (_named(mr.group(3)) if mr.group(4) and mr.group(3) else [])
+                    dsts = (_named(mr.group(4)) + _named(mr.group(5) or "")) if mr.group(4) else _named(mr.group(3))
+                    _pair_flows(f, ln, verb, "arith", srcs, dsts, g)
             else:
                 _refs(f, _idents(frag), "read", verb, ln)
 
@@ -1585,39 +2020,86 @@ def _extract_field_and_literal_refs(f: ProgramFacts, st: LogicalLine) -> None:
                     if tpl:
                         for t in _idents(m.group(1)):
                             f.literal_refs.append((tpl, "string_group", t, ln))
+                mr = _INTO_TGT.search(raw)
+                if mr and verb == "STRING":
+                    # the sources, without their DELIMITED BY operands; the POINTER is cut by _INTO_TGT
+                    _pair_flows(f, ln, verb, "string", _named(_DELIM_BY.sub(" ", raw[:mr.start()])),
+                                _named(mr.group(1)), g)
+                elif mr:
+                    # the source before DELIMITED / INTO; every INTO target, minus DELIMITER IN / COUNT IN
+                    head = re.split(B + r"(?:DELIMITED|INTO)" + E, raw, maxsplit=1, flags=re.I)[0]
+                    tail = _UNSTRING_END.split(raw[mr.start(1):], maxsplit=1)[0]
+                    _pair_flows(f, ln, verb, "unstring", _named(head)[:1], _named(_DELIM_COUNT_IN.sub(" ", tail)), g)
             else:
                 _refs(f, _idents(frag), "read", verb, ln)
 
         elif verb == "INITIALIZE":
             head = re.split(B + r"(?:REPLACING|WITH)" + E, frag, maxsplit=1, flags=re.I)[0]
             _refs(f, _idents(head), "write", verb, ln)
+            mr = re.search(B + r"((?:REPLACING|WITH)" + E + r".*)$", raw, re.I | re.S)
+            rep = Operand(lit=" ".join(mr.group(1).split())) if mr else None
+            for i, d in enumerate(_named(re.split(B + r"(?:REPLACING|WITH)" + E, raw, maxsplit=1, flags=re.I)[0])):
+                f.flows.append(_flow(ln, verb, "initialize", src=rep, dst=d, ordinal=i, guard=g))
 
         elif verb == "SET":
             m = _SET.match(frag)
             if m:
                 _refs(f, _idents(m.group(1)), "write", verb, ln)
                 _refs(f, _idents(m.group(2)), "read", verb, ln)
+            _set_flows(f, raw, ln, g)
 
         elif verb == "ACCEPT":
             ids = _idents(frag)
             if ids:
                 _refs(f, ids[:1], "write", verb, ln)
+            mf = re.search(B + r"FROM\s+([A-Z0-9][A-Z0-9\-]*)", raw, re.I)
+            for d in _named(re.split(B + "FROM" + E, raw, maxsplit=1, flags=re.I)[0])[:1]:
+                f.flows.append(_flow(ln, verb, "accept", dst=d, note=mf.group(1).upper() if mf else None, guard=g))
 
         elif verb in ("READ", "RETURN"):
             m = _INTO_TGT.search(frag)
             if m:
                 _refs(f, _idents(m.group(1)), "write", verb, ln)
+            mf = _FIRST_NAME.match(raw)
+            if mf:
+                # the file fills each of its 01 records (io_in); INTO copies the record on to x
+                fname = mf.group(1).upper()
+                fd = next((x for x in f.files if x.select_name == fname), None)
+                recs = fd.fd_records if fd else []
+                note = f"file {fname}" + (" multi-record" if len(recs) > 1 else "")
+                for i, r in enumerate(recs):
+                    f.flows.append(_flow(ln, verb, "io_in", dst=Operand(name=r), ordinal=i, note=note, guard=g))
+                mr = _INTO_TGT.search(raw)
+                if mr:
+                    for d in _named(mr.group(1))[:1]:
+                        if recs:
+                            for i, r in enumerate(recs):
+                                f.flows.append(_flow(ln, verb, "read_into", src=Operand(name=r), dst=d, ordinal=i,
+                                                     note=note, guard=g))
+                        else:
+                            f.flows.append(_flow(ln, verb, "read_into", dst=d, note=note + " (records unknown)", guard=g))
 
         elif verb in ("WRITE", "REWRITE", "RELEASE"):
             m = _FROM_SRC.search(frag)
             if m:
                 _refs(f, [m.group(1).upper()], "read", verb, ln)
+            mf = _FIRST_NAME.match(raw)
+            if mf:
+                rec = mf.group(1).upper()
+                fd = _record_of(f, rec)
+                note = f"file {fd.select_name}" if fd else "file ?"
+                f.flows.append(_flow(ln, verb, "io_out", src=Operand(name=rec), note=note, guard=g))
+                mr = re.search(B + r"FROM\s+(.+)$", raw, re.I | re.S)
+                if mr:
+                    _pair_flows(f, ln, verb, "write_from", _named(mr.group(1))[:1], [Operand(name=rec)], g)
 
         elif verb == "INSPECT":
             ids = _idents(frag)
             if ids:
                 if re.search(B + r"(?:REPLACING|CONVERTING)" + E, frag, re.I):
                     _refs(f, ids[:1], "write", verb, ln)
+                    for op in _named(raw)[:1]:
+                        f.flows.append(_flow(ln, verb, "inspect", src=op, dst=op, guard=g))
                 else:
                     _refs(f, ids[:1], "read", verb, ln)
                 mt = re.search(B + r"TALLYING\s+([A-Z0-9][A-Z0-9\-]*)", frag, re.I)
@@ -1636,13 +2118,35 @@ def _extract_field_and_literal_refs(f: ProgramFacts, st: LogicalLine) -> None:
 
         elif verb == "CALL":
             # BY REFERENCE is the default: the callee may write every argument.
-            for a in _parse_using("CALL " + frag):
-                f.field_refs.append((a, "write", "CALL-USING", ln))
-                f.field_refs.append((a, "read", "CALL-USING", ln))
+            # BY CONTENT / BY VALUE give the callee a copy, LENGTH OF x a number:
+            # read only. From the text as written, so LENGTH and ADDRESS never
+            # become fields of their own.
+            args, returning = _parse_using_detail("CALL " + raw)
+            for a in args:
+                if not a.name:
+                    continue
+                if a.how not in ("content", "value", "length_of"):
+                    f.field_refs.append((a.name, "write", "CALL-USING", ln))
+                f.field_refs.append((a.name, "read", "CALL-USING", ln))
+            if returning:
+                f.field_refs.append((returning, "write", "CALL-RETURNING", ln))
+                mt = re.match(r"\s*(?:(['\"])([^'\"]+)\1|([A-Z0-9][A-Z0-9\-]*))", raw, re.I)
+                target = (mt.group(2) or mt.group(3)).strip().upper() if mt else None
+                f.flows.append(_flow(ln, verb, "returning", dst=Operand(name=returning), note=target, guard=g))
 
         elif verb == "IF":
             _refs(f, _idents(frag), "test", verb, ln)
             _compare_literals(f, frag, "compare", ln)
+            stack.append(["if", _cond_text(raw), False])
+
+        elif verb == "ELSE":
+            for e in reversed(stack):
+                if e[0] == "if":
+                    e[2] = True
+                    break
+
+        elif verb == "END-IF":
+            _pop_to(stack, "if")
 
         elif verb == "EVALUATE":
             eval_subjects = []
@@ -1650,6 +2154,7 @@ def _extract_field_and_literal_refs(f: ProgramFacts, st: LogicalLine) -> None:
                 m = _EVAL_SUBJ.match(part.strip())
                 eval_subjects.append(m.group(1).upper() if m and m.group(1) else None)
             _refs(f, _idents(frag), "test", verb, ln)
+            stack.append(["eval", _cond_text(raw), False])
 
         elif verb == "WHEN":
             _refs(f, _idents(frag), "test", verb, ln)
@@ -1657,6 +2162,13 @@ def _extract_field_and_literal_refs(f: ProgramFacts, st: LogicalLine) -> None:
             for i, part in enumerate(parts):
                 subj = eval_subjects[i] if i < len(eval_subjects) else None
                 _compare_literals(f, part, "when", ln, subject=subj)
+            if stack and stack[-1][0] == "when":
+                stack.pop()
+            subject = next((e[1] for e in reversed(stack) if e[0] == "eval"), None)
+            stack.append(["when", _cond_text((f"EVALUATE {subject} " if subject else "") + "WHEN " + raw), False])
+
+        elif verb in ("END-EVALUATE", "END-SEARCH"):
+            _pop_to(stack, "eval")
 
         elif verb == "PERFORM":
             mu = re.search(B + r"UNTIL\s+(.+)$", frag, re.I | re.S)
@@ -1666,9 +2178,20 @@ def _extract_field_and_literal_refs(f: ProgramFacts, st: LogicalLine) -> None:
             mv = re.search(B + r"VARYING\s+([A-Z0-9][A-Z0-9\-]*)", frag, re.I)
             if mv:
                 _refs(f, [mv.group(1).upper()], "write", verb, ln)
+            mvr = _VARYING_FROM.search(raw)
+            if mvr:
+                # the index starts at FROM's value: a `set` row, src_lit when it is a number
+                for d in _named(mvr.group(1))[:1]:
+                    for s in _operands(mvr.group(2))[:1]:
+                        f.flows.append(_flow(ln, verb, "set", src=s, dst=d, guard=g))
 
         elif verb in ("SEARCH", "START", "DELETE", "OPEN", "CLOSE"):
             _refs(f, _idents(frag), "read", verb, ln)
+            if verb == "SEARCH":
+                stack.append(["eval", None, False])
+
+        guards.append((off, guard()))
+    return guards
 
 
 def _extract_value_literals(f: ProgramFacts, st: LogicalLine) -> None:

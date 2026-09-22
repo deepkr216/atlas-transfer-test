@@ -290,7 +290,9 @@ class FlowParser(unittest.TestCase):
             self.assertIn(("WS-X", "read", "CALL-USING", ln), self.refs)
             self.assertNotIn(("WS-X", "write", "CALL-USING", ln), self.refs)       # BY CONTENT: one-way
             self.assertIn(("WS-Y", "write", "CALL-USING", ln), self.refs)
-            self.assertEqual([r for r in self.refs if r[0] == "LENGTH"], [])
+            # LENGTH OF / ADDRESS OF are phrases, not fields: neither word may survive as a ref
+            self.assertEqual([r for r in self.refs if r[0] in ("LENGTH", "ADDRESS")], [])
+            self.assertIn(("WS-I", "write", "CALL-RETURNING", ln), self.refs)   # the RETURNING item is set (LESSONS 174)
         with self.subTest("guard: the enclosing IF, NOT (...) under ELSE, NULL outside"):
             a = self.rows(_ln("    MOVE WS-A TO WS-B"), "move")
             b = self.rows(_ln("    MOVE WS-B TO WS-A"), "move")
@@ -675,12 +677,22 @@ class FlowIndex(unittest.TestCase):
             c.close()
         out = self.flow("WS-STATUS", "--program", "FLOWSRC", db=old)
         self.assertIn("index has no data_flow - reconstructed from field_ref; exact after the next re-parse", out)
-        self.assertRegex(out, r"\d+ MOVE statements? could not be paired \(index predates data_flow\)")
+        unpaired = re.search(r"(\d+) MOVE statements? could not be paired \(index predates data_flow\)", out)
+        self.assertIsNotNone(unpaired, out)
         moves = [ln for ln in out.splitlines() if "MOVE ->" in ln]
         self.assertTrue(moves, out)
         for ln in moves:
             self.assertIn("(reconstructed)", ln, ln)
         self.assertIn("OR-STAT", out)                       # a single-pair line is still paired
+        # guard 2: field_ref alone cannot say which read pairs with which write on a line that holds
+        # more than one of either, so such lines are COUNTED, never paired reads x writes. FLOWSRC has
+        # two: the one-line IF/ELSE (one MOVE read, two MOVE writes: WS-STATUS and WS-RC) and the
+        # subscripted MOVE (two reads: WS-STATUS and WS-I, one write: WS-STAT-ENT). WS-RC and
+        # WS-STAT-ENT are reachable from WS-STATUS only through those lines, so a cross-pairing
+        # reconstruction is the one that prints them.
+        self.assertGreaterEqual(int(unpaired.group(1)), 2, out)
+        self.assertNotIn("MOVE -> WS-RC", out)
+        self.assertNotIn("WS-STAT-ENT", out)
         self.assertIn("TEST.STAT.OUT", out)                 # file bytes of a program-owned record
         self.assertIn("copybook fields: not followed until re-parse", out)
         self.assertIn("FLOWSUB.LK-STATUS", out)             # CALL from call_edge / linkage_using

@@ -1421,6 +1421,8 @@ UNRESOLVED_MEANING = {
                      "the target may come from a control card, a DB2 table or LINKAGE: `callers` / `crud` are incomplete for it"),
     "screen": ("a BMS / MFS member in which no map, format or message macro was recognised",
                "check it really is a map source; if it is, send its first lines (no data) so the parser can be fixed"),
+    "operand_parse": ("a statement that split into different verbs with and without its OF/IN qualifiers",
+                      "its data_flow rows were taken from the qualifier-blanked text: `flow` through that line may miss a qualified operand - send the statement shape (no data) so the parser can be fixed"),
     "dli_function": ("a DL/I call whose function code is not a literal in this program",
                      "the function (GU/ISRT/REPL...) comes from a variable: read/update intent for that call is unknown"),
     "ims_psb": ("a program whose PSB could not be matched",
