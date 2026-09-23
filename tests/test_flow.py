@@ -477,6 +477,166 @@ class FlowPrunedSelfCheck(unittest.TestCase):
                WHERE p.program_id='TSTREPL' AND d.kind='move'""")], [(None, None)])
 
 
+class FlowSharedStorage(unittest.TestCase):
+    """A CALL BY REFERENCE / LINKAGE hop is the SAME storage, not a copy.
+    (1) A parameter reached through one CALL is that caller's argument: the
+    value cannot come out at another CALL's argument (another invocation, or
+    another caller); every caller is right only when the value entered the
+    parameter by a copy inside the callee. (2) The bytes keep their place:
+    no PIC conversion, no whole-item fill, so a ref-mod on the caller's bytes
+    the callee never touches is not a hop (guards 6, 16). Inline, fictional."""
+
+    SUB = """       IDENTIFICATION DIVISION.
+       PROGRAM-ID. SHSUB.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01  WS-SAVE                  PIC X(02).
+       LINKAGE SECTION.
+       01  LK-Q                     PIC X(02).
+       PROCEDURE DIVISION USING LK-Q.
+           MOVE LK-Q TO WS-SAVE.
+           MOVE 'OK' TO LK-Q.
+           GOBACK.
+"""
+    KEEP = """       IDENTIFICATION DIVISION.
+       PROGRAM-ID. SHKEEP.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01  WS-KEPT                  PIC X(02).
+       LINKAGE SECTION.
+       01  LK-K                     PIC X(02).
+       PROCEDURE DIVISION USING LK-K.
+           IF WS-KEPT = SPACES
+               MOVE LK-K TO WS-KEPT
+           ELSE
+               MOVE WS-KEPT TO LK-K
+           END-IF.
+           GOBACK.
+"""
+    TWO = """       IDENTIFICATION DIVISION.
+       PROGRAM-ID. SHTWO.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01  WF-A                     PIC X(02).
+       01  WF-B                     PIC X(02).
+       01  WF-C                     PIC X(02).
+       PROCEDURE DIVISION.
+           CALL 'SHSUB' USING WF-A.
+           CALL 'SHSUB' USING WF-B.
+           DISPLAY WF-B.
+           CALL 'SHKEEP' USING WF-C.
+           GOBACK.
+"""
+    ONE = """       IDENTIFICATION DIVISION.
+       PROGRAM-ID. SHONE.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01  WC-OTHER                 PIC X(02).
+       01  WC-KEEP                  PIC X(02).
+       PROCEDURE DIVISION.
+           CALL 'SHSUB' USING WC-OTHER.
+           DISPLAY WC-OTHER.
+           CALL 'SHKEEP' USING WC-KEEP.
+           DISPLAY WC-KEEP.
+           GOBACK.
+"""
+    PART = """       IDENTIFICATION DIVISION.
+       PROGRAM-ID. SHPART.
+       DATA DIVISION.
+       LINKAGE SECTION.
+       01  LK-P                     PIC X(02).
+       PROCEDURE DIVISION USING LK-P.
+           MOVE 'ZZ' TO LK-P.
+           GOBACK.
+"""
+    TEXT = """       IDENTIFICATION DIVISION.
+       PROGRAM-ID. SHTEXT.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01  WT-TXT                   PIC X(04).
+       01  WT-TAIL                  PIC X(02).
+       01  WT-NUM                   PIC 9(04).
+       PROCEDURE DIVISION.
+           CALL 'SHPART' USING WT-TXT.
+           MOVE WT-TXT(3:2) TO WT-TAIL.
+           DISPLAY WT-TAIL.
+           CALL 'SHPART' USING WT-NUM.
+           GOBACK.
+"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.td = tempfile.mkdtemp()
+        src = os.path.join(cls.td, "estate")
+        os.makedirs(src)
+        for name, text in (("SHSUB.cbl", cls.SUB), ("SHKEEP.cbl", cls.KEEP), ("SHTWO.cbl", cls.TWO),
+                           ("SHONE.cbl", cls.ONE), ("SHPART.cbl", cls.PART), ("SHTEXT.cbl", cls.TEXT)):
+            with open(os.path.join(src, name), "w", encoding="utf-8") as fh:
+                fh.write(text)
+        cls.db = os.path.join(cls.td, "t.db")
+        with contextlib.redirect_stdout(io.StringIO()):
+            build._main([src, "--db", cls.db, "--rebuild", "--quiet"])
+        # the same index as it looks before the re-parse (fallback walker)
+        cls.old = os.path.join(cls.td, "old.db")
+        shutil.copyfile(cls.db, cls.old)
+        c = sqlite3.connect(cls.old)
+        c.executescript("DROP TABLE data_flow; DROP TABLE pfield;")
+        c.close()
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.td, ignore_errors=True)
+
+    def flow(self, *args, db=None) -> str:
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = query._main(["--db", db or self.db, "flow", *args])
+        self.assertEqual(rc, 0, err.getvalue())
+        return out.getvalue()
+
+    def test_param_reached_through_a_call_goes_back_to_no_other_call(self):
+        for db, tag in ((self.db, "exact"), (self.old, "reconstructed")):
+            with self.subTest(tag):
+                down = self.flow("WF-A", "--program", "SHTWO", db=db)
+                self.assertRegex(down, r"CALL SHSUB arg 1 -> SHSUB\.LK-Q")
+                self.assertIn("SHSUB.WS-SAVE", down)                 # the callee's own copy is still followed
+                for other in ("WF-B", "WC-OTHER", "back to"):
+                    self.assertNotIn(other, down, other)
+                up = self.flow("WF-B", "--program", "SHTWO", "--up", db=db)
+                self.assertRegex(up, r"CALL SHSUB arg 1 <- SHSUB\.LK-Q")
+                self.assertIn("'OK'", up)
+                for other in ("WF-A", "WC-OTHER"):
+                    self.assertNotIn(other, up, other)
+                # starting AT the parameter: whatever is in it goes back to every caller (rule 3)
+                lk = self.flow("LK-Q", "--program", "SHSUB", db=db)
+                for arg in ("SHONE.WC-OTHER", "SHTWO.WF-A", "SHTWO.WF-B"):
+                    self.assertRegex(lk, rf"LINKAGE pos 1 -> back to {re.escape(arg)}\b")
+        # entered by a copy inside the callee (kept, then moved back into the parameter on a later
+        # call): then every caller's argument CAN receive it
+        kept = self.flow("WF-C", "--program", "SHTWO", "--hops", "4")
+        self.assertRegex(kept, r"MOVE -> SHKEEP\.LK-K\b")
+        self.assertRegex(kept, r"LINKAGE pos 1 -> back to SHONE\.WC-KEEP\b")
+
+    def test_by_reference_hops_share_bytes_never_convert(self):
+        # the callee's 2 bytes are bytes 1-2 of the caller's 4: not the whole item
+        lk = self.flow("LK-P", "--program", "SHPART")
+        self.assertRegex(lk, r"LINKAGE pos 1 -> back to SHTEXT\.WT-TXT \(bytes 1-2 of 4\)")
+        self.assertRegex(lk, r"LINKAGE pos 1 -> back to SHTEXT\.WT-NUM \(bytes 1-2 of 4\)")
+        # WT-TXT(3:2) is bytes SHPART never touches: no hop
+        self.assertNotIn("WT-TAIL", lk)
+        self.assertNotIn("converted", lk)
+        # into the callee: the first 2 bytes, cut, never a PIC conversion
+        num = _lines_of(self.flow("WT-NUM", "--program", "SHTEXT"), "CALL SHPART arg 1")
+        self.assertRegex(num, r"CALL SHPART arg 1 -> SHPART\.LK-P \(LINKAGE, X\(02\)\); truncated 4 -> 2")
+        self.assertNotIn("converted", num)
+        # --up: bytes 3-4 of WT-TXT come from no CALL; the whole item from SHPART's write (bytes 1-2)
+        tail = self.flow("WT-TAIL", "--program", "SHTEXT", "--up")
+        self.assertIn("WT-TXT", tail)
+        self.assertNotIn("SHPART", tail)
+        txt = self.flow("WT-TXT", "--program", "SHTEXT", "--up")
+        self.assertRegex(txt, r"CALL SHPART arg 1 <- SHPART\.LK-P\b")
+
+
 class FlowIndex(unittest.TestCase):
 
     @classmethod
@@ -750,7 +910,8 @@ class FlowIndex(unittest.TestCase):
         self.assertRegex(rc, r"(arg|pos|position) 2")
         one = self.flow("WS-STATUS", "--program", "FLOWSRC", "--hops", "1")
         self.assertIn("hop limit 1", one)
-        self.assertNotIn("WS-HOLD", one)
+        # no hop into WS-HOLD (a guard naming it on an `also set here` line is not a hop)
+        self.assertNotRegex(one, r"-> (?:FLOWSUB\.)?WS-HOLD")
         narrow = self.flow("WS-STATUS", "--program", "FLOWSRC", "--width", "1")
         drop = [ln for ln in narrow.splitlines() if "(--all)" in ln]
         # the cap is per node (plan section 4): the root's collapse line names every dropped program with
@@ -763,6 +924,18 @@ class FlowIndex(unittest.TestCase):
         ping = self.flow("WS-PING", "--program", "FLOWSRC")
         self.assertIn("WS-PONG", ping)
         self.assertEqual(ping.count("(shown as "), 1, ping)
+
+    def test_call_hops_share_storage_in_the_fixtures(self):
+        # FLOWSUB.LK-RC reached through `CALL WS-PGM` (FLOWENT, arg 1) IS WS-STATUS's storage: it never goes
+        # back to another CALL's argument (WS-RC, WS-Y); and a CALL / LINKAGE hop never converts a PIC
+        down = self.flow("WS-STATUS", "--program", "FLOWSRC")
+        self.assertNotRegex(down, r"back to FLOWSRC\.WS-(?:RC|Y)\b")
+        up = self.flow("WS-RC", "--program", "FLOWSRC", "--up")
+        self.assertNotIn("WS-Y", up)
+        for text in (down, up):
+            for ln in text.splitlines():
+                if re.search(r"\b(?:CALL|LINKAGE|COMMAREA)\b", ln):
+                    self.assertNotIn("converted", ln)
 
     def test_flow_partial_program_is_labelled(self):
         # ERRPGM's COPY POLDCL is not in the fixtures (parse_status partial, an

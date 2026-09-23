@@ -109,12 +109,19 @@ def has_flow_tables(conn: sqlite3.Connection) -> bool:
 # ---------------------------------------------------------------------------
 
 class _Node:
-    __slots__ = ("pid", "pname", "root", "lo", "hi", "pf", "hop", "unnamed", "kind", "data", "name")
+    """`via_call`: the call_edge id when the node is a callee's parameter
+    reached THROUGH that CALL (or, under --up, written back through it). The
+    parameter then IS that caller's storage: the value cannot reach another
+    invocation's argument, and back through the same CALL is the argument
+    it came from - so such a node has no LINKAGE-back / param-in edges, and
+    its subtree is the same whichever CALL it came through."""
+    __slots__ = ("pid", "pname", "root", "lo", "hi", "pf", "hop", "unnamed", "kind", "data", "name", "via_call")
 
     def __init__(self, pid: int, pname: str, root: int, lo: int, hi: int, pf, hop: int,
                  unnamed: bool = False, kind: str = "field", data=None, name: Optional[str] = None) -> None:
         self.pid, self.pname, self.root, self.lo, self.hi, self.pf, self.hop = pid, pname, root, lo, hi, pf, hop
         self.unnamed, self.kind, self.data, self.name = unnamed, kind, data, name
+        self.via_call: Optional[int] = None
 
 
 class _Edge:
@@ -453,7 +460,7 @@ class _Walker(_Report):
         self._prog: Dict[int, sqlite3.Row] = {}
         self._dup: Dict[Tuple[int, str], int] = {}
         self._aliases: Dict[int, Set[str]] = {}
-        self.visited: Dict[Tuple[int, int], List[Tuple[int, int, str]]] = defaultdict(list)
+        self.visited: Dict[Tuple[int, int], List[Tuple[int, int, str, Optional[int]]]] = defaultdict(list)
         self._partial_shown: Set[int] = set()
         self._layout: Dict[int, Optional[str]] = {}
 
@@ -657,10 +664,15 @@ class _Walker(_Report):
         return _Node(pid, self.prog(pid)["program_id"], row["root_id"], lo, hi, row, hop, unnamed=(how == "unnamed"))
 
     def seen(self, node: _Node) -> Optional[str]:
-        for (vlo, vhi, num) in self.visited[(node.pid, node.root)]:
-            if vlo <= node.lo and node.hi <= vhi:
+        # a parameter walked as one CALL's storage (via_call) has fewer edges than the
+        # same parameter reached by a copy inside the callee: it never stands in for that
+        for (vlo, vhi, num, via) in self.visited[(node.pid, node.root)]:
+            if vlo <= node.lo and node.hi <= vhi and (via is None or node.via_call is not None):
                 return num
         return None
+
+    def visit(self, node: _Node, num: str) -> None:
+        self.visited[(node.pid, node.root)].append((node.lo, node.hi, num, node.via_call))
 
     # ---- byte mapping between a source item and a destination item ------------------
     def map_bytes(self, node: _Node, src, src_refmod: Optional[str], dst, dst_refmod: Optional[str],
@@ -716,6 +728,33 @@ class _Walker(_Report):
         if du:
             return d0, d1, labels, None
         return d0 + rel0, d0 + rel1, labels, None
+
+    def overlay(self, node: _Node, frm, to) -> Optional[Tuple[int, int, List[str], Optional[str]]]:
+        """(lo, hi, labels, end) in `to` of the node's bytes in `frm` when the
+        two SHARE storage from their first byte (CALL BY REFERENCE, LINKAGE,
+        COMMAREA, pointer alias) or a carrier moves the bytes as they are (a
+        queue, a segment, START data): same relative place, never converted,
+        never spread over the whole receiving item (guards 6, 16). None when
+        the node's bytes are outside `frm`; bytes past the end of `to` are
+        cut and labelled."""
+        f0, f1 = self.extent(frm)
+        t0, t1 = self.extent(to)
+        x0, x1 = max(node.lo, f0), min(node.hi, f1)
+        if x0 >= x1:
+            return None
+        rel0, rel1, tlen = x0 - f0, x1 - f0, t1 - t0
+        cut = END_TRUNC.format(n=f1 - f0, m=tlen)
+        if rel0 >= tlen:
+            return t0, t1, [], cut
+        if rel1 > tlen:
+            return t0 + rel0, t1, [cut], None
+        return t0 + rel0, t0 + rel1, [], None
+
+    def place_ref(self, dst, lo: int, hi: int) -> List[Tuple[sqlite3.Row, int, int, str]]:
+        """place() for shared storage: part of an elementary item is that
+        item's bytes a-b, not a group MOVE's unnamed bytes."""
+        return [(row, a, b, "partial" if how == "unnamed" and not row["is_group"] else how)
+                for (row, a, b, how) in self.place(dst, lo, hi)]
 
     # ---- edges: down ------------------------------------------------------------------
     def edges(self, node: _Node) -> List[_Edge]:
@@ -878,12 +917,14 @@ class _Walker(_Report):
             if a is None:
                 self.unlinked += 1
                 continue
-            mapped = self.map_bytes(node, x, None, a, None)
+            mapped = self.overlay(node, x, a)
             if mapped is None:
                 continue
-            n_lo, n_hi, labels, end = mapped
+            n_lo, n_hi, labels, cut = mapped
+            if cut:
+                continue            # the node's bytes lie past the end of the other side: not shared
             cites = self.cite_stmt(pid, r["line"], "SET", p["name"]) + "; " + self.cite_stmt(pid, r2["line"], "SET", a["name"])
-            for (row, plo, phi, how) in self.place(a, n_lo, n_hi):
+            for (row, plo, phi, how) in self.place_ref(a, n_lo, n_hi):
                 ch = self.child(pid, row, plo, phi, how, node.hop + 1)
                 out.append(_Edge(8, node.pname, r["line"], f"pointer alias {p['name']} -> {self.nm(ch)} {self.desc(ch)}".rstrip()
                                  + self._lbls(labels), cites, None, child=ch))
@@ -1187,7 +1228,8 @@ class _Walker(_Report):
                 if a["how"] == "address_of":
                     out.extend(self.address_of_edges(node, a, callee, ppf, cites, callname))
                     continue
-                mapped = self.map_bytes(node, apf, None, ppf, None)
+                # the parameter IS the argument's storage (or, BY CONTENT, a copy of its bytes): no MOVE rules
+                mapped = self.overlay(node, apf, ppf)
                 if mapped is None:
                     continue
                 n_lo, n_hi, labels, end = mapped
@@ -1199,8 +1241,9 @@ class _Walker(_Report):
                     out.append(_Edge(2, cname, a["cline"], f"{callname} arg {a['pos']} -> {cname}.{ppf['name']}"
                                      + self._lbls(labels), cites, end=end, extra=extra))
                     continue
-                for (row, plo, phi, how) in self.place(ppf, n_lo, n_hi):
+                for (row, plo, phi, how) in self.place_ref(ppf, n_lo, n_hi):
                     ch = self.child(callee["id"], row, plo, phi, how, node.hop + 1)
+                    ch.via_call = a["cid"]
                     self.touch(callee["id"])
                     label = f"{callname} arg {a['pos']} -> {cname}.{self.nm(ch)} {self.desc(ch)}".rstrip() + self._lbls(labels)
                     out.append(_Edge(2, cname, a["cline"], label, cites, child=ch, extra=extra))
@@ -1218,11 +1261,13 @@ class _Walker(_Report):
             if tgt is None:
                 self.unlinked += 1
                 continue
-            mapped = self.map_bytes(node, apf, None, tgt, None)
+            mapped = self.overlay(node, apf, tgt)
             if mapped is None:
                 continue
-            n_lo, n_hi, labels, _end = mapped
-            for (row, plo, phi, how) in self.place(tgt, n_lo, n_hi):
+            n_lo, n_hi, labels, cut = mapped
+            if cut:
+                continue            # the node's bytes lie past the end of the other side: not shared
+            for (row, plo, phi, how) in self.place_ref(tgt, n_lo, n_hi):
                 ch = self.child(callee["id"], row, plo, phi, how, node.hop + 1)
                 self.touch(callee["id"])
                 out.append(_Edge(2, callee["program_id"], a["cline"],
@@ -1265,11 +1310,13 @@ class _Walker(_Report):
                                  end=END_NO_COMMAREA))
                 continue
             for (tpf, note) in targets:
-                mapped = self.map_bytes(node, apf, None, tpf, None)
+                mapped = self.overlay(node, apf, tpf)
                 if mapped is None:
                     continue
-                n_lo, n_hi, labels, end = mapped
-                for (row, plo, phi, how) in self.place(tpf, n_lo, n_hi):
+                n_lo, n_hi, labels, cut = mapped
+                if cut:
+                    continue            # the node's bytes lie past the end of the other side: not shared
+                for (row, plo, phi, how) in self.place_ref(tpf, n_lo, n_hi):
                     ch = self.child(callee["id"], row, plo, phi, how, node.hop + 1)
                     self.touch(callee["id"])
                     out.append(_Edge(2, callee["program_id"], a["cline"],
@@ -1318,6 +1365,10 @@ class _Walker(_Report):
 
     def linkage_back(self, node: _Node, ids: Set[int]) -> List[_Edge]:
         out: List[_Edge] = []
+        # reached through one CALL: the parameter is that caller's storage, so the value cannot
+        # reach another CALL's argument; every caller only when it got here by a copy (or is the start)
+        if node.via_call is not None:
+            return out
         params = self.params_of_root(node)
         if not params or not self.written_here(node, ids):
             return out
@@ -1342,7 +1393,7 @@ class _Walker(_Report):
                     if apf is None:
                         self.unlinked += 1
                         continue
-                    mapped = self.map_bytes(node, ppf, None, apf, None)
+                    mapped = self.overlay(node, ppf, apf)
                     if mapped is None:
                         continue
                     n_lo, n_hi, labels, end = mapped
@@ -1350,7 +1401,7 @@ class _Walker(_Report):
                         out.append(_Edge(3, c["caller"], c["line"], f"LINKAGE {tag} -> back to {c['caller']}.{a['name']}"
                                          + self._lbls(labels), cites, end=end))
                         continue
-                    for (row, plo, phi, how) in self.place(apf, n_lo, n_hi):
+                    for (row, plo, phi, how) in self.place_ref(apf, n_lo, n_hi):
                         ch = self.child(c["cpid"], row, plo, phi, how, node.hop + 1)
                         self.touch(c["cpid"])
                         out.append(_Edge(3, c["caller"], c["line"], f"LINKAGE {tag} -> back to {c['caller']}.{self.nm(ch)} "
@@ -1418,11 +1469,13 @@ class _Walker(_Report):
             if tpf is None or mine is None:
                 self.unlinked += 1
                 continue
-            mapped = self.map_bytes(node, mine, None, tpf, None)
+            mapped = self.overlay(node, mine, tpf)
             if mapped is None:
                 continue
-            n_lo, n_hi, labels, _end = mapped
-            for (row, plo, phi, how) in self.place(tpf, n_lo, n_hi):
+            n_lo, n_hi, labels, cut = mapped
+            if cut:
+                continue            # the node's bytes lie past the end of the other side: not shared
+            for (row, plo, phi, how) in self.place_ref(tpf, n_lo, n_hi):
                 ch = self.child(p["program_id"], row, plo, phi, how, node.hop + 1)
                 self.touch(p["program_id"])
                 arrow = "<-" if up else "->"
@@ -1456,12 +1509,14 @@ class _Walker(_Report):
                 if tpf is None or src is None:
                     self.unlinked += 1
                     continue
-                mapped = self.map_bytes(node, src, None, tpf, None)
+                mapped = self.overlay(node, src, tpf)
                 if mapped is None:
                     continue
-                n_lo, n_hi, labels, _end = mapped
+                n_lo, n_hi, labels, cut = mapped
+                if cut:
+                    continue            # the node's bytes lie past the end of the other side: not shared
                 pverb = (p["note"] or "").split(" ")[0]
-                for (row, plo, phi, how) in self.place(tpf, n_lo, n_hi):
+                for (row, plo, phi, how) in self.place_ref(tpf, n_lo, n_hi):
                     ch = self.child(p["program_id"], row, plo, phi, how, node.hop + 1)
                     self.touch(p["program_id"])
                     out.append(_Edge(6, p["pname"], r["line"], f"{verb} {kind.upper()} {res} -> {pverb} into {p['pname']}."
@@ -1505,11 +1560,13 @@ class _Walker(_Report):
                 apf = self.pf(c["pfield"])
                 if apf is None or dst is None:
                     continue
-                mapped = self.map_bytes(node, apf, None, dst, None, reverse=True)
+                mapped = self.overlay(node, dst, apf)
                 if mapped is None:
                     continue
-                n_lo, n_hi, labels, _end = mapped
-                for (row, plo, phi, how) in self.place(apf, n_lo, n_hi):
+                n_lo, n_hi, labels, cut = mapped
+                if cut:
+                    continue            # the node's bytes lie past the end of the other side: not shared
+                for (row, plo, phi, how) in self.place_ref(apf, n_lo, n_hi):
                     ch = self.child(c["cpid"], row, plo, phi, how, node.hop + 1)
                     self.touch(c["cpid"])
                     out.append(_Edge(2, c["caller"], r["line"], f"RETRIEVE <- START {c['target']} FROM {c['caller']}.{self.nm(ch)}"
@@ -1525,12 +1582,14 @@ class _Walker(_Report):
             if spf is None or dst is None:
                 self.unlinked += 1
                 continue
-            mapped = self.map_bytes(node, spf, None, dst, None, reverse=True)
+            mapped = self.overlay(node, dst, spf)
             if mapped is None:
                 continue
-            n_lo, n_hi, labels, _end = mapped
+            n_lo, n_hi, labels, cut = mapped
+            if cut:
+                continue            # the node's bytes lie past the end of the other side: not shared
             pverb = (p["note"] or "").split(" ")[0]
-            for (row, plo, phi, how) in self.place(spf, n_lo, n_hi):
+            for (row, plo, phi, how) in self.place_ref(spf, n_lo, n_hi):
                 ch = self.child(p["program_id"], row, plo, phi, how, node.hop + 1)
                 self.touch(p["program_id"])
                 out.append(_Edge(6, p["pname"], r["line"], f"{verb} {kind.upper()} {res} <- {pverb} from {p['pname']}."
@@ -1564,11 +1623,13 @@ class _Walker(_Report):
             if tpf is None or mine is None:
                 self.unlinked += 1
                 continue
-            mapped = self.map_bytes(node, mine, None, tpf, None)
+            mapped = self.overlay(node, mine, tpf)
             if mapped is None:
                 continue
-            n_lo, n_hi, labels, _end = mapped
-            for (row, plo, phi, how) in self.place(tpf, n_lo, n_hi):
+            n_lo, n_hi, labels, cut = mapped
+            if cut:
+                continue            # the node's bytes lie past the end of the other side: not shared
+            for (row, plo, phi, how) in self.place_ref(tpf, n_lo, n_hi):
                 ch = self.child(p["program_id"], row, plo, phi, how, node.hop + 1)
                 self.touch(p["program_id"])
                 arrow = "<-" if up else "->"
@@ -1618,11 +1679,13 @@ class _Walker(_Report):
                 a = self.pf(r["dst_pfield"])
                 if x is None or a is None:
                     continue
-                mapped = self.map_bytes(node, x, None, a, None, reverse=True)
+                mapped = self.overlay(node, a, x)
                 if mapped is None:
                     continue
-                n_lo, n_hi, labels, _end = mapped
-                for (row, plo, phi, how) in self.place(x, n_lo, n_hi):
+                n_lo, n_hi, labels, cut = mapped
+                if cut:
+                    continue            # the node's bytes lie past the end of the other side: not shared
+                for (row, plo, phi, how) in self.place_ref(x, n_lo, n_hi):
                     ch = self.child(pid, row, plo, phi, how, node.hop + 1)
                     out.append(_Edge(8, node.pname, r["line"], f"pointer alias {p['name']} <- {self.nm(ch)} {self.desc(ch)}".rstrip()
                                      + self._lbls(labels), self.cite_stmt(pid, r["line"], "SET", a["name"]), child=ch))
@@ -1736,6 +1799,8 @@ class _Walker(_Report):
         caller's argument at that position (BY CONTENT included: the value
         does arrive)."""
         out: List[_Edge] = []
+        if node.via_call is not None:
+            return out          # written back through one CALL: its argument is where the walk came from
         for prm in self.params_of_root(node):
             ppf = self.pf(prm["pfield"])
             for c in self.callers_of(node.pname, prm["entry"]):
@@ -1756,7 +1821,7 @@ class _Walker(_Report):
                     if apf is None:
                         self.unlinked += 1
                         continue
-                    mapped = self.map_bytes(node, apf, None, ppf, None, reverse=True)
+                    mapped = self.overlay(node, ppf, apf)
                     if mapped is None:
                         continue
                     n_lo, n_hi, labels, end = mapped
@@ -1768,7 +1833,7 @@ class _Walker(_Report):
                         out.append(_Edge(2, c["caller"], c["line"], f"{word} {tag} <- {c['caller']}.{a['name']}" + self._lbls(labels),
                                          cites, end=end))
                         continue
-                    for (row, plo, phi, how) in self.place(apf, n_lo, n_hi):
+                    for (row, plo, phi, how) in self.place_ref(apf, n_lo, n_hi):
                         ch = self.child(c["cpid"], row, plo, phi, how, node.hop + 1)
                         self.touch(c["cpid"])
                         out.append(_Edge(2, c["caller"], c["line"], f"{word} {tag} <- {c['caller']}.{self.nm(ch)} {self.desc(ch)}".rstrip()
@@ -1804,14 +1869,17 @@ class _Walker(_Report):
                 if prm is None or prm["pfield"] is None:
                     continue
                 ppf = self.pf(prm["pfield"])
-                mapped = self.map_bytes(node, ppf, None, apf, None, reverse=True)
+                mapped = self.overlay(node, apf, ppf)
                 if mapped is None:
                     continue
-                n_lo, n_hi, labels, _end = mapped
+                n_lo, n_hi, labels, cut = mapped
+                if cut:
+                    continue            # the node's bytes lie past the end of the other side: not shared
                 callname = f"{word} {t}" + (f" ({cand})" if cand else "")
                 tag = "COMMAREA" if a["how"] == "commarea" else f"arg {a['pos']}"
-                for (row, plo, phi, how) in self.place(ppf, n_lo, n_hi):
+                for (row, plo, phi, how) in self.place_ref(ppf, n_lo, n_hi):
                     ch = self.child(callee["id"], row, plo, phi, how, node.hop + 1)
+                    ch.via_call = a["cid"]
                     # only the bytes the callee writes come back: CA-MESSAGE set there is not CA-STATUS
                     cids, _cl = self.closure_ids(ch)
                     if not self.written_here(ch, cids):
@@ -1931,7 +1999,7 @@ class _Walker(_Report):
         if prev is not None:
             self.put(depth, self.fmt(num, depth, f"{head}   (shown as {prev})"))
             return
-        self.visited[(node.pid, node.root)].append((node.lo, node.hi, num))
+        self.visit(node, num)
         self.count += 1
         ids, cl = self.closure_ids(node)
         edges = self.edges(node)
@@ -2052,7 +2120,7 @@ class _Walker(_Report):
         p = self.prog(pid)
         lo, hi = self.extent(row)
         node = _Node(pid, p["program_id"], row["root_id"], lo, hi, row, 0)
-        self.visited[(pid, node.root)].append((lo, hi, "root"))
+        self.visit(node, "root")
         ids, cl = self.closure_ids(node)
         edges = self.edges(node)
         sf = self.set_from(node, ids) if not self.o.up else []
@@ -2087,11 +2155,12 @@ class _Walker(_Report):
 # ---------------------------------------------------------------------------
 
 class _FNode:
-    __slots__ = ("pid", "pname", "name", "frow", "hop", "kind")
+    __slots__ = ("pid", "pname", "name", "frow", "hop", "kind", "via_call")
 
     def __init__(self, pid: int, pname: str, name: str, frow, hop: int) -> None:
         self.pid, self.pname, self.name, self.frow, self.hop = pid, pname, name, frow, hop
         self.kind = "field"
+        self.via_call: Optional[int] = None        # as _Node.via_call
 
 
 class _Fallback(_Report):
@@ -2106,6 +2175,7 @@ class _Fallback(_Report):
         self.unpaired: Dict[int, int] = {}
         self.pairs: Dict[int, List[Tuple[int, str, str]]] = {}
         self.visited: Dict[Tuple[int, str], str] = {}
+        self.via_only: Set[Tuple[int, str]] = set()    # visited only as one CALL's storage (_Walker.seen)
         self._prog: Dict[int, sqlite3.Row] = {}
 
     def prog(self, pid: int):
@@ -2192,12 +2262,15 @@ class _Fallback(_Report):
                                          f"parameter(s)) (reconstructed)", cites, end=END_POS))
                         continue
                     ch = self.node(callee["id"], lk[pos - 1], node.hop + 1)
+                    ch.via_call = c["id"]
                     out.append(_Edge(2, callee["program_id"], c["line"], f"{callname} arg {pos} -> {callee['program_id']}.{ch.name} "
                                      f"(reconstructed){self.call_modes(pid, c['line'])}", cites, child=ch))
-        # 3. LINKAGE back
+        # 3. LINKAGE back (never for a parameter reached through a CALL: _Node.via_call)
         lk = [a.upper() for a in Q._jl(self.prog(pid)["linkage_using"])]
         entries = [(None, lk)] + [(r["alias"], [a.upper() for a in Q._jl(r["linkage_using"])]) for r in
                                   self.conn.execute("SELECT alias, linkage_using FROM program_alias WHERE program_id=?", (pid,))]
+        if node.via_call is not None:
+            entries = []
         written = bool(self.conn.execute("SELECT 1 FROM field_ref WHERE program_id=? AND UPPER(name)=? AND mode='write' "
                                          "AND stmt<>'CALL-USING' LIMIT 1", (pid, name)).fetchone())
         for (entry, using) in entries:
@@ -2232,6 +2305,8 @@ class _Fallback(_Report):
         lk = [a.upper() for a in Q._jl(self.prog(pid)["linkage_using"])]
         entries = [(None, lk)] + [(r["alias"], [a.upper() for a in Q._jl(r["linkage_using"])]) for r in
                                   self.conn.execute("SELECT alias, linkage_using FROM program_alias WHERE program_id=?", (pid,))]
+        if node.via_call is not None:
+            entries = []
         for (entry, using) in entries:
             if name not in using:
                 continue
@@ -2263,6 +2338,7 @@ class _Fallback(_Report):
                                              "AND stmt<>'CALL-USING' LIMIT 1", (callee["id"], pname.upper())).fetchone():
                         continue
                     ch = self.node(callee["id"], pname, node.hop + 1)
+                    ch.via_call = c["id"]
                     out.append(_Edge(3, callee["program_id"], c["line"], f"CALL {t} arg {pos} <- {callee['program_id']}.{ch.name} "
                                      f"(written there) (reconstructed){self.call_modes(pid, c['line'])}",
                                      self.cite_stmt(pid, c["line"], "CALL", name), child=ch))
@@ -2442,10 +2518,14 @@ class _Fallback(_Report):
         self.touch(node.pid)
         head = f"{e.label}   {e.cites}"
         key = (node.pid, node.name)
-        if key in self.visited:
+        if key in self.visited and (key not in self.via_only or node.via_call is not None):
             self.put(depth, self.fmt(num, depth, f"{head}   (shown as {self.visited[key]})"))
             return
         self.visited[key] = num
+        if node.via_call is not None:
+            self.via_only.add(key)
+        else:
+            self.via_only.discard(key)
         self.count += 1
         edges = self.edges(node)
         uses = self.uses(node)
