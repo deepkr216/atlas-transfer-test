@@ -1795,6 +1795,28 @@ class FlowKnownLimits(unittest.TestCase):
                        "//SYSUT1   DD DSN=TEST.KG.RAW,DISP=SHR\n"
                        "//SYSUT2   DD DSN=TEST.KG.C4,DISP=(NEW,CATLG,DELETE)\n"
                        "//R4       EXEC PGM=KGR\n//GIN      DD DSN=TEST.KG.C4,DISP=SHR\n"),
+        # PROC steps expanded into a job keep the PROC's line numbers: KPJOB:5 is a comment, RDPROC:5 the DD;
+        # KFJOB:2 is F1 (a GET of another dataset), FTPPROC:2 the PUT of TEST.KP.RAW that S1 runs
+        "KPW.cbl": ("       IDENTIFICATION DIVISION.\n       PROGRAM-ID. KPW.\n       ENVIRONMENT DIVISION.\n"
+                    "       INPUT-OUTPUT SECTION.\n       FILE-CONTROL.\n           SELECT OUT-F ASSIGN TO POUT.\n"
+                    "       DATA DIVISION.\n       FILE SECTION.\n       FD  OUT-F.\n       01  OUT-REC.\n"
+                    "           05  OP-CODE              PIC X(04).\n       WORKING-STORAGE SECTION.\n"
+                    "       01  WS-PCODE                 PIC X(04).\n       PROCEDURE DIVISION.\n"
+                    "           OPEN OUTPUT OUT-F.\n           MOVE WS-PCODE TO OP-CODE.\n           WRITE OUT-REC.\n"
+                    "           CLOSE OUT-F.\n           GOBACK.\n"),
+        "KPR.cbl": ("       IDENTIFICATION DIVISION.\n       PROGRAM-ID. KPR.\n       ENVIRONMENT DIVISION.\n"
+                    "       INPUT-OUTPUT SECTION.\n       FILE-CONTROL.\n           SELECT IN-F ASSIGN TO PIN.\n"
+                    "       DATA DIVISION.\n       FILE SECTION.\n       FD  IN-F.\n       01  IN-REC.\n"
+                    "           05  IP-CODE              PIC X(04).\n       PROCEDURE DIVISION.\n"
+                    "           OPEN INPUT IN-F.\n           READ IN-F.\n           DISPLAY IP-CODE.\n"
+                    "           CLOSE IN-F.\n           GOBACK.\n"),
+        "KPJOB.jcl": ("//KPJOB    JOB (ACCT),'P'\n//W1       EXEC PGM=KPW\n"
+                      "//POUT     DD DSN=TEST.KP.RAW,DISP=(NEW,CATLG,DELETE)\n//*\n//*\n//*\n//S1       EXEC RDPROC\n"),
+        "RDPROC.prc": "//RDPROC   PROC\n//*\n//*\n//P1       EXEC PGM=KPR\n//PIN      DD DSN=TEST.KP.RAW,DISP=SHR\n//         PEND\n",
+        "KFJOB.jcl": ("//KFJOB    JOB (ACCT),'F'\n//F1       EXEC PGM=FTP,PARM='PEERHOST (EXIT'\n//INPUT    DD *\n"
+                      "get stat.txt 'TEST.KP.IN'\nquit\n/*\n//S1       EXEC FTPPROC\n"),
+        "FTPPROC.prc": ("//FTPPROC  PROC\n//P1       EXEC PGM=FTP,PARM='PEERHOST (EXIT'\n//INPUT    DD *\n"
+                        "put 'TEST.KP.RAW' raw.txt\nquit\n/*\n//         PEND\n"),
     }
 
     @classmethod
@@ -2012,6 +2034,51 @@ class FlowKnownLimits(unittest.TestCase):
                                    for m in cites)
                 res, _u = verify_citations.check_answer(answer, db_path=self.db)
                 self.assertEqual([(r.raw, r.status) for r in res if r.status != "PASS"], [])
+
+    def gate(self, *texts) -> dict:
+        """{cite: status} from verify_citations for every cite in the texts."""
+        cites = [m for t in texts for m in CITE.finditer(t)]
+        answer = "\n".join(f'[[{m.group(1)} {m.group(2)}{"-" + m.group(3) if m.group(3) else ""} "{m.group(4)}"]]'
+                           for m in cites)
+        res, _u = verify_citations.check_answer(answer, db_path=self.db)
+        return {r.raw: r.status for r in res}
+
+    def test_a_dd_cite_quotes_its_own_statement_or_fails_the_gate(self):
+        from atlas import flow
+        conn = query.connect(self.db)
+        try:
+            w = flow._Walker(conn, flow.Opts())
+            # a real DD whose line holds no DD (a comment here) quotes the DD it claims: the gate FAILS it,
+            # never a cite with no token and never the EXEC text of another statement
+            self.assertEqual(w.cite_dd("KPJOB", 5, "PIN", False), 'KPJOB:5 "//PIN DD"')
+            self.assertEqual(w.cite_dd("KFJOB", 2, "PIN", False), 'KFJOB:2 "//PIN DD"')
+            # another DD on the line is not this one
+            self.assertEqual(w.cite_dd("KPJOB", 3, "PIN", True), 'KPJOB:3 "//PIN DD"')
+            self.assertEqual(w.cite_dd("KPJOB", 3, "POUT", True), 'KPJOB:3 "//POUT DD DSN=TEST.KP.RAW"')
+            # a pseudo-DD quotes the EXEC line only when it is the step's own EXEC
+            self.assertEqual(w.cite_dd("KFJOB", 2, "*FTP*", False, "F1"), 'KFJOB:2 "//F1       EXEC PGM=FTP"')
+            self.assertEqual(w.cite_dd("FTPPROC", 2, "*FTP*", False, "S1.P1"), 'FTPPROC:2 "//P1       EXEC PGM=FTP"')
+            self.assertEqual(w.cite_dd("KFJOB", 2, "*FTP*", False, "S1.P1"), 'KFJOB:2 "//P1 EXEC"')
+            # an interface row is cited only where its line is tied to the DSN
+            self.assertEqual(w.cite_iface("KFJOB", 2, "TEST.KP.IN"), 'KFJOB:2 "//F1       EXEC PGM=FTP"')
+            self.assertEqual(w.cite_iface("KFJOB", 2, "TEST.KP.RAW"), "")
+            self.assertEqual(w.cite_iface("FTPPROC", 2, "TEST.KP.RAW"), 'FTPPROC:2 "//P1       EXEC PGM=FTP"')
+        finally:
+            conn.close()
+        g = self.gate('KPJOB:5 "//PIN DD"', 'KFJOB:2 "//P1 EXEC"', 'KPJOB:3 "//PIN DD"', 'FTPPROC:2 "//P1       EXEC PGM=FTP"')
+        self.assertEqual(sorted(g.values()), ["FAIL", "FAIL", "FAIL", "PASS"], g)
+        # end to end: the PUT that S1 runs is one branch (the parser stores its pseudo-DD twice), and no
+        # line cites F1, the GET of another dataset, for it
+        for db in (self.db, self.old):
+            down = self.flow("WS-PCODE", "--program", "KPW", db=db)
+            self.assertEqual(len(re.findall(r"KFJOB S1\.P1 FTP ", down)), 1, down)
+            self.assertNotIn("//F1", down)
+            up = self.flow("IP-CODE", "--program", "KPR", "--up", db=db)
+            self.assertNotIn("//F1", up)
+            self.assertNotRegex(up, r"KFJOB S1\.P1 FTP ")       # a PUT is no writer of the dataset
+            for cite, status in self.gate(down, up).items():
+                if status == "PASS":
+                    self.assertNotRegex(cite, r"KPJOB 5|KFJOB 2", cite)
 
     def test_up_ends_at_the_fixture_callees_it_cannot_follow(self):
         # the fixtures' own shapes (ROADMAP example): ERRLOG is not in the index and may set WS-ERR-CD;

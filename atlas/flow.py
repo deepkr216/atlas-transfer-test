@@ -342,19 +342,32 @@ class _Report:
             rng = f"{m1}:{hit}"
         return f'{rng}{via} "{tok}"'
 
-    def cite_dd(self, member: Optional[str], line: Optional[int], dd_name: str, with_dsn: bool) -> str:
-        """MEMBER:line "//NAME DD" for a DD; a pseudo-DD the JCL parser adds
+    def cite_dd(self, member: Optional[str], line: Optional[int], dd_name: str, with_dsn: bool,
+                step: Optional[str] = None) -> str:
+        """MEMBER:line "//NAME DD" for a DD. A pseudo-DD the JCL parser adds
         on the EXEC line (`*FTP*`, `*NDM*`: the dataset an FTP / NDM step
-        sends) quotes the EXEC text that is there, never a DD that is not."""
+        sends) quotes the EXEC text there only when that EXEC is the step's
+        own (its label is the last part of `step`). Anything else quotes the
+        statement the cite claims (`//NAME DD`, `//STEP EXEC`), so a line
+        that does not hold it FAILS the citation gate visibly - never the
+        text of whatever other statement is on that line, never no token."""
         if not member or not line:
             return f"{member or '?'}:{line or '?'}"
         raw = self.raw(member, line)
-        mm = re.match(r"//(\S+)\s+DD\b", raw)
-        if not mm:
-            ex = re.match(r"//\S*\s+EXEC\s+[^\s,]+", raw)
-            return f'{member}:{line} "{self._tok(ex.group(0))}"' if ex else f"{member}:{line}"
-        tok = f"//{mm.group(1)} DD"
-        if with_dsn:
+        dd_name = dd_name or ""                 # a concatenation continuation has no name
+        if dd_name.startswith("*"):
+            label = (step or "?").rpartition(".")[2].upper()
+            ex = re.match(r"//(\S*)\s+EXEC\s+[^\s,]+", raw)
+            if ex and ex.group(1).upper() == label:
+                return f'{member}:{line} "{self._tok(ex.group(0))}"'
+            return f'{member}:{line} "//{label} EXEC"'
+        # the DD on the line must be this one (an override //S1.GIN DD is GIN): another DD there
+        # would pass the gate with a name the flow never meant
+        mm = re.match(r"//(\S*)\s+DD\b", raw)
+        if mm and mm.group(1).upper().rpartition(".")[2] != dd_name.upper().rpartition(".")[2]:
+            mm = None
+        tok = f"//{mm.group(1) if mm else dd_name} DD"
+        if mm and with_dsn:
             dm = re.search(r"DSN(?:AME)?=([^,\s(]+)", raw, re.I)
             if dm and len(tok) + 5 + len(dm.group(1)) <= TOKEN_MAX:
                 tok += f" DSN={dm.group(1)}"
@@ -1077,9 +1090,23 @@ class _Walker(_Report):
         iface_at: Set[Tuple[str, int]] = set()
         rows = self.dds_on(dsn)
         want = ("output", "mod", "unknown") if up else ("input", "mod", "unknown")
+        # the JCL parser stores an FTP / NDM step's pseudo-DD twice when the step comes from a PROC
+        # expanded into a job: once re-derived as `unknown`/`undetermined`, once with the direction
+        # the cards give. The determined row is the fact; the other would be a second branch (and,
+        # upstream, a PUT shown as a writer)
+        determined = {(r["step_id"], r["dd_name"]) for r in rows
+                      if (r["dd_name"] or "").startswith("*") and r["mode_source"] != "undetermined"}
+        once: Set[Tuple] = set()
         for s in rows:
             if s["dd_id"] == d.get("dd_id"):
                 continue
+            if ((s["dd_name"] or "").startswith("*") and s["mode_source"] == "undetermined"
+                    and (s["step_id"], s["dd_name"]) in determined):
+                continue
+            key = (s["step_id"], s["dd_name"], s["dd_line"], s["mode"])
+            if key in once:
+                continue            # the same DD of the same step stored twice is one branch
+            once.add(key)
             if s["mode"] not in want:
                 continue
             if (d.get("is_temp") or s["is_temp"]) and not _same_run(d, s):
@@ -1096,7 +1123,7 @@ class _Walker(_Report):
                 kind = pgm.strip("*").lower()
                 iface_at.add((s["member_name"], s["dd_line"]))
                 leaves.append(_Leaf(list(path), f"{job} {s['step_name']} {launcher or kind.upper()}",
-                                    self.cite_dd(s["member_name"], s["dd_line"], s["dd_name"], False),
+                                    self.cite_dd(s["member_name"], s["dd_line"], s["dd_name"], False, s["step_name"]),
                                     end=END_INTERFACE.format(x=kind)))
                 continue
             if pgm.startswith("*") or launcher in ("SORT", "ICETOOL", "SYNCSORT", "IEBGENER", "ICEGENER", "IDCAMS", "DFSORT"):
@@ -1160,9 +1187,26 @@ class _Walker(_Report):
         for (kind, mem, ln) in self.interfaces_on(dsn):
             if (mem, ln) in iface_at:
                 continue            # the step above already ends there
-            leaves.append(_Leaf(list(path), f"{dsn} {kind}", self.cite_dd(mem, ln, "", False) if mem and ln else "",
+            leaves.append(_Leaf(list(path), f"{dsn} {kind}", self.cite_iface(mem, ln, dsn),
                                 end=END_INTERFACE.format(x=kind)))
         return leaves
+
+    def cite_iface(self, mem: Optional[str], ln: Optional[int], dsn: str) -> str:
+        """The cite of an interface_edge row on the DSN: the DSN where its
+        line names it (a CSD TDQUEUE DSNAME), else the EXEC line of the step
+        written in that member at that line that carries the DSN as its
+        pseudo-DD. A row whose line cannot be tied to the DSN gets no cite -
+        never the text of an unrelated statement that happens to be there."""
+        if not mem or not ln:
+            return ""
+        if dsn.upper() in self.raw(mem, ln).upper():
+            return f'{mem}:{ln} "{self._tok(dsn)}"'
+        st = self.conn.execute("""SELECT s.step_name, d.dd_name FROM step s JOIN dd d ON d.step_id=s.id
+                                  LEFT JOIN job j ON j.id=s.job_id LEFT JOIN proc_def pd ON pd.id=s.proc_id
+                                  JOIN member m ON m.id=COALESCE(j.member_id, pd.member_id)
+                                  WHERE m.name=? AND s.line=? AND s.from_proc IS NULL AND d.dsn_resolved=?
+                                  AND d.dd_name LIKE '*%' LIMIT 1""", (mem, ln, dsn)).fetchone()
+        return self.cite_dd(mem, ln, st["dd_name"], False, st["step_name"]) if st else ""
 
     def unindexed_sysin(self, step_id: int) -> Optional[int]:
         """The line of the step's SYSIN DD (or a dataset concatenated to it)
@@ -3028,6 +3072,7 @@ class _Fallback(_Report):
     dds_on = _Walker.dds_on
     dds_on_step = _Walker.dds_on_step
     unindexed_sysin = _Walker.unindexed_sysin
+    cite_iface = _Walker.cite_iface
     step_cards = _Walker.step_cards
     interfaces_on = _Walker.interfaces_on
     cite_card = _Report.cite_card
