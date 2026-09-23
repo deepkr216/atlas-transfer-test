@@ -1846,7 +1846,24 @@ class FlowKnownLimits(unittest.TestCase):
                       "//SYSUT2   DD DSN=TEST.KC.C2,DISP=(NEW,CATLG,DELETE)\n//S3       EXEC KCPROC\n"),
         "KCPROC.prc": ("//KCPROC   PROC\n//P1       EXEC PGM=KCR\n//CIN      DD DSN=TEST.KC.OTHER,DISP=SHR\n"
                        "//         DD DSN=TEST.KC.RAW,DISP=SHR\n//         PEND\n"),
+        # plain copies whose other side has nobody: C1 copies TEST.KD.RAW to TEST.KD.CPY, which no step
+        # reads; C2 copies TEST.KD.EXT, which no step writes, to the dataset KDR reads. C3 and C4 are a
+        # second copy into a dataset the walk already followed
+        "KDJOB.jcl": ("//KDJOB    JOB (ACCT),'D'\n//W1       EXEC PGM=KDW\n"
+                      "//DOUT     DD DSN=TEST.KD.RAW,DISP=(NEW,CATLG,DELETE)\n"
+                      "//C1       EXEC PGM=IEBGENER\n//SYSPRINT DD SYSOUT=*\n//SYSIN    DD DUMMY\n"
+                      "//SYSUT1   DD DSN=TEST.KD.RAW,DISP=SHR\n//SYSUT2   DD DSN=TEST.KD.CPY,DISP=(NEW,CATLG,DELETE)\n"
+                      "//C2       EXEC PGM=IEBGENER\n//SYSPRINT DD SYSOUT=*\n//SYSIN    DD DUMMY\n"
+                      "//SYSUT1   DD DSN=TEST.KD.EXT,DISP=SHR\n//SYSUT2   DD DSN=TEST.KD.IN,DISP=(NEW,CATLG,DELETE)\n"
+                      "//C3       EXEC PGM=IEBGENER\n//SYSPRINT DD SYSOUT=*\n//SYSIN    DD DUMMY\n"
+                      "//SYSUT1   DD DSN=TEST.KD.RAW,DISP=SHR\n//SYSUT2   DD DSN=TEST.KD.CPY,DISP=(NEW,CATLG,DELETE)\n"
+                      "//C4       EXEC PGM=IEBGENER\n//SYSPRINT DD SYSOUT=*\n//SYSIN    DD DUMMY\n"
+                      "//SYSUT1   DD DSN=TEST.KD.EXT,DISP=SHR\n//SYSUT2   DD DSN=TEST.KD.IN,DISP=(NEW,CATLG,DELETE)\n"
+                      "//R1       EXEC PGM=KDR\n//DIN      DD DSN=TEST.KD.IN,DISP=SHR\n"),
     }
+    FILES["KDW.cbl"] = FILES["KCW.cbl"].replace("KCW", "KDW").replace("COUT", "DOUT").replace("C-CODE", "D-CODE") \
+        .replace("CCODE", "DCODE")
+    FILES["KDR.cbl"] = FILES["KCR.cbl"].replace("KCR", "KDR").replace("CIN", "DIN").replace("C-CODE", "D-CODE")
 
     @classmethod
     def setUpClass(cls):
@@ -2163,6 +2180,37 @@ class FlowKnownLimits(unittest.TestCase):
                 self.assertEqual({c: st for c, st in g.items() if st != "PASS"}, {}, g)
                 self.assertIn(f'[[KCJOB {cin2} "// DD DSN=TEST.KC.RAW"]]', g)
                 self.assertIn(f'[[KCJOB {sysin2} "// DD DSN=TEST.CTL.KCSEQ"]]', g)
+
+    def test_a_copy_with_nobody_on_the_other_side_is_a_labelled_end(self):
+        # C1 reads TEST.KD.RAW and writes a copy nobody reads: the branch was dropped and the dataset printed
+        # a false `no step reads TEST.KD.RAW`. Now the copy line stays, with the stop on its far side; a
+        # second copy into the dataset already followed says so instead of vanishing
+        job = self.FILES["KDJOB.jcl"].splitlines()
+        ut1 = [i + 1 for i, ln in enumerate(job) if ln.startswith("//SYSUT1")]
+        ut2 = [i + 1 for i, ln in enumerate(job) if ln.startswith("//SYSUT2")]
+        for db, tag in ((self.db, "exact"), (self.old, "reconstructed")):
+            with self.subTest(tag):
+                down = self.flow("WS-DCODE", "--program", "KDW", db=db)
+                self.assertNotIn("no step reads TEST.KD.RAW", down)
+                self.assertRegex(down, r"(?m)^1\.1\.1\s+KDJOB C1 IEBGENER copy - bytes unchanged -> TEST\.KD\.CPY: "
+                                       rf'no step reads TEST\.KD\.CPY\s+KDJOB:{ut1[0]} "//SYSUT1 DD DSN=TEST\.KD\.RAW"\s+'
+                                       r"\[end: no indexed reader\]")
+                self.assertRegex(down, r"(?m)^1\.1\.2\s+KDJOB C3 IEBGENER copy - bytes unchanged -> TEST\.KD\.CPY\s+"
+                                       rf'KDJOB:{ut1[2]} "//SYSUT1 DD DSN=TEST\.KD\.RAW"\s+'
+                                       r"\[end: dataset already followed in this flow\]")
+                up = self.flow("ID-CODE", "--program", "KDR", "--up", "--all", db=db)
+                self.assertNotIn("no step writes TEST.KD.IN", up)
+                self.assertRegex(up, r"(?m)^1\.1\s+KDJOB C2 IEBGENER copy - bytes unchanged <- TEST\.KD\.EXT: "
+                                     rf'no step writes TEST\.KD\.EXT\s+KDJOB:{ut2[1]} "//SYSUT2 DD DSN=TEST\.KD\.IN"\s+'
+                                     r"\[end: no indexed writer\]")
+                self.assertRegex(up, r"(?m)^1\.2\s+KDJOB C4 IEBGENER copy - bytes unchanged <- TEST\.KD\.EXT\s+"
+                                     rf'KDJOB:{ut2[3]} "//SYSUT2 DD DSN=TEST\.KD\.IN"\s+'
+                                     r"\[end: dataset already followed in this flow\]")
+                g = self.gate(down, up)
+                self.assertEqual({c: st for c, st in g.items() if st != "PASS"}, {}, g)
+        # a copy that does reach a reader is unchanged: the copy line is a path line, the reader the leaf
+        down = self.flow("WS-GCODE", "--program", "KGW")
+        self.assertNotRegex(down, r"C1 ICEGENER copy .*\[end:")
 
     def test_an_idcams_step_cites_its_own_exec_line(self):
         # every pseudo-DD cite knows its step, so the *REPRO* rows on C5's EXEC line quote that EXEC and pass

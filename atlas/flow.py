@@ -54,6 +54,7 @@ END_CONTENT = "BY CONTENT: one-way"
 END_XCTL = "XCTL does not return"
 END_NO_READER = "no indexed reader"
 END_NO_WRITER = "no indexed writer"
+END_SEEN_DSN = "dataset already followed in this flow"
 END_NO_FIELD = "reader layout has no field at bytes {lo}-{hi}"
 END_COPYBOOK = "copybook differs from the writer's: verify layout"
 END_SORT = "sort step re-arranges bytes - mapping not indexed"
@@ -1195,10 +1196,21 @@ class _Walker(_Report):
                     arrow = "<-" if up else "->"
                     line = (f"{s['step_name']} {what}{gdg} - bytes unchanged {arrow} {o['dsn_resolved']}",
                             self.cite_dd(s["member_name"], s["dd_line"], s["dd_name"], True, s["step_name"]))
+                    if o["dsn_resolved"] in seen:
+                        # a second copy into (or, upstream, out of) a dataset this walk already
+                        # followed: the copy is said, the branch is the one shown above
+                        leaves.append(_Leaf(list(path), f"{job} {line[0]}", line[1], end=END_SEEN_DSN))
+                        continue
                     nxt = _Node(ds.pid, ds.pname, ds.root, ds.lo, ds.hi, ds.pf, ds.hop, kind="dataset",
                                 data={"dsn": o["dsn_resolved"], "job_id": s["job_id"], "proc_id": s["proc_id"], "is_temp": o["is_temp"],
                                       "dd_id": o["dd_id"], "gdg": o["gdg_rel"], "writer_pf": d.get("writer_pf")})
-                    leaves.extend(self.dataset_leaves(nxt, reader_fn, seen, path + [line]))
+                    sub = self.dataset_leaves(nxt, reader_fn, seen, path + [line])
+                    if not sub:
+                        # nothing reads the copy (or writes the copy's input): the copy step is still the
+                        # reader (writer) of this dataset - its line stays, with the stop on the other side
+                        sub = [_Leaf(list(path), f"{job} {line[0]}: no step {'writes' if up else 'reads'} {o['dsn_resolved']}",
+                                     line[1], end=END_NO_WRITER if up else END_NO_READER)]
+                    leaves.extend(sub)
                 continue
             progs = Q.programs_named(self.conn, pgm) if pgm else []
             if not progs:
