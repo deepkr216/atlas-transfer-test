@@ -1795,6 +1795,10 @@ class FlowKnownLimits(unittest.TestCase):
                        "//SYSUT1   DD DSN=TEST.KG.RAW,DISP=SHR\n"
                        "//SYSUT2   DD DSN=TEST.KG.C4,DISP=(NEW,CATLG,DELETE)\n"
                        "//R4       EXEC PGM=KGR\n//GIN      DD DSN=TEST.KG.C4,DISP=SHR\n"),
+        # IDCAMS REPRO: the parser puts the pseudo-DD *REPRO* on the EXEC line, as an FTP step's
+        "KGJOB4.jcl": ("//KGJOB4   JOB (ACCT),'REP'\n//C5       EXEC PGM=IDCAMS\n//SYSPRINT DD SYSOUT=*\n"
+                       "//SYSIN    DD *\n  REPRO INDATASET(TEST.KG.RAW) OUTDATASET(TEST.KG.REP)\n/*\n"
+                       "//R5       EXEC PGM=KGR\n//GIN      DD DSN=TEST.KG.REP,DISP=SHR\n"),
         # PROC steps expanded into a job keep the PROC's line numbers: KPJOB:5 is a comment, RDPROC:5 the DD;
         # KFJOB:2 is F1 (a GET of another dataset), FTPPROC:2 the PUT of TEST.KP.RAW that S1 runs
         "KPW.cbl": ("       IDENTIFICATION DIVISION.\n       PROGRAM-ID. KPW.\n       ENVIRONMENT DIVISION.\n"
@@ -2079,6 +2083,18 @@ class FlowKnownLimits(unittest.TestCase):
             for cite, status in self.gate(down, up).items():
                 if status == "PASS":
                     self.assertNotRegex(cite, r"KPJOB 5|KFJOB 2", cite)
+
+    def test_an_idcams_step_cites_its_own_exec_line(self):
+        # every pseudo-DD cite knows its step, so the *REPRO* rows on C5's EXEC line quote that EXEC and pass
+        for db in (self.db, self.old):
+            down = self.flow("WS-GCODE", "--program", "KGW", db=db)
+            self.assertRegex(down, r'C5 IDCAMS copy - bytes unchanged -> TEST\.KG\.REP\s+KGJOB4:2 "//C5       EXEC PGM=IDCAMS"')
+            self.assertRegex(down, r"read by KGR\.IR-GCODE bytes 1-4 \(KGJOB4 R5 DD GIN")
+            up = self.flow("IR-GCODE", "--program", "KGR", "--up", "--all", db=db)
+            self.assertRegex(up, r'C5 IDCAMS copy - bytes unchanged <- TEST\.KG\.RAW\s+KGJOB4:2 "//C5       EXEC PGM=IDCAMS"')
+            g = self.gate(down, up)
+            self.assertEqual({c: st for c, st in g.items() if "KGJOB4" in c and st != "PASS"}, {}, g)
+            self.assertIn("PASS", {st for c, st in g.items() if "KGJOB4 2" in c})
 
     def test_up_ends_at_the_fixture_callees_it_cannot_follow(self):
         # the fixtures' own shapes (ROADMAP example): ERRLOG is not in the index and may set WS-ERR-CD;

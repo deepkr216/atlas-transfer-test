@@ -1043,7 +1043,7 @@ class _Walker(_Report):
         for s in steps:
             where = f"{s['job_name'] or ('PROC ' + (s['proc_name'] or '?'))} {s['step_name']} DD {s['dd_name']}"
             label = f"{verb} {rec} -> {s['dsn_resolved']} ({where}, {s['mode']}/{s['mode_source']})"
-            cites = stmt_cite + "; " + self.cite_dd(s["member_name"], s["dd_line"], s["dd_name"], True)
+            cites = stmt_cite + "; " + self.cite_dd(s["member_name"], s["dd_line"], s["dd_name"], True, s["step_name"])
             ds = _Node(pid, node.pname, node.root, node.lo, node.hi, node.pf, node.hop, kind="dataset",
                        data={"dsn": s["dsn_resolved"], "job_id": s["job_id"], "proc_id": s["proc_id"], "is_temp": s["is_temp"],
                              "dd_id": s["dd_id"], "gdg": s["gdg_rel"], "writer_pf": node.pf})
@@ -1137,11 +1137,11 @@ class _Walker(_Report):
                 if is_sort and not kinds and not self.conn.execute(
                         "SELECT 1 FROM dd WHERE step_id=? AND sysin_text IS NOT NULL", (s["step_id"],)).fetchone():
                     leaves.append(_Leaf(list(path), f"{job} {s['step_name']} SORT: control cards not indexed",
-                                        self.cite_dd(s["member_name"], s["dd_line"], s["dd_name"], False), end=END_UTILITY))
+                                        self.cite_dd(s["member_name"], s["dd_line"], s["dd_name"], False, s["step_name"]), end=END_UTILITY))
                     continue
                 if not (is_sort or launcher in ("IEBGENER", "ICEGENER", "IDCAMS")):
                     leaves.append(_Leaf(list(path), f"{job} {s['step_name']} {launcher or pgm}",
-                                        self.cite_dd(s["member_name"], s["dd_line"], s["dd_name"], False), end=END_UTILITY))
+                                        self.cite_dd(s["member_name"], s["dd_line"], s["dd_name"], False, s["step_name"]), end=END_UTILITY))
                     continue
                 if launcher in ("IEBGENER", "ICEGENER"):
                     # SYSIN DD DUMMY is the plain copy; GENERATE / RECORD FIELD= moves fields around
@@ -1163,13 +1163,13 @@ class _Walker(_Report):
                 outs = [x for x in self.dds_on_step(s["step_id"]) if x["mode"] == other and x["dsn_resolved"] != dsn]
                 if not outs:
                     leaves.append(_Leaf(list(path), f"{job} {s['step_name']} {launcher or pgm}: no {other} DD",
-                                        self.cite_dd(s["member_name"], s["dd_line"], s["dd_name"], False), end=END_UTILITY))
+                                        self.cite_dd(s["member_name"], s["dd_line"], s["dd_name"], False, s["step_name"]), end=END_UTILITY))
                     continue
                 what = "SORT FIELDS only" if is_sort else f"{launcher} copy"
                 for o in outs:
                     arrow = "<-" if up else "->"
                     line = (f"{s['step_name']} {what}{gdg} - bytes unchanged {arrow} {o['dsn_resolved']}",
-                            self.cite_dd(s["member_name"], s["dd_line"], s["dd_name"], True))
+                            self.cite_dd(s["member_name"], s["dd_line"], s["dd_name"], True, s["step_name"]))
                     nxt = _Node(ds.pid, ds.pname, ds.root, ds.lo, ds.hi, ds.pf, ds.hop, kind="dataset",
                                 data={"dsn": o["dsn_resolved"], "job_id": s["job_id"], "proc_id": s["proc_id"], "is_temp": o["is_temp"],
                                       "dd_id": o["dd_id"], "gdg": o["gdg_rel"], "writer_pf": d.get("writer_pf")})
@@ -1178,7 +1178,7 @@ class _Walker(_Report):
             progs = Q.programs_named(self.conn, pgm) if pgm else []
             if not progs:
                 leaves.append(_Leaf(list(path), f"{here} runs {pgm or '?'} (not in index)",
-                                    self.cite_dd(s["member_name"], s["dd_line"], s["dd_name"], False),
+                                    self.cite_dd(s["member_name"], s["dd_line"], s["dd_name"], False, s["step_name"]),
                                     end=END_NO_WRITER if up else END_NO_READER))
                 continue
             for lf in reader_fn(progs[0], s, here + gdg, ds):
@@ -1232,7 +1232,7 @@ class _Walker(_Report):
         self.touch(rpid)
         fds = [f for f in self.conn.execute("SELECT * FROM file_decl WHERE program_id=?", (rpid,))
                if self.dd_matches(f["assign_dd"], s["dd_name"])]
-        dd_cite = self.cite_dd(s["member_name"], s["dd_line"], s["dd_name"], False)
+        dd_cite = self.cite_dd(s["member_name"], s["dd_line"], s["dd_name"], False, s["step_name"])
         if not fds:
             return [_Leaf([], f"{prog['program_id']} runs in {where} but declares no file on that DD",
                           dd_cite, end=END_NO_FIELD.format(lo=ds.lo + 1, hi=ds.hi))]
@@ -1992,7 +1992,7 @@ class _Walker(_Report):
         for s in steps:
             where = f"{s['job_name'] or ('PROC ' + (s['proc_name'] or '?'))} {s['step_name']} DD {s['dd_name']}"
             label = f"{verb} {rec} <- {s['dsn_resolved']} ({where}, {s['mode']}/{s['mode_source']})"
-            cites = stmt_cite + "; " + self.cite_dd(s["member_name"], s["dd_line"], s["dd_name"], True)
+            cites = stmt_cite + "; " + self.cite_dd(s["member_name"], s["dd_line"], s["dd_name"], True, s["step_name"])
             ds = _Node(pid, node.pname, node.root, node.lo, node.hi, node.pf, node.hop, kind="dataset",
                        data={"dsn": s["dsn_resolved"], "job_id": s["job_id"], "proc_id": s["proc_id"], "is_temp": s["is_temp"], "dd_id": s["dd_id"],
                              "gdg": s["gdg_rel"], "writer_pf": node.pf})
@@ -2929,7 +2929,7 @@ class _Fallback(_Report):
         for s in steps:
             where = f"{s['job_name'] or ('PROC ' + (s['proc_name'] or '?'))} {s['step_name']} DD {s['dd_name']}"
             label = f"{op} {root['name']} {arrow} {s['dsn_resolved']} ({where}, {s['mode']}/{s['mode_source']}) (reconstructed)"
-            cites = stmt_cite + "; " + self.cite_dd(s["member_name"], s["dd_line"], s["dd_name"], True)
+            cites = stmt_cite + "; " + self.cite_dd(s["member_name"], s["dd_line"], s["dd_name"], True, s["step_name"])
             ds = _Node(pid, node.pname, root["id"], lo, hi, None, node.hop, kind="dataset",
                        data={"dsn": s["dsn_resolved"], "job_id": s["job_id"], "proc_id": s["proc_id"], "is_temp": s["is_temp"], "dd_id": s["dd_id"],
                              "gdg": s["gdg_rel"], "writer_pf": None})
@@ -2944,7 +2944,7 @@ class _Fallback(_Report):
         self.touch(rpid)
         fds = [f for f in self.conn.execute("SELECT * FROM file_decl WHERE program_id=?", (rpid,))
                if _Walker.dd_matches(f["assign_dd"], s["dd_name"])]
-        dd_cite = self.cite_dd(s["member_name"], s["dd_line"], s["dd_name"], False)
+        dd_cite = self.cite_dd(s["member_name"], s["dd_line"], s["dd_name"], False, s["step_name"])
         if not fds:
             return [_Leaf([], f"{prog['program_id']} runs in {where} but declares no file on that DD", dd_cite,
                           end=END_NO_FIELD.format(lo=ds.lo + 1, hi=ds.hi))]
