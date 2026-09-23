@@ -539,7 +539,7 @@ def _build_literal_map(stmts: Sequence[LogicalLine]) -> Dict[str, Set[str]]:
             lit = m.group(2).strip().upper()
             targets = m.group(3)
             # Stop at the first COBOL keyword; MOVE targets are a name list.
-            targets = re.split(r"\b(?:OF|IN|WHEN|END-|IF|ELSE|PERFORM|MOVE|CALL)\b",
+            targets = re.split(r"(?<![\w-])(?:OF|IN|WHEN|END-|IF|ELSE|PERFORM|MOVE|CALL)\b",
                                targets, maxsplit=1, flags=re.IGNORECASE)[0]
             for t in re.split(r"[,\s]+", targets):
                 t = t.strip().rstrip(".").upper()
@@ -621,7 +621,7 @@ def _parse_using(body: str) -> List[str]:
     if ms:
         raw = raw[:ms.start()]
     raw = re.sub(r"\b(?:LENGTH|ADDRESS)\s+OF\s+", " ", raw, flags=re.IGNORECASE)
-    raw = re.sub(r"\b(?:OF|IN)\s+" + ID, " ", raw, flags=re.IGNORECASE)     # qualifier, not an argument
+    raw = re.sub(r"(?<![\w-])(?:OF|IN)\s+" + ID, " ", raw, flags=re.IGNORECASE)     # qualifier, not an argument
     raw = re.sub(r"\([^)]*\)", " ", raw)                                       # subscripts
     out = []
     for tok in re.split(r"[,\s]+", raw):
@@ -1627,7 +1627,8 @@ def _idents(text: str) -> List[str]:
     out: List[str] = []
     # `WS-KEY OF WS-REC` is ONE identifier (WS-KEY); the qualifier is not a
     # second reference.
-    text = re.sub(r"\b(?:OF|IN)\s+[A-Z0-9][A-Z0-9\-]*", " ", text or "", flags=re.IGNORECASE)
+    # (?<![\w-]): the IN of WS-Q-IN is part of the name, not a qualifier
+    text = re.sub(r"(?<![\w-])(?:OF|IN)\s+[A-Z0-9][A-Z0-9\-]*", " ", text or "", flags=re.IGNORECASE)
     for m in _TOKEN.finditer(text):
         t = m.group(0)
         if t[0] in ("'", '"'):
@@ -1941,7 +1942,10 @@ def _extract_field_and_literal_refs(f: ProgramFacts, st: LogicalLine) -> List[Tu
     body_raw = body
     # `WS-KEY OF WS-REC = 'B'` tests WS-KEY; the qualifier is blanked (same
     # length, so line attribution is unchanged) before verbs are read.
-    body = re.sub(r"\b(?:OF|IN)\s+[A-Z0-9][A-Z0-9\-]*", lambda m: " " * len(m.group(0)), body, flags=re.IGNORECASE)
+    # A name ending in -IN / -OF (WS-Q-IN) is not a qualifier: `\b` matched after its
+    # hyphen and blanked `IN TO`, so `MOVE WS-Q-IN TO WM-STAT` vanished.
+    body = re.sub(r"(?<![\w-])(?:OF|IN)\s+[A-Z0-9][A-Z0-9\-]*", lambda m: " " * len(m.group(0)), body,
+                  flags=re.IGNORECASE)
     # EVALUATE A ALSO B ... WHEN 3 ALSO 'M': one subject per ALSO position, and
     # each WHEN literal attaches to the subject at ITS position.
     eval_subjects: List[Optional[str]] = []

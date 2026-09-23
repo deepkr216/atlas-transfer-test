@@ -1,0 +1,2760 @@
+"""
+flow.py - where a VALUE goes (`flow FIELD`, docs/PLAN-value-flow.md section 4).
+
+A node is bytes inside one 01 of one program: (program, root pfield, lo, hi).
+Never a bare name - WS-STATUS is three unrelated fields in three programs.
+From a node the walk follows, in a fixed order (cross-program edges first):
+the file the record is written to and every step and program that reads
+those bytes, CALL USING positions into the callee, LINKAGE positions back to
+the callers, DB2 columns to their static readers, IMS segments by DBD, CICS
+queues and maps, MQ queues, pointer aliases, and last the local copies.
+Every place the walk widens (a group MOVE, an OCCURS, a REDEFINES) or stops
+is LABELLED with a fixed string; nothing is followed silently.
+
+Not a fact module: the walk reads data_flow / pfield / call_arg / param /
+file_record that build.py stored, so a fix here never costs a re-parse.
+
+On an index built before those tables existed (his index at work until the
+next night) the same questions are answered from field_ref, call_edge and
+sql_col_ref alone: MOVE pairs only from lines that hold exactly one MOVE
+read and one MOVE write, every hop marked (reconstructed).
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import sqlite3
+from collections import defaultdict
+from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
+
+from . import query as Q
+from . import verify_citations as V
+
+FOOTER = "Flow-insensitive: statement order and IF guards are not evaluated; a hop is a copy that CAN happen."
+FALLBACK_HEADER = "index has no data_flow - reconstructed from field_ref; exact after the next re-parse"
+FALLBACK_COPY = "copybook fields: not followed until re-parse"
+
+# Fixed end strings (plan section 5): each is a test assertion, so the words
+# never change. `{}` slots are filled per hop.
+END_TESTED = "only tested/displayed here"
+END_NO_USE = "no further use in {p}"
+END_UNNAMED = "group MOVE into unnamed bytes"
+END_TRUNC = "truncated {n} -> {m}"
+END_DERIVED = "derived - value not preserved (--derived)"
+END_DYNAMIC = "dynamic CALL unresolved (via {x})"
+END_NO_CALLEE = "callee not in index"
+END_POS = "LINKAGE position out of range / count mismatch - HUMAN MUST VERIFY"
+END_LENGTH_OF = "callee receives LENGTH OF, not the bytes"
+END_NO_COMMAREA = "callee has no DFHCOMMAREA 01"
+END_CONTENT = "BY CONTENT: one-way"
+END_NO_READER = "no indexed reader"
+END_NO_WRITER = "no indexed writer"
+END_NO_FIELD = "reader layout has no field at bytes {lo}-{hi}"
+END_COPYBOOK = "copybook differs from the writer's: verify layout"
+END_SORT = "sort step re-arranges bytes - mapping not indexed"
+END_UTILITY = "utility step - bytes not modelled"
+END_INTERFACE = "dataset leaves the mainframe (interfaces: {x})"
+END_NO_DB2_READER = "DB2 column: no static reader"
+END_NO_DB2_WRITER = "DB2 column: no static writer"
+END_PCB = "PCB unresolved"
+END_SEGMENT = "segment not resolved (RM-03)"
+END_SCREEN = "screen field - a human sees it"
+END_MQ = "MQ PUT to {q} (peer from manifest)"
+END_ODO = "offset is a maximum (ODO)"
+END_MISSING = "field not declared in this program (missing copybook {x})"
+END_AMBIGUOUS = "ambiguous name - HUMAN MUST VERIFY"
+END_HOPS = "hop limit {n}"
+END_WIDTH = "width cap"
+END_NODES = "node cap"
+
+COPY_KINDS = ("move", "move_corr", "set", "read_into", "write_from")
+DERIVED_KINDS = ("arith", "string", "unstring", "function", "inspect")
+SET_KINDS = ("literal", "figurative", "initialize", "accept")
+TOKEN_MAX = 40
+_CALL_WORD = {"static": "CALL", "dynamic": "CALL", "cics_link": "LINK", "cics_xctl": "XCTL", "cics_start": "START",
+              "cics_return": "RETURN", "proc_call": "CALL"}
+_REFMOD = re.compile(r"^\(\s*(\d+)\s*:\s*(\d+)\s*\)$")
+_STOP_WORDS = {"ELSE", "END-IF", "END-EVALUATE", "END-PERFORM", "END-CALL", "END-STRING", "END-UNSTRING",
+               "IF", "MOVE", "PERFORM", "GO", "CALL", "DISPLAY", "COMPUTE", "ADD", "SUBTRACT", "MULTIPLY",
+               "DIVIDE", "STRING", "UNSTRING", "SET", "READ", "WRITE", "EXEC", "EVALUATE", "WHEN", "INITIALIZE",
+               "ACCEPT", "OPEN", "CLOSE", "GOBACK", "STOP", "CONTINUE", "NEXT", "EXIT", "INSPECT", "ROUNDED",
+               "ON", "SIZE", "NOT", "DELIMITED", "BY", "WITH", "POINTER", "OVERFLOW", "DELIMITER", "COUNT",
+               "IN", "OF", "REFERENCE", "CONTENT", "VALUE", "LENGTH", "ADDRESS", "OMITTED", "RETURNING",
+               "USING", "TO", "FROM", "GIVING", "INTO", "CORR", "CORRESPONDING", "REMAINDER", "AT", "END",
+               "INVALID", "KEY", "AND", "OR", "THRU", "THROUGH", "UNTIL", "VARYING", "TIMES", "ALSO", "OTHER"}
+
+
+class Opts:
+    def __init__(self, up: bool = False, hops: int = 3, width: int = 12, nodes: int = 200, derived: bool = False,
+                 show_all: bool = False, budget: Optional[int] = None, header: bool = True) -> None:
+        self.up = up
+        self.hops = max(0, hops)
+        self.width = max(1, width)
+        self.nodes = max(1, nodes)
+        self.derived = derived
+        self.show_all = show_all
+        self.budget = budget
+        self.header = header
+
+
+def has_flow_tables(conn: sqlite3.Connection) -> bool:
+    names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name IN "
+                                        "('data_flow','pfield','call_arg','param','file_record')")}
+    return {"data_flow", "pfield", "call_arg", "param", "file_record"} <= names
+
+
+# ---------------------------------------------------------------------------
+# shared: lines, ends, cites
+# ---------------------------------------------------------------------------
+
+class _Node:
+    __slots__ = ("pid", "pname", "root", "lo", "hi", "pf", "hop", "unnamed", "kind", "data", "name")
+
+    def __init__(self, pid: int, pname: str, root: int, lo: int, hi: int, pf, hop: int,
+                 unnamed: bool = False, kind: str = "field", data=None, name: Optional[str] = None) -> None:
+        self.pid, self.pname, self.root, self.lo, self.hi, self.pf, self.hop = pid, pname, root, lo, hi, pf, hop
+        self.unnamed, self.kind, self.data, self.name = unnamed, kind, data, name
+
+
+class _Edge:
+    """One thing the walk can print under a node: a hop to `child`, an end
+    (`end` set, no child), or a table (DB2 readers). `rank` is the plan's
+    fixed order; `prog` names the program a dropped branch would have led to."""
+    __slots__ = ("rank", "prog", "line", "label", "cites", "guard", "child", "end", "table", "extra")
+
+    def __init__(self, rank: int, prog: str, line: int, label: str, cites: str, guard: Optional[str] = None,
+                 child: Optional[_Node] = None, end: Optional[str] = None, table: Optional[str] = None,
+                 extra: Optional[List[str]] = None) -> None:
+        self.rank, self.prog, self.line, self.label, self.cites, self.guard = rank, prog, line, label, cites, guard
+        self.child, self.end, self.table, self.extra = child, end, table, extra or []
+
+
+class _Leaf:
+    """What a dataset hop reaches after the pass-through steps: a reader
+    node, or an end. `path` is the pass-through lines printed before it."""
+    __slots__ = ("path", "text", "cites", "node", "end")
+
+    def __init__(self, path: List[Tuple[str, str]], text: str, cites: str, node: Optional[_Node] = None,
+                 end: Optional[str] = None) -> None:
+        self.path, self.text, self.cites, self.node, self.end = path, text, cites, node, end
+
+
+class _Report:
+    """The line buffer and the bookkeeping both walkers share: node numbers,
+    the visited ranges (cycles), the ends, the caps, and the cite forms."""
+
+    def __init__(self, conn: sqlite3.Connection, opts: Opts) -> None:
+        self.conn = conn
+        self.o = opts
+        self.lines: List[Tuple[int, str]] = []          # (depth, text); depth 0 = the root's own lines
+        self.ends: Dict[str, List[str]] = {}
+        self.end_order: List[str] = []
+        self.count = 0                                  # nodes printed, the root excluded
+        self.derived = 0
+        self.dropped_width = 0
+        self.dropped_nodes = 0
+        self.unlinked = 0
+        self.members: Set[int] = set()
+        self.programs: Set[int] = set()
+        self.root_pid: int = 0
+        self._member_tag: Dict[int, str] = {}
+        self._raw: Dict[Tuple[str, int], str] = {}
+
+    # ---- output ----------------------------------------------------------
+    def put(self, depth: int, text: str) -> None:
+        self.lines.append((depth, text))
+
+    def end(self, reason: str, num: str) -> str:
+        if reason not in self.ends:
+            self.ends[reason] = []
+            self.end_order.append(reason)
+        self.ends[reason].append(num)
+        return f"   [end: {reason}]"
+
+    @staticmethod
+    def fmt(num: str, depth: int, text: str) -> str:
+        return f"{num:<7}{'  ' * max(0, depth - 1)}{text}"
+
+    @staticmethod
+    def sub(depth: int, text: str) -> str:
+        return f"{'':7}{'  ' * depth}{text}"
+
+    def hop_prefix(self, node: _Node) -> str:
+        return "" if node.pid == self.root_pid else f"{node.pname}."
+
+    # ---- members / source --------------------------------------------------
+    def member_tag(self, mid: Optional[int]) -> Optional[str]:
+        if mid is None:
+            return None
+        if mid not in self._member_tag:
+            r = self.conn.execute("SELECT name, system FROM member WHERE id=?", (mid,)).fetchone()
+            self._member_tag[mid] = (f"{r['system']}/{r['name']}" if r and r["system"] else (r["name"] if r else None))
+        return self._member_tag[mid]
+
+    def raw(self, tag: str, line: int) -> str:
+        key = (tag, line)
+        if key not in self._raw:
+            self._raw[key] = Q.source_line_raw(self.conn, tag, line) if line else ""
+        return self._raw[key]
+
+    # ---- cites ---------------------------------------------------------------
+    @staticmethod
+    def _tok(text: str) -> str:
+        # the line's own spacing is kept ("01  WS-STATUS" reads as the source
+        # does); the gate collapses whitespace, so a joined or cut token passes too
+        tok = text.strip().rstrip(".").rstrip()
+        if "\n" in tok or len(tok) > TOKEN_MAX:
+            tok = re.sub(r"\s+", " ", tok)
+        if len(tok) > TOKEN_MAX:
+            cut = tok[-TOKEN_MAX:]
+            sp = cut.find(" ")
+            if 0 <= sp < TOKEN_MAX - 6:
+                cut = cut[sp + 1:]
+            tok = cut
+        return tok.replace('"', '\\"')
+
+    def cite_stmt(self, pid: int, exp_line: Optional[int], verb: Optional[str], operand: Optional[str]) -> str:
+        """MEMBER:line "token" for a statement: the token runs from the verb
+        keyword through the operand that carries the value (<= 40 chars);
+        an operand on a continuation line makes the cite a line range."""
+        m, ln, depth, via = Q.origin(self.conn, pid, exp_line)
+        if not m or ln is None:
+            return f"?:{exp_line}"
+        via_tag = f" (via COPY {via})" if depth else ""
+        raw0 = self.raw(m, ln)
+        if not raw0.strip():
+            return f"{m}:{ln}{via_tag}"
+        vword = (verb or "").upper()
+        if vword.startswith("EXEC-CICS-"):
+            vword = vword[len("EXEC-CICS-"):]
+        vrx = re.compile(r"(?<![\w-])" + re.escape(vword) + r"(?![\w-])", re.I) if vword else None
+        orx = re.compile(r"(?<![\w-])" + re.escape(operand) + r"(?![\w-])", re.I) if operand else None
+        vs = [x.start() for x in vrx.finditer(raw0)] if vrx else []
+        start = vs[0] if vs else (len(raw0) - len(raw0.lstrip()))
+        end_line = ln
+        token = None
+        if orx:
+            om = orx.search(raw0, start)
+            if om:
+                v = max([x for x in vs if x <= om.start()] or [start])
+                head = raw0[:v].rstrip().upper()
+                if head.endswith("ELSE") or head.endswith("WHEN"):
+                    v = raw0.upper().rfind(head[-4:], 0, v)
+                token = raw0[v:om.end()]
+            else:
+                parts = [raw0[start:].strip()]
+                for k in range(1, 7):
+                    if self.raw(m, ln + k - 1).rstrip().endswith("."):
+                        break                   # the statement ended: never cite into the next one
+                    rawk = self.raw(m, ln + k)
+                    if not rawk.strip():
+                        break
+                    omk = orx.search(rawk)
+                    if omk:
+                        parts.append(rawk[:omk.end()].strip())
+                        end_line = ln + k
+                        break
+                    parts.append(rawk.strip())
+                else:
+                    parts = [raw0[start:].strip()]
+                if end_line == ln:
+                    parts = [raw0[start:].strip()]
+                token = " ".join(parts)
+        if token is None:
+            token = raw0[start:].strip()
+        tok = self._tok(token)
+        if len(tok) < V.WEAK_TOKEN_CHARS:
+            tok = self._tok(raw0.strip())
+        if end_line - ln > 20:
+            end_line = ln
+            tok = self._tok(raw0[start:].strip())
+        rng = f"{m}:{ln}" if end_line == ln else f"{m}:{ln}-{end_line}"
+        return f'{rng}{via_tag} "{tok}"'
+
+    def cite_def(self, row, pid: Optional[int] = None) -> str:
+        """MEMBER:line "05  NAME" for a data item: the member that holds the
+        line (the copybook for a copied item) without the via note, the
+        level and the name as the token."""
+        tag = self.member_tag(row["src_member"]) if "src_member" in row.keys() else None
+        line = row["src_line"] if "src_line" in row.keys() else None
+        if not tag or line is None:
+            m, ln, _d, _v = Q.origin(self.conn, pid or 0, row["exp_line"] if "exp_line" in row.keys() else row["line"])
+            tag, line = m, ln
+        if not tag or line is None:
+            return "?"
+        raw = self.raw(tag, line)
+        mm = re.search(r"(\d\d\s+" + re.escape(row["name"]) + r")(?![\w-])", raw, re.I)
+        tok = self._tok(mm.group(1) if mm else (raw.strip() if raw.strip() else row["name"]))
+        return f'{tag}:{line} "{tok}"'
+
+    def cite_sql(self, pid: int, line: int, col: str, host_var: Optional[str] = None) -> str:
+        """sql_stmt start-end with the column as the token; a FETCH names no
+        column (the cursor's DECLARE does), so there the host variable is the
+        token, on the line that holds it."""
+        st = self.conn.execute("SELECT start_line, end_line FROM sql_stmt WHERE program_id=? AND start_line<=? "
+                               "AND COALESCE(end_line,start_line)>=? ORDER BY start_line DESC LIMIT 1",
+                               (pid, line, line)).fetchone()
+        s, e = (st["start_line"], st["end_line"] or st["start_line"]) if st else (line, line)
+        m1, l1, d1, v1 = Q.origin(self.conn, pid, s)
+        m2, l2, _d2, _v2 = Q.origin(self.conn, pid, e)
+        if not m1 or l1 is None:
+            return f"?:{line}"
+        if m2 != m1 or l2 is None or l2 < l1 or l2 - l1 > V.WIDE_RANGE_LINES:
+            l2 = l1
+        via = f" (via COPY {v1})" if d1 else ""
+        rng = f"{m1}:{l1}" if l1 == l2 else f"{m1}:{l1}-{l2}"
+        text = " ".join(self.raw(m1, ln) for ln in range(l1, l2 + 1)).upper()
+        if not re.search(r"(?<![\w-])" + re.escape(col.upper()) + r"(?![\w-])", text) and host_var:
+            for ln in range(l1, l2 + 1):
+                raw = self.raw(m1, ln)
+                hm = re.search(r":\s*" + re.escape(host_var) + r"(?![\w-])", raw, re.I)
+                if hm:
+                    tok = hm.group(0) if len(hm.group(0)) >= V.WEAK_TOKEN_CHARS else raw.strip()
+                    return f'{m1}:{ln}{via} "{self._tok(tok)}"'
+        tok = col if len(col) >= V.WEAK_TOKEN_CHARS else None
+        if tok is None:
+            hit = next((ln for ln in range(l1, l2 + 1) if col.upper() in self.raw(m1, ln).upper()), l1)
+            t = self.raw(m1, hit).strip()
+            tok = self._tok(t) if t else col
+            rng = f"{m1}:{hit}"
+        return f'{rng}{via} "{tok}"'
+
+    def cite_dd(self, member: Optional[str], line: Optional[int], dd_name: str, with_dsn: bool) -> str:
+        if not member or not line:
+            return f"{member or '?'}:{line or '?'}"
+        raw = self.raw(member, line)
+        tok = f"//{dd_name} DD"
+        mm = re.match(r"//(\S+)\s+DD\b", raw)
+        if mm:
+            tok = f"//{mm.group(1)} DD"
+        if with_dsn:
+            dm = re.search(r"DSN(?:AME)?=([^,\s(]+)", raw, re.I)
+            if dm and len(tok) + 5 + len(dm.group(1)) <= TOKEN_MAX:
+                tok += f" DSN={dm.group(1)}"
+        return f'{member}:{line} "{tok}"'
+
+    def cite_card(self, step_id: int, kind: str) -> str:
+        r = self.conn.execute("""SELECT d.sysin_text, d.card_member, d.line, m.name AS mem
+                                 FROM dd d JOIN step s ON s.id=d.step_id LEFT JOIN job j ON j.id=s.job_id
+                                 LEFT JOIN proc_def pd ON pd.id=s.proc_id
+                                 LEFT JOIN member m ON m.id=COALESCE(j.member_id, pd.member_id)
+                                 WHERE d.step_id=? AND d.sysin_text IS NOT NULL ORDER BY d.line""", (step_id,)).fetchall()
+        for d in r:
+            for i, txt in enumerate(d["sysin_text"].splitlines()):
+                if re.search(r"(?<![\w-])" + re.escape(kind) + r"(?![\w-])", txt, re.I):
+                    if d["card_member"]:
+                        return f'{d["card_member"]}:{i + 1} "{self._tok(txt)}"'
+                    return f'{d["mem"]}:{(d["line"] or 0) + i + 1} "{self._tok(txt)}"'
+        return "?"
+
+    # ---- sections ------------------------------------------------------------
+    def budget_cut(self) -> None:
+        """--budget: drop the deepest tree lines first; the end reasons of
+        what stays are kept, and the cut is said."""
+        b = self.o.budget
+        if not b:
+            return
+        total = sum(len(t) + 1 for _d, t in self.lines)
+        cut = 0
+        while total > b and self.lines:
+            deepest = max(d for d, _t in self.lines)
+            if deepest <= 1:
+                break
+            kept = [(d, t) for (d, t) in self.lines if d < deepest]
+            cut += len(self.lines) - len(kept)
+            self.lines = kept
+            total = sum(len(t) + 1 for _d, t in self.lines)
+        if cut:
+            self.put(1, f"... --budget {b}: {cut} deeper line(s) cut; their end reasons stay listed under Ends")
+
+    def sections(self, root_pname: str, extra_not_followed: Sequence[str] = ()) -> List[str]:
+        out = ["## Not followed"]
+        if self.o.derived:
+            out.append("- derived edges (COMPUTE/STRING/FUNCTION): followed (--derived)")
+        else:
+            out.append(f"- derived edges (COMPUTE/STRING/FUNCTION): {self.derived} (--derived follows them)")
+        if self.unlinked:
+            out.append(f"- {self.unlinked} statement(s) name an item with no pfield link (ambiguous or undeclared: "
+                       "see Unresolved in scope)")
+        out.extend(extra_not_followed)
+        out.append("## Ends")
+        any_end = False
+        caps = {END_WIDTH: f"{self.dropped_width} branch(es) collapsed (--all shows them)",
+                END_NODES: f"{self.dropped_nodes} branch(es) not printed (--nodes {self.o.nodes})"}
+        for reason in self.end_order:
+            nums = self.ends[reason]
+            out.append(f"- {reason}: " + ", ".join(nums[:12]) + (f" (+{len(nums) - 12} more)" if len(nums) > 12 else "")
+                       + (f" - {caps[reason]}" if reason in caps else ""))
+            any_end = True
+        if self.derived and not self.o.derived:
+            out.append(f"- {END_DERIVED}: {self.derived} edge(s)")
+            any_end = True
+        if not any_end:
+            out.append("- none")
+        return out
+
+
+# ---------------------------------------------------------------------------
+# the walker over pfield / data_flow (the normal mode)
+# ---------------------------------------------------------------------------
+
+def _refmod(text: Optional[str]) -> Tuple[Optional[Tuple[int, int]], Optional[str]]:
+    if not text:
+        return None, None
+    m = _REFMOD.match(text.strip())
+    if m:
+        return (int(m.group(1)), int(m.group(2))), None
+    return None, "(ref-mod with variable position: whole item)"
+
+
+def _how_resolved(c) -> str:
+    """call_edge.resolution in words: how a dynamic CALL's target was found."""
+    how = c["resolution"] if "resolution" in c.keys() else None
+    return {"move_literal": "MOVE literal", "value_clause": "VALUE clause"}.get(how or "", how or "?")
+
+
+def _candidates(c) -> List[Tuple[str, str]]:
+    """A dynamic CALL's targets, one labelled branch each (guard 19); a
+    `(+N more)` entry is kept so the caller can end on it, never drop it."""
+    return [(t, f"candidate: resolved via {_how_resolved(c)}") for t in Q._jl(c["resolved"])]
+
+
+def _note_file(note: Optional[str]) -> Optional[str]:
+    """The SELECT name of an io_in / io_out note: `file STAT-OUT multi-record` -> STAT-OUT."""
+    parts = (note or "").split()
+    return parts[1] if len(parts) > 1 and parts[0] == "file" else None
+
+
+def _numeric(row) -> bool:
+    pic = (row["pic"] or "").upper()
+    usage = (row["usage"] or "").upper()
+    if usage.startswith("COMP") or usage in ("BINARY", "PACKED-DECIMAL", "INDEX"):
+        return True
+    return bool(pic) and "9" in pic and not any(c in pic for c in "XA")
+
+
+def _picstr(row) -> str:
+    pic = row["pic"]
+    usage = row["usage"]
+    if pic:
+        return pic + (f" {usage}" if usage and usage.upper() != "DISPLAY" else "")
+    if usage:
+        return usage
+    return f"group of {row['length']} bytes"
+
+
+class _Walker(_Report):
+
+    def __init__(self, conn: sqlite3.Connection, opts: Opts) -> None:
+        super().__init__(conn, opts)
+        self._pf: Dict[int, sqlite3.Row] = {}
+        self._root_items: Dict[int, List[sqlite3.Row]] = {}
+        self._prog: Dict[int, sqlite3.Row] = {}
+        self._dup: Dict[Tuple[int, str], int] = {}
+        self._aliases: Dict[int, Set[str]] = {}
+        self.visited: Dict[Tuple[int, int], List[Tuple[int, int, str]]] = defaultdict(list)
+        self._partial_shown: Set[int] = set()
+        self._layout: Dict[int, Optional[str]] = {}
+
+    # ---- lookups -------------------------------------------------------------
+    def pf(self, pf_id: Optional[int]):
+        if pf_id is None:
+            return None
+        if pf_id not in self._pf:
+            self._pf[pf_id] = self.conn.execute("SELECT * FROM pfield WHERE id=?", (pf_id,)).fetchone()
+        return self._pf[pf_id]
+
+    def root_items(self, root_id: int) -> List[sqlite3.Row]:
+        if root_id not in self._root_items:
+            rows = self.conn.execute("SELECT * FROM pfield WHERE root_id=? ORDER BY offset, id", (root_id,)).fetchall()
+            self._root_items[root_id] = rows
+            for r in rows:
+                self._pf[r["id"]] = r
+        return self._root_items[root_id]
+
+    def prog(self, pid: int):
+        if pid not in self._prog:
+            self._prog[pid] = self.conn.execute(
+                "SELECT p.*, m.name AS member_name, m.parse_status FROM program p JOIN member m ON m.id=p.member_id "
+                "WHERE p.id=?", (pid,)).fetchone()
+        return self._prog[pid]
+
+    def aliases(self, pid: int) -> Set[str]:
+        if pid not in self._aliases:
+            self._aliases[pid] = {r[0].upper() for r in self.conn.execute(
+                "SELECT alias FROM program_alias WHERE program_id=?", (pid,))}
+        return self._aliases[pid]
+
+    def dup(self, pid: int, name: str) -> int:
+        key = (pid, name.upper())
+        if key not in self._dup:
+            self._dup[key] = self.conn.execute("SELECT COUNT(*) FROM pfield WHERE program_id=? AND UPPER(name)=?",
+                                               key).fetchone()[0]
+        return self._dup[key]
+
+    @staticmethod
+    def extent(row) -> Tuple[int, int]:
+        n = row["occurs_max"] or 1
+        return row["offset"], row["offset"] + row["length"] * max(1, n)
+
+    def ancestors(self, row) -> List[sqlite3.Row]:
+        out = []
+        p = row["parent_id"]
+        while p is not None:
+            r = self.pf(p)
+            if r is None:
+                break
+            out.append(r)
+            p = r["parent_id"]
+        return out
+
+    def redefines_chain(self, row) -> bool:
+        if row["redefines"]:
+            return True
+        return any(a["redefines"] for a in self.ancestors(row))
+
+    def touch(self, pid: int) -> None:
+        self.programs.add(pid)
+        p = self.prog(pid)
+        if p:
+            self.members.add(p["member_id"])
+
+    # ---- naming ----------------------------------------------------------------
+    def base_name(self, pid: int, row) -> str:
+        name = row["name"]
+        if self.dup(pid, name) > 1 and row["qualified"] and "." in row["qualified"]:
+            return f"{name} OF {row['qualified'].split('.')[-2]}"
+        return name
+
+    def nm(self, node: _Node) -> str:
+        if node.name:
+            return node.name
+        pf = node.pf
+        base = self.base_name(node.pid, pf)
+        lo, hi = self.extent(pf)
+        if node.unnamed:
+            return f"unnamed bytes of {base} ({_picstr(pf)})"
+        if (node.lo, node.hi) != (lo, hi):
+            return f"{base} (bytes {node.lo - lo + 1}-{node.hi - lo} of {hi - lo})"
+        return base
+
+    def desc(self, node: _Node, full: bool = False) -> str:
+        pf = node.pf
+        if pf is None:
+            return ""
+        sec = pf["section"]
+        root = self.pf(node.root)
+        pic = _picstr(pf)
+        notes = []
+        if pf["after_odo"]:
+            notes.append(END_ODO)
+        p = self.prog(node.pid)
+        if p and pf["src_member"] is not None and pf["src_member"] != p["member_id"] and sec in ("FILE", "LINKAGE"):
+            notes.append(f"copybook {self.member_tag(pf['src_member'])}")
+        if sec in ("FILE", "LINKAGE") or root is not None and root["id"] != pf["id"]:
+            lw = self.layout_note(node.pid)
+            if lw:
+                notes.append(lw)
+        tail = ("; " + "; ".join(notes)) if notes else ""
+        if sec == "FILE":
+            return f"(FILE {root['name']} bytes {node.lo + 1}-{node.hi}, {pic}{tail})"
+        if sec == "LINKAGE":
+            if root is not None and root["id"] != pf["id"]:
+                return f"(LINKAGE {root['name']} bytes {node.lo + 1}-{node.hi}, {pic}{tail})"
+            return f"(LINKAGE, {pic}{tail})"
+        if full:
+            return f"({sec}, {pic}{tail})"
+        return f"({END_ODO})" if pf["after_odo"] else ""
+
+    def layout_note(self, pid: int) -> Optional[str]:
+        """A layout_warning on the program (REDEFINES larger than its object,
+        SYNC slack): byte offsets there are not exact (guard 15)."""
+        if pid not in self._layout:
+            p = self.prog(pid)
+            n = self.conn.execute("SELECT COUNT(*) FROM unresolved WHERE member_id=? AND kind='layout_warning'",
+                                  (p["member_id"],)).fetchone()[0] if p else 0
+            self._layout[pid] = (f"layout warning in {p['member_name']}: offsets HUMAN MUST VERIFY" if n else None)
+        return self._layout[pid]
+
+    def partial_note(self, pid: int) -> Optional[str]:
+        p = self.prog(pid)
+        if not p or p["parse_status"] != "partial":
+            return None
+        rows = self.conn.execute("""SELECT detail FROM unresolved WHERE member_id=? AND kind IN ('expand','missing_copybook')
+                                    ORDER BY id LIMIT 4""", (p["member_id"],)).fetchall()
+        det = "; ".join(r["detail"].split(" - ")[0].replace("]", ")") for r in rows) or "facts incomplete"
+        return f"[program partial: {det}]"
+
+    # ---- closure -----------------------------------------------------------------
+    def closure(self, node: _Node) -> List[Tuple[sqlite3.Row, str]]:
+        """Every item of the root whose bytes intersect the node's, with the
+        reason it shares them (guard 7): printed before any edge is followed."""
+        out = []
+        anc = {a["id"] for a in self.ancestors(node.pf)} if node.pf is not None else set()
+        self_id = node.pf["id"] if node.pf is not None else None
+        for r in self.root_items(node.root):
+            lo, hi = self.extent(r)
+            if hi <= node.lo or lo >= node.hi:
+                continue
+            if r["id"] == self_id:
+                reason = "self"
+            elif r["id"] in anc:
+                reason = "parent group"
+            elif node.pf is not None and self_id in {a["id"] for a in self.ancestors(r)}:
+                reason = "child"
+            elif self.redefines_chain(r) or (node.pf is not None and self.redefines_chain(node.pf)):
+                reason = "REDEFINES"
+            else:
+                reason = "overlaps"
+            bits = [reason]
+            if reason == "self":
+                out.append((r, reason))
+                continue
+            if r["occurs_max"]:
+                bits.append("OCCURS element, index unknown")
+            if r["after_odo"]:
+                bits.append(END_ODO)
+            out.append((r, ", ".join(bits)))
+        # nearest ancestor first, then by offset
+        depth = {a["id"]: i for i, a in enumerate(self.ancestors(node.pf))} if node.pf is not None else {}
+        out.sort(key=lambda x: (0 if x[1] == "self" else 1 if x[0]["id"] in depth else 2,
+                                depth.get(x[0]["id"], 0), x[0]["offset"], x[0]["id"]))
+        return out
+
+    def closure_ids(self, node: _Node) -> Tuple[Set[int], List[Tuple[sqlite3.Row, str]]]:
+        cl = self.closure(node)
+        return {r["id"] for r, _why in cl}, cl
+
+    def place(self, dst, lo: int, hi: int) -> List[Tuple[sqlite3.Row, int, int, str]]:
+        """Which named items of the destination root the bytes [lo,hi) land
+        in: the item itself when exact, its covering elementary children, or
+        'unnamed' when nothing names those bytes (guard 6)."""
+        d0, d1 = self.extent(dst)
+        if not dst["is_group"]:
+            if (lo, hi) == (d0, d1):
+                return [(dst, lo, hi, "exact")]
+            if dst["parent_id"] is None:
+                return [(dst, lo, hi, "unnamed")]
+            return [(dst, lo, hi, "partial")]
+        under = {dst["id"]}
+        items = []
+        for r in self.root_items(dst["root_id"]):
+            if r["parent_id"] in under:
+                under.add(r["id"])
+            if r["id"] == dst["id"] or r["id"] not in under or r["is_group"] or self.redefines_chain(r):
+                continue
+            a, b = self.extent(r)
+            if b <= lo or a >= hi:
+                continue
+            xlo, xhi = max(lo, a), min(hi, b)
+            items.append((r, xlo, xhi, "exact" if (xlo, xhi) == (a, b) else "partial"))
+        if not items:
+            return [(dst, lo, hi, "unnamed")]
+        return items
+
+    def child(self, pid: int, row, lo: int, hi: int, how: str, hop: int) -> _Node:
+        return _Node(pid, self.prog(pid)["program_id"], row["root_id"], lo, hi, row, hop, unnamed=(how == "unnamed"))
+
+    def seen(self, node: _Node) -> Optional[str]:
+        for (vlo, vhi, num) in self.visited[(node.pid, node.root)]:
+            if vlo <= node.lo and node.hi <= vhi:
+                return num
+        return None
+
+    # ---- byte mapping between a source item and a destination item ------------------
+    def map_bytes(self, node: _Node, src, src_refmod: Optional[str], dst, dst_refmod: Optional[str],
+                  reverse: bool = False, src_sub: bool = False,
+                  dst_sub: bool = False) -> Optional[Tuple[int, int, List[str], Optional[str]]]:
+        """(lo, hi, labels, end) of the node's bytes after a copy from `src`
+        to `dst`; None when the copy does not touch the node's bytes. With
+        `reverse` the node lies in `dst` and the result is where in `src`
+        those bytes came from. A subscripted side is ANY element: its bytes
+        are taken element-relative, and a subscripted target is the whole
+        table (index unknown)."""
+        def span(row, refmod, sub):
+            a, b = self.extent(row)
+            rm, lbl = _refmod(refmod)
+            if rm:
+                a, b = a + rm[0] - 1, min(b, a + rm[0] - 1 + rm[1])
+            unit = row["length"] if sub and row["occurs_max"] else None
+            return a, b, unit, lbl
+
+        s0, s1, su, s_lbl = span(src, src_refmod, src_sub)
+        d0, d1, du, d_lbl = span(dst, dst_refmod, dst_sub)
+        labels = [x for x in (s_lbl, d_lbl) if x]
+        if reverse:
+            s0, s1, su, d0, d1, du = d0, d1, du, s0, s1, su
+            src, dst = dst, src
+        x0, x1 = max(node.lo, s0), min(node.hi, s1)
+        if x0 >= x1:
+            return None
+        slen, dlen = su or (s1 - s0), du or (d1 - d0)
+        if not src["is_group"] and not dst["is_group"] and (_numeric(src) or _numeric(dst))                 and (_picstr(src) != _picstr(dst)):
+            a, b = (_picstr(dst), _picstr(src)) if reverse else (_picstr(src), _picstr(dst))
+            labels.append(f"converted {a} -> {b}")
+            return d0, d1, labels, None
+        if not src["is_group"] and not dst["is_group"] and (x0, x1) == (s0, s1) and not su:
+            # an elementary MOVE of the whole item fills the whole receiving item (padded or cut):
+            # never "bytes 1-2 of 20"; part of an item (bytes a group MOVE left there) keeps its place
+            trunc = None
+            if (dlen > slen) if reverse else (slen > dlen):
+                trunc = END_TRUNC.format(n=max(slen, dlen), m=min(slen, dlen))
+            return d0, d1, labels + ([trunc] if trunc else []), None
+        rel0 = (x0 - s0) % su if su else x0 - s0
+        rel1 = rel0 + min(x1 - x0, su - rel0) if su else x1 - s0
+        # the copy runs original source -> original target: under --up that is dst -> src here
+        if reverse:
+            trunc = END_TRUNC.format(n=dlen, m=slen) if dlen > slen else None
+        else:
+            trunc = END_TRUNC.format(n=slen, m=dlen) if slen > dlen else None
+        if rel0 >= dlen:
+            return d0, d1, labels, trunc or END_TRUNC.format(n=slen, m=dlen)
+        rel1 = min(rel1, dlen)
+        if trunc:
+            labels.append(trunc)
+        if du:
+            return d0, d1, labels, None
+        return d0 + rel0, d0 + rel1, labels, None
+
+    # ---- edges: down ------------------------------------------------------------------
+    def edges(self, node: _Node) -> List[_Edge]:
+        ids, _cl = self.closure_ids(node)
+        out = self.edges_up(node, ids) if self.o.up else self.edges_down(node, ids)
+        out.sort(key=lambda e: (e.rank, e.prog, e.line))
+        return out
+
+    def edges_down(self, node: _Node, ids: Set[int]) -> List[_Edge]:
+        out: List[_Edge] = []
+        pid = node.pid
+        q = ",".join("?" * len(ids))
+        rows = self.conn.execute(f"SELECT * FROM data_flow WHERE program_id=? AND src_pfield IN ({q}) ORDER BY line, id",
+                                 (pid, *ids)).fetchall()
+        for r in rows:
+            k = r["kind"]
+            if k in COPY_KINDS:
+                out.extend(self.copy_edges(node, r))
+            elif k in DERIVED_KINDS:
+                if self.o.derived:
+                    out.extend(self.copy_edges(node, r, derived=True))
+                else:
+                    self.derived += 1
+            elif k == "set_address":
+                out.extend(self.pointer_edges(node, r))
+            elif k == "cics_out":
+                out.extend(self.cics_out_edges(node, r))
+            elif k == "dli_out":
+                out.extend(self.dli_edges(node, r))
+            elif k == "mq_out":
+                out.extend(self.mq_edges(node, r))
+            elif k == "io_out" and r["src_pfield"] == node.root:
+                out.extend(self.file_edges(node, r))
+        out.extend(self.call_edges(node, ids))
+        out.extend(self.linkage_back(node, ids))
+        out.extend(self.sql_edges(node, ids, "write"))
+        return out
+
+    def copy_edges(self, node: _Node, r, derived: bool = False) -> List[_Edge]:
+        pid = node.pid
+        verb = r["verb"] or "MOVE"
+        src, dst = self.pf(r["src_pfield"]), self.pf(r["dst_pfield"])
+        if r["kind"] == "move_corr":
+            return self.corr_edges(node, r, src, dst)
+        cites = self.cite_stmt(pid, r["line"], verb, r["dst_name"])
+        lbl_verb = {"read_into": "READ INTO", "write_from": "WRITE FROM", "set": "SET"}.get(r["kind"], verb)
+        if derived:
+            lbl_verb = f"{verb}"
+        if dst is None or src is None:
+            self.unlinked += 1
+            e = _Edge(9, node.pname, r["line"], f"{lbl_verb} -> {r['dst_name']}", cites, r["guard"])
+            e.end = END_AMBIGUOUS
+            return [e]
+        mapped = self.map_bytes(node, src, r["src_refmod"], dst, r["dst_refmod"],
+                                src_sub=bool(r["src_sub"]), dst_sub=bool(r["dst_sub"]))
+        if mapped is None:
+            return []
+        n_lo, n_hi, labels, end = mapped
+        subs = self._subs(r, src, dst)
+        if derived:
+            # the value is not preserved: the whole target is the next node, no byte mapping
+            n_lo, n_hi = self.extent(dst)
+            labels, end, lbl_verb = [], None, f"derived ({verb})"
+        rank = 10 if derived else (1 if dst["section"] == "FILE" else 3 if dst["section"] == "LINKAGE" else 9)
+        s0, s1 = self.extent(src)
+        group_src = bool(src["is_group"]) and (node.lo > s0 or node.hi < s1) and not derived
+        if end:
+            label = (f"group {lbl_verb} {src['name']} -> {self.base_name(pid, dst)}: bytes {node.lo + 1}-{node.hi} "
+                     f"fall outside it" if group_src else f"{lbl_verb} -> {self.base_name(pid, dst)}{subs}")
+            return [_Edge(rank, node.pname, r["line"], label + self._lbls(labels), cites, r["guard"], end=end)]
+        out = []
+        for (row, plo, phi, how) in self.place(dst, n_lo, n_hi):
+            ch = self.child(pid, row, plo, phi, how, node.hop + 1)
+            if group_src:
+                label = (f"group {lbl_verb} {src['name']} -> {dst['name']}: bytes {n_lo + 1}-{n_hi} land in "
+                         f"{self.nm(ch)}")
+                if self.layout_note(pid):
+                    labels = labels + [self.layout_note(pid)] if self.layout_note(pid) not in labels else labels
+            else:
+                label = f"{lbl_verb} -> {self.hop_prefix(ch)}{self.nm(ch)}{subs}"
+                d = self.desc(ch)
+                if d:
+                    label += " " + d
+            out.append(_Edge(rank, node.pname, r["line"], label + self._lbls(labels), cites, r["guard"], child=ch))
+        return out
+
+    @staticmethod
+    def _subs(r, src, dst) -> str:
+        """` (subscripted: any of N elements)` for a subscripted operand: the
+        element is not known, so the whole table is the node (guard 7)."""
+        out = ""
+        for sub, row in ((r["src_sub"], src), (r["dst_sub"], dst)):
+            if sub and row is not None:
+                out += f" (subscripted: any of {row['occurs_max'] or '?'} elements)"
+        return out
+
+    @staticmethod
+    def _lbls(labels: List[str]) -> str:
+        return ("; " + "; ".join(labels)) if labels else ""
+
+    def corr_edges(self, node: _Node, r, src, dst) -> List[_Edge]:
+        """MOVE CORR pairs same-named immediate children by NAME, never by
+        bytes; FILLER, REDEFINES and OCCURS children are not moved (guard 8)."""
+        pid = node.pid
+        cites = self.cite_stmt(pid, r["line"], r["verb"] or "MOVE", r["dst_name"])
+        if src is None or dst is None:
+            self.unlinked += 1
+            return [_Edge(9, node.pname, r["line"], f"MOVE CORR -> {r['dst_name']}", cites, r["guard"], end=END_AMBIGUOUS)]
+        out = []
+        up = self.o.up
+        arrow = "<-" if up else "->"
+
+        def pairs(s, d):
+            # s, d: the source and destination groups; the node lies in d under --up
+            s_kids = {}
+            for x in self.root_items(s["root_id"]):
+                if x["parent_id"] == s["id"] and x["name"].upper() != "FILLER" and not x["redefines"] and not x["occurs_max"]:
+                    s_kids.setdefault(x["name"].upper(), x)
+            for y in self.root_items(d["root_id"]):
+                if y["parent_id"] == d["id"] and y["name"].upper() in s_kids and not y["redefines"] and not y["occurs_max"]:
+                    x = s_kids[y["name"].upper()]
+                    if x["is_group"] and y["is_group"]:
+                        pairs(x, y)
+                        continue
+                    if x["is_group"] != y["is_group"]:
+                        continue
+                    mine = y if up else x
+                    a, b = self.extent(mine)
+                    if b <= node.lo or a >= node.hi:
+                        continue
+                    mapped = self.map_bytes(node, x, None, y, None, reverse=up)
+                    if mapped is None:
+                        continue
+                    n_lo, n_hi, labels, end = mapped
+                    head = f"MOVE CORR {s['name']} {arrow} {d['name']}: {x['name']} by name" if not up else \
+                        f"MOVE CORR {d['name']} {arrow} {s['name']}: {y['name']} by name"
+                    if end:
+                        out.append(_Edge(9, node.pname, r["line"], head + self._lbls(labels), cites, r["guard"], end=end))
+                        continue
+                    for (row, plo, phi, how) in self.place(x if up else y, n_lo, n_hi):
+                        ch = self.child(pid, row, plo, phi, how, node.hop + 1)
+                        out.append(_Edge(9, node.pname, r["line"], f"{head} {arrow} {self.hop_prefix(ch)}{self.nm(ch)}"
+                                         + self._lbls(labels), cites, r["guard"], child=ch))
+
+        pairs(src, dst)
+        return out
+
+    def pointer_edges(self, node: _Node, r) -> List[_Edge]:
+        """SET p TO ADDRESS OF x (row x -> p) then SET ADDRESS OF a TO p
+        (row p -> a): `a` overlays `x` (rule 8)."""
+        pid = node.pid
+        p = self.pf(r["dst_pfield"])
+        x = self.pf(r["src_pfield"])
+        if p is None or x is None or (p["usage"] or "").upper() != "POINTER":
+            return []
+        out = []
+        for r2 in self.conn.execute("SELECT * FROM data_flow WHERE program_id=? AND kind='set_address' AND src_pfield=?",
+                                    (pid, p["id"])):
+            a = self.pf(r2["dst_pfield"])
+            if a is None:
+                self.unlinked += 1
+                continue
+            mapped = self.map_bytes(node, x, None, a, None)
+            if mapped is None:
+                continue
+            n_lo, n_hi, labels, end = mapped
+            cites = self.cite_stmt(pid, r["line"], "SET", p["name"]) + "; " + self.cite_stmt(pid, r2["line"], "SET", a["name"])
+            for (row, plo, phi, how) in self.place(a, n_lo, n_hi):
+                ch = self.child(pid, row, plo, phi, how, node.hop + 1)
+                out.append(_Edge(8, node.pname, r["line"], f"pointer alias {p['name']} -> {self.nm(ch)} {self.desc(ch)}".rstrip()
+                                 + self._lbls(labels), cites, None, child=ch))
+        return out
+
+    # ---- rule 1: the file -----------------------------------------------------------------
+    @staticmethod
+    def dd_matches(assign: Optional[str], dd_name: Optional[str]) -> bool:
+        if not assign or not dd_name:
+            return False
+        a, d = assign.upper(), dd_name.upper()
+        d_last = d.split(".")[-1]
+        return a == d or a == d_last or a.endswith("-" + d_last) or d_last.endswith("-" + a)
+
+    def steps_of(self, pname: str) -> List[sqlite3.Row]:
+        return self.conn.execute("""SELECT d.id AS dd_id, d.dd_name, d.dsn_resolved, d.mode, d.mode_source, d.gdg_rel,
+                                           d.is_temp, d.line AS dd_line, s.id AS step_id, s.step_name, s.effective_pgm AS pgm,
+                                           s.launcher, s.job_id, s.proc_id, j.job_name, pd.proc_name, m.name AS member_name
+                                    FROM dd d JOIN step s ON s.id=d.step_id LEFT JOIN job j ON j.id=s.job_id
+                                    LEFT JOIN proc_def pd ON pd.id=s.proc_id
+                                    LEFT JOIN member m ON m.id=COALESCE(j.member_id, pd.member_id)
+                                    WHERE UPPER(s.effective_pgm)=? AND d.dsn_resolved IS NOT NULL
+                                    ORDER BY j.job_name, s.ordinal, d.line""", (pname.upper(),)).fetchall()
+
+    def dds_on(self, dsn: str) -> List[sqlite3.Row]:
+        return self.conn.execute("""SELECT d.id AS dd_id, d.dd_name, d.dsn_resolved, d.mode, d.mode_source, d.gdg_rel,
+                                           d.is_temp, d.line AS dd_line, s.id AS step_id, s.step_name, s.effective_pgm AS pgm,
+                                           s.launcher, s.job_id, s.proc_id, j.job_name, pd.proc_name, m.name AS member_name
+                                    FROM dd d JOIN step s ON s.id=d.step_id LEFT JOIN job j ON j.id=s.job_id
+                                    LEFT JOIN proc_def pd ON pd.id=s.proc_id
+                                    LEFT JOIN member m ON m.id=COALESCE(j.member_id, pd.member_id)
+                                    WHERE d.dsn_resolved=? ORDER BY j.job_name, pd.proc_name, s.ordinal, d.line""",
+                                 (dsn,)).fetchall()
+
+    def file_edges(self, node: _Node, r) -> List[_Edge]:
+        """WRITE of the record root -> the DD -> the DSN, one hop that then
+        fans out to every step reading it (rule 1). The dataset line is a
+        child; the readers hang under it."""
+        pid = node.pid
+        select = _note_file(r["note"])
+        fd = self.conn.execute("SELECT * FROM file_decl WHERE program_id=? AND UPPER(select_name)=?",
+                               (pid, (select or "").upper())).fetchone() if select else None
+        if fd is None:
+            fd = self.conn.execute("""SELECT f.* FROM file_decl f JOIN file_record fr ON fr.file_id=f.id
+                                      WHERE fr.program_id=? AND fr.pfield=?""", (pid, node.root)).fetchone()
+        verb = r["verb"] or "WRITE"
+        rec = self.pf(node.root)["name"]
+        stmt_cite = self.cite_stmt(pid, r["line"], verb, rec)
+        if fd is None or not fd["assign_dd"]:
+            return [_Edge(1, node.pname, r["line"], f"{verb} {rec} -> (no SELECT/ASSIGN for it)", stmt_cite, end=END_NO_READER)]
+        steps = [s for s in self.steps_of(node.pname) if self.dd_matches(fd["assign_dd"], s["dd_name"])]
+        cf = self.conn.execute("SELECT dsname FROM cics_file WHERE UPPER(name)=? AND dsname IS NOT NULL",
+                               (fd["assign_dd"].upper(),)).fetchone()
+        if not steps and not cf:
+            return [_Edge(1, node.pname, r["line"], f"{verb} {rec} -> DD {fd['assign_dd']}: no job step runs "
+                          f"{node.pname} with this DD", stmt_cite, end=END_NO_READER)]
+        out = []
+        for s in steps:
+            where = f"{s['job_name'] or ('PROC ' + (s['proc_name'] or '?'))} {s['step_name']} DD {s['dd_name']}"
+            label = f"{verb} {rec} -> {s['dsn_resolved']} ({where}, {s['mode']}/{s['mode_source']})"
+            cites = stmt_cite + "; " + self.cite_dd(s["member_name"], s["dd_line"], s["dd_name"], True)
+            ds = _Node(pid, node.pname, node.root, node.lo, node.hi, node.pf, node.hop, kind="dataset",
+                       data={"dsn": s["dsn_resolved"], "job_id": s["job_id"], "is_temp": s["is_temp"],
+                             "dd_id": s["dd_id"], "gdg": s["gdg_rel"], "writer_pf": node.pf})
+            out.append(_Edge(1, node.pname, r["line"], label, cites, child=ds))
+        if cf:
+            ds = _Node(pid, node.pname, node.root, node.lo, node.hi, node.pf, node.hop, kind="dataset",
+                       data={"dsn": cf["dsname"], "job_id": None, "is_temp": 0, "dd_id": None, "gdg": None,
+                             "writer_pf": node.pf})
+            out.append(_Edge(1, node.pname, r["line"], f"{verb} {rec} -> {cf['dsname']} (CICS FILE {fd['assign_dd']})",
+                             stmt_cite, child=ds))
+        return out
+
+    def interfaces_on(self, dsn: str) -> List[str]:
+        out = []
+        for r in self.conn.execute("SELECT kind, detail, peer_system FROM interface_edge WHERE UPPER(detail) LIKE ?",
+                                   (f"%{dsn.upper()}%",)):
+            out.append(f"{r['kind']}" + (f" to {r['peer_system']}" if r["peer_system"] else ""))
+        for r in self.conn.execute("SELECT kind, peer, direction FROM external_interface WHERE UPPER(target)=?",
+                                   (dsn.upper(),)):
+            out.append(f"{r['kind']}" + (f" {r['direction'] or ''} {r['peer'] or ''}".rstrip()))
+        return out
+
+    def step_cards(self, step_id: int) -> Set[str]:
+        return {r[0].upper() for r in self.conn.execute("SELECT DISTINCT card_kind FROM card_field_ref WHERE step_id=?",
+                                                        (step_id,)) if r[0]}
+
+    def dataset_leaves(self, ds: _Node, reader_fn: Callable, seen: Optional[Set[str]] = None,
+                       path: Optional[List[Tuple[str, str]]] = None) -> List[_Leaf]:
+        """Every place the bytes go from a dataset (down) or came from (up):
+        through plain sort / copy steps, into COBOL readers (reader_fn gives
+        the nodes), stopping at reformatting sorts, utilities, interfaces."""
+        up = self.o.up
+        d = ds.data
+        dsn = d["dsn"]
+        seen = seen if seen is not None else set()
+        path = path or []
+        if dsn in seen:
+            return []
+        seen.add(dsn)
+        leaves: List[_Leaf] = []
+        rows = self.dds_on(dsn)
+        want = ("output", "mod", "unknown") if up else ("input", "mod", "unknown")
+        for s in rows:
+            if s["dd_id"] == d.get("dd_id"):
+                continue
+            if s["mode"] not in want:
+                continue
+            if (d.get("is_temp") or s["is_temp"]) and s["job_id"] != d.get("job_id"):
+                continue
+            pgm = s["pgm"] or ""
+            job = s["job_name"] or (f"PROC {s['proc_name']}" if s["proc_name"] else "?")
+            here = f"{job} {s['step_name']} DD {s['dd_name']}"
+            gdg = ""
+            if d.get("gdg") is not None and s["gdg_rel"] is not None and d.get("gdg") != s["gdg_rel"]:
+                gdg = f"; GDG {d.get('gdg')} vs {s['gdg_rel']}: generation not modelled"
+            launcher = (s["launcher"] or "").upper()
+            if pgm.startswith("*") or launcher in ("SORT", "ICETOOL", "SYNCSORT", "IEBGENER", "IDCAMS", "DFSORT"):
+                kinds = self.step_cards(s["step_id"])
+                is_sort = launcher in ("SORT", "ICETOOL", "SYNCSORT", "DFSORT") or "SORT" in pgm
+                if is_sort and kinds & {"INREC", "OUTREC", "OUTFIL", "JOINKEYS"}:
+                    k = sorted(kinds & {"INREC", "OUTREC", "OUTFIL", "JOINKEYS"})[0]
+                    leaves.append(_Leaf(list(path), f"{job} {s['step_name']} SORT has {k}", self.cite_card(s["step_id"], k),
+                                        end=END_SORT))
+                    continue
+                if is_sort and not kinds and not self.conn.execute(
+                        "SELECT 1 FROM dd WHERE step_id=? AND sysin_text IS NOT NULL", (s["step_id"],)).fetchone():
+                    leaves.append(_Leaf(list(path), f"{job} {s['step_name']} SORT: control cards not indexed",
+                                        self.cite_dd(s["member_name"], s["dd_line"], s["dd_name"], False), end=END_UTILITY))
+                    continue
+                if not (is_sort or launcher in ("IEBGENER", "IDCAMS")):
+                    leaves.append(_Leaf(list(path), f"{job} {s['step_name']} {launcher or pgm}",
+                                        self.cite_dd(s["member_name"], s["dd_line"], s["dd_name"], False), end=END_UTILITY))
+                    continue
+                other = "input" if up else "output"
+                outs = [x for x in self.dds_on_step(s["step_id"]) if x["mode"] == other and x["dsn_resolved"] != dsn]
+                if not outs:
+                    leaves.append(_Leaf(list(path), f"{job} {s['step_name']} {launcher or pgm}: no {other} DD",
+                                        self.cite_dd(s["member_name"], s["dd_line"], s["dd_name"], False), end=END_UTILITY))
+                    continue
+                what = "SORT FIELDS only" if is_sort else f"{launcher} copy"
+                for o in outs:
+                    arrow = "<-" if up else "->"
+                    line = (f"{s['step_name']} {what}{gdg} - bytes unchanged {arrow} {o['dsn_resolved']}",
+                            self.cite_dd(s["member_name"], s["dd_line"], s["dd_name"], True))
+                    nxt = _Node(ds.pid, ds.pname, ds.root, ds.lo, ds.hi, ds.pf, ds.hop, kind="dataset",
+                                data={"dsn": o["dsn_resolved"], "job_id": s["job_id"], "is_temp": o["is_temp"],
+                                      "dd_id": o["dd_id"], "gdg": o["gdg_rel"], "writer_pf": d.get("writer_pf")})
+                    leaves.extend(self.dataset_leaves(nxt, reader_fn, seen, path + [line]))
+                continue
+            progs = Q.programs_named(self.conn, pgm) if pgm else []
+            if not progs:
+                leaves.append(_Leaf(list(path), f"{here} runs {pgm or '?'} (not in index)",
+                                    self.cite_dd(s["member_name"], s["dd_line"], s["dd_name"], False),
+                                    end=END_NO_WRITER if up else END_NO_READER))
+                continue
+            for lf in reader_fn(progs[0], s, here + gdg, ds):
+                lf.path = list(path) + lf.path
+                leaves.append(lf)
+        for kind in self.interfaces_on(dsn):
+            leaves.append(_Leaf(list(path), f"{dsn} {kind}", "", end=END_INTERFACE.format(x=kind)))
+        return leaves
+
+    def dds_on_step(self, step_id: int) -> List[sqlite3.Row]:
+        return self.conn.execute("SELECT id AS dd_id, dd_name, dsn_resolved, mode, gdg_rel, is_temp FROM dd "
+                                 "WHERE step_id=? AND dsn_resolved IS NOT NULL ORDER BY line", (step_id,)).fetchall()
+
+    def cobol_reader(self, prog, s, where: str, ds: _Node) -> List[_Leaf]:
+        """The COBOL program on the other side of the DSN: its file on that DD,
+        the 01s it READs (or WRITEs, upstream), the items at the same bytes."""
+        up = self.o.up
+        rpid = prog["id"]
+        self.touch(rpid)
+        fds = [f for f in self.conn.execute("SELECT * FROM file_decl WHERE program_id=?", (rpid,))
+               if self.dd_matches(f["assign_dd"], s["dd_name"])]
+        dd_cite = self.cite_dd(s["member_name"], s["dd_line"], s["dd_name"], False)
+        if not fds:
+            return [_Leaf([], f"{prog['program_id']} runs in {where} but declares no file on that DD",
+                          dd_cite, end=END_NO_FIELD.format(lo=ds.lo + 1, hi=ds.hi))]
+        leaves = []
+        for fd in fds:
+            kind = "io_out" if up else "io_in"
+            roots = [r[0] for r in self.conn.execute(
+                f"SELECT DISTINCT {'src_pfield' if up else 'dst_pfield'} FROM data_flow WHERE program_id=? AND kind=? "
+                f"AND (note=? OR note LIKE ?) AND {'src_pfield' if up else 'dst_pfield'} IS NOT NULL",
+                (rpid, kind, f"file {fd['select_name']}", f"file {fd['select_name']} %"))]
+            if not roots:
+                roots = [r[0] for r in self.conn.execute(
+                    "SELECT pfield FROM file_record WHERE file_id=? AND pfield IS NOT NULL ORDER BY ordinal", (fd["id"],))]
+            found = False
+            for root in roots:
+                for r in self.root_items(root):
+                    if r["is_group"] or self.redefines_chain(r):
+                        continue
+                    a, b = self.extent(r)
+                    if b <= ds.lo or a >= ds.hi:
+                        continue
+                    xlo, xhi = max(ds.lo, a), min(ds.hi, b)
+                    how = "exact" if (xlo, xhi) == (a, b) else "partial"
+                    ch = self.child(rpid, r, xlo, xhi, how, ds.hop + 1)
+                    wpf = ds.data.get("writer_pf")
+                    my_layout = self.member_tag(r["src_member"]) or prog["program_id"]
+                    their_layout = self.member_tag(wpf["src_member"]) if wpf is not None and wpf["src_member"] is not None else None
+                    if their_layout and their_layout != my_layout:
+                        lay = f"layout {my_layout}, not {their_layout} - {END_COPYBOOK}"
+                    else:
+                        lay = f"layout {my_layout}" + (" (same as the other side)" if their_layout else "")
+                    verb = "written by" if up else "read by"
+                    lw = self.layout_note(rpid)
+                    if lw:
+                        lay += f"; {lw}"
+                    text = (f"{verb} {prog['program_id']}.{self.base_name(rpid, r)} bytes {xlo + 1}-{xhi}"
+                            + (f" (bytes {xlo - a + 1}-{xhi - a} of {b - a})" if how == "partial" else "")
+                            + f" ({where}; {lay})")
+                    leaves.append(_Leaf([], text, self.cite_def(r, rpid) + "; " + dd_cite, node=ch))
+                    found = True
+            if not found:
+                leaves.append(_Leaf([], f"{prog['program_id']} {fd['select_name']} ({where}): no item at those bytes",
+                                    dd_cite, end=END_NO_FIELD.format(lo=ds.lo + 1, hi=ds.hi)))
+        return leaves
+
+    # ---- rule 2: CALL out ----------------------------------------------------------------------
+    def entry_for(self, callee, target: str) -> Optional[str]:
+        t = target.upper()
+        if t == (callee["program_id"] or "").upper() or t == (callee["member_name"] or "").upper():
+            return None
+        return t if t in self.aliases(callee["id"]) else None
+
+    def call_edges(self, node: _Node, ids: Set[int]) -> List[_Edge]:
+        pid = node.pid
+        q = ",".join("?" * len(ids))
+        rows = self.conn.execute(f"""SELECT a.*, c.kind AS ckind, c.target, c.via_var, c.resolved, c.resolution,
+                                            c.line AS cline, c.returning_item, c.id AS cid
+                                     FROM call_arg a JOIN call_edge c ON c.id=a.call_id
+                                     WHERE a.program_id=? AND a.pfield IN ({q}) ORDER BY c.line, a.pos""", (pid, *ids)).fetchall()
+        out: List[_Edge] = []
+        for a in rows:
+            apf = self.pf(a["pfield"])
+            a0, a1 = self.extent(apf)
+            x0, x1 = max(node.lo, a0), min(node.hi, a1)
+            if x0 >= x1:
+                continue
+            word = _CALL_WORD.get(a["ckind"], "CALL")
+            cites = self.cite_stmt(pid, a["cline"], word, a["name"])
+            if a["ckind"] in ("cics_start", "cics_return"):
+                out.extend(self.tran_edges(node, a, apf, x0, x1, cites))
+                continue
+            targets = [(a["target"], None)] if a["target"] else _candidates(a)
+            if not targets:
+                out.append(_Edge(2, "?", a["cline"], f"{word} {a['via_var']} arg {a['pos']}", cites,
+                                 end=END_DYNAMIC.format(x=a["via_var"])))
+                continue
+            for (t, cand) in targets:
+                if t.startswith("(+"):
+                    out.append(_Edge(2, "?", a["cline"], f"{word} {a['via_var']} arg {a['pos']}: {t} candidate(s) not listed",
+                                     cites, end=END_DYNAMIC.format(x=a["via_var"])))
+                    continue
+                callname = f"{word} {t}" if a["target"] else f"{word} {a['via_var']} = {t} ({cand})"
+                if a["how"] == "length_of":
+                    out.append(_Edge(2, t.upper(), a["cline"], f"{callname} arg {a['pos']} LENGTH OF {a['name']}", cites,
+                                     end=END_LENGTH_OF))
+                    continue
+                progs = Q.programs_named(self.conn, t)
+                if not progs:
+                    out.append(_Edge(2, t.upper(), a["cline"], f"{callname} arg {a['pos']}", cites, end=END_NO_CALLEE))
+                    continue
+                callee = progs[0]
+                cname = callee["program_id"]
+                extra: List[str] = []
+                if a["returning_item"] and a["pos"] == min(x["pos"] for x in rows if x["cid"] == a["cid"]):
+                    ret = self.conn.execute("SELECT name FROM param WHERE program_id=? AND pos=0", (callee["id"],)).fetchone()
+                    extra.append(f"RETURNING -> {a['returning_item']}" + (f" (from {cname}.{ret['name']})" if ret else ""))
+                if a["how"] in ("commarea", "start_from"):
+                    prm = self.conn.execute("SELECT * FROM param WHERE program_id=? AND entry='DFHCOMMAREA' AND pos=1",
+                                            (callee["id"],)).fetchone()
+                    if prm is None:
+                        out.append(_Edge(2, cname, a["cline"], f"{callname} COMMAREA arg {a['pos']}", cites, end=END_NO_COMMAREA,
+                                         extra=extra))
+                        continue
+                    note = "by CICS convention"
+                else:
+                    entry = self.entry_for(callee, t)
+                    prm = self.conn.execute("SELECT * FROM param WHERE program_id=? AND entry IS ? AND pos=?",
+                                            (callee["id"], entry, a["pos"])).fetchone()
+                    if prm is None:
+                        n = self.conn.execute("SELECT COUNT(*) FROM param WHERE program_id=? AND entry IS ? AND pos>0",
+                                              (callee["id"], entry)).fetchone()[0]
+                        out.append(_Edge(2, cname, a["cline"], f"{callname} arg {a['pos']} (callee declares {n} parameter(s))",
+                                         cites, end=END_POS, extra=extra))
+                        continue
+                    note = ""
+                if prm["pfield"] is None:
+                    miss = self.conn.execute("""SELECT detail FROM unresolved WHERE member_id=? AND kind IN ('expand','missing_copybook')
+                                                LIMIT 1""", (callee["member_id"],)).fetchone()
+                    x = (re.search(r"COPY\s+(\S+)", miss["detail"]).group(1) if miss and re.search(r"COPY\s+(\S+)", miss["detail"])
+                         else "?")
+                    out.append(_Edge(2, cname, a["cline"], f"{callname} arg {a['pos']} -> {cname}.{prm['name']}", cites,
+                                     end=END_MISSING.format(x=x), extra=extra))
+                    continue
+                ppf = self.pf(prm["pfield"])
+                if a["how"] == "address_of":
+                    out.extend(self.address_of_edges(node, a, callee, ppf, cites, callname))
+                    continue
+                mapped = self.map_bytes(node, apf, None, ppf, None)
+                if mapped is None:
+                    continue
+                n_lo, n_hi, labels, end = mapped
+                if a["how"] in ("content", "value"):
+                    labels.append(END_CONTENT)
+                if note:
+                    labels.append(note)
+                if end:
+                    out.append(_Edge(2, cname, a["cline"], f"{callname} arg {a['pos']} -> {cname}.{ppf['name']}"
+                                     + self._lbls(labels), cites, end=end, extra=extra))
+                    continue
+                for (row, plo, phi, how) in self.place(ppf, n_lo, n_hi):
+                    ch = self.child(callee["id"], row, plo, phi, how, node.hop + 1)
+                    self.touch(callee["id"])
+                    label = f"{callname} arg {a['pos']} -> {cname}.{self.nm(ch)} {self.desc(ch)}".rstrip() + self._lbls(labels)
+                    out.append(_Edge(2, cname, a["cline"], label, cites, child=ch, extra=extra))
+                    extra = []
+        return out
+
+    def address_of_edges(self, node: _Node, a, callee, ppf, cites: str, callname: str) -> List[_Edge]:
+        """ADDRESS OF x passed: the callee's SET ADDRESS OF a TO param makes
+        `a` overlay x."""
+        out = []
+        apf = self.pf(a["pfield"])
+        for r2 in self.conn.execute("SELECT * FROM data_flow WHERE program_id=? AND kind='set_address' AND src_pfield=?",
+                                    (callee["id"], ppf["id"])):
+            tgt = self.pf(r2["dst_pfield"])
+            if tgt is None:
+                self.unlinked += 1
+                continue
+            mapped = self.map_bytes(node, apf, None, tgt, None)
+            if mapped is None:
+                continue
+            n_lo, n_hi, labels, _end = mapped
+            for (row, plo, phi, how) in self.place(tgt, n_lo, n_hi):
+                ch = self.child(callee["id"], row, plo, phi, how, node.hop + 1)
+                self.touch(callee["id"])
+                out.append(_Edge(2, callee["program_id"], a["cline"],
+                                 f"{callname} arg {a['pos']} ADDRESS OF -> {callee['program_id']}.{self.nm(ch)} "
+                                 f"{self.desc(ch)}; pointer alias".rstrip() + self._lbls(labels),
+                                 cites + "; " + self.cite_stmt(callee["id"], r2["line"], "SET", tgt["name"]), child=ch))
+        if not out:
+            out.append(_Edge(2, callee["program_id"], a["cline"], f"{callname} arg {a['pos']} ADDRESS OF {a['name']}: "
+                             f"{callee['program_id']} never SETs an item to it", cites, end=END_NO_USE.format(p=callee["program_id"])))
+        return out
+
+    def tran_edges(self, node: _Node, a, apf, x0: int, x1: int, cites: str) -> List[_Edge]:
+        """START TRANSID / RETURN TRANSID with data: the transaction's program
+        RETRIEVEs it (START) or gets it as DFHCOMMAREA (RETURN)."""
+        out = []
+        t = a["target"] or ""
+        progs = [r["program"] for r in self.conn.execute(
+            "SELECT DISTINCT program FROM transaction_def WHERE UPPER(tran_code)=? AND program IS NOT NULL", (t.upper(),))]
+        if not progs:
+            return [_Edge(2, t.upper(), a["cline"], f"{_CALL_WORD.get(a['ckind'], 'START')} {t} arg {a['pos']}", cites,
+                          end=END_NO_CALLEE)]
+        for pg in progs:
+            rows = Q.programs_named(self.conn, pg)
+            if not rows:
+                out.append(_Edge(2, pg.upper(), a["cline"], f"START {t} -> {pg}", cites, end=END_NO_CALLEE))
+                continue
+            callee = rows[0]
+            targets = []
+            if a["ckind"] == "cics_start":
+                for r in self.conn.execute("SELECT * FROM data_flow WHERE program_id=? AND kind='cics_in' AND note LIKE 'RETRIEVE%'",
+                                           (callee["id"],)):
+                    if r["dst_pfield"] is not None:
+                        targets.append((self.pf(r["dst_pfield"]), f"RETRIEVE in {callee['program_id']}"))
+            else:
+                prm = self.conn.execute("SELECT * FROM param WHERE program_id=? AND entry='DFHCOMMAREA'", (callee["id"],)).fetchone()
+                if prm is not None and prm["pfield"] is not None:
+                    targets.append((self.pf(prm["pfield"]), "by CICS convention"))
+            if not targets:
+                out.append(_Edge(2, callee["program_id"], a["cline"], f"START/RETURN {t} -> {callee['program_id']}", cites,
+                                 end=END_NO_COMMAREA))
+                continue
+            for (tpf, note) in targets:
+                mapped = self.map_bytes(node, apf, None, tpf, None)
+                if mapped is None:
+                    continue
+                n_lo, n_hi, labels, end = mapped
+                for (row, plo, phi, how) in self.place(tpf, n_lo, n_hi):
+                    ch = self.child(callee["id"], row, plo, phi, how, node.hop + 1)
+                    self.touch(callee["id"])
+                    out.append(_Edge(2, callee["program_id"], a["cline"],
+                                     f"{_CALL_WORD.get(a['ckind'], 'START')} {t} -> {callee['program_id']}.{self.nm(ch)} "
+                                     f"{self.desc(ch)}; {note}".rstrip() + self._lbls(labels), cites, child=ch))
+        return out
+
+    # ---- rule 3: LINKAGE back ----------------------------------------------------------------------
+    def params_of_root(self, node: _Node) -> List[sqlite3.Row]:
+        return self.conn.execute("""SELECT pr.* FROM param pr JOIN pfield f ON f.id=pr.pfield
+                                    WHERE pr.program_id=? AND f.root_id=? AND pr.pos>0""", (node.pid, node.root)).fetchall()
+
+    def written_here(self, node: _Node, ids: Set[int]) -> bool:
+        q = ",".join("?" * len(ids))
+        if self.conn.execute(f"SELECT 1 FROM data_flow WHERE program_id=? AND dst_pfield IN ({q}) LIMIT 1",
+                             (node.pid, *ids)).fetchone():
+            return True
+        return bool(self.conn.execute(f"""SELECT 1 FROM field_ref WHERE program_id=? AND pfield_id IN ({q}) AND mode='write'
+                                          AND stmt NOT IN ('CALL-USING') LIMIT 1""", (node.pid, *ids)).fetchone())
+
+    def callers_of(self, pname: str, entry: Optional[str]) -> List[sqlite3.Row]:
+        # DFHCOMMAREA is the program's own LINK / XCTL target, not an entry name
+        name = (pname if entry in (None, "DFHCOMMAREA") else entry).upper()
+        return self.conn.execute("""SELECT c.*, q.program_id AS caller, q.id AS cpid, ? AS callee_name
+                                    FROM call_edge c JOIN program q ON q.id=c.program_id
+                                    WHERE (UPPER(c.target)=? OR c.resolved LIKE ?) ORDER BY q.program_id, c.line""",
+                                 (name, name, f'%"{name}"%')).fetchall()
+
+    @staticmethod
+    def pos_tag(prm, c) -> str:
+        """`pos 2`, `pos 1 of ENTRY FLOWENT`, `COMMAREA` - and `(candidate)` when
+        the caller's CALL is dynamic and this program is one of its targets."""
+        if prm["entry"] == "DFHCOMMAREA":
+            tag = "COMMAREA"
+        else:
+            tag = f"pos {prm['pos']}" + (f" of ENTRY {prm['entry']}" if prm["entry"] else "")
+        return tag + ("" if c["target"] else f" (CALL {c['via_var']}: {_how_resolved(c)} candidate)")
+
+    @staticmethod
+    def call_tag(prm, c) -> str:
+        """The caller's side of the same position: `CALL FLOWENT arg 1`."""
+        if prm["entry"] == "DFHCOMMAREA":
+            return f"{c['target'] or c['via_var']} COMMAREA"
+        name = c["target"] or f"{c['via_var']} = {prm['entry'] or c['callee_name']} (candidate: resolved via {_how_resolved(c)})"
+        return f"{name} arg {prm['pos']}"
+
+    def linkage_back(self, node: _Node, ids: Set[int]) -> List[_Edge]:
+        out: List[_Edge] = []
+        params = self.params_of_root(node)
+        if not params or not self.written_here(node, ids):
+            return out
+        for prm in params:
+            ppf = self.pf(prm["pfield"])
+            for c in self.callers_of(node.pname, prm["entry"]):
+                if prm["entry"] == "DFHCOMMAREA":
+                    args = self.conn.execute("SELECT * FROM call_arg WHERE call_id=? AND how IN ('commarea')", (c["id"],)).fetchall()
+                else:
+                    args = self.conn.execute("SELECT * FROM call_arg WHERE call_id=? AND pos=?", (c["id"], prm["pos"])).fetchall()
+                for a in args:
+                    word = _CALL_WORD.get(c["kind"], "CALL")
+                    cites = self.cite_stmt(c["cpid"], c["line"], word, a["name"])
+                    tag = self.pos_tag(prm, c)
+                    if a["how"] in ("content", "value"):
+                        out.append(_Edge(3, c["caller"], c["line"], f"LINKAGE {tag} -> back to {c['caller']}.{a['name']}: "
+                                         f"not returned", cites, end=END_CONTENT))
+                        continue
+                    if a["how"] in ("length_of", "address_of"):
+                        continue
+                    apf = self.pf(a["pfield"])
+                    if apf is None:
+                        self.unlinked += 1
+                        continue
+                    mapped = self.map_bytes(node, ppf, None, apf, None)
+                    if mapped is None:
+                        continue
+                    n_lo, n_hi, labels, end = mapped
+                    if end:
+                        out.append(_Edge(3, c["caller"], c["line"], f"LINKAGE {tag} -> back to {c['caller']}.{a['name']}"
+                                         + self._lbls(labels), cites, end=end))
+                        continue
+                    for (row, plo, phi, how) in self.place(apf, n_lo, n_hi):
+                        ch = self.child(c["cpid"], row, plo, phi, how, node.hop + 1)
+                        self.touch(c["cpid"])
+                        out.append(_Edge(3, c["caller"], c["line"], f"LINKAGE {tag} -> back to {c['caller']}.{self.nm(ch)} "
+                                         f"{self.desc(ch)} (BY REFERENCE)".replace("  ", " ") + self._lbls(labels), cites, child=ch))
+        return out
+
+    # ---- rule 4: DB2 -----------------------------------------------------------------------------
+    def sql_edges(self, node: _Node, ids: Set[int], mode: str) -> List[_Edge]:
+        q = ",".join("?" * len(ids))
+        rows = self.conn.execute(f"""SELECT * FROM sql_col_ref WHERE program_id=? AND mode=? AND pfield_id IN ({q})
+                                     ORDER BY line""", (node.pid, mode, *ids)).fetchall()
+        out: List[_Edge] = []
+        done = set()
+        for r in rows:
+            base = (r["tbl"] or "?").rpartition(".")[2].upper()
+            key = (base, r["col"].upper())
+            if key in done:
+                continue
+            done.add(key)
+            cites = self.cite_sql(node.pid, r["line"], r["col"], r["host_var"])
+            sep = " SET" if (r["stmt"] or "").upper() == "UPDATE" else ""
+            label = f"EXEC SQL {r['stmt'] or ''} {r['tbl'] or '?'}{sep} {r['col']}".replace("  ", " ")
+            if base == "?":
+                out.append(_Edge(4, "DB2 ?", r["line"], label + " (table unresolved)", cites,
+                                 end=END_NO_DB2_READER if mode == "write" else END_NO_DB2_WRITER))
+                continue
+            other = "read" if mode == "write" else "write"
+            peers = self.conn.execute("""SELECT c.*, p.program_id AS pname FROM sql_col_ref c JOIN program p ON p.id=c.program_id
+                                         WHERE c.mode=? AND UPPER(c.col)=? AND (UPPER(c.tbl)=? OR UPPER(c.tbl) LIKE ?)
+                                         ORDER BY p.program_id, c.line""", (other, key[1], base, f"%.{base}")).fetchall()
+            if not peers:
+                out.append(_Edge(4, f"DB2 {base}", r["line"], label, cites,
+                                 end=END_NO_DB2_READER if mode == "write" else END_NO_DB2_WRITER))
+                continue
+            trows = []
+            for p in peers:
+                self.touch(p["program_id"])
+                trows.append((p["pname"], p["host_var"] or "", self.cite_sql(p["program_id"], p["line"], p["col"], p["host_var"])))
+            word = "readers" if mode == "write" else "writers"
+            tbl = (f"via table {base}.{r['col']}: {len(peers)} static {word}, no ordering\n"
+                   + Q.table(["program", "host variable", "cite"], trows).rstrip("\n"))
+            out.append(_Edge(4, f"DB2 {base}", r["line"], label, cites, table=tbl))
+        return out
+
+    # ---- rules 5-7: IMS, CICS carriers, MQ --------------------------------------------------------------
+    def dli_edges(self, node: _Node, r) -> List[_Edge]:
+        up = self.o.up
+        pid = node.pid
+        call = self.conn.execute("SELECT * FROM dli_call WHERE program_id=? AND line=?", (pid, r["line"])).fetchone()
+        func = (r["note"] or (call["func"] if call else "") or "DL/I").split(" ")[0]
+        area = r["dst_name"] if up else r["src_name"]
+        cites = self.cite_stmt(pid, r["line"], "CALL", area)
+        if call is None or not call["dbd_name"]:
+            return [_Edge(5, "IMS", r["line"], f"{func} via {call['pcb_arg'] if call else '?'}", cites, end=END_PCB)]
+        dbd = call["dbd_name"]
+        other = "dli_out" if up else "dli_in"
+        peers = self.conn.execute(f"""SELECT d.*, p.program_id AS pname, c.func FROM data_flow d JOIN program p ON p.id=d.program_id
+                                      JOIN dli_call c ON c.program_id=d.program_id AND c.line=d.line
+                                      WHERE d.kind=? AND UPPER(c.dbd_name)=? ORDER BY p.program_id, d.line""",
+                                  (other, dbd.upper())).fetchall()
+        mine = self.pf(r["dst_pfield"] if up else r["src_pfield"])
+        out = []
+        for p in peers:
+            tpf = self.pf(p["src_pfield"] if up else p["dst_pfield"])
+            if tpf is None or mine is None:
+                self.unlinked += 1
+                continue
+            mapped = self.map_bytes(node, mine, None, tpf, None)
+            if mapped is None:
+                continue
+            n_lo, n_hi, labels, _end = mapped
+            for (row, plo, phi, how) in self.place(tpf, n_lo, n_hi):
+                ch = self.child(p["program_id"], row, plo, phi, how, node.hop + 1)
+                self.touch(p["program_id"])
+                arrow = "<-" if up else "->"
+                out.append(_Edge(5, p["pname"], r["line"], f"{func} {dbd} {arrow} {p['func']} {p['pname']}.{self.nm(ch)} "
+                                 f"{self.desc(ch)} ({END_SEGMENT} - matched by DBD and offset)".replace("  ", " ")
+                                 + self._lbls(labels), cites + "; " + self.cite_stmt(p["program_id"], p["line"], "CALL", tpf["name"]),
+                                 child=ch))
+        if not out:
+            out.append(_Edge(5, "IMS", r["line"], f"{func} {dbd}", cites, end=END_NO_WRITER if up else END_NO_READER))
+        return out
+
+    def cics_out_edges(self, node: _Node, r) -> List[_Edge]:
+        pid = node.pid
+        parts = (r["note"] or "").split(" ", 2)
+        verb = parts[0] if parts else "SEND"
+        kind = parts[1] if len(parts) > 1 else ""
+        res = parts[2] if len(parts) > 2 else ""
+        cites = self.cite_stmt(pid, r["line"], verb, r["src_name"])
+        src = self.pf(r["src_pfield"])
+        carrier = self.base_name(pid, node.pf) if node.pf is not None else r["src_name"]
+        if kind in ("map", "terminal"):
+            return [_Edge(6, "screen", r["line"], f"{verb} {kind.upper()} {res} FROM {r['src_name']} ({carrier} bytes "
+                          f"{node.lo + 1}-{node.hi})", cites, end=END_SCREEN)]
+        out: List[_Edge] = []
+        if kind in ("tsq", "tdq", "container", "file", "channel"):
+            peers = self.conn.execute("""SELECT d.*, p.program_id AS pname FROM data_flow d JOIN program p ON p.id=d.program_id
+                                         WHERE d.kind='cics_in' AND UPPER(d.note) LIKE ? ORDER BY p.program_id, d.line""",
+                                      (f"% {kind.upper()} {res.upper()}",)).fetchall()
+            for p in peers:
+                tpf = self.pf(p["dst_pfield"])
+                if tpf is None or src is None:
+                    self.unlinked += 1
+                    continue
+                mapped = self.map_bytes(node, src, None, tpf, None)
+                if mapped is None:
+                    continue
+                n_lo, n_hi, labels, _end = mapped
+                pverb = (p["note"] or "").split(" ")[0]
+                for (row, plo, phi, how) in self.place(tpf, n_lo, n_hi):
+                    ch = self.child(p["program_id"], row, plo, phi, how, node.hop + 1)
+                    self.touch(p["program_id"])
+                    out.append(_Edge(6, p["pname"], r["line"], f"{verb} {kind.upper()} {res} -> {pverb} into {p['pname']}."
+                                     f"{self.nm(ch)} {self.desc(ch)}".rstrip() + self._lbls(labels),
+                                     cites + "; " + self.cite_stmt(p["program_id"], p["line"], pverb, tpf["name"]), child=ch))
+            dsn = None
+            if kind == "tdq":
+                cr = self.conn.execute("SELECT attrs FROM cics_resource WHERE type LIKE 'TDQ%' AND UPPER(name)=?", (res.upper(),)).fetchone()
+                attrs = Q._jl(cr["attrs"]) if cr and cr["attrs"] else {}
+                dsn = (attrs.get("DSNAME") or attrs.get("DSN")) if isinstance(attrs, dict) else None
+            if kind == "file":
+                cf = self.conn.execute("SELECT dsname FROM cics_file WHERE UPPER(name)=? AND dsname IS NOT NULL", (res.upper(),)).fetchone()
+                dsn = cf["dsname"] if cf else None
+            if dsn:
+                ds = _Node(pid, node.pname, node.root, node.lo, node.hi, node.pf, node.hop, kind="dataset",
+                           data={"dsn": dsn, "job_id": None, "is_temp": 0, "dd_id": None, "gdg": None, "writer_pf": node.pf})
+                out.append(_Edge(6, dsn, r["line"], f"{verb} {kind.upper()} {res} -> {dsn} (CICS {kind.upper()})", cites, child=ds))
+        if not out:
+            out.append(_Edge(6, "CICS", r["line"], f"{verb} {kind.upper()} {res} FROM {r['src_name']}", cites, end=END_NO_READER))
+        return out
+
+    def cics_in_edges(self, node: _Node, r) -> List[_Edge]:
+        """--up: what fills a READQ / GET / RECEIVE target."""
+        pid = node.pid
+        parts = (r["note"] or "").split(" ", 2)
+        verb = parts[0] if parts else "RECEIVE"
+        kind = parts[1] if len(parts) > 1 else ""
+        res = parts[2] if len(parts) > 2 else ""
+        cites = self.cite_stmt(pid, r["line"], verb, r["dst_name"])
+        dst = self.pf(r["dst_pfield"])
+        if kind in ("map", "terminal") or verb in ("RECEIVE",):
+            return [_Edge(6, "screen", r["line"], f"{verb} {kind.upper()} {res} INTO {r['dst_name']}", cites, end=END_SCREEN)]
+        if verb in ("GETMAIN",):
+            return []
+        if verb == "RETRIEVE":
+            out = []
+            for c in self.conn.execute("""SELECT a.*, c.line AS cline, c.target, q.program_id AS caller, q.id AS cpid
+                                          FROM call_arg a JOIN call_edge c ON c.id=a.call_id JOIN program q ON q.id=c.program_id
+                                          JOIN transaction_def t ON UPPER(t.tran_code)=UPPER(c.target)
+                                          WHERE a.how='start_from' AND UPPER(t.program)=?""", (node.pname.upper(),)):
+                apf = self.pf(c["pfield"])
+                if apf is None or dst is None:
+                    continue
+                mapped = self.map_bytes(node, apf, None, dst, None, reverse=True)
+                if mapped is None:
+                    continue
+                n_lo, n_hi, labels, _end = mapped
+                for (row, plo, phi, how) in self.place(apf, n_lo, n_hi):
+                    ch = self.child(c["cpid"], row, plo, phi, how, node.hop + 1)
+                    self.touch(c["cpid"])
+                    out.append(_Edge(2, c["caller"], r["line"], f"RETRIEVE <- START {c['target']} FROM {c['caller']}.{self.nm(ch)}"
+                                     + self._lbls(labels), cites + "; " + self.cite_stmt(c["cpid"], c["cline"], "START", c["name"]),
+                                     child=ch))
+            return out
+        out: List[_Edge] = []
+        peers = self.conn.execute("""SELECT d.*, p.program_id AS pname FROM data_flow d JOIN program p ON p.id=d.program_id
+                                     WHERE d.kind='cics_out' AND UPPER(d.note) LIKE ? ORDER BY p.program_id, d.line""",
+                                  (f"% {kind.upper()} {res.upper()}",)).fetchall()
+        for p in peers:
+            spf = self.pf(p["src_pfield"])
+            if spf is None or dst is None:
+                self.unlinked += 1
+                continue
+            mapped = self.map_bytes(node, spf, None, dst, None, reverse=True)
+            if mapped is None:
+                continue
+            n_lo, n_hi, labels, _end = mapped
+            pverb = (p["note"] or "").split(" ")[0]
+            for (row, plo, phi, how) in self.place(spf, n_lo, n_hi):
+                ch = self.child(p["program_id"], row, plo, phi, how, node.hop + 1)
+                self.touch(p["program_id"])
+                out.append(_Edge(6, p["pname"], r["line"], f"{verb} {kind.upper()} {res} <- {pverb} from {p['pname']}."
+                                 f"{self.nm(ch)} {self.desc(ch)}".rstrip() + self._lbls(labels),
+                                 cites + "; " + self.cite_stmt(p["program_id"], p["line"], pverb, spf["name"]), child=ch))
+        if kind == "file":
+            cf = self.conn.execute("SELECT dsname FROM cics_file WHERE UPPER(name)=? AND dsname IS NOT NULL", (res.upper(),)).fetchone()
+            if cf:
+                ds = _Node(pid, node.pname, node.root, node.lo, node.hi, node.pf, node.hop, kind="dataset",
+                           data={"dsn": cf["dsname"], "job_id": None, "is_temp": 0, "dd_id": None, "gdg": None, "writer_pf": node.pf})
+                out.append(_Edge(6, cf["dsname"], r["line"], f"{verb} FILE {res} <- {cf['dsname']} (CICS FILE)", cites, child=ds))
+        if not out:
+            out.append(_Edge(6, "CICS", r["line"], f"{verb} {kind.upper()} {res} INTO {r['dst_name']}", cites, end=END_NO_WRITER))
+        return out
+
+    def mq_edges(self, node: _Node, r) -> List[_Edge]:
+        up = self.o.up
+        pid = node.pid
+        note = r["note"] or ""
+        queue = note.split("queue ", 1)[1].strip() if "queue " in note else "(queue not resolvable)"
+        item = r["dst_name"] if up else r["src_name"]
+        cites = self.cite_stmt(pid, r["line"], "CALL", item)
+        other = "mq_out" if up else "mq_in"
+        peers = self.conn.execute("""SELECT d.*, p.program_id AS pname FROM data_flow d JOIN program p ON p.id=d.program_id
+                                     WHERE d.kind=? AND UPPER(d.note) LIKE ? ORDER BY p.program_id, d.line""",
+                                  (other, f"%QUEUE {queue.upper()}%")).fetchall() if "(" not in queue else []
+        mine = self.pf(r["dst_pfield"] if up else r["src_pfield"])
+        out = []
+        for p in peers:
+            tpf = self.pf(p["src_pfield"] if up else p["dst_pfield"])
+            if tpf is None or mine is None:
+                self.unlinked += 1
+                continue
+            mapped = self.map_bytes(node, mine, None, tpf, None)
+            if mapped is None:
+                continue
+            n_lo, n_hi, labels, _end = mapped
+            for (row, plo, phi, how) in self.place(tpf, n_lo, n_hi):
+                ch = self.child(p["program_id"], row, plo, phi, how, node.hop + 1)
+                self.touch(p["program_id"])
+                arrow = "<-" if up else "->"
+                out.append(_Edge(7, p["pname"], r["line"], f"MQ {queue} {arrow} {p['pname']}.{self.nm(ch)} {self.desc(ch)}".rstrip()
+                                 + self._lbls(labels), cites + "; " + self.cite_stmt(p["program_id"], p["line"], "CALL", tpf["name"]),
+                                 child=ch))
+        if not out:
+            out.append(_Edge(7, "MQ", r["line"], f"MQ {'GET' if up else 'PUT'} {queue}", cites,
+                             end=END_MQ.format(q=queue) if not up else END_NO_WRITER))
+        return out
+
+    # ---- edges: up (mirrors) ---------------------------------------------------------------------------
+    def edges_up(self, node: _Node, ids: Set[int]) -> List[_Edge]:
+        out: List[_Edge] = []
+        pid = node.pid
+        q = ",".join("?" * len(ids))
+        rows = self.conn.execute(f"SELECT * FROM data_flow WHERE program_id=? AND dst_pfield IN ({q}) ORDER BY line, id",
+                                 (pid, *ids)).fetchall()
+        for r in rows:
+            k = r["kind"]
+            if k in COPY_KINDS:
+                out.extend(self.copy_edges_up(node, r))
+            elif k in DERIVED_KINDS:
+                if self.o.derived:
+                    out.extend(self.copy_edges_up(node, r, derived=True))
+                else:
+                    self.derived += 1
+            elif k == "io_in" and r["dst_pfield"] == node.root:
+                out.extend(self.file_edges_up(node, r))
+            elif k == "returning":
+                out.extend(self.returning_up(node, r))
+            elif k == "cics_in":
+                out.extend(self.cics_in_edges(node, r))
+            elif k == "dli_in":
+                out.extend(self.dli_edges(node, r))
+            elif k == "mq_in":
+                out.extend(self.mq_edges(node, r))
+        # pointer alias, both ways: an item SET ADDRESS OF to a pointer that holds x
+        for r in self.conn.execute(f"SELECT * FROM data_flow WHERE program_id=? AND kind='set_address' AND dst_pfield IN ({q})",
+                                   (pid, *ids)):
+            p = self.pf(r["src_pfield"])
+            if p is None or (p["usage"] or "").upper() != "POINTER":
+                continue
+            for r2 in self.conn.execute("SELECT * FROM data_flow WHERE program_id=? AND kind='set_address' AND dst_pfield=?",
+                                        (pid, p["id"])):
+                x = self.pf(r2["src_pfield"])
+                a = self.pf(r["dst_pfield"])
+                if x is None or a is None:
+                    continue
+                mapped = self.map_bytes(node, x, None, a, None, reverse=True)
+                if mapped is None:
+                    continue
+                n_lo, n_hi, labels, _end = mapped
+                for (row, plo, phi, how) in self.place(x, n_lo, n_hi):
+                    ch = self.child(pid, row, plo, phi, how, node.hop + 1)
+                    out.append(_Edge(8, node.pname, r["line"], f"pointer alias {p['name']} <- {self.nm(ch)} {self.desc(ch)}".rstrip()
+                                     + self._lbls(labels), self.cite_stmt(pid, r["line"], "SET", a["name"]), child=ch))
+        out.extend(self.param_in(node))
+        out.extend(self.arg_back(node, ids))
+        out.extend(self.sql_edges(node, ids, "read"))
+        return out
+
+    def copy_edges_up(self, node: _Node, r, derived: bool = False) -> List[_Edge]:
+        pid = node.pid
+        verb = r["verb"] or "MOVE"
+        src, dst = self.pf(r["src_pfield"]), self.pf(r["dst_pfield"])
+        if r["kind"] == "move_corr":
+            return self.corr_edges(node, r, src, dst)
+        cites = self.cite_stmt(pid, r["line"], verb, r["dst_name"])
+        lbl_verb = {"read_into": "READ INTO", "write_from": "WRITE FROM", "set": "SET"}.get(r["kind"], verb)
+        if src is None or dst is None:
+            self.unlinked += 1
+            return [_Edge(9, node.pname, r["line"], f"{lbl_verb} <- {r['src_name']}", cites, r["guard"], end=END_AMBIGUOUS)]
+        mapped = self.map_bytes(node, src, r["src_refmod"], dst, r["dst_refmod"], reverse=True,
+                                src_sub=bool(r["src_sub"]), dst_sub=bool(r["dst_sub"]))
+        if mapped is None:
+            return []
+        n_lo, n_hi, labels, end = mapped
+        subs = self._subs(r, src, dst)
+        if derived:
+            n_lo, n_hi = self.extent(src)
+            labels, end, lbl_verb = [], None, f"derived ({verb})"
+        rank = 10 if derived else (1 if src["section"] == "FILE" else 3 if src["section"] == "LINKAGE" else 9)
+        if end:
+            return [_Edge(rank, node.pname, r["line"], f"{lbl_verb} <- {self.base_name(pid, src)}{subs}" + self._lbls(labels),
+                          cites, r["guard"], end=end)]
+        d0, d1 = self.extent(dst)
+        group_dst = bool(dst["is_group"]) and (node.lo > d0 or node.hi < d1) and not derived
+        out = []
+        for (row, plo, phi, how) in self.place(src, n_lo, n_hi):
+            ch = self.child(pid, row, plo, phi, how, node.hop + 1)
+            if group_dst:
+                label = f"group {lbl_verb} {dst['name']} <- {src['name']}: bytes {n_lo + 1}-{n_hi} come from {self.nm(ch)}"
+            else:
+                label = f"{lbl_verb} <- {self.hop_prefix(ch)}{self.nm(ch)}{subs}"
+                d = self.desc(ch)
+                if d:
+                    label += " " + d
+            out.append(_Edge(rank, node.pname, r["line"], label + self._lbls(labels), cites, r["guard"], child=ch))
+        return out
+
+    def file_edges_up(self, node: _Node, r) -> List[_Edge]:
+        pid = node.pid
+        select = _note_file(r["note"])
+        fd = self.conn.execute("SELECT * FROM file_decl WHERE program_id=? AND UPPER(select_name)=?",
+                               (pid, (select or "").upper())).fetchone() if select else None
+        verb = r["verb"] or "READ"
+        rec = self.pf(node.root)["name"]
+        stmt_cite = self.cite_stmt(pid, r["line"], verb, select or rec)
+        if fd is None or not fd["assign_dd"]:
+            return [_Edge(1, node.pname, r["line"], f"{verb} {rec} <- (no SELECT/ASSIGN for it)", stmt_cite, end=END_NO_WRITER)]
+        steps = [s for s in self.steps_of(node.pname) if self.dd_matches(fd["assign_dd"], s["dd_name"])]
+        cf = self.conn.execute("SELECT dsname FROM cics_file WHERE UPPER(name)=? AND dsname IS NOT NULL",
+                               (fd["assign_dd"].upper(),)).fetchone()
+        if not steps and not cf:
+            return [_Edge(1, node.pname, r["line"], f"{verb} {rec} <- DD {fd['assign_dd']}: no job step runs {node.pname} "
+                          f"with this DD", stmt_cite, end=END_NO_WRITER)]
+        out = []
+        for s in steps:
+            where = f"{s['job_name'] or ('PROC ' + (s['proc_name'] or '?'))} {s['step_name']} DD {s['dd_name']}"
+            label = f"{verb} {rec} <- {s['dsn_resolved']} ({where}, {s['mode']}/{s['mode_source']})"
+            cites = stmt_cite + "; " + self.cite_dd(s["member_name"], s["dd_line"], s["dd_name"], True)
+            ds = _Node(pid, node.pname, node.root, node.lo, node.hi, node.pf, node.hop, kind="dataset",
+                       data={"dsn": s["dsn_resolved"], "job_id": s["job_id"], "is_temp": s["is_temp"], "dd_id": s["dd_id"],
+                             "gdg": s["gdg_rel"], "writer_pf": node.pf})
+            out.append(_Edge(1, node.pname, r["line"], label, cites, child=ds))
+        if cf:
+            ds = _Node(pid, node.pname, node.root, node.lo, node.hi, node.pf, node.hop, kind="dataset",
+                       data={"dsn": cf["dsname"], "job_id": None, "is_temp": 0, "dd_id": None, "gdg": None, "writer_pf": node.pf})
+            out.append(_Edge(1, node.pname, r["line"], f"{verb} {rec} <- {cf['dsname']} (CICS FILE {fd['assign_dd']})", stmt_cite,
+                             child=ds))
+        return out
+
+    def returning_up(self, node: _Node, r) -> List[_Edge]:
+        pid = node.pid
+        c = self.conn.execute("SELECT * FROM call_edge WHERE program_id=? AND line=? AND returning_item IS NOT NULL",
+                              (pid, r["line"])).fetchone()
+        cites = self.cite_stmt(pid, r["line"], "CALL", r["dst_name"])
+        if c is None:
+            return []
+        targets = [c["target"]] if c["target"] else [t for t, _c in _candidates(c) if not t.startswith("(+")]
+        out = []
+        for t in targets:
+            progs = Q.programs_named(self.conn, t)
+            if not progs:
+                out.append(_Edge(2, t.upper(), r["line"], f"RETURNING <- {t}", cites, end=END_NO_CALLEE))
+                continue
+            callee = progs[0]
+            prm = self.conn.execute("SELECT * FROM param WHERE program_id=? AND pos=0", (callee["id"],)).fetchone()
+            if prm is None or prm["pfield"] is None:
+                out.append(_Edge(2, callee["program_id"], r["line"], f"RETURNING <- {callee['program_id']} (no RETURNING item)",
+                                 cites, end=END_POS))
+                continue
+            ppf = self.pf(prm["pfield"])
+            ch = self.child(callee["id"], ppf, *self.extent(ppf), "exact", node.hop + 1)
+            self.touch(callee["id"])
+            out.append(_Edge(2, callee["program_id"], r["line"], f"RETURNING <- {callee['program_id']}.{self.nm(ch)} "
+                             f"{self.desc(ch)} (pos 0)".replace("  ", " "), cites, child=ch))
+        if not targets:
+            out.append(_Edge(2, "?", r["line"], f"RETURNING <- {c['via_var']}", cites, end=END_DYNAMIC.format(x=c["via_var"])))
+        return out
+
+    def param_in(self, node: _Node) -> List[_Edge]:
+        """--up mirror of rule 2: a LINKAGE parameter's bytes come from every
+        caller's argument at that position (BY CONTENT included: the value
+        does arrive)."""
+        out: List[_Edge] = []
+        for prm in self.params_of_root(node):
+            ppf = self.pf(prm["pfield"])
+            for c in self.callers_of(node.pname, prm["entry"]):
+                if prm["entry"] == "DFHCOMMAREA":
+                    args = self.conn.execute("SELECT * FROM call_arg WHERE call_id=? AND how IN ('commarea','start_from')",
+                                             (c["id"],)).fetchall()
+                else:
+                    args = self.conn.execute("SELECT * FROM call_arg WHERE call_id=? AND pos=?", (c["id"], prm["pos"])).fetchall()
+                word = _CALL_WORD.get(c["kind"], "CALL")
+                tag = self.call_tag(prm, c)
+                for a in args:
+                    cites = self.cite_stmt(c["cpid"], c["line"], word, a["name"])
+                    if a["how"] == "length_of":
+                        out.append(_Edge(2, c["caller"], c["line"], f"{word} {tag} <- LENGTH OF {c['caller']}.{a['name']}", cites,
+                                         end=END_LENGTH_OF))
+                        continue
+                    apf = self.pf(a["pfield"])
+                    if apf is None:
+                        self.unlinked += 1
+                        continue
+                    mapped = self.map_bytes(node, apf, None, ppf, None, reverse=True)
+                    if mapped is None:
+                        continue
+                    n_lo, n_hi, labels, end = mapped
+                    if a["how"] in ("content", "value"):
+                        labels.append("BY CONTENT")
+                    if prm["entry"] == "DFHCOMMAREA":
+                        labels.append("by CICS convention")
+                    if end:
+                        out.append(_Edge(2, c["caller"], c["line"], f"{word} {tag} <- {c['caller']}.{a['name']}" + self._lbls(labels),
+                                         cites, end=end))
+                        continue
+                    for (row, plo, phi, how) in self.place(apf, n_lo, n_hi):
+                        ch = self.child(c["cpid"], row, plo, phi, how, node.hop + 1)
+                        self.touch(c["cpid"])
+                        out.append(_Edge(2, c["caller"], c["line"], f"{word} {tag} <- {c['caller']}.{self.nm(ch)} {self.desc(ch)}".rstrip()
+                                         + self._lbls(labels), cites, child=ch))
+        return out
+
+    def arg_back(self, node: _Node, ids: Set[int]) -> List[_Edge]:
+        """--up mirror of rule 3: a BY REFERENCE argument holds what the callee
+        wrote into the parameter (only when the callee writes it)."""
+        pid = node.pid
+        q = ",".join("?" * len(ids))
+        rows = self.conn.execute(f"""SELECT a.*, c.kind AS ckind, c.target, c.via_var, c.resolved, c.resolution, c.line AS cline,
+                                            c.id AS cid
+                                     FROM call_arg a JOIN call_edge c ON c.id=a.call_id
+                                     WHERE a.program_id=? AND a.pfield IN ({q}) AND a.how IN ('reference','commarea')
+                                     ORDER BY c.line, a.pos""", (pid, *ids)).fetchall()
+        out: List[_Edge] = []
+        for a in rows:
+            apf = self.pf(a["pfield"])
+            targets = [(a["target"], None)] if a["target"] else [x for x in _candidates(a) if not x[0].startswith("(+")]
+            word = _CALL_WORD.get(a["ckind"], "CALL")
+            cites = self.cite_stmt(pid, a["cline"], word, a["name"])
+            for (t, cand) in targets:
+                progs = Q.programs_named(self.conn, t)
+                if not progs:
+                    continue
+                callee = progs[0]
+                if a["how"] == "commarea":
+                    prm = self.conn.execute("SELECT * FROM param WHERE program_id=? AND entry='DFHCOMMAREA'", (callee["id"],)).fetchone()
+                else:
+                    prm = self.conn.execute("SELECT * FROM param WHERE program_id=? AND entry IS ? AND pos=?",
+                                            (callee["id"], self.entry_for(callee, t), a["pos"])).fetchone()
+                if prm is None or prm["pfield"] is None:
+                    continue
+                ppf = self.pf(prm["pfield"])
+                mapped = self.map_bytes(node, ppf, None, apf, None, reverse=True)
+                if mapped is None:
+                    continue
+                n_lo, n_hi, labels, _end = mapped
+                callname = f"{word} {t}" + (f" ({cand})" if cand else "")
+                tag = "COMMAREA" if a["how"] == "commarea" else f"arg {a['pos']}"
+                for (row, plo, phi, how) in self.place(ppf, n_lo, n_hi):
+                    ch = self.child(callee["id"], row, plo, phi, how, node.hop + 1)
+                    # only the bytes the callee writes come back: CA-MESSAGE set there is not CA-STATUS
+                    cids, _cl = self.closure_ids(ch)
+                    if not self.written_here(ch, cids):
+                        continue
+                    self.touch(callee["id"])
+                    out.append(_Edge(3, callee["program_id"], a["cline"], f"{callname} {tag} <- {callee['program_id']}.{self.nm(ch)} "
+                                     f"{self.desc(ch)} (written there, BY REFERENCE)".replace("  ", " ") + self._lbls(labels),
+                                     cites, child=ch))
+        return out
+
+    # ---- per-node information: sets, uses, writers -------------------------------------------------------
+    def sets(self, node: _Node, ids: Set[int]) -> List[str]:
+        q = ",".join("?" * len(ids))
+        out, seen = [], set()
+        for r in self.conn.execute(f"""SELECT * FROM data_flow WHERE program_id=? AND dst_pfield IN ({q}) AND kind IN
+                                       ('literal','figurative','initialize','accept') ORDER BY line, id""", (node.pid, *ids)):
+            verb = r["verb"] or "MOVE"
+            if r["kind"] in ("literal", "figurative"):
+                what = f"{verb} {r['src_lit']}"
+            elif r["kind"] == "accept":
+                what = f"ACCEPT FROM {r['note'] or '?'}"
+            else:
+                what = verb
+            cites = self.cite_stmt(node.pid, r["line"], verb, r["dst_name"])
+            text = f"also set here: {what}   {cites}" + (f"   guard: {r['guard']}" if r["guard"] else "")
+            if text not in seen:
+                seen.add(text)
+                out.append(text)
+        return out
+
+    def uses(self, node: _Node, ids: Set[int]) -> Optional[str]:
+        """IF / EVALUATE / DISPLAY / a WHERE clause on the node's names: the
+        value is looked at, not copied."""
+        q = ",".join("?" * len(ids))
+        rows = self.conn.execute(f"""SELECT * FROM field_ref WHERE program_id=? AND pfield_id IN ({q})
+                                     AND (mode IN ('test','display') OR (mode='read' AND stmt='EXEC-SQL')) ORDER BY line, id""",
+                                 (node.pid, *ids)).fetchall()
+        texts, cites, seen = [], [], set()
+        for r in rows:
+            if r["mode"] == "read":
+                if not self.conn.execute("SELECT 1 FROM sql_col_ref WHERE program_id=? AND line=? AND UPPER(host_var)=? AND mode='predicate'",
+                                         (node.pid, r["line"], r["name"].upper())).fetchone():
+                    continue
+            pf = self.pf(r["pfield_id"])
+            m, ln, depth, via = Q.origin(self.conn, node.pid, r["line"])
+            if not m or ln is None:
+                continue
+            tag = f"{m}:{ln}" + (f" (via COPY {via})" if depth else "")
+            if r["mode"] == "display":
+                text, cite = "DISPLAY", tag
+            elif r["mode"] == "read":
+                text, cite = f"EXEC SQL WHERE :{r['name']}", tag
+            else:
+                raw = self.raw(m, ln)
+                stmt = (r["stmt"] or "IF").upper()
+                mm = re.search(r"(?<![\w-])" + re.escape(stmt) + r"(?![\w-])", raw, re.I)
+                body = raw[mm.start():].strip() if mm else f"{stmt} {r['name']}"
+                body = re.sub(r"\s+", " ", body).rstrip(".")
+                if pf is not None and r["name"].upper() != pf["name"].upper():
+                    c88 = self.conn.execute("SELECT values_lit FROM cond88 WHERE UPPER(name)=? LIMIT 1", (r["name"].upper(),)).fetchone()
+                    if c88 is not None:
+                        vals = " ".join(str(v) for v in Q._jl(c88["values_lit"]))
+                        text = f"88 {r['name']} {vals} tested".replace("  ", " ")
+                        om = re.search(r"(?<![\w-])" + re.escape(r["name"]) + r"(?![\w-])", raw, re.I)
+                        tok = self._tok(raw[mm.start() if mm else 0:om.end()] if om else body)
+                        cite = f'{tag} "{tok}"'
+                        if (text, cite) not in seen:
+                            seen.add((text, cite))
+                            texts.append(text)
+                            cites.append(cite)
+                        continue
+                text, cite = body[:TOKEN_MAX], tag
+            if (text, cite) in seen:
+                continue
+            seen.add((text, cite))
+            texts.append(text)
+            cites.append(cite)
+        if not texts:
+            return None
+        return "; ".join(texts) + "   " + "; ".join(cites)
+
+    def writers(self, node: _Node, ids: Set[int], exclude: Set[int]) -> int:
+        q = ",".join("?" * len(ids))
+        lines = {r[0] for r in self.conn.execute(f"SELECT DISTINCT line FROM data_flow WHERE program_id=? AND dst_pfield IN ({q})",
+                                                  (node.pid, *ids))}
+        lines |= {r[0] for r in self.conn.execute(f"""SELECT DISTINCT line FROM field_ref WHERE program_id=? AND pfield_id IN ({q})
+                                                       AND mode='write' AND stmt NOT IN ('CALL-USING')""", (node.pid, *ids))}
+        return len(lines - exclude)
+
+    def set_from(self, node: _Node, ids: Set[int]) -> List[Tuple[int, str]]:
+        """The root's own sources (down mode): the copies into it, as context."""
+        q = ",".join("?" * len(ids))
+        out = []
+        for r in self.conn.execute(f"""SELECT * FROM data_flow WHERE program_id=? AND dst_pfield IN ({q}) AND kind IN
+                                       ('move','move_corr','set','read_into','write_from','returning','cics_in','dli_in','mq_in','io_in')
+                                       ORDER BY line, id""", (node.pid, *ids)):
+            src = self.pf(r["src_pfield"])
+            verb = r["verb"] or "MOVE"
+            if src is None:
+                what = f"{verb} {r['note'] or ''}".strip() if r["src_name"] is None else f"{verb} {r['src_name']}"
+                operand = _note_file(r["note"]) if r["kind"] == "io_in" else None
+                out.append((r["line"], f"set from {what}   {self.cite_stmt(node.pid, r['line'], verb, operand or r['dst_name'])}"))
+                continue
+            sn = _Node(node.pid, node.pname, src["root_id"], *self.extent(src), src, 0)
+            out.append((r["line"], f"set from {self.base_name(node.pid, src)} {self.desc(sn, True)[:-1]}, {self.cite_def(src, node.pid)})"
+                        f"   {self.cite_stmt(node.pid, r['line'], verb, r['dst_name'])}"
+                        + (f"   guard: {r['guard']}" if r["guard"] else "")))
+        return out
+
+    # ---- emission ------------------------------------------------------------------------------
+    def emit_node(self, e: _Edge, num: str, depth: int) -> None:
+        node = e.child
+        self.touch(node.pid)
+        guard = f"   guard: {e.guard}" if e.guard else ""
+        head = f"{e.label}{guard}   {e.cites}"
+        prev = self.seen(node)
+        if prev is not None:
+            self.put(depth, self.fmt(num, depth, f"{head}   (shown as {prev})"))
+            return
+        self.visited[(node.pid, node.root)].append((node.lo, node.hi, num))
+        self.count += 1
+        ids, cl = self.closure_ids(node)
+        edges = self.edges(node)
+        uses = self.uses(node, ids)
+        tail = ""
+        at_limit = bool(edges) and node.hop >= self.o.hops
+        if at_limit:
+            tail = f"   ({len(edges)} edge(s) not followed)" + self.end(END_HOPS.format(n=self.o.hops), num)
+            edges = []
+        elif not edges and not uses:
+            tail = self.end(END_UNNAMED if node.unnamed else END_NO_USE.format(p=node.pname), num)
+        self.put(depth, self.fmt(num, depth, head + tail))
+        part = self.partial_note(node.pid) if node.pid not in self._partial_shown else None
+        if part:
+            self._partial_shown.add(node.pid)
+            self.put(depth, self.sub(depth, part))
+        for x in e.extra:
+            self.put(depth, self.sub(depth, x))
+        if at_limit:
+            # the node at the limit prints its edge count only: what sets or
+            # tests it there is the next hop's business (--hops N+1)
+            return
+        also = [f"{self.base_name(node.pid, r)} ({why})" for (r, why) in cl if why != "self"]
+        if also:
+            self.put(depth, self.sub(depth, "also read as: " + ", ".join(also)))
+        n = self.writers(node, ids, {e.line} if e.line else set())
+        if n:
+            self.put(depth, self.sub(depth, f"also written by {n} other statement{'s' if n != 1 else ''} (order not checked)"))
+        for s in self.sets(node, ids):
+            self.put(depth, self.sub(depth, s))
+        if uses:
+            self.put(depth, self.sub(depth, uses + ("" if edges else self.end(END_TESTED, num))))
+        self.children(node, edges, num, depth + 1)
+
+    def emit_dataset(self, e: _Edge, num: str, depth: int) -> None:
+        ds = e.child
+        self.put(depth, self.fmt(num, depth, f"{e.label}   {e.cites}"))
+        leaves = self.dataset_leaves(ds, self.cobol_reader)
+        if not leaves:
+            self.put(depth, self.sub(depth, f"no step {'writes' if self.o.up else 'reads'} {ds.data['dsn']}"
+                                            + self.end(END_NO_WRITER if self.o.up else END_NO_READER, num)))
+            return
+        printed: Set[str] = set()
+        shown = leaves if self.o.show_all else leaves[:self.o.width]
+        for i, leaf in enumerate(shown, 1):
+            for (text, cites) in leaf.path:
+                key = text + cites
+                if key not in printed:
+                    printed.add(key)
+                    self.put(depth, self.sub(depth, f"{text}   {cites}"))
+            cnum = f"{num}.{i}"
+            if leaf.end:
+                self.put(depth + 1, self.fmt(cnum, depth + 1, f"{leaf.text}   {leaf.cites}".rstrip() + self.end(leaf.end, cnum)))
+                continue
+            if self.count >= self.o.nodes:
+                self.dropped_nodes += 1
+                self.put(depth + 1, self.fmt(cnum, depth + 1, f"{leaf.text}   {leaf.cites}" + self.end(END_NODES, cnum)))
+                continue
+            self.emit_node(_Edge(1, leaf.node.pname, 0, leaf.text, leaf.cites, child=leaf.node), cnum, depth + 1)
+        if len(leaves) > len(shown):
+            rest = leaves[len(shown):]
+            progs = defaultdict(int)
+            for lf in rest:
+                progs[lf.node.pname if lf.node else lf.text.split(" ")[0]] += 1
+            self.dropped_width += len(rest)
+            self.put(depth + 1, self.sub(depth, f"... {len(rest)} more reader(s) in {len(progs)} program(s): "
+                                                + ", ".join(f"{p} {n}" for p, n in sorted(progs.items(), key=lambda x: -x[1]))
+                                                + " (--all)" + self.end(END_WIDTH, num)))
+
+    def children(self, node: _Node, edges: List[_Edge], prefix: str, depth: int) -> None:
+        shown = edges if self.o.show_all else edges[:self.o.width]
+        for i, e in enumerate(shown, 1):
+            num = f"{prefix}.{i}" if prefix else str(i)
+            if e.child is None:
+                guard = f"   guard: {e.guard}" if e.guard else ""
+                line = f"{e.label}{guard}   {e.cites}"
+                if e.end:
+                    line += self.end(e.end, num)
+                self.put(depth, self.fmt(num, depth, line))
+                for x in e.extra:
+                    self.put(depth, self.sub(depth, x))
+                if e.table:
+                    tnum = f"{num}.1"
+                    self.count += 1
+                    tl = e.table.split("\n")
+                    self.put(depth + 1, self.fmt(tnum, depth + 1, tl[0]))
+                    for t in tl[1:]:
+                        self.put(depth + 1, self.sub(depth + 1, t))
+                continue
+            if e.child.kind == "dataset":
+                self.emit_dataset(e, num, depth)
+                continue
+            if self.count >= self.o.nodes:
+                rest = shown[i - 1:]
+                progs = defaultdict(int)
+                for x in rest:
+                    progs[x.prog] += 1
+                self.dropped_nodes += len(rest)
+                self.put(depth, self.sub(depth - 1, f"... {len(rest)} more branch(es) in {len(progs)} program(s): "
+                                                    + ", ".join(f"{p} {n}" for p, n in sorted(progs.items(), key=lambda x: -x[1]))
+                                                    + f" not printed (--nodes {self.o.nodes})" + self.end(END_NODES, prefix or "root")))
+                break
+            self.emit_node(e, num, depth)
+        if len(edges) > len(shown):
+            rest = edges[len(shown):]
+            progs = defaultdict(int)
+            for x in rest:
+                progs[x.prog] += 1
+            self.dropped_width += len(rest)
+            self.put(depth, self.sub(depth - 1, f"... {len(rest)} more target(s) in {len(progs)} program(s): "
+                                                + ", ".join(f"{p} {n}" for p, n in sorted(progs.items(), key=lambda x: (-x[1], x[0])))
+                                                + " (--all)" + self.end(END_WIDTH, prefix or "root")))
+
+    # ---- the root ------------------------------------------------------------------------------
+    def run(self, pid: int, row, via88: Optional[str] = None) -> _Node:
+        self.root_pid = pid
+        self.touch(pid)
+        p = self.prog(pid)
+        lo, hi = self.extent(row)
+        node = _Node(pid, p["program_id"], row["root_id"], lo, hi, row, 0)
+        self.visited[(pid, node.root)].append((lo, hi, "root"))
+        ids, cl = self.closure_ids(node)
+        edges = self.edges(node)
+        sf = self.set_from(node, ids) if not self.o.up else []
+        n_writers = self.writers(node, ids, {ln for ln, _t in sf})
+        defined = (f"- defined {self.cite_def(row, pid)} {self.desc(node, True)}"
+                   + (f" (via 88 {via88})" if via88 else "")
+                   + (f"; also written by {n_writers} other statement{'s' if n_writers != 1 else ''} (order not checked)"
+                      if n_writers else ""))
+        self.put(0, defined)
+        part = self.partial_note(pid)
+        if part:
+            self._partial_shown.add(pid)
+            self.put(0, f"- {part}")
+        also = [f"{self.base_name(pid, r)} ({why})" for (r, why) in cl if why != "self"]
+        if also:
+            self.put(0, "- also read as: " + ", ".join(also))
+        for _ln, t in sf:
+            self.put(0, f"- {t}")
+        for s in self.sets(node, ids):
+            self.put(0, f"- {s}")
+        uses = self.uses(node, ids)
+        if uses:
+            self.put(0, f"- {uses}" + ("" if edges else self.end(END_TESTED, "root")))
+        elif not edges:
+            self.put(0, f"- {END_NO_USE.format(p=p['program_id'])}" + self.end(END_NO_USE.format(p=p["program_id"]), "root"))
+        self.children(node, edges, "", 1)
+        return node
+
+
+# ---------------------------------------------------------------------------
+# the fallback walker over field_ref / call_edge / sql_col_ref
+# ---------------------------------------------------------------------------
+
+class _FNode:
+    __slots__ = ("pid", "pname", "name", "frow", "hop", "kind")
+
+    def __init__(self, pid: int, pname: str, name: str, frow, hop: int) -> None:
+        self.pid, self.pname, self.name, self.frow, self.hop = pid, pname, name, frow, hop
+        self.kind = "field"
+
+
+class _Fallback(_Report):
+    """Before the re-parse: MOVE pairs only from lines with exactly one MOVE
+    read and one MOVE write (a line with more cannot say which read fed
+    which write - guard 2), CALL / LINKAGE by position from call_edge and
+    linkage_using, DB2 from sql_col_ref, file bytes from the program's own
+    field rows. Every hop says (reconstructed)."""
+
+    def __init__(self, conn: sqlite3.Connection, opts: Opts) -> None:
+        super().__init__(conn, opts)
+        self.unpaired: Dict[int, int] = {}
+        self.pairs: Dict[int, List[Tuple[int, str, str]]] = {}
+        self.visited: Dict[Tuple[int, str], str] = {}
+        self._prog: Dict[int, sqlite3.Row] = {}
+
+    def prog(self, pid: int):
+        if pid not in self._prog:
+            self._prog[pid] = self.conn.execute(
+                "SELECT p.*, m.name AS member_name, m.parse_status FROM program p JOIN member m ON m.id=p.member_id "
+                "WHERE p.id=?", (pid,)).fetchone()
+        return self._prog[pid]
+
+    def touch(self, pid: int) -> None:
+        self.programs.add(pid)
+        self.members.add(self.prog(pid)["member_id"])
+
+    def move_pairs(self, pid: int) -> List[Tuple[int, str, str]]:
+        if pid in self.pairs:
+            return self.pairs[pid]
+        by_line: Dict[int, Tuple[Set[str], Set[str]]] = defaultdict(lambda: (set(), set()))
+        for r in self.conn.execute("SELECT line, name, mode FROM field_ref WHERE program_id=? AND stmt='MOVE' AND mode IN ('read','write')",
+                                   (pid,)):
+            by_line[r["line"]][0 if r["mode"] == "read" else 1].add(r["name"].upper())
+        pairs, bad = [], 0
+        for ln, (reads, writes) in sorted(by_line.items()):
+            if len(reads) == 1 and len(writes) == 1:
+                pairs.append((ln, next(iter(reads)), next(iter(writes))))
+            elif len(reads) == 0:
+                continue                       # a literal / figurative MOVE: a set, not a pair
+            else:
+                bad += 1
+        self.pairs[pid] = pairs
+        self.unpaired[pid] = bad
+        return pairs
+
+    def field_row(self, pid: int, name: str):
+        p = self.prog(pid)
+        return self.conn.execute("SELECT * FROM field WHERE member_id=? AND UPPER(name)=? ORDER BY id LIMIT 1",
+                                 (p["member_id"], name.upper())).fetchone()
+
+    def root_of(self, frow):
+        r = frow
+        while r is not None and r["parent_id"]:
+            r = self.conn.execute("SELECT * FROM field WHERE id=?", (r["parent_id"],)).fetchone()
+        return r
+
+    def node(self, pid: int, name: str, hop: int) -> _FNode:
+        return _FNode(pid, self.prog(pid)["program_id"], name.upper(), self.field_row(pid, name), hop)
+
+    def pfx(self, node: _FNode) -> str:
+        return "" if node.pid == self.root_pid else f"{node.pname}."
+
+    def edges(self, node: _FNode) -> List[_Edge]:
+        out = self.edges_up(node) if self.o.up else self.edges_down(node)
+        out.sort(key=lambda e: (e.rank, e.prog, e.line))
+        return out
+
+    def edges_down(self, node: _FNode) -> List[_Edge]:
+        out: List[_Edge] = []
+        pid, name = node.pid, node.name
+        # 1. the file: a program-owned record field written to a file
+        out.extend(self.file_edges(node))
+        # 2. CALL USING by position
+        for c in self.conn.execute("SELECT * FROM call_edge WHERE program_id=? AND using_args IS NOT NULL ORDER BY line", (pid,)):
+            args = [a.upper() for a in Q._jl(c["using_args"])]
+            for pos in [i + 1 for i, a in enumerate(args) if a == name]:
+                word = _CALL_WORD.get(c["kind"], "CALL")
+                cites = self.cite_stmt(pid, c["line"], word, name)
+                targets = [(c["target"], None)] if c["target"] else _candidates(c)
+                if not targets:
+                    out.append(_Edge(2, "?", c["line"], f"{word} {c['via_var']} arg {pos} (reconstructed)", cites,
+                                     end=END_DYNAMIC.format(x=c["via_var"])))
+                for (t, cand) in targets:
+                    if t.startswith("(+"):
+                        out.append(_Edge(2, "?", c["line"], f"{word} {c['via_var']} arg {pos}: {t} candidate(s) not listed "
+                                         f"(reconstructed)", cites, end=END_DYNAMIC.format(x=c["via_var"])))
+                        continue
+                    callname = f"{word} {t}" if c["target"] else f"{word} {c['via_var']} = {t} ({cand})"
+                    progs = Q.programs_named(self.conn, t)
+                    if not progs:
+                        out.append(_Edge(2, t.upper(), c["line"], f"{callname} arg {pos} (reconstructed)", cites, end=END_NO_CALLEE))
+                        continue
+                    callee = progs[0]
+                    lk = self.linkage_of(callee, t)
+                    if pos > len(lk):
+                        out.append(_Edge(2, callee["program_id"], c["line"], f"{callname} arg {pos} (callee declares {len(lk)} "
+                                         f"parameter(s)) (reconstructed)", cites, end=END_POS))
+                        continue
+                    ch = self.node(callee["id"], lk[pos - 1], node.hop + 1)
+                    out.append(_Edge(2, callee["program_id"], c["line"], f"{callname} arg {pos} -> {callee['program_id']}.{ch.name} "
+                                     f"(reconstructed){self.call_modes(pid, c['line'])}", cites, child=ch))
+        # 3. LINKAGE back
+        lk = [a.upper() for a in Q._jl(self.prog(pid)["linkage_using"])]
+        entries = [(None, lk)] + [(r["alias"], [a.upper() for a in Q._jl(r["linkage_using"])]) for r in
+                                  self.conn.execute("SELECT alias, linkage_using FROM program_alias WHERE program_id=?", (pid,))]
+        written = bool(self.conn.execute("SELECT 1 FROM field_ref WHERE program_id=? AND UPPER(name)=? AND mode='write' "
+                                         "AND stmt<>'CALL-USING' LIMIT 1", (pid, name)).fetchone())
+        for (entry, using) in entries:
+            if name not in using or not written:
+                continue
+            pos = using.index(name) + 1
+            cname = (entry or node.pname).upper()
+            for c in self.conn.execute("""SELECT c.*, q.program_id AS caller, q.id AS cpid FROM call_edge c JOIN program q ON q.id=c.program_id
+                                          WHERE (UPPER(c.target)=? OR c.resolved LIKE ?) ORDER BY q.program_id, c.line""",
+                                       (cname, f'%"{cname}"%')):
+                args = Q._jl(c["using_args"])
+                if pos > len(args):
+                    continue
+                ch = self.node(c["cpid"], args[pos - 1], node.hop + 1)
+                out.append(_Edge(3, c["caller"], c["line"], f"LINKAGE pos {pos} -> back to {c['caller']}.{ch.name} (reconstructed)"
+                                 + self.call_modes(c["cpid"], c["line"]),
+                                 self.cite_stmt(c["cpid"], c["line"], "CALL", args[pos - 1]), child=ch))
+        # 4. DB2
+        out.extend(self.sql_edges(node, "write"))
+        # 9. local copies
+        for (ln, rd, wr) in self.move_pairs(pid):
+            if rd == name:
+                ch = self.node(pid, wr, node.hop + 1)
+                out.append(_Edge(9, node.pname, ln, f"MOVE -> {self.pfx(ch)}{ch.name} (reconstructed)",
+                                 self.cite_stmt(pid, ln, "MOVE", wr), child=ch))
+        return out
+
+    def edges_up(self, node: _FNode) -> List[_Edge]:
+        out: List[_Edge] = []
+        pid, name = node.pid, node.name
+        out.extend(self.file_edges(node))
+        lk = [a.upper() for a in Q._jl(self.prog(pid)["linkage_using"])]
+        entries = [(None, lk)] + [(r["alias"], [a.upper() for a in Q._jl(r["linkage_using"])]) for r in
+                                  self.conn.execute("SELECT alias, linkage_using FROM program_alias WHERE program_id=?", (pid,))]
+        for (entry, using) in entries:
+            if name not in using:
+                continue
+            pos = using.index(name) + 1
+            cname = (entry or node.pname).upper()
+            for c in self.conn.execute("""SELECT c.*, q.program_id AS caller, q.id AS cpid FROM call_edge c JOIN program q ON q.id=c.program_id
+                                          WHERE (UPPER(c.target)=? OR c.resolved LIKE ?) ORDER BY q.program_id, c.line""",
+                                       (cname, f'%"{cname}"%')):
+                args = Q._jl(c["using_args"])
+                if pos > len(args):
+                    continue
+                ch = self.node(c["cpid"], args[pos - 1], node.hop + 1)
+                out.append(_Edge(2, c["caller"], c["line"], f"CALL {cname} arg {pos} <- {c['caller']}.{ch.name} (reconstructed)"
+                                 + self.call_modes(c["cpid"], c["line"]),
+                                 self.cite_stmt(c["cpid"], c["line"], "CALL", args[pos - 1]), child=ch))
+        for c in self.conn.execute("SELECT * FROM call_edge WHERE program_id=? AND using_args IS NOT NULL ORDER BY line", (pid,)):
+            args = [a.upper() for a in Q._jl(c["using_args"])]
+            for pos in [i + 1 for i, a in enumerate(args) if a == name]:
+                for t in ([c["target"]] if c["target"] else [t for t, _c in _candidates(c) if not t.startswith("(+")]):
+                    progs = Q.programs_named(self.conn, t)
+                    if not progs:
+                        continue
+                    callee = progs[0]
+                    lk2 = self.linkage_of(callee, t)
+                    if pos > len(lk2):
+                        continue
+                    pname = lk2[pos - 1]
+                    if not self.conn.execute("SELECT 1 FROM field_ref WHERE program_id=? AND UPPER(name)=? AND mode='write' "
+                                             "AND stmt<>'CALL-USING' LIMIT 1", (callee["id"], pname.upper())).fetchone():
+                        continue
+                    ch = self.node(callee["id"], pname, node.hop + 1)
+                    out.append(_Edge(3, callee["program_id"], c["line"], f"CALL {t} arg {pos} <- {callee['program_id']}.{ch.name} "
+                                     f"(written there) (reconstructed){self.call_modes(pid, c['line'])}",
+                                     self.cite_stmt(pid, c["line"], "CALL", name), child=ch))
+        out.extend(self.sql_edges(node, "read"))
+        for (ln, rd, wr) in self.move_pairs(pid):
+            if wr == name:
+                ch = self.node(pid, rd, node.hop + 1)
+                out.append(_Edge(9, node.pname, ln, f"MOVE <- {self.pfx(ch)}{ch.name} (reconstructed)",
+                                 self.cite_stmt(pid, ln, "MOVE", rd), child=ch))
+        return out
+
+    def call_modes(self, pid: int, exp_line: int) -> str:
+        """call_edge.using_args has no BY CONTENT / LENGTH OF: when the CALL's
+        own text holds one, a position may be one-way or a length - said on
+        the hop, never assumed away (guards 9, 10)."""
+        m, ln, _d, _v = Q.origin(self.conn, pid, exp_line)
+        if not m or ln is None:
+            return ""
+        text = []
+        for k in range(8):
+            raw = self.raw(m, ln + k)
+            text.append(raw)
+            if raw.rstrip().endswith("."):
+                break
+        t = " ".join(text).upper()
+        if re.search(r"(?<![\w-])(?:CONTENT|VALUE|LENGTH\s+OF)(?![\w-])", t):
+            return " (this CALL passes BY CONTENT / VALUE / LENGTH OF: the position may be one-way or a length - HUMAN MUST VERIFY)"
+        return ""
+
+    def linkage_of(self, callee, target: str) -> List[str]:
+        t = target.upper()
+        if t != (callee["program_id"] or "").upper() and t != (callee["member_name"] or "").upper():
+            r = self.conn.execute("SELECT linkage_using FROM program_alias WHERE program_id=? AND UPPER(alias)=?",
+                                  (callee["id"], t)).fetchone()
+            if r:
+                return Q._jl(r["linkage_using"])
+        return Q._jl(callee["linkage_using"])
+
+    def sql_edges(self, node: _FNode, mode: str) -> List[_Edge]:
+        out: List[_Edge] = []
+        done = set()
+        for r in self.conn.execute("SELECT * FROM sql_col_ref WHERE program_id=? AND mode=? AND UPPER(host_var)=? ORDER BY line",
+                                   (node.pid, mode, node.name)):
+            base = (r["tbl"] or "?").rpartition(".")[2].upper()
+            key = (base, r["col"].upper())
+            if key in done:
+                continue
+            done.add(key)
+            cites = self.cite_sql(node.pid, r["line"], r["col"], r["host_var"])
+            sep = " SET" if (r["stmt"] or "").upper() == "UPDATE" else ""
+            label = f"EXEC SQL {r['stmt'] or ''} {r['tbl'] or '?'}{sep} {r['col']} (reconstructed)".replace("  ", " ")
+            other = "read" if mode == "write" else "write"
+            peers = self.conn.execute("""SELECT c.*, p.program_id AS pname FROM sql_col_ref c JOIN program p ON p.id=c.program_id
+                                         WHERE c.mode=? AND UPPER(c.col)=? AND (UPPER(c.tbl)=? OR UPPER(c.tbl) LIKE ?)
+                                         ORDER BY p.program_id, c.line""", (other, key[1], base, f"%.{base}")).fetchall() \
+                if base != "?" else []
+            if not peers:
+                out.append(_Edge(4, f"DB2 {base}", r["line"], label, cites,
+                                 end=END_NO_DB2_READER if mode == "write" else END_NO_DB2_WRITER))
+                continue
+            trows = [(p["pname"], p["host_var"] or "", self.cite_sql(p["program_id"], p["line"], p["col"], p["host_var"]))
+                     for p in peers]
+            for p in peers:
+                self.touch(p["program_id"])
+            word = "readers" if mode == "write" else "writers"
+            out.append(_Edge(4, f"DB2 {base}", r["line"], label, cites,
+                             table=f"via table {base}.{r['col']}: {len(peers)} static {word}, no ordering\n"
+                                   + Q.table(["program", "host variable", "cite"], trows).rstrip("\n")))
+        return out
+
+    def file_edges(self, node: _FNode) -> List[_Edge]:
+        """Program-owned record fields only: a copybook's items sit at the
+        copybook's offsets, one byte off in a program with a prefix byte."""
+        pid = node.pid
+        fr = node.frow
+        if fr is None:
+            return []
+        root = self.root_of(fr)
+        if root is None:
+            return []
+        fd = self.conn.execute("SELECT * FROM file_decl WHERE program_id=? AND UPPER(fd_record)=?", (pid, root["name"].upper())).fetchone()
+        if fd is None or not fd["assign_dd"]:
+            return []
+        up = self.o.up
+        op = "READ" if up else "WRITE"
+        io = self.conn.execute("SELECT line FROM io_op WHERE program_id=? AND target_kind='file' AND UPPER(target)=? AND op=? "
+                               "ORDER BY line LIMIT 1", (pid, fd["select_name"].upper(), op)).fetchone()
+        if io is None:
+            return []
+        lo, hi = fr["offset"], fr["offset"] + fr["length"]
+        stmt_cite = self.cite_stmt(pid, io["line"], op, fd["select_name"] if up else root["name"])
+        steps = [s for s in _Walker.steps_of(self, node.pname) if _Walker.dd_matches(fd["assign_dd"], s["dd_name"])]
+        out = []
+        arrow = "<-" if up else "->"
+        for s in steps:
+            where = f"{s['job_name'] or ('PROC ' + (s['proc_name'] or '?'))} {s['step_name']} DD {s['dd_name']}"
+            label = f"{op} {root['name']} {arrow} {s['dsn_resolved']} ({where}, {s['mode']}/{s['mode_source']}) (reconstructed)"
+            cites = stmt_cite + "; " + self.cite_dd(s["member_name"], s["dd_line"], s["dd_name"], True)
+            ds = _Node(pid, node.pname, root["id"], lo, hi, None, node.hop, kind="dataset",
+                       data={"dsn": s["dsn_resolved"], "job_id": s["job_id"], "is_temp": s["is_temp"], "dd_id": s["dd_id"],
+                             "gdg": s["gdg_rel"], "writer_pf": None})
+            out.append(_Edge(1, node.pname, io["line"], label, cites, child=ds))
+        if not steps:
+            out.append(_Edge(1, node.pname, io["line"], f"{op} {root['name']} {arrow} DD {fd['assign_dd']}: no job step runs "
+                             f"{node.pname} with this DD (reconstructed)", stmt_cite, end=END_NO_WRITER if up else END_NO_READER))
+        return out
+
+    def cobol_reader(self, prog, s, where: str, ds: _Node) -> List[_Leaf]:
+        rpid = prog["id"]
+        self.touch(rpid)
+        fds = [f for f in self.conn.execute("SELECT * FROM file_decl WHERE program_id=?", (rpid,))
+               if _Walker.dd_matches(f["assign_dd"], s["dd_name"])]
+        dd_cite = self.cite_dd(s["member_name"], s["dd_line"], s["dd_name"], False)
+        if not fds:
+            return [_Leaf([], f"{prog['program_id']} runs in {where} but declares no file on that DD", dd_cite,
+                          end=END_NO_FIELD.format(lo=ds.lo + 1, hi=ds.hi))]
+        leaves = []
+        verb = "written by" if self.o.up else "read by"
+        for fd in fds:
+            if not fd["fd_record"]:
+                continue
+            root = self.conn.execute("SELECT * FROM field WHERE member_id=? AND UPPER(name)=? AND parent_id IS NULL",
+                                     (prog["member_id"], fd["fd_record"].upper())).fetchone()
+            if root is None:
+                leaves.append(_Leaf([], f"{prog['program_id']} {fd['fd_record']} ({where}): {FALLBACK_COPY}", dd_cite,
+                                    end=END_NO_FIELD.format(lo=ds.lo + 1, hi=ds.hi)))
+                continue
+            items = self.conn.execute("""WITH RECURSIVE sub(id) AS (SELECT ? UNION ALL SELECT f.id FROM field f JOIN sub ON f.parent_id=sub.id)
+                                         SELECT f.* FROM field f JOIN sub ON sub.id=f.id WHERE f.is_group=0 AND f.id<>?
+                                         AND f.offset<? AND f.offset+f.length>? ORDER BY f.offset""",
+                                      (root["id"], root["id"], ds.hi, ds.lo)).fetchall()
+            if not items:
+                leaves.append(_Leaf([], f"{prog['program_id']}.{root['name']} ({where}): {FALLBACK_COPY}", dd_cite,
+                                    end=END_NO_FIELD.format(lo=ds.lo + 1, hi=ds.hi)))
+                continue
+            for r in items:
+                ch = _FNode(rpid, prog["program_id"], r["name"].upper(), r, ds.hop + 1)
+                xlo, xhi = max(ds.lo, r["offset"]), min(ds.hi, r["offset"] + r["length"])
+                leaves.append(_Leaf([], f"{verb} {prog['program_id']}.{r['name']} bytes {xlo + 1}-{xhi} ({where}) (reconstructed)",
+                                    self.cite_def(r, rpid) + "; " + dd_cite, node=ch))
+        return leaves
+
+    def uses(self, node: _FNode) -> Optional[str]:
+        texts, cites = [], []
+        for r in self.conn.execute("SELECT * FROM field_ref WHERE program_id=? AND UPPER(name)=? AND mode IN ('test','display') ORDER BY line",
+                                   (node.pid, node.name)):
+            m, ln, depth, via = Q.origin(self.conn, node.pid, r["line"])
+            if not m or ln is None:
+                continue
+            tag = f"{m}:{ln}" + (f" (via COPY {via})" if depth else "")
+            if r["mode"] == "display":
+                text = "DISPLAY"
+            else:
+                raw = self.raw(m, ln)
+                stmt = (r["stmt"] or "IF").upper()
+                mm = re.search(r"(?<![\w-])" + re.escape(stmt) + r"(?![\w-])", raw, re.I)
+                text = re.sub(r"\s+", " ", raw[mm.start():].strip() if mm else f"{stmt} {node.name}").rstrip(".")[:TOKEN_MAX]
+            if (text, tag) in zip(texts, cites):
+                continue
+            texts.append(text)
+            cites.append(tag)
+        return ("; ".join(texts) + "   " + "; ".join(cites)) if texts else None
+
+    def sets(self, node: _FNode) -> List[str]:
+        out = []
+        for r in self.conn.execute("""SELECT literal, line FROM literal_ref WHERE program_id=? AND UPPER(field)=? AND context='move_to'
+                                      ORDER BY line""", (node.pid, node.name)):
+            reads = self.conn.execute("SELECT COUNT(*) FROM field_ref WHERE program_id=? AND line=? AND stmt='MOVE' AND mode='read'",
+                                      (node.pid, r["line"])).fetchone()[0]
+            if reads:
+                continue
+            out.append(f"also set here: MOVE '{r['literal']}' (reconstructed)   {self.cite_stmt(node.pid, r['line'], 'MOVE', node.name)}")
+        return out
+
+    def emit_node(self, e: _Edge, num: str, depth: int) -> None:
+        node = e.child
+        self.touch(node.pid)
+        head = f"{e.label}   {e.cites}"
+        key = (node.pid, node.name)
+        if key in self.visited:
+            self.put(depth, self.fmt(num, depth, f"{head}   (shown as {self.visited[key]})"))
+            return
+        self.visited[key] = num
+        self.count += 1
+        edges = self.edges(node)
+        uses = self.uses(node)
+        tail = ""
+        if edges and node.hop >= self.o.hops:
+            tail = f"   ({len(edges)} edge(s) not followed)" + self.end(END_HOPS.format(n=self.o.hops), num)
+            edges = []
+        elif not edges and not uses:
+            tail = self.end(END_NO_USE.format(p=node.pname), num)
+        self.put(depth, self.fmt(num, depth, head + tail))
+        for s in self.sets(node):
+            self.put(depth, self.sub(depth, s))
+        if uses:
+            self.put(depth, self.sub(depth, uses + ("" if edges else self.end(END_TESTED, num))))
+        self.children(node, edges, num, depth + 1)
+
+    emit_dataset = _Walker.emit_dataset
+    children = _Walker.children
+    dataset_leaves = _Walker.dataset_leaves
+    dds_on = _Walker.dds_on
+    dds_on_step = _Walker.dds_on_step
+    step_cards = _Walker.step_cards
+    interfaces_on = _Walker.interfaces_on
+    cite_card = _Report.cite_card
+
+    def run(self, pid: int, name: str, frow) -> None:
+        self.root_pid = pid
+        self.touch(pid)
+        p = self.prog(pid)
+        node = _FNode(pid, p["program_id"], name.upper(), frow, 0)
+        self.visited[(pid, node.name)] = "root"
+        if frow is not None:
+            self.put(0, f"- defined {self.cite_def(frow, pid)} ({_picstr(frow)}; offsets as this program's own text declares them)")
+        else:
+            cb = self.conn.execute("""SELECT m.name, f.offset, f.length, f.pic FROM field f JOIN member m ON m.id=f.member_id
+                                      WHERE UPPER(f.name)=? AND m.kind='copybook' LIMIT 1""", (node.name,)).fetchone()
+            if cb:
+                self.put(0, f"- defined in copybook {cb['name']} at the copybook's offset {cb['offset']} ({cb['pic'] or 'group'}); "
+                            f"{FALLBACK_COPY}")
+            else:
+                self.put(0, f"- not declared in {p['program_id']}'s own text; {FALLBACK_COPY}")
+        edges = self.edges(node)
+        for s in self.sets(node):
+            self.put(0, f"- {s}")
+        uses = self.uses(node)
+        if uses:
+            self.put(0, f"- {uses}" + ("" if edges else self.end(END_TESTED, "root")))
+        elif not edges:
+            self.put(0, f"- {END_NO_USE.format(p=p['program_id'])}" + self.end(END_NO_USE.format(p=p["program_id"]), "root"))
+        self.children(node, edges, "", 1)
+
+
+# ---------------------------------------------------------------------------
+# entry points
+# ---------------------------------------------------------------------------
+
+def _split_name(name: str) -> Tuple[str, List[str]]:
+    parts = re.split(r"\s+(?:OF|IN)\s+", name.strip().upper())
+    return parts[0], parts[1:]
+
+
+def _resolve_starts(conn: sqlite3.Connection, name: str, program: Optional[str]) -> Tuple[List[Tuple[int, sqlite3.Row, Optional[str]]], List[str]]:
+    """(pid, pfield row, via88) per declaring program, and the problems: an
+    ambiguous name lists its candidates and picks none (guard 4)."""
+    base, quals = _split_name(name)
+    problems: List[str] = []
+    pids: Optional[List[int]] = None
+    if program:
+        progs = Q.programs_named(conn, program)
+        if not progs:
+            return [], [f"program {program.upper()} not in index"]
+        pids = [p["id"] for p in progs]
+    names = {base}
+    for r in conn.execute("SELECT DISTINCT new_name FROM field_alias WHERE UPPER(orig_name)=?", (base,)):
+        names.add(r[0].upper())
+    for r in conn.execute("SELECT DISTINCT orig_name FROM field_alias WHERE UPPER(new_name)=?", (base,)):
+        names.add(r[0].upper())
+    q = ",".join("?" * len(names))
+    rows = conn.execute(f"SELECT * FROM pfield WHERE UPPER(name) IN ({q}) ORDER BY program_id, id", tuple(names)).fetchall()
+    via88: Dict[int, str] = {}
+    if not rows:
+        # an 88 name: its parent field, in the programs that declare it
+        for c in conn.execute("""SELECT c.name AS cname, f.id AS fid, f.name, f.member_id, f.line FROM cond88 c JOIN field f ON f.id=c.field_id
+                                 WHERE UPPER(c.name)=?""", (base,)):
+            for r in conn.execute("""SELECT * FROM pfield WHERE UPPER(name)=? AND (copy_field_id=? OR (src_member=? AND src_line=?))
+                                     ORDER BY program_id, id""", (c["name"].upper(), c["fid"], c["member_id"], c["line"])):
+                rows.append(r)
+                via88[r["id"]] = c["cname"]
+    by_prog: Dict[int, List[sqlite3.Row]] = defaultdict(list)
+    for r in rows:
+        if pids is not None and r["program_id"] not in pids:
+            continue
+        by_prog[r["program_id"]].append(r)
+    out = []
+    for pid, cands in sorted(by_prog.items(), key=lambda x: x[0]):
+        if quals:
+            cands = [c for c in cands if all(qq in (c["qualified"] or "").upper().split(".") for qq in quals)]
+        pname = conn.execute("SELECT program_id FROM program WHERE id=?", (pid,)).fetchone()[0]
+        if len(cands) == 1:
+            out.append((pid, cands[0], via88.get(cands[0]["id"])))
+        elif len(cands) > 1:
+            problems.append(f"{base} is declared {len(cands)} times in {pname}: "
+                            + ", ".join(f"{c['qualified']} (line {c['src_line']})" for c in cands)
+                            + " - HUMAN MUST VERIFY which one; run `flow \"" + base + " OF <group>\"`")
+        else:
+            problems.append(f"{base} in {pname}: no declaration matches the qualifier {' OF '.join(quals)}")
+    if not out and not problems:
+        if program:
+            pname = program.upper()
+            miss = conn.execute("""SELECT u.detail FROM unresolved u JOIN program p ON p.member_id=u.member_id
+                                   WHERE p.id IN ({}) AND u.kind IN ('expand','missing_copybook')""".format(",".join("?" * len(pids))),
+                                tuple(pids)).fetchall() if pids else []
+            if miss:
+                x = re.search(r"COPY\s+(\S+)", miss[0]["detail"])
+                problems.append(f"{base}: {END_MISSING.format(x=x.group(1) if x else '?')} in {pname}")
+            else:
+                pruned = conn.execute(f"""SELECT 1 FROM field f JOIN member m ON m.id=f.member_id
+                                          JOIN copy_use cu ON UPPER(cu.copybook)=UPPER(m.name)
+                                          JOIN program p ON p.member_id=cu.member_id
+                                          WHERE UPPER(f.name)=? AND p.id IN ({",".join("?" * len(pids))}) LIMIT 1""",
+                                      (base, *pids)).fetchone() if pids else None
+                if pruned:
+                    problems.append(f"{base} is in a copybook {pname} copies but nothing in {pname} references it (root stored pruned): "
+                                    f"no flow starts there")
+                else:
+                    problems.append(f"{base} is NOT DEFINED in {pname}")
+        else:
+            problems.append(f"{base} is NOT DEFINED in any indexed program (check spelling, REPLACING renames, or try `field`)")
+    return out, problems
+
+
+def render(conn: sqlite3.Connection, name: str, program: Optional[str] = None, up: bool = False, hops: int = 3,
+           width: int = 12, nodes: int = 200, derived: bool = False, show_all: bool = False,
+           budget: Optional[int] = None, header: bool = True) -> str:
+    opts = Opts(up=up, hops=hops, width=width, nodes=nodes, derived=derived, show_all=show_all, budget=budget, header=header)
+    if not has_flow_tables(conn):
+        return _render_fallback(conn, name, program, opts)
+    starts, problems = _resolve_starts(conn, name, program)
+    base, _q = _split_name(name)
+    direction = "up" if up else "down"
+    title_tail = ("upstream; where the value comes from" if up
+                  else "downstream; copies only - --derived adds COMPUTE/STRING")
+    bodies: List[str] = []
+    members: Set[int] = set()
+    total_nodes = 0
+    shown = starts if (show_all or program) else starts[:width]
+    for (pid, row, via88) in shown:
+        w = _Walker(conn, opts)
+        w.run(pid, row, via88)
+        w.budget_cut()
+        pname = w.prog(pid)["program_id"]
+        body = [f"# Flow of {pname}.{base} ({title_tail})"]
+        body.extend(t for _d, t in w.lines)
+        body.extend(w.sections(pname))
+        bodies.append("\n".join(body))
+        members |= w.members
+        total_nodes += w.count
+    if len(starts) > len(shown):
+        rest = starts[len(shown):]
+        names = [conn.execute("SELECT program_id FROM program WHERE id=?", (pid,)).fetchone()[0] for (pid, _r, _v) in rest]
+        bodies.append(f"... {len(rest)} more program(s) declare {base}: " + ", ".join(names) + " (--all, or --program P)")
+    for pr in problems:
+        bodies.append(f"# Flow of {base}\n- {pr}")
+    text = "\n\n".join(bodies) + "\n"
+    text += Q.unresolved_for(conn, sorted(members)) if members else "\n### Unresolved in scope\n_none in scope_\n"
+    text += FOOTER + "\n"
+    if header:
+        label = f"{program.upper()}." if program else ""
+        est = len(text) // 4
+        text = (f"<!-- flow {label}{base}: ~{est} tokens ({len(text)} chars); {direction}, hops {hops}, {total_nodes} nodes; "
+                f"{Q.index_header(conn)} -->\n") + text
+    return text
+
+
+def _render_fallback(conn: sqlite3.Connection, name: str, program: Optional[str], opts: Opts) -> str:
+    base, _q = _split_name(name)
+    if program:
+        progs = Q.programs_named(conn, program)
+        if not progs:
+            return f"# Flow of {base}\n- program {program.upper()} not in index\n{FOOTER}\n"
+    else:
+        progs = conn.execute("""SELECT DISTINCT p.*, m.name AS member_name FROM program p JOIN member m ON m.id=p.member_id
+                                WHERE p.id IN (SELECT program_id FROM field_ref WHERE UPPER(name)=?)
+                                ORDER BY p.program_id""", (base,)).fetchall()
+    direction = "up" if opts.up else "down"
+    bodies: List[str] = []
+    members: Set[int] = set()
+    total = 0
+    unpaired_total = 0
+    shown = progs if (opts.show_all or program) else progs[:opts.width]
+    for p in shown:
+        w = _Fallback(conn, opts)
+        w.run(p["id"], base, w.field_row(p["id"], base))
+        w.budget_cut()
+        body = [f"# Flow of {p['program_id']}.{base} ({'upstream' if opts.up else 'downstream'}; reconstructed)",
+                f"- {FALLBACK_HEADER}"]
+        body.extend(t for _d, t in w.lines)
+        for pid in w.programs:
+            w.move_pairs(pid)
+        n = sum(w.unpaired.values())
+        unpaired_total += n
+        body.extend(w.sections(p["program_id"], [f"- {n} MOVE statement{'s' if n != 1 else ''} could not be paired "
+                                                 f"(index predates data_flow)"]))
+        bodies.append("\n".join(body))
+        members |= w.members
+        total += w.count
+    if not progs:
+        bodies.append(f"# Flow of {base}\n- {FALLBACK_HEADER}\n- {base} is referenced by no indexed program")
+    if len(progs) > len(shown):
+        bodies.append(f"... {len(progs) - len(shown)} more program(s) reference {base}: "
+                      + ", ".join(p["program_id"] for p in progs[len(shown):]) + " (--all, or --program P)")
+    text = "\n\n".join(bodies) + "\n"
+    text += Q.unresolved_for(conn, sorted(members)) if members else "\n### Unresolved in scope\n_none in scope_\n"
+    text += FOOTER + "\n"
+    if opts.header:
+        label = f"{program.upper()}." if program else ""
+        text = (f"<!-- flow {label}{base}: ~{len(text) // 4} tokens ({len(text)} chars); {direction}, hops {opts.hops}, "
+                f"{total} nodes, reconstructed; {Q.index_header(conn)} -->\n") + text
+    return text
+
+
+def lines_from(conn: sqlite3.Connection, pid: int, name: str, hops: int = 2, width: int = 6, nodes: int = 40) -> List[str]:
+    """The hop lines of `flow NAME --program <pid>` for another report
+    (`literal`, `diff`; `flow_from` before it): where the value goes, no
+    header, no footer - the tree in a fenced block so its indentation
+    survives markdown. A name that is ambiguous or not declared here says
+    so instead of an empty answer."""
+    opts = Opts(hops=hops, width=width, nodes=nodes, header=False)
+    if not has_flow_tables(conn):
+        w = _Fallback(conn, opts)
+        w.run(pid, name, w.field_row(pid, name))
+        lines = [t for d, t in w.lines if d > 0]
+        return ([f"- {FALLBACK_HEADER}", "```"] + lines + ["```"]) if lines else []
+    pname = conn.execute("SELECT program_id FROM program WHERE id=?", (pid,)).fetchone()
+    if not pname:
+        return []
+    starts, problems = _resolve_starts(conn, name, pname[0])
+    starts = [s for s in starts if s[0] == pid]
+    if not starts:
+        return [f"- {p}" for p in problems]
+    w = _Walker(conn, opts)
+    w.run(pid, starts[0][1], starts[0][2])
+    lines = [t for d, t in w.lines if d > 0]
+    return (["```"] + lines + ["```"]) if lines else []
+
+
+_TARGET_STOP = {"ELSE", "END-IF", "END-EVALUATE", "END-PERFORM", "END-CALL", "END-STRING", "END-UNSTRING", "END-ADD",
+                "END-COMPUTE", "IF", "MOVE", "PERFORM", "GO", "CALL", "DISPLAY", "COMPUTE", "ADD", "SUBTRACT", "MULTIPLY",
+                "DIVIDE", "STRING", "UNSTRING", "SET", "READ", "WRITE", "EXEC", "EVALUATE", "WHEN", "INITIALIZE", "ACCEPT",
+                "OPEN", "CLOSE", "GOBACK", "STOP", "CONTINUE", "EXIT", "INSPECT", "ROUNDED", "ON", "SIZE", "NOT", "DELIMITED",
+                "WITH", "POINTER", "OVERFLOW", "DELIMITER", "COUNT", "RETURNING", "REMAINDER", "AT", "END", "INVALID",
+                "UNTIL", "VARYING", "THRU", "THROUGH", "TALLYING", "REPLACING", "GIVING", "TO", "FROM", "INTO", "USING",
+                "AND", "OR", "ALSO", "OTHER", "NEXT", "SENTENCE", "TIMES", "BEFORE", "AFTER"}
+_SKIP_ARG = {"BY", "REFERENCE", "CONTENT", "VALUE", "LENGTH", "OF", "ADDRESS", "OMITTED", "IN"}
+
+
+def changed_targets(lines: Sequence[str], fixed: bool) -> List[str]:
+    """The data items the changed lines set: MOVE / COMPUTE / STRING / CALL
+    USING (and the arithmetic verbs) - the starts of `diff`'s flow."""
+    code = []
+    for s in lines:
+        if fixed:
+            if len(s) > 6 and s[6] in "*/":
+                continue
+            code.append(s[7:72])
+        else:
+            code.append(s)
+    text = re.sub(r"'[^']*'|\"[^\"]*\"", "'L'", " ".join(code).upper())
+    out: List[str] = []
+
+    def names_after(m_end: int, limit: int = 8) -> List[str]:
+        got = []
+        skip_next = False
+        for tok in re.findall(r"[A-Z0-9][\w-]*|\(|\)|\.", text[m_end:]):
+            if tok == ".":
+                break
+            if tok in ("(", ")"):
+                continue
+            if tok in _TARGET_STOP and tok not in _SKIP_ARG:
+                break
+            if skip_next:
+                skip_next = False
+                continue
+            if tok in ("OF", "IN"):
+                skip_next = True
+                continue
+            if tok in _SKIP_ARG or tok[0].isdigit():
+                continue
+            got.append(tok)
+            if len(got) >= limit:
+                break
+        return got
+
+    for m in re.finditer(r"\bMOVE\b.*?\bTO\s", text):
+        out.extend(names_after(m.end()))
+    for m in re.finditer(r"\bCOMPUTE\s+([A-Z0-9][\w-]*)", text):
+        out.append(m.group(1))
+    for m in re.finditer(r"\b(?:STRING|UNSTRING)\b.*?\bINTO\s", text):
+        out.extend(names_after(m.end()))
+    for m in re.finditer(r"\b(?:ADD|SUBTRACT|MULTIPLY|DIVIDE)\b.*?\b(?:TO|GIVING)\s", text):
+        out.extend(names_after(m.end()))
+    for m in re.finditer(r"\bCALL\b.*?\bUSING\s", text):
+        out.extend(names_after(m.end(), 12))
+    seen: Set[str] = set()
+    uniq = []
+    for n in out:
+        if n in seen or n in _TARGET_STOP or n in _SKIP_ARG:
+            continue
+        if "-" in n or (n.isalpha() and len(n) > 2):
+            seen.add(n)
+            uniq.append(n)
+    return uniq[:8]

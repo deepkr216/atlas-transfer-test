@@ -40,6 +40,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 import re
 
 from . import cobol, reader, screens
+from . import flow   # the `flow` engine; it imports this module back, both at run time only
 
 
 # --------------------------------------------------------------------------
@@ -770,98 +771,6 @@ def _root_of(conn: sqlite3.Connection, field_id: int) -> sqlite3.Row:
     return r
 
 
-def flow_from(conn: sqlite3.Connection, program_id: int, program_name: str, field: str) -> List[str]:
-    """Where does the VALUE in `field` go after this program? Three routes:
-    positional CALL USING to a callee, positional LINKAGE back to a caller,
-    and the same BYTES of a file record read by another program.
-    """
-    lines: List[str] = []
-    prog = conn.execute("SELECT * FROM program WHERE id=?", (program_id,)).fetchone()
-
-    # 1. passed out via CALL ... USING (position -> callee LINKAGE)
-    for c in conn.execute("SELECT * FROM call_edge WHERE program_id=? AND using_args IS NOT NULL", (program_id,)):
-        args = [a.upper() for a in _jl(c["using_args"])]
-        if field.upper() not in args:
-            continue
-        pos = args.index(field.upper())
-        targets = [c["target"]] if c["target"] else _jl(c["resolved"])
-        if not targets:
-            lines.append(f"- passed as arg {pos + 1} of an UNRESOLVED dynamic CALL {c['via_var']} "
-                         f"({cite(conn, program_id, c['line'])}) - destination unknown")
-        for t in targets:
-            for callee in programs_named(conn, t):
-                lk = _jl(callee["linkage_using"])
-                if pos < len(lk):
-                    cf = lk[pos]
-                    refs = conn.execute("""SELECT mode, stmt, line FROM field_ref WHERE program_id=? AND name=?
-                                           AND mode IN ('display','write','test') ORDER BY line""",
-                                        (callee["id"], cf)).fetchall()
-                    r = "; ".join(f"{x['mode']} {x['stmt']} @{cite(conn, callee['id'], x['line'])}" for x in refs[:6])
-                    lines.append(f"- CALL {t} arg {pos + 1} -> **{t}.{cf}** ({cite(conn, program_id, c['line'])})"
-                                 + (f": {r}" if r else ": no display/write/test refs in callee"))
-                else:
-                    lines.append(f"- CALL {t} arg {pos + 1}: callee has only {len(lk)} LINKAGE params - mismatch")
-            if not programs_named(conn, t):
-                lines.append(f"- CALL {t} arg {pos + 1}: **{t} not in index**")
-
-    # 2. returned to callers via LINKAGE position
-    lk = [a.upper() for a in _jl(prog["linkage_using"])]
-    if field.upper() in lk:
-        pos = lk.index(field.upper())
-        for cr in conn.execute("""SELECT c.*, q.program_id AS caller FROM call_edge c JOIN program q ON q.id=c.program_id
-                                  WHERE UPPER(c.target)=? OR c.resolved LIKE ?""",
-                               (program_name.upper(), f'%"{program_name.upper()}"%')):
-            args = _jl(cr["using_args"])
-            if pos < len(args):
-                caf = args[pos]
-                refs = conn.execute("""SELECT mode, stmt, line FROM field_ref WHERE program_id=? AND name=?
-                                       AND mode IN ('display','write','test') ORDER BY line""",
-                                    (cr["program_id"], caf)).fetchall()
-                r = "; ".join(f"{x['mode']} {x['stmt']} @{cite(conn, cr['program_id'], x['line'])}" for x in refs[:6])
-                lines.append(f"- returned to caller **{cr['caller']}.{caf}** (LINKAGE pos {pos + 1}, "
-                             f"{cite(conn, cr['program_id'], cr['line'])})" + (f": {r}" if r else ""))
-
-    # 3. written to a file record, read by another program at the same bytes
-    frow = conn.execute("SELECT * FROM field WHERE member_id=? AND UPPER(name)=?",
-                        (prog["member_id"], field.upper())).fetchone()
-    if frow:
-        root = _root_of(conn, frow["id"])
-        fd = conn.execute("SELECT * FROM file_decl WHERE program_id=? AND fd_record=?",
-                          (program_id, root["name"])).fetchone() if root else None
-        if fd and fd["assign_dd"]:
-            lo, hi = frow["offset"] + 1, frow["offset"] + frow["length"]
-            dsns = conn.execute("""SELECT DISTINCT d.dsn_resolved FROM dd d JOIN step s ON s.id=d.step_id
-                                   WHERE UPPER(s.effective_pgm)=? AND UPPER(d.dd_name) LIKE ? AND d.dsn_resolved IS NOT NULL""",
-                                (program_name.upper(), f"%{fd['assign_dd'].upper()}")).fetchall()
-            for dsn in dsns:
-                readers_ = conn.execute("""SELECT DISTINCT s.effective_pgm, d.dd_name FROM dd d JOIN step s ON s.id=d.step_id
-                                           WHERE d.dsn_resolved=? AND UPPER(s.effective_pgm)<>?""",
-                                        (dsn[0], program_name.upper())).fetchall()
-                for rp in readers_:
-                    for other in programs_named(conn, rp["effective_pgm"] or ""):
-                        ofd = conn.execute("SELECT fd_record FROM file_decl WHERE program_id=? AND UPPER(assign_dd)=?",
-                                           (other["id"], rp["dd_name"].upper().split(".")[-1])).fetchone()
-                        if not ofd:
-                            continue
-                        twins = conn.execute("""SELECT f.name FROM field f JOIN field r ON r.id=(
-                                                   WITH RECURSIVE up(id,pid) AS (SELECT f.id,f.parent_id UNION ALL
-                                                   SELECT x.id,x.parent_id FROM field x JOIN up ON x.id=up.pid)
-                                                   SELECT id FROM up WHERE pid IS NULL)
-                                                WHERE f.member_id=? AND r.name=? AND f.offset+1<=? AND f.offset+f.length>=? AND f.is_group=0""",
-                                             (other["member_id"], ofd["fd_record"], hi, lo)).fetchall()
-                        for tw in twins:
-                            refs = conn.execute("""SELECT mode, stmt, line FROM field_ref WHERE program_id=? AND name=?
-                                                   AND mode IN ('display','write','test') ORDER BY line""",
-                                                (other["id"], tw["name"])).fetchall()
-                            r = "; ".join(f"{x['mode']} {x['stmt']} @{cite(conn, other['id'], x['line'])}" for x in refs[:6])
-                            lines.append(f"- bytes {lo}-{hi} of `{dsn[0]}` read by **{other['program_id']}.{tw['name']}**"
-                                         + (f": {r}" if r else ""))
-                        if not twins:
-                            lines.append(f"- `{dsn[0]}` is read by {other['program_id']} but no field covers bytes "
-                                         f"{lo}-{hi} in its {ofd['fd_record']} (copybook missing or layout differs)")
-    return lines
-
-
 def cmd_field(conn: sqlite3.Connection, name: str, show_all: bool = False,
               program: Optional[str] = None) -> str:
     defs = _field_defs(conn, name)
@@ -965,8 +874,8 @@ def cmd_field(conn: sqlite3.Connection, name: str, show_all: bool = False,
         if cap and len(rows) > cap:
             dropped = sorted({r[2] for r in rows[cap:]})
             out.append(f"_...{len(rows) - cap} more (programs: {', '.join(dropped[:20])}); `--all` shows them_\n")
-    out.append("\n> Group-level MOVEs (MOVE REC-A TO REC-B) touch this field without naming it; check the "
-               "parents listed under 'under' with `field <parent>`.\n")
+    out.append(f"\n> Where the VALUE goes - group MOVEs, READ INTO / WRITE FROM, CALL USING positions, the file's "
+               f"bytes to the reader, DB2 columns: `flow {name.upper()} --program P` (`--up`: where it comes from).\n")
 
     # DB2 columns this field is loaded from / stored to (column-level lineage)
     sc = conn.execute("""SELECT c.tbl, c.col, c.mode, c.stmt, c.line, p.program_id, p.id AS pid
@@ -1015,6 +924,15 @@ def cmd_field(conn: sqlite3.Connection, name: str, show_all: bool = False,
         out.append(table(["copybook", "field bytes", "job", "step", "card", "card bytes"], hits[:40]))
     out.append(_docs_section(conn, name.upper()))
     return "".join(out)
+
+
+def cmd_flow(conn: sqlite3.Connection, name: str, program: Optional[str] = None, up: bool = False, hops: int = 3,
+             width: int = 12, nodes: int = 200, derived: bool = False, show_all: bool = False,
+             budget: Optional[int] = None) -> str:
+    """Where the VALUE in a field goes (or, --up, comes from): the engine is
+    atlas/flow.py, outside the fact modules, so a walk fix costs no re-parse."""
+    return flow.render(conn, name, program, up=up, hops=hops, width=width, nodes=nodes, derived=derived,
+                       show_all=show_all, budget=budget)
 
 
 def cmd_literal(conn: sqlite3.Connection, value: str, field: Optional[str] = None,
@@ -1105,14 +1023,16 @@ def cmd_literal(conn: sqlite3.Connection, value: str, field: Optional[str] = Non
         out.append(f"\n**{pname}.{fld}**\n")
         if disp:
             out.append("- displayed in the same program: " + "; ".join(f"{d['stmt']} @{cite(conn, pid, d['line'])}" for d in disp) + "\n")
-        for line in flow_from(conn, pid, pname, fld):
+        # the `flow` engine (MOVE, WRITE, the job, the reader; CALL USING positions; DB2): two hops reach
+        # the program that reads the file the value was written to
+        for line in flow.lines_from(conn, pid, fld, hops=2):
             out.append(line + "\n")
             any_flow = True
         if wr:
             out.append("- also written via: " + "; ".join(f"{w['stmt']} @{cite(conn, pid, w['line'])}" for w in wr[:6]) + "\n")
     if not any_flow:
-        out.append("_no CALL/LINKAGE/file route found from the setting programs - the value may leave via "
-                   "DB2/IMS/MQ, or via a group-level MOVE (not name-traceable)_\n")
+        out.append("_`flow` found no hop from the setting programs (no copy, CALL, file, DB2, CICS or MQ route "
+                   "in the index) - see Unresolved below for what the index could not read_\n")
     mids = sorted({r["member_id"] for r in rows})
     out.append(unresolved_for(conn, mids, limit=20))
     return "".join(out)
@@ -1860,9 +1780,12 @@ def cmd_pack(conn: sqlite3.Connection, name: str, max_lines: int = 120, kind: Op
                 add("program", "\n---\n" + cmd_program(conn, pg), 2)
     else:
         add("header", cmd_field(conn, name), 0)
-    text = _fit_budget(parts, budget)
+        add("flow", "\n---\n" + flow.render(conn, name, hops=2, width=8, nodes=60, header=False), 2)
     if not keep_paths:
-        text = _strip_paths(text)
+        # per section, before the budget; the flow section names members, never files, and
+        # "COMPUTE/STRING/FUNCTION" would read as a POSIX path
+        parts = [(t, x if t == "flow" else _strip_paths(x), p) for (t, x, p) in parts]
+    text = _fit_budget(parts, budget)
     est = len(text) // 4
     return (f"<!-- pack {kind} {name.upper()}: ~{est} tokens ({len(text)} chars)"
             + (f", budget {budget}" if budget else "") + f"; {index_header(conn)} -->\n") + text
@@ -3352,6 +3275,23 @@ def cmd_diff(conn: sqlite3.Connection, old_ref: Optional[str] = None, new_ref: O
         out.append(f"- cite as `[[{oi} line \"token\"]]` / `[[{ni} line \"token\"]]` (NAME@LIBRARY: without a system "
                    f"per environment the plain [[NAME line]] form checks the production copy only)\n")
 
+    # ---- where the items set on a changed line of NEW go: `flow --hops 2` over the indexed copy's facts
+    flow_targets = flow.changed_targets([b[y] for _t, _i1, _i2, j1, j2 in ops for y in range(j1, j2)], fixed)
+    flow_section: List[str] = []
+    walked = new if new["id"] is not None else old
+    prow = conn.execute("SELECT id, program_id FROM program WHERE member_id=?", (walked["id"],)).fetchone() \
+        if walked["id"] is not None and flow_targets else None
+    if prow:
+        flow_section.append(f"\n## Flow from the changed statements (`flow --hops 2` over the facts of the indexed "
+                            f"copy {_ident(walked)})\n")
+        for t in flow_targets:
+            got = flow.lines_from(conn, prow["id"], t, hops=2)
+            flow_section.append(f"\n**{prow['program_id']}.{t}**\n")
+            flow_section.extend(ln + "\n" for ln in got)
+            if not got:
+                flow_section.append("- no hop in the index (not declared here, or nothing copies it on)\n")
+        flow_section.append(f"\n{flow.FOOTER}\n")
+
     # ---- facts that changed
     fo, fn = _facts_of(conn, old), _facts_of(conn, new)
     out.append("\n## What changed (from the index)\n")
@@ -3417,8 +3357,13 @@ def cmd_diff(conn: sqlite3.Connection, old_ref: Optional[str] = None, new_ref: O
             out.append("- **Paragraphs with changed lines**: " + ", ".join(f"`{p}`" for p in touched)
                        + f" - `walk {ni.split('/')[-1].split('@')[0]} --from PARA` / `paragraph` for what each does now\n")
         if not any_fact:
-            out.append("- no fact the index tracks changed: the edit is inside statements (a condition, a MOVE, "
-                       "a literal, a comment) - see the lines\n")
+            if flow_targets:
+                out.append("- no declaration, call, copybook, file or table changed: the edit is inside statements - "
+                           "where the items they set go is under **Flow from the changed statements**\n")
+            else:
+                out.append("- no fact the index tracks changed: the edit is inside statements (a condition, a "
+                           "literal, a comment) - see the lines\n")
+    out.extend(flow_section)
 
     # ---- the lines, both sides, their own numbers
     out.append(f"\n## Lines (`-` old {oi}, `+` new {ni}, two spaces = unchanged context)\n```\n")
@@ -4171,6 +4116,17 @@ def _main(argv: Optional[List[str]] = None) -> int:
     s.add_argument("name")
     s.add_argument("--all", action="store_true", help="every reference site (default: one cite per program/statement)")
     s.add_argument("--program", help="only this program's references")
+    s = sub.add_parser("flow", help="where a field's VALUE goes: file bytes to the reader, CALL USING positions, "
+                                    "DB2 columns, CICS carriers, local copies - every stop labelled")
+    s.add_argument("name")
+    s.add_argument("--program", help="start in this program (default: one tree per declaring program)")
+    s.add_argument("--up", action="store_true", help="upstream: where the value comes from")
+    s.add_argument("--hops", type=int, default=3, help="hops to follow (a dataset with its pass-through steps is one)")
+    s.add_argument("--width", type=int, default=12, help="branches per node before the collapse line")
+    s.add_argument("--nodes", type=int, default=200, help="nodes in total")
+    s.add_argument("--derived", action="store_true", help="also follow COMPUTE/STRING/UNSTRING/FUNCTION/INSPECT")
+    s.add_argument("--all", action="store_true", help="no width cap")
+    s.add_argument("--budget", type=int, help="character budget for the tree: the deepest hops are cut first")
     s = sub.add_parser("layout")
     s.add_argument("name")
     s.add_argument("--program", help="the 01 as this program sees it (REPLACING applied)")
@@ -4283,6 +4239,8 @@ def _run(a: argparse.Namespace) -> int:
             print(cmd_graph(conn, a.name, a.cmd, a.depth, a.args))
         elif a.cmd == "field":
             print(cmd_field(conn, a.name, a.all, a.program))
+        elif a.cmd == "flow":
+            print(cmd_flow(conn, a.name, a.program, a.up, a.hops, a.width, a.nodes, a.derived, a.all, a.budget))
         elif a.cmd == "crud":
             print(cmd_crud(conn, a.programs, a.job, a.copybook, a.system))
         elif a.cmd == "conditions":

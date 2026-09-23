@@ -344,6 +344,29 @@ class FlowParser(unittest.TestCase):
             self.assertEqual(self.f.returning, "LK-RET")
             self.assertEqual(self.f.linkage_using, ["LK-A", "LK-B"])
 
+    def test_name_ending_in_in_is_not_a_qualifier(self):
+        # `\b(OF|IN)` matched after the hyphen of WS-Q-IN and blanked `IN TO`, so
+        # `MOVE WS-Q-IN TO WM-STAT` left no field_ref and no data_flow row: the
+        # CICS chain (READQ INTO WS-Q-IN, MOVE, SEND MAP) stopped one hop early.
+        f = cobol.parse_program("\n".join([
+            "       IDENTIFICATION DIVISION.",
+            "       PROGRAM-ID. QUALIN.",
+            "       DATA DIVISION.",
+            "       WORKING-STORAGE SECTION.",
+            "       01  WS-Q-IN                  PIC X(02).",
+            "       01  REC-OF.",
+            "           05  WM-STAT              PIC X(02).",
+            "       PROCEDURE DIVISION.",
+            "           MOVE WS-Q-IN TO WM-STAT IN REC-OF.",
+            "           MOVE 'AB' TO WS-Q-IN.",
+            "           GOBACK."]) + "\n")
+        self.assertIn(("WS-Q-IN", "read", "MOVE", 9), f.field_refs)
+        self.assertIn(("WM-STAT", "write", "MOVE", 9), f.field_refs)
+        self.assertNotIn("REC-OF", {r[0] for r in f.field_refs})          # a real qualifier is still blanked
+        self.assertEqual([(r.src_name, r.dst_name, r.dst_qual) for r in f.flows if r.kind == "move"],
+                         [("WS-Q-IN", "WM-STAT", "REC-OF")])
+        self.assertIn(("AB", "move_to", "WS-Q-IN", 10), f.literal_refs)
+
     def test_existing_refs_unchanged(self):
         # The flow pass reads the same statements; the facts it already made
         # must not move by a line or a mode (guard 26). Snapshot taken from the
