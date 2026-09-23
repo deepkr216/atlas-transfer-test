@@ -150,6 +150,7 @@ python -m atlas.query --db atlas.db ambiguous          # duplicate member names 
 python -m atlas.query --db atlas.db program  CLMPOST
 python -m atlas.query --db atlas.db job      CLMNIGHT
 python -m atlas.query --db atlas.db field    PM-POLICY-STATUS
+python -m atlas.query --db atlas.db flow     WS-STATUS --program CLMPOST   # where the VALUE goes: file, CALL USING, DB2 (--up: where it comes from)
 python -m atlas.query --db atlas.db literal  E001               # where is this code set / tested / shown
 python -m atlas.query --db atlas.db values   WS-GENDER-CD       # every value the code assumes (incl. undocumented)
 python -m atlas.query --db atlas.db pair     WS-REL-CD WS-GENDER-CD   # cross-field rules (son must be male)
@@ -328,6 +329,29 @@ falls back to the bare PROC only when no indexed job expands it.
   (write/read/test/display), 88s, literals, screen fields, sort cards, the
   **DB2 columns** it is loaded from or stored to, and the **IMS DL/I calls**
   whose I/O area contains it (GU/GN read into it, ISRT/REPL write from it).
+- `flow FIELD [--program P] [--up] [--hops 3] [--width 12] [--nodes 200]
+  [--derived] [--all] [--budget N]` — where the **value** in a field goes,
+  hop by hop, as bytes inside one 01 of one program (never a bare name:
+  without `--program`, one tree per program that declares it). In a fixed
+  order, cross-program first: the record it is moved into, the WRITE, the
+  dataset and every step and program that reads the same bytes (plain sorts
+  and IEBGENER/IDCAMS copies pass through; a sort with INREC/OUTREC ends);
+  `CALL ... USING` by position into the callee's LINKAGE (the ENTRY the CALL
+  named, each dynamic-CALL candidate labelled), a LINK's COMMAREA to
+  DFHCOMMAREA, and LINKAGE back to every caller; DB2 columns to their static
+  readers as one table; IMS segments by DBD; CICS queues and maps; MQ
+  queues; then the local copies - MOVE, MOVE CORR by name, READ INTO, WRITE
+  FROM, group MOVEs cut to the target's length. Every widening (REDEFINES,
+  parent group, OCCURS, ODO) is printed as `also read as:`, every stop ends
+  with a fixed reason (`[end: callee not in index]`, `[end: sort step
+  re-arranges bytes - mapping not indexed]`, `[end: hop limit 3]`...), and a width cap names every program it
+  dropped. `--up` asks where the value comes from. COMPUTE / STRING /
+  UNSTRING are counted, not followed, unless `--derived`. Flow-insensitive:
+  a hop is a copy that CAN happen - statement order and IF guards are not
+  evaluated (the guard is printed). On an index built before the value-flow
+  re-parse it reconstructs MOVE pairs from lines with one MOVE only and marks
+  every hop `(reconstructed)`. `diff OLD NEW` runs it from every changed
+  MOVE / COMPUTE / STRING / CALL.
 - `column TABLE.COL` — every program that writes the column (INSERT/UPDATE
   from a host variable, with where that host variable was set), reads it
   (SELECT INTO / FETCH INTO, with where the value goes next) or filters on

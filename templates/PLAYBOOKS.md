@@ -31,12 +31,19 @@ python -m atlas.query --db atlas.db layout   PMASTREC              > y.md   # th
 python -m atlas.query --db atlas.db crud     --copybook PMASTREC   > x.md   # who creates/reads/updates/deletes
 python -m atlas.query --db atlas.db literal  AC                    > l.md   # for each 88 value in play
 python -m atlas.query --db atlas.db interfaces --dsn PROD.POLICY   > i.md   # does the record leave the mainframe?
+python -m atlas.query --db atlas.db flow PM-POLICY-STATUS --program CLMPOST      > w.md   # where its VALUE goes, per writing program
+python -m atlas.query --db atlas.db flow PM-POLICY-STATUS --program CLMPOST --up > u.md   # where it comes from
 ```
 
 Hand the model: `f.md`, `c.md`, `y.md`, `x.md`, the relevant `l.md`s, `i.md`,
-and the change request - or one `pack copybook PMASTREC --budget 12000`.
+`w.md` / `u.md` for each program `f.md` lists as a writer, and the change
+request - or one `pack copybook PMASTREC --budget 12000`.
 `field` follows COPY REPLACING renames (`LK-POLICY-STATUS`), answers an 88
-name, and never drops a program silently.
+name, and never drops a program silently. `flow` follows the value by bytes:
+MOVEs (group moves cut to the target), the record to the dataset and every
+program that reads those bytes, CALL USING positions into the callee and back,
+DB2 columns to their readers; each branch ends with a fixed `[end: ...]`
+reason the model repeats, never smooths over.
 
 The model must produce, in FACTS: (1) every copybook copy and its offset/length
 for the field, flagging version skew; (2) every program including each copy,
@@ -49,7 +56,8 @@ non-mainframe consumers are all in scope), and which programs need
 RECOMPILE-ONLY vs SOURCE-CHANGE vs BIND vs DATA-CONVERSION.
 
 HUMAN MUST VERIFY: unresolved dynamic CALLs in scope, copies not marked
-authoritative, any consumer outside the index.
+authoritative, any consumer outside the index, every `flow` branch that ends
+at a width/node/hop cap or says HUMAN MUST VERIFY.
 
 ## A2. What does this job do
 

@@ -23,6 +23,7 @@ and you say so.
 ```
 python -m atlas.query --db atlas.db --out work/pack.md       pack <NAME> [--kind program|job|copybook|transaction|field] [--budget 12000]
 python -m atlas.query --db atlas.db --out work/field.md      field <FIELD> [--all] [--program PGM]
+python -m atlas.query --db atlas.db --out work/flow.md       flow <FIELD> --program <PGM> [--up] [--hops 3]   # where the VALUE goes (--up: comes from), every stop labelled
 python -m atlas.query --db atlas.db --out work/layout.md     layout <COPYBOOK> [--program PGM]
 python -m atlas.query --db atlas.db --out work/literal.md    literal <CODE>
 python -m atlas.query --db atlas.db --out work/values.md     values <FIELD>
@@ -95,7 +96,9 @@ Every answer has these sections, in this order:
 - The same copybook differs between systems; check the skew the `field`
   report flags. Same member name is not the same program (`ambiguous`).
 - Group-level MOVEs, READ INTO, WRITE FROM, INITIALIZE and CALL BY REFERENCE
-  touch fields without naming them.
+  touch fields without naming them. `flow` follows them by bytes and USING
+  position; repeat its `[end: ...]` reasons. A hop is a copy that CAN happen,
+  and a `(reconstructed)` hop comes from an index older than the re-parse.
 - A never-PERFORMed paragraph may still run (GO TO, fall-through, SORT
   procedures); a program with no caller may be started by a transaction,
   an INTRDR submit or the scheduler.

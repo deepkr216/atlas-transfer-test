@@ -108,6 +108,24 @@
       "problemMatcher": []
     },
     {
+      "label": "Atlas: flow (where a value goes) -> work/flow.md",
+      "detail": "The field's value hop by hop from one program: file bytes to every reader, CALL USING positions, DB2 columns, local copies; every stop labelled.",
+      "type": "shell",
+      "command": "python -m atlas.query --db atlas.db --out work/flow.md flow ${input:field} --program ${input:program}",
+      "options": {"cwd": "${workspaceFolder}", "env": {"PYTHONUTF8": "1"}},
+      "presentation": {"reveal": "always", "panel": "shared", "showReuseMessage": false},
+      "problemMatcher": []
+    },
+    {
+      "label": "Atlas: flow --up (where a value comes from) -> work/flow-up.md",
+      "detail": "The same walk upstream: the MOVEs, callers, readers-to-writers and DB2 writers that can put the value in the field.",
+      "type": "shell",
+      "command": "python -m atlas.query --db atlas.db --out work/flow-up.md flow ${input:field} --program ${input:program} --up",
+      "options": {"cwd": "${workspaceFolder}", "env": {"PYTHONUTF8": "1"}},
+      "presentation": {"reveal": "always", "panel": "shared", "showReuseMessage": false},
+      "problemMatcher": []
+    },
+    {
       "label": "Atlas: layout -> work/layout.md",
       "detail": "Byte layout of a copybook (record length on top) - for test data and interface contracts.",
       "type": "shell",

@@ -22,6 +22,7 @@ error code or dependency, run the matching query first:
 python -m atlas.query --db atlas.db program  <NAME>
 python -m atlas.query --db atlas.db job      <NAME>
 python -m atlas.query --db atlas.db field    <NAME>
+python -m atlas.query --db atlas.db flow     <FIELD> --program <PGM> [--up] [--hops 3]   # where the VALUE goes (--up: comes from): file bytes, CALL USING, DB2, local copies
 python -m atlas.query --db atlas.db literal  <VALUE> [--field <FIELD>] [--like]
 python -m atlas.query --db atlas.db values   <FIELD>          # every value the code assumes
 python -m atlas.query --db atlas.db pair     <FIELD1> <FIELD2> # cross-field rules
@@ -119,7 +120,11 @@ Every answer has these sections, in this order:
   marked authoritative, say which copy you used.
 - **Group-level MOVEs, READ INTO, WRITE FROM, INITIALIZE and CALL BY REFERENCE
   touch fields without naming them.** Field-name search alone understates
-  impact; follow the parent group and the CALL USING positions.
+  impact. `flow FIELD --program P` follows group moves by bytes and CALL
+  USING by position (the ENTRY the CALL named) - use it, and repeat its
+  `[end: ...]` reasons and `also read as:` overlays; a hop is a copy that CAN
+  happen (order and IF guards not evaluated). A `(reconstructed)` hop comes
+  from an index built before the value-flow re-parse: say so.
 - **A never-PERFORMed paragraph may still run** (fall-through, GO TO). Never
   call code dead without saying which caveats were not checked.
 - **Documents describe intent; code describes behaviour.** Quote both when

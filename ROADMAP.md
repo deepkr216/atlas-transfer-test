@@ -101,7 +101,8 @@ only; `no` = not handled.
    medium). Derive the segment from the SSA's literal; join a MID's MFLD
    offsets to the I/O-area 01 of the program that GUs the I/O PCB.
 4. **RM-04 Lineage, batch order, restart, release diff** (P1, large).
-   `lineage --upstream/--downstream`, `flow JOB --before/--after`,
+   `lineage --upstream/--downstream`: **delivered** for values as `flow FIELD` /
+   `flow FIELD --up` (next re-parse batch, item 14). `flow JOB --before/--after`,
    `schedule`, `restart JOB STEP`. Release diff: **delivered** as
    `diff OLD NEW` / `diff --system SYS-TEST` (one folder per environment
    under `estate\`, the folder names the system).
@@ -166,16 +167,23 @@ shipped alone and cost one such night; these still wait for the next one:
 13. Parser reach (from his coverage tables): dynamic CALL targets across
     members, `sql_cursor` declared in another member, INTRDR-submitted JCL
     through a card member, the MFS macros in his estate.
-14. **Value flow** - `flow FIELD`: one `data_flow` row per (source, target) a MOVE / COMPUTE /
-   STRING / CALL USING / WRITE FROM / SQL INTO moves data between, per-program field offsets
-   (`pfield`), `call_arg` / `param` tables, and a walk that labels every widening (group MOVE,
-   REDEFINES, subscripts, truncation at the landing field) and every stop instead of following
-   silently. Full plan: docs/PLAN-value-flow.md. His example: 'if I change a MOVE statement it
-   could have business impact through the calling tree - the tool cannot identify those'.
-15. **`ADD A B GIVING C` records C as read, not written** (also SUBTRACT / MULTIPLY / DIVIDE
-   ... GIVING, and RETURNING on a CALL is lost): `_ARITH` in cobol.py stops at TO/FROM/BY/INTO and
-   never sees GIVING, so `field C` lists the statement under 'read' and an impact search for who
-   sets C misses it. Found by the value-flow review (LESSONS 174); the fix is in the plan, step 2.4.
+14. **Value flow** (RM-04, first part): `pfield` (per-program data items with section, FD, this
+   program's offsets, ODO flag, link to the copybook row; unused roots pruned), `data_flow` (one row
+   per source->target pair per verb: MOVE / CORR / literal / figurative / arithmetic / STRING /
+   UNSTRING / INITIALIZE / SET / SET ADDRESS OF / ACCEPT / READ INTO / WRITE FROM / bare READ-WRITE /
+   INSPECT / FUNCTION / RETURNING / EXEC CICS FROM-INTO / DL/I / MQ, with the enclosing IF as
+   `guard`), `call_arg` (BY REFERENCE / CONTENT / VALUE / LENGTH OF / ADDRESS OF / COMMAREA / START
+   FROM), `param` (PROCEDURE DIVISION USING, every ENTRY, RETURNING, DFHCOMMAREA), `file_record`
+   (every 01 under an FD), `field_ref.pfield_id`, `sql_col_ref.pfield_id`, `call_edge.returning`;
+   `ADD a b GIVING c` records `c` as a write (LESSONS 174); `expand_map` dropped. Query `flow FIELD`
+   reads them; on an index built before this batch it reconstructs MOVE pairs from single-pair lines
+   only and marks every hop `(reconstructed)`.
+15. **Done with item 14** - **`ADD A B GIVING C` records C as read, not written** (also SUBTRACT /
+   MULTIPLY / DIVIDE ... GIVING, and RETURNING on a CALL is lost): `_ARITH` in cobol.py stopped at
+   TO/FROM/BY/INTO and never saw GIVING, so `field C` listed the statement under 'read' and an impact
+   search for who sets C missed it. Found by the value-flow review (LESSONS 174). Now the GIVING target
+   is a write and a CALL's RETURNING item is kept (`call_edge.returning`);
+   `test_add_giving_without_to_is_a_write`.
 16. **OS/VS `01 data-name COPY text.`** (also `77 ... COPY`, `FD file-name COPY`, `SD ... COPY`; the
    COPY may sit on the next line): the compiler copies the library text and puts data-name in place of
    the library's own 01 / 77 / FD / SD name. expand.py commented out the whole line, so the program's
@@ -185,6 +193,38 @@ shipped alone and cost one such night; these still wait for the next one:
    ways, the program's `field` row); a library that starts at 05 hangs under the program's own 01,
    kept as code. `01 X.` with the COPY after the period is unchanged (LESSONS 177).
 
+### flow: known limits (open after review)
+
+Found by the reviewer of the `flow` engine and left open after four fix rounds; each is a wrong or
+missing answer to know about before the merge. None needs a re-parse to fix (atlas/flow.py only).
+
+- **`diff` misses a changed MOVE whose sender ends in `-TO`, and takes the wrong target on ADD ...
+  TO ... GIVING.** `changed_targets` matches `\bMOVE\b.*?\bTO\s`, and `\b` matches after a
+  hyphen: `MOVE WS-BILL-TO TO OUT-BILL-TO` gives no target, so `diff` prints no "Flow from the
+  changed statements" section; `ADD WS-A TO WS-B GIVING WS-C` gives WS-B, which that statement
+  does not change (the LESSONS 174 shape). Fix: `(?<![\w-])` on the keywords, as cobol.py does,
+  and GIVING replaces the TO operands.
+- **`--up` silently drops a BY REFERENCE argument to a callee that can write it but cannot be
+  followed**: a callee not in the index, an unresolved dynamic CALL, a `(+N more)` candidate list,
+  a position out of range. Downstream ends each with a labelled `[end: ...]`; upstream prints
+  nothing, so the origins look complete. Example: `flow WS-ERR-CD --program ERRPGM --up` never
+  mentions `CALL 'ERRLOG' USING WS-ERR-CD`, and ERRLOG may set the field. Both walkers (exact and
+  fallback).
+- **The cite on an FTP / NDM step fails the gate.** The interface pseudo-DD (`*FTP*`) sits on the
+  EXEC line, but the cite quotes `"//*FTP* DD"`, which is not on that line: `verify_citations`
+  says FAIL. Any value that reaches a dataset sent by FTP or NDM prints it (the fixtures have no
+  FTP step, so the gate test does not see it). Fix: quote the EXEC text, or cite the line with no
+  token.
+- **Fallback `--up` (index before the re-parse) prints a dynamic CALL as a static one**:
+  `CALL FLOWSUB arg 2 <- ...` where the exact walker says `CALL FLOWSUB (candidate: resolved via
+  MOVE literal)`. The cite still shows `CALL WS-PGM`, so a reader can see it.
+- **Fallback nodes never print `[program partial: ...]`** (guard 23): on the index before the
+  re-parse a program with a missing copybook looks complete in the tree; only the `Unresolved in
+  scope` table lists the missing COPY.
+- **ICEGENER ends as `utility step - bytes not modelled`**, while IEBGENER (the same plain copy
+  SYSUT1 -> SYSUT2 in jcl.py) passes the bytes through to the reader. The end is labelled, so
+  nothing wrong is claimed; the readers after an ICEGENER copy are not reached.
+
 ## What the tool was not built for - scenario audit (2026-09-21)
 
 docs/AUDIT-scenarios-2026-09-21.md lists the scenarios a month of real analysis asks (change impact, abends,
@@ -192,16 +232,6 @@ data fixes, audits) and marks each full / partial / none against the tool as it 
 change-impact work. Three families are open: following a VALUE across renames (item 14 above closes most of
 it), ORDER IN TIME (which write is live at the CALL, which job ran before this one), and OVERLAP judgement
 (REDEFINES, group moves, truncation). Pick from that table; do not add to it from guesswork.
-14. **Value flow** - `flow FIELD`: one `data_flow` row per (source, target) a MOVE / COMPUTE /
-   STRING / CALL USING / WRITE FROM / SQL INTO moves data between, per-program field offsets
-   (`pfield`), `call_arg` / `param` tables, and a walk that labels every widening (group MOVE,
-   REDEFINES, subscripts, truncation at the landing field) and every stop instead of following
-   silently. Full plan: docs/PLAN-value-flow.md. His example: 'if I change a MOVE statement it
-   could have business impact through the calling tree - the tool cannot identify those'.
-15. **`ADD A B GIVING C` records C as read, not written** (also SUBTRACT / MULTIPLY / DIVIDE
-   ... GIVING, and RETURNING on a CALL is lost): `_ARITH` in cobol.py stops at TO/FROM/BY/INTO and
-   never sees GIVING, so `field C` lists the statement under 'read' and an impact search for who
-   sets C misses it. Found by the value-flow review (LESSONS 174); the fix is in the plan, step 2.4.
 
 ## What stays out of reach, by design
 
