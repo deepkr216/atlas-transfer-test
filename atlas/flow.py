@@ -75,6 +75,21 @@ END_HOPS = "hop limit {n}"
 END_WIDTH = "width cap"
 END_NODES = "node cap"
 
+# The member whose line numbers a DD row carries. A step expanded from a PROC into a job keeps the
+# PROC's lines (the step, its DDs, an FTP / NDM pseudo-DD on its EXEC) but belongs to the job; a
+# //STEP.DD override and a JOBLIB DD are the job's own lines. The PROC is the in-stream one of the
+# job's member first (JCL looks there first), else the one cataloged PROC of that name; with none
+# or several the job's member stays, and a cite there fails the gate rather than pass on a
+# statement it does not mean.
+_DD_MEMBER = """COALESCE(CASE WHEN s.from_proc IS NOT NULL AND COALESCE(d.is_override, 0)=0
+                                   AND COALESCE(d.mode_source, '')<>'joblib' THEN
+                    COALESCE((SELECT MIN(mi.name) FROM proc_def pi JOIN member mi ON mi.id=pi.member_id
+                              WHERE UPPER(pi.proc_name)=UPPER(s.from_proc) AND pi.instream=1 AND pi.member_id=j.member_id),
+                             (SELECT CASE WHEN COUNT(DISTINCT pc.member_id)=1 THEN MIN(mc.name) END
+                              FROM proc_def pc JOIN member mc ON mc.id=pc.member_id
+                              WHERE UPPER(pc.proc_name)=UPPER(s.from_proc) AND pc.instream=0)) END,
+                m.name)"""
+
 COPY_KINDS = ("move", "move_corr", "set", "read_into", "write_from")
 DERIVED_KINDS = ("arith", "string", "unstring", "function", "inspect")
 SET_KINDS = ("literal", "figurative", "initialize", "accept")
@@ -1000,7 +1015,8 @@ class _Walker(_Report):
     def steps_of(self, pname: str) -> List[sqlite3.Row]:
         return self.conn.execute("""SELECT d.id AS dd_id, d.dd_name, d.dsn_resolved, d.mode, d.mode_source, d.gdg_rel,
                                            d.is_temp, d.line AS dd_line, s.id AS step_id, s.step_name, s.effective_pgm AS pgm,
-                                           s.launcher, s.job_id, s.proc_id, j.job_name, pd.proc_name, m.name AS member_name
+                                           s.launcher, s.job_id, s.proc_id, j.job_name, pd.proc_name, m.name AS owner_name,
+                                           """ + _DD_MEMBER + """ AS member_name
                                     FROM dd d JOIN step s ON s.id=d.step_id LEFT JOIN job j ON j.id=s.job_id
                                     LEFT JOIN proc_def pd ON pd.id=s.proc_id
                                     LEFT JOIN member m ON m.id=COALESCE(j.member_id, pd.member_id)
@@ -1010,7 +1026,8 @@ class _Walker(_Report):
     def dds_on(self, dsn: str) -> List[sqlite3.Row]:
         return self.conn.execute("""SELECT d.id AS dd_id, d.dd_name, d.dsn_resolved, d.mode, d.mode_source, d.gdg_rel,
                                            d.is_temp, d.line AS dd_line, s.id AS step_id, s.step_name, s.effective_pgm AS pgm,
-                                           s.launcher, s.job_id, s.proc_id, j.job_name, pd.proc_name, m.name AS member_name
+                                           s.launcher, s.job_id, s.proc_id, j.job_name, pd.proc_name, m.name AS owner_name,
+                                           """ + _DD_MEMBER + """ AS member_name
                                     FROM dd d JOIN step s ON s.id=d.step_id LEFT JOIN job j ON j.id=s.job_id
                                     LEFT JOIN proc_def pd ON pd.id=s.proc_id
                                     LEFT JOIN member m ON m.id=COALESCE(j.member_id, pd.member_id)
@@ -1122,6 +1139,7 @@ class _Walker(_Report):
                 # the step that sends (or, upstream, receives) the dataset: the bytes leave the estate here
                 kind = pgm.strip("*").lower()
                 iface_at.add((s["member_name"], s["dd_line"]))
+                iface_at.add((s["owner_name"], s["dd_line"]))      # the interface_edge row sits on the job
                 leaves.append(_Leaf(list(path), f"{job} {s['step_name']} {launcher or kind.upper()}",
                                     self.cite_dd(s["member_name"], s["dd_line"], s["dd_name"], False, s["step_name"]),
                                     end=END_INTERFACE.format(x=kind)))
@@ -1157,7 +1175,7 @@ class _Walker(_Report):
                     blind = self.unindexed_sysin(s["step_id"])
                     if blind is not None:
                         leaves.append(_Leaf(list(path), f"{job} {s['step_name']} {launcher}: control cards not indexed",
-                                            self.cite_dd(s["member_name"], blind, "SYSIN", True), end=END_UTILITY))
+                                            self.cite_dd(blind[0], blind[1], "SYSIN", True), end=END_UTILITY))
                         continue
                 other = "input" if up else "output"
                 outs = [x for x in self.dds_on_step(s["step_id"]) if x["mode"] == other and x["dsn_resolved"] != dsn]
@@ -1184,40 +1202,52 @@ class _Walker(_Report):
             for lf in reader_fn(progs[0], s, here + gdg, ds):
                 lf.path = list(path) + lf.path
                 leaves.append(lf)
+        shown: Set[Tuple[str, str]] = set()
         for (kind, mem, ln) in self.interfaces_on(dsn):
             if (mem, ln) in iface_at:
                 continue            # the step above already ends there
-            leaves.append(_Leaf(list(path), f"{dsn} {kind}", self.cite_iface(mem, ln, dsn),
-                                end=END_INTERFACE.format(x=kind)))
+            cite = self.cite_iface(mem, ln, dsn)
+            if cite and (kind, cite) in shown:
+                continue            # a PROC's step and its expansion in a job: one interface, one line
+            shown.add((kind, cite))
+            leaves.append(_Leaf(list(path), f"{dsn} {kind}", cite, end=END_INTERFACE.format(x=kind)))
         return leaves
 
     def cite_iface(self, mem: Optional[str], ln: Optional[int], dsn: str) -> str:
         """The cite of an interface_edge row on the DSN: the DSN where its
         line names it (a CSD TDQUEUE DSNAME), else the EXEC line of the step
-        written in that member at that line that carries the DSN as its
-        pseudo-DD. A row whose line cannot be tied to the DSN gets no cite -
-        never the text of an unrelated statement that happens to be there."""
+        of that member at that line that carries the DSN as its pseudo-DD
+        (for a step expanded from a PROC the row sits on the job with the
+        PROC's line: the PROC member is cited). A row whose line cannot be
+        tied to the DSN gets no cite - never the text of an unrelated
+        statement that happens to be there."""
         if not mem or not ln:
             return ""
         if dsn.upper() in self.raw(mem, ln).upper():
             return f'{mem}:{ln} "{self._tok(dsn)}"'
-        st = self.conn.execute("""SELECT s.step_name, d.dd_name FROM step s JOIN dd d ON d.step_id=s.id
+        st = self.conn.execute("""SELECT s.step_name, d.dd_name, """ + _DD_MEMBER + """ AS member_name
+                                  FROM step s JOIN dd d ON d.step_id=s.id
                                   LEFT JOIN job j ON j.id=s.job_id LEFT JOIN proc_def pd ON pd.id=s.proc_id
                                   JOIN member m ON m.id=COALESCE(j.member_id, pd.member_id)
-                                  WHERE m.name=? AND s.line=? AND s.from_proc IS NULL AND d.dsn_resolved=?
-                                  AND d.dd_name LIKE '*%' LIMIT 1""", (mem, ln, dsn)).fetchone()
-        return self.cite_dd(mem, ln, st["dd_name"], False, st["step_name"]) if st else ""
+                                  WHERE m.name=? AND s.line=? AND d.line=s.line AND d.dsn_resolved=? AND d.dd_name LIKE '*%'
+                                  ORDER BY s.from_proc IS NOT NULL, s.id LIMIT 1""", (mem, ln, dsn)).fetchone()
+        return self.cite_dd(st["member_name"], ln, st["dd_name"], False, st["step_name"]) if st else ""
 
-    def unindexed_sysin(self, step_id: int) -> Optional[int]:
-        """The line of the step's SYSIN DD (or a dataset concatenated to it)
-        that is not DUMMY and whose control-card text is not indexed; None
-        when every SYSIN is DUMMY or indexed, or there is none."""
+    def unindexed_sysin(self, step_id: int) -> Optional[Tuple[str, int]]:
+        """(member, line) of the step's SYSIN DD (or a dataset concatenated
+        to it) that is not DUMMY and whose control-card text is not indexed;
+        None when every SYSIN is DUMMY or indexed, or there is none. In the
+        order the step lists its DDs: a PROC step's lines and a job
+        override's are in two members, so line order means nothing."""
         cur = ""
-        for r in self.conn.execute("SELECT dd_name, mode, dsn_resolved, sysin_text, line FROM dd WHERE step_id=? "
-                                   "ORDER BY line, concat_seq", (step_id,)):
+        for r in self.conn.execute("""SELECT d.dd_name, d.mode, d.sysin_text, d.line, """ + _DD_MEMBER + """ AS member_name
+                                      FROM dd d JOIN step s ON s.id=d.step_id LEFT JOIN job j ON j.id=s.job_id
+                                      LEFT JOIN proc_def pd ON pd.id=s.proc_id
+                                      LEFT JOIN member m ON m.id=COALESCE(j.member_id, pd.member_id)
+                                      WHERE d.step_id=? ORDER BY d.id""", (step_id,)):
             cur = (r["dd_name"] or cur).upper().split(".")[-1]
             if cur == "SYSIN" and r["mode"] != "dummy" and r["sysin_text"] is None:
-                return r["line"]
+                return r["member_name"], r["line"]
         return None
 
     def dds_on_step(self, step_id: int) -> List[sqlite3.Row]:

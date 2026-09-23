@@ -2065,7 +2065,9 @@ class FlowKnownLimits(unittest.TestCase):
             self.assertEqual(w.cite_dd("KFJOB", 2, "*FTP*", False, "S1.P1"), 'KFJOB:2 "//P1 EXEC"')
             # an interface row is cited only where its line is tied to the DSN
             self.assertEqual(w.cite_iface("KFJOB", 2, "TEST.KP.IN"), 'KFJOB:2 "//F1       EXEC PGM=FTP"')
-            self.assertEqual(w.cite_iface("KFJOB", 2, "TEST.KP.RAW"), "")
+            # the row of the PUT that S1 runs sits on KFJOB with FTPPROC's line: FTPPROC is cited
+            self.assertEqual(w.cite_iface("KFJOB", 2, "TEST.KP.RAW"), 'FTPPROC:2 "//P1       EXEC PGM=FTP"')
+            self.assertEqual(w.cite_iface("KFJOB", 3, "TEST.KP.RAW"), "")
             self.assertEqual(w.cite_iface("FTPPROC", 2, "TEST.KP.RAW"), 'FTPPROC:2 "//P1       EXEC PGM=FTP"')
         finally:
             conn.close()
@@ -2083,6 +2085,24 @@ class FlowKnownLimits(unittest.TestCase):
             for cite, status in self.gate(down, up).items():
                 if status == "PASS":
                     self.assertNotRegex(cite, r"KPJOB 5|KFJOB 2", cite)
+
+    def test_a_proc_step_in_a_job_cites_the_proc_member(self):
+        # the DDs of a step expanded from a PROC carry the PROC's line numbers: the cite names the PROC member,
+        # so it is the DD it claims and the gate passes; the job's own DDs stay on the job
+        for db in (self.db, self.old):
+            down = self.flow("WS-PCODE", "--program", "KPW", db=db)
+            self.assertRegex(down, r'KPJOB S1\.P1 DD PIN\b.*RDPROC:5 "//PIN DD"')
+            self.assertRegex(down, r'KFJOB S1\.P1 FTP   FTPPROC:2 "//P1       EXEC PGM=FTP"   \[end: dataset leaves the mainframe')
+            self.assertRegex(down, r'KPJOB:3 "//POUT DD DSN=TEST\.KP\.RAW"')
+            up = self.flow("IP-CODE", "--program", "KPR", "--up", db=db)
+            self.assertRegex(up, r'KPJOB S1\.P1 DD PIN\b.*RDPROC:5 "//PIN DD DSN=TEST\.KP\.RAW"')
+            # the PROC's own interface row and its expansion in KFJOB are one line under each reader
+            self.assertEqual(len(re.findall(r"(?m)^1\.\d+\s+TEST\.KP\.RAW ftp ", up)), 1, up)
+            self.assertNotRegex(up, r"TEST\.KP\.RAW ftp   \[end")          # never without its cite
+            g = self.gate(down, up)
+            self.assertEqual([c for c, st in g.items() if st != "PASS"], [], g)
+            self.assertNotIn("KPJOB 5", " ".join(g))
+            self.assertNotIn("KFJOB 2", " ".join(g))
 
     def test_an_idcams_step_cites_its_own_exec_line(self):
         # every pseudo-DD cite knows its step, so the *REPRO* rows on C5's EXEC line quote that EXEC and pass
