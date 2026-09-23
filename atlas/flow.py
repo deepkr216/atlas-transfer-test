@@ -1256,12 +1256,8 @@ class _Walker(_Report):
                         continue
                     note = ""
                 if prm["pfield"] is None:
-                    miss = self.conn.execute("""SELECT detail FROM unresolved WHERE member_id=? AND kind IN ('expand','missing_copybook')
-                                                LIMIT 1""", (callee["member_id"],)).fetchone()
-                    x = (re.search(r"COPY\s+(\S+)", miss["detail"]).group(1) if miss and re.search(r"COPY\s+(\S+)", miss["detail"])
-                         else "?")
                     out.append(_Edge(2, cname, a["cline"], f"{callname} arg {a['pos']} -> {cname}.{prm['name']}", cites,
-                                     end=END_MISSING.format(x=x), extra=extra))
+                                     end=END_MISSING.format(x=self.missing_copy(callee)), extra=extra))
                     continue
                 ppf = self.pf(prm["pfield"])
                 if a["how"] == "address_of":
@@ -1288,6 +1284,13 @@ class _Walker(_Report):
                     out.append(_Edge(2, cname, a["cline"], label, cites, child=ch, extra=extra))
                     extra = []
         return out
+
+    def missing_copy(self, callee) -> str:
+        """The COPY a callee's parameter would have come from (END_MISSING)."""
+        miss = self.conn.execute("""SELECT detail FROM unresolved WHERE member_id=? AND kind IN ('expand','missing_copybook')
+                                    LIMIT 1""", (callee["member_id"],)).fetchone()
+        m = re.search(r"COPY\s+(\S+)", miss["detail"]) if miss else None
+        return m.group(1) if m else "?"
 
     def address_of_edges(self, node: _Node, a, callee, ppf, cites: str, callname: str) -> List[_Edge]:
         """ADDRESS OF x passed: the callee's SET ADDRESS OF a TO param makes
@@ -1915,9 +1918,13 @@ class _Walker(_Report):
         cites = self.cite_stmt(pid, r["line"], "CALL", r["dst_name"])
         if c is None:
             return []
-        targets = [c["target"]] if c["target"] else [t for t, _c in _candidates(c) if not t.startswith("(+")]
+        targets = [c["target"]] if c["target"] else [t for t, _c in _candidates(c)]
         out = []
         for t in targets:
+            if t.startswith("(+"):
+                out.append(_Edge(2, "?", r["line"], f"RETURNING <- {c['via_var']}: {t} candidate(s) not listed", cites,
+                                 end=END_DYNAMIC.format(x=c["via_var"])))
+                continue
             progs = Q.programs_named(self.conn, t)
             if not progs:
                 out.append(_Edge(2, t.upper(), r["line"], f"RETURNING <- {t}", cites, end=END_NO_CALLEE))
@@ -1998,21 +2005,61 @@ class _Walker(_Report):
                                      ORDER BY c.line, a.pos""", (pid, *ids)).fetchall()
         out: List[_Edge] = []
         for a in rows:
+            if a["ckind"] in ("cics_return", "cics_start"):
+                continue                # RETURN / START TRANSID: the next task gets a copy, nothing comes back
             apf = self.pf(a["pfield"])
-            targets = [(a["target"], None)] if a["target"] else [x for x in _candidates(a) if not x[0].startswith("(+")]
+            a0, a1 = self.extent(apf)
+            if max(node.lo, a0) >= min(node.hi, a1):
+                continue                # the argument does not hold the node's bytes
+            targets = [(a["target"], None)] if a["target"] else _candidates(a)
             word = _CALL_WORD.get(a["ckind"], "CALL")
             cites = self.cite_stmt(pid, a["cline"], word, a["name"])
+            tag = "COMMAREA" if a["how"] == "commarea" else f"arg {a['pos']}"
+            # XCTL never comes back: a program it transfers to that cannot be followed is no origin here.
+            # Any other callee that can write the bytes but cannot be followed is a labelled end, never a
+            # silent drop - the origins listed would look complete (downstream call_edges ends each alike)
+            xctl = a["ckind"] == "cics_xctl"
+            may = "may set it (BY REFERENCE)"
+            if not targets and not xctl:
+                out.append(_Edge(3, "?", a["cline"], f"{word} {a['via_var']} {tag} <- ? {may}", cites,
+                                 end=END_DYNAMIC.format(x=a["via_var"])))
+                continue
             for (t, cand) in targets:
+                if t.startswith("(+"):
+                    if not xctl:
+                        out.append(_Edge(3, "?", a["cline"], f"{word} {a['via_var']} {tag} <- {t} candidate(s) not "
+                                         f"listed, each {may}", cites, end=END_DYNAMIC.format(x=a["via_var"])))
+                    continue
+                callname = f"{word} {t}" + (f" ({cand})" if cand else "")
                 progs = Q.programs_named(self.conn, t)
                 if not progs:
+                    if not xctl:
+                        out.append(_Edge(3, t.upper(), a["cline"], f"{callname} {tag} <- {t.upper()} {may}", cites,
+                                         end=END_NO_CALLEE))
                     continue
                 callee = progs[0]
+                cname = callee["program_id"]
                 if a["how"] == "commarea":
                     prm = self.conn.execute("SELECT * FROM param WHERE program_id=? AND entry='DFHCOMMAREA'", (callee["id"],)).fetchone()
                 else:
                     prm = self.conn.execute("SELECT * FROM param WHERE program_id=? AND entry IS ? AND pos=?",
                                             (callee["id"], self.entry_for(callee, t), a["pos"])).fetchone()
-                if prm is None or prm["pfield"] is None:
+                if prm is None:
+                    if xctl:
+                        continue
+                    if a["how"] == "commarea":
+                        out.append(_Edge(3, cname, a["cline"], f"{callname} {tag} <- {cname}", cites, end=END_NO_COMMAREA))
+                        continue
+                    n = self.conn.execute("SELECT COUNT(*) FROM param WHERE program_id=? AND entry IS ? AND pos>0",
+                                          (callee["id"], self.entry_for(callee, t))).fetchone()[0]
+                    out.append(_Edge(3, cname, a["cline"], f"{callname} {tag} <- {cname} (callee declares {n} parameter(s))",
+                                     cites, end=END_POS))
+                    continue
+                if prm["pfield"] is None:
+                    if xctl:
+                        continue
+                    out.append(_Edge(3, cname, a["cline"], f"{callname} {tag} <- {cname}.{prm['name']} {may}", cites,
+                                     end=END_MISSING.format(x=self.missing_copy(callee))))
                     continue
                 ppf = self.pf(prm["pfield"])
                 mapped = self.overlay(node, apf, ppf)
@@ -2021,8 +2068,6 @@ class _Walker(_Report):
                 n_lo, n_hi, labels, cut = mapped
                 if cut:
                     continue            # the node's bytes lie past the end of the other side: not shared
-                callname = f"{word} {t}" + (f" ({cand})" if cand else "")
-                tag = "COMMAREA" if a["how"] == "commarea" else f"arg {a['pos']}"
                 for (row, plo, phi, how) in self.place_ref(ppf, n_lo, n_hi):
                     ch = self.child(callee["id"], row, plo, phi, how, node.hop + 1)
                     ch.via_call, ch.via_root = a["cid"], ppf["root_id"]
@@ -2582,15 +2627,45 @@ class _Fallback(_Report):
                                  + self.call_modes(c["cpid"], c["line"]),
                                  self.cite_stmt(c["cpid"], c["line"], "CALL", args[pos - 1]), child=ch))
         for c in self.conn.execute("SELECT * FROM call_edge WHERE program_id=? AND using_args IS NOT NULL ORDER BY line", (pid,)):
+            if c["kind"] in ("cics_return", "cics_start"):
+                continue            # RETURN / START TRANSID: the next task gets a copy, nothing comes back
             args = [a.upper() for a in Q._jl(c["using_args"])]
+            xctl = c["kind"] == "cics_xctl"
+            word = _CALL_WORD.get(c["kind"], "CALL")
             for pos in [i + 1 for i, a in enumerate(args) if a == name]:
-                for t in ([c["target"]] if c["target"] else [t for t, _c in _candidates(c) if not t.startswith("(+")]):
+                # a callee that may write the position but cannot be followed is a labelled end (as
+                # _Walker.arg_back); XCTL never comes back, so there it is no origin at all
+                modes = self.call_modes(pid, c["line"])
+                may = f"may set it (reconstructed){modes}"
+                cites = self.cite_stmt(pid, c["line"], word, name)
+                targets = [c["target"]] if c["target"] else [t for t, _c in _candidates(c)]
+                if not targets and not xctl:
+                    out.append(_Edge(3, "?", c["line"], f"{word} {c['via_var']} arg {pos} <- ? {may}", cites,
+                                     end=END_DYNAMIC.format(x=c["via_var"])))
+                for t in targets:
+                    if t.startswith("(+"):
+                        if not xctl:
+                            out.append(_Edge(3, "?", c["line"], f"{word} {c['via_var']} arg {pos} <- {t} candidate(s) not "
+                                             f"listed, each {may}", cites, end=END_DYNAMIC.format(x=c["via_var"])))
+                        continue
+                    callname = f"{word} {t}" + ("" if c["target"] else f" (candidate: resolved via {_how_resolved(c)})")
                     progs = Q.programs_named(self.conn, t)
                     if not progs:
+                        if not xctl:
+                            out.append(_Edge(3, t.upper(), c["line"], f"{callname} arg {pos} <- {t.upper()} {may}", cites,
+                                             end=END_NO_CALLEE))
                         continue
                     callee = progs[0]
                     lk2 = self.linkage_of(callee, t)
+                    if not lk2 and c["kind"] == "cics_link":
+                        out.append(_Edge(3, callee["program_id"], c["line"], f"{callname} COMMAREA <- {callee['program_id']} "
+                                         f"(reconstructed)", cites, end=END_NO_COMMAREA))
+                        continue
                     if pos > len(lk2):
+                        if not xctl:
+                            out.append(_Edge(3, callee["program_id"], c["line"], f"{callname} arg {pos} <- {callee['program_id']} "
+                                             f"(callee declares {len(lk2)} parameter(s)) (reconstructed){modes}", cites,
+                                             end=END_POS))
                         continue
                     pname = lk2[pos - 1]
                     if not self.conn.execute("SELECT 1 FROM field_ref WHERE program_id=? AND UPPER(name)=? AND mode='write' "

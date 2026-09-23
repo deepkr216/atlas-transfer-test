@@ -1710,6 +1710,26 @@ class FlowKnownLimits(unittest.TestCase):
             "       01  WS-C                     PIC 9(04).\n       PROCEDURE DIVISION.\n"
             "           MOVE WS-BILL-TO TO OUT-BILL-TO.\n           ADD WS-A TO WS-B GIVING WS-C.\n"
             "           DISPLAY OUT-BILL-TO WS-B WS-C.\n           GOBACK.\n"),
+        # WU-CODE passed BY REFERENCE to callees --up cannot follow: not in the index, a CALL through a
+        # LINKAGE item (unresolved), 41 candidates (the parser keeps 40 and a `(+1 more)`), a parameter
+        # from a missing copybook, a COMMAREA to a program with no DFHCOMMAREA
+        "KUP.cbl": H.format(p="KUP") + (
+            "       01  WS-MANY                  PIC X(08).\n       01  WU-CODE                  PIC X(02).\n"
+            "       01  WU-RET                   PIC X(02).\n"
+            "       LINKAGE SECTION.\n       01  LK-PGM                   PIC X(08).\n"
+            "       PROCEDURE DIVISION USING LK-PGM.\n"
+            + "".join(f"           MOVE 'KP{i:02d}' TO WS-MANY.\n" for i in range(1, 42))
+            + "           CALL 'KNOWHERE' USING WU-CODE.\n           CALL LK-PGM USING WU-CODE.\n"
+            "           CALL WS-MANY USING WU-CODE.\n           CALL 'KMISS' USING WU-CODE.\n"
+            "           EXEC CICS LINK PROGRAM('KNOCA') COMMAREA(WU-CODE) END-EXEC.\n"
+            "           CALL WS-MANY RETURNING WU-RET.\n"
+            "           DISPLAY WU-CODE WU-RET.\n           GOBACK.\n"),
+        "KMISS.cbl": ("       IDENTIFICATION DIVISION.\n       PROGRAM-ID. KMISS.\n       DATA DIVISION.\n"
+                      "       LINKAGE SECTION.\n           COPY KNOCPY.\n       PROCEDURE DIVISION USING LK-MISS.\n"
+                      "           MOVE 'XX' TO LK-MISS.\n           GOBACK.\n"),
+        "KNOCA.cbl": H.format(p="KNOCA") + (
+            "       01  WN-X                     PIC X(02).\n       PROCEDURE DIVISION.\n"
+            "           MOVE 'NO' TO WN-X.\n           EXEC CICS RETURN END-EXEC.\n"),
     }
 
     @classmethod
@@ -1772,6 +1792,58 @@ class FlowKnownLimits(unittest.TestCase):
         self.assertIn("**KDIFF.OUT-BILL-TO**", d)
         self.assertIn("**KDIFF.WS-C**", d)
         self.assertNotIn("**KDIFF.WS-B**", d)
+
+    def test_up_ends_at_every_callee_it_cannot_follow(self):
+        ends = {"KNOWHERE": (r"CALL KNOWHERE arg 1 <- KNOWHERE may set it", "callee not in index"),
+                "LK-PGM": (r"CALL LK-PGM arg 1 <- \? may set it", "dynamic CALL unresolved (via LK-PGM)"),
+                "WS-MANY": (r"CALL WS-MANY arg 1 <- \(\+1 more\) candidate\(s\) not listed", "dynamic CALL unresolved (via WS-MANY)"),
+                "KP01": (r"CALL KP01 \(candidate: resolved via MOVE literal\) arg 1 <- KP01 may set it", "callee not in index")}
+        for db, tag in ((self.db, "exact"), (self.old, "reconstructed")):
+            with self.subTest(tag):
+                up = self.flow("WU-CODE", "--program", "KUP", "--up", "--all", db=db)
+                for what, (label, end) in ends.items():
+                    hop = _lines_of(up, f"CALL {what} ")
+                    self.assertRegex(hop, label, up)
+                    self.assertIn(f"[end: {end}]", hop)
+                    if tag == "reconstructed":
+                        self.assertIn("(reconstructed)", hop)
+                self.assertEqual(len(re.findall(r"(?m)^\d+\s+CALL KP\d\d ", up)), 40, up)
+                self.assertNotIn("no further use", up)
+        # the exact walker knows the callee's parameter and the COMMAREA it has not got
+        up = self.flow("WU-CODE", "--program", "KUP", "--up", "--all")
+        self.assertRegex(_lines_of(up, "CALL KMISS"), r"CALL KMISS arg 1 <- KMISS\.LK-MISS may set it \(BY REFERENCE\).*"
+                                                      r"\[end: field not declared in this program \(missing copybook KNOCPY\)\]")
+        self.assertRegex(_lines_of(up, "LINK KNOCA"), r"LINK KNOCA COMMAREA <- KNOCA\s.*\[end: callee has no DFHCOMMAREA 01\]")
+        # a RETURNING item from a CALL with more candidates than listed: the rest is an end, not dropped
+        ret = self.flow("WU-RET", "--program", "KUP", "--up", "--all")
+        self.assertRegex(_lines_of(ret, "(+1 more)"), r"RETURNING <- WS-MANY: \(\+1 more\) candidate\(s\) not listed\s.*"
+                                                      r"\[end: dynamic CALL unresolved \(via WS-MANY\)\]")
+        self.assertEqual(len(re.findall(r"(?m)^\d+\s+RETURNING <- KP\d\d\s.*\[end: callee not in index\]", ret)), 40, ret)
+        old = self.flow("WU-CODE", "--program", "KUP", "--up", db=self.old)
+        self.assertRegex(_lines_of(old, "LINK KNOCA"), r"LINK KNOCA COMMAREA <- KNOCA \(reconstructed\)\s.*"
+                                                       r"\[end: callee has no DFHCOMMAREA 01\]")
+
+    def test_up_ends_at_the_fixture_callees_it_cannot_follow(self):
+        # the fixtures' own shapes (ROADMAP example): ERRLOG is not in the index and may set WS-ERR-CD;
+        # FLOWSUB declares 2 parameters and is passed WS-EXTRA third
+        fx = os.path.join(self.td, "fx.db")
+        with contextlib.redirect_stdout(io.StringIO()):
+            build._main([FIX, "--db", fx, "--rebuild", "--quiet"])
+        old = os.path.join(self.td, "fxold.db")
+        shutil.copyfile(fx, old)
+        c = sqlite3.connect(old)
+        c.executescript("DROP TABLE data_flow; DROP TABLE pfield; DROP TABLE call_arg; DROP TABLE param; "
+                        "DROP TABLE file_record;")
+        c.close()
+        for db, tag in ((fx, "exact"), (old, "reconstructed")):
+            with self.subTest(tag):
+                err = self.flow("WS-ERR-CD", "--program", "ERRPGM", "--up", db=db)
+                self.assertRegex(err, rf"(?m)^1\s+CALL ERRLOG arg 1 <- ERRLOG may set it\b.*ERRPGM:"
+                                      rf"{_line('ERRPGM.cbl', 'ERRLOG')} \"CALL 'ERRLOG' USING WS-ERR-CD\"\s+"
+                                      r"\[end: callee not in index\]")
+                ext = self.flow("WS-EXTRA", "--program", "FLOWSRC", "--up", db=db)
+                self.assertRegex(ext, r"(?m)^1\s+CALL FLOWSUB arg 3 <- FLOWSUB \(callee declares 2 parameter\(s\)\).*"
+                                      r"\[end: LINKAGE position out of range / count mismatch - HUMAN MUST VERIFY\]")
 
 
 if __name__ == "__main__":
