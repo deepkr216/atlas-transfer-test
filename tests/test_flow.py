@@ -1071,6 +1071,136 @@ class FlowCarriersAndInvocations(unittest.TestCase):
         raise AssertionError(needle)
 
 
+class FlowBytesParentsXctl(unittest.TestCase):
+    """Third review of the walk (inline, fictional): an elementary MOVE
+    between items of different lengths keeps the value in its bytes - the
+    padding of a longer receiver and the cut bytes of a longer sender never
+    carry it (guard 6, both ways); before the re-parse a group above the item
+    that is moved or passed is a labelled end, never `no further use` (guard
+    7); XCTL never returns, so nothing written in the program it transfers
+    to goes back to the program that XCTLed."""
+
+    H = ("       IDENTIFICATION DIVISION.\n       PROGRAM-ID. {p}.\n       DATA DIVISION.\n"
+         "       WORKING-STORAGE SECTION.\n")
+    FILES = {
+        "PA.cbl": H.format(p="PA") + (
+            "       01  WS-SRC.\n           05  S-PFX PIC X(10).\n           05  S-CODE PIC X(04).\n"
+            "           05  S-REST PIC X(26).\n       01  WS-SMALL PIC X(12).\n       01  WS-TXT PIC X(04).\n"
+            "       01  WS-DST.\n           05  D-A PIC X(08).\n           05  D-B PIC X(04).\n"
+            "       PROCEDURE DIVISION.\n           MOVE WS-SRC TO WS-SMALL.\n           MOVE WS-SMALL TO WS-TXT.\n"
+            "           MOVE WS-SRC TO WS-DST.\n           DISPLAY WS-TXT.\n           GOBACK.\n"),
+        "PC.cbl": H.format(p="PC") + (
+            "       01  WS-TXT PIC X(04).\n       01  WS-SMALL PIC X(12).\n"
+            "       01  WS-DST.\n           05  D-A PIC X(08).\n           05  D-B PIC X(04).\n"
+            "       PROCEDURE DIVISION.\n           MOVE WS-TXT TO WS-SMALL.\n           MOVE WS-SMALL TO WS-DST.\n"
+            "           DISPLAY D-A.\n           DISPLAY D-B.\n           GOBACK.\n"),
+        # XA transfers control to XB with XCTL, XL LINKs to it: only XL gets XB's write back
+        "XA.cbl": H.format(p="XA") + (
+            "       01  WS-CA.\n           05  WA-CODE PIC X(02).\n       PROCEDURE DIVISION.\n"
+            "           EXEC CICS XCTL PROGRAM('XB') COMMAREA(WS-CA) END-EXEC.\n           DISPLAY WA-CODE.\n"
+            "           GOBACK.\n"),
+        "XL.cbl": H.format(p="XL") + (
+            "       01  WS-CA.\n           05  WL-CODE PIC X(02).\n       PROCEDURE DIVISION.\n"
+            "           EXEC CICS LINK PROGRAM('XB') COMMAREA(WS-CA) END-EXEC.\n           DISPLAY WL-CODE.\n"
+            "           GOBACK.\n"),
+        "XB.cbl": H.format(p="XB") + (
+            "       01  WB-NEW PIC X(02).\n       LINKAGE SECTION.\n       01  DFHCOMMAREA.\n"
+            "           05  CB-CODE PIC X(02).\n       PROCEDURE DIVISION.\n           MOVE WB-NEW TO CB-CODE.\n"
+            "           EXEC CICS RETURN END-EXEC.\n"),
+        # USING DFHCOMMAREA: the shape the fallback sees as a USING position
+        "XD.cbl": H.format(p="XD") + (
+            "       01  WD-CA PIC X(02).\n       PROCEDURE DIVISION.\n"
+            "           EXEC CICS XCTL PROGRAM('XC') COMMAREA(WD-CA) END-EXEC.\n           DISPLAY WD-CA.\n"
+            "           GOBACK.\n"),
+        "XC.cbl": H.format(p="XC") + (
+            "       01  WC-NEW PIC X(02).\n       LINKAGE SECTION.\n       01  DFHCOMMAREA PIC X(02).\n"
+            "       PROCEDURE DIVISION USING DFHCOMMAREA.\n           MOVE WC-NEW TO DFHCOMMAREA.\n"
+            "           EXEC CICS RETURN END-EXEC.\n"),
+    }
+
+    @classmethod
+    def setUpClass(cls):
+        cls.td = tempfile.mkdtemp()
+        src = os.path.join(cls.td, "estate")
+        os.makedirs(src)
+        for name, text in cls.FILES.items():
+            with open(os.path.join(src, name), "w", encoding="utf-8") as fh:
+                fh.write(text)
+        cls.db = os.path.join(cls.td, "t.db")
+        with contextlib.redirect_stdout(io.StringIO()):
+            build._main([src, "--db", cls.db, "--rebuild", "--quiet"])
+        cls.old = os.path.join(cls.td, "old.db")
+        shutil.copyfile(cls.db, cls.old)
+        c = sqlite3.connect(cls.old)
+        c.executescript("DROP TABLE data_flow; DROP TABLE pfield; DROP TABLE call_arg; DROP TABLE param; "
+                        "DROP TABLE file_record;")
+        c.close()
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.td, ignore_errors=True)
+
+    def flow(self, *args, db=None) -> str:
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = query._main(["--db", db or self.db, "flow", *args])
+        self.assertEqual(rc, 0, err.getvalue())
+        return out.getvalue()
+
+    def test_elementary_move_keeps_the_value_in_its_bytes(self):
+        # --up: WS-TXT gets bytes 1-4 of WS-SMALL, which came from S-PFX - never S-CODE (bytes 11-14 of WS-SRC)
+        up = self.flow("WS-TXT", "--program", "PA", "--up")
+        self.assertRegex(up, r"(?m)^1\s+MOVE <- WS-SMALL \(bytes 1-4 of 12\); truncated 12 -> 4\s+PA:\d+ \"MOVE WS-SMALL TO WS-TXT\"")
+        self.assertRegex(up, r"(?m)^1\.1\s+MOVE <- S-PFX \(bytes 1-4 of 10\)")
+        self.assertNotIn("S-CODE", up)
+        self.assertNotIn("S-REST", up)
+        # down: WS-TXT fills bytes 1-4 of WS-SMALL; the rest is padding, so D-B (bytes 9-12) is not reached
+        down = self.flow("WS-TXT", "--program", "PC")
+        self.assertRegex(down, r"(?m)^1\s+MOVE -> WS-SMALL \(bytes 1-4 of 12\)\s+PC:\d+ \"MOVE WS-TXT TO WS-SMALL\"")
+        self.assertRegex(down, r"(?m)^1\.1\s+MOVE -> D-A \(bytes 1-4 of 8\)")
+        self.assertNotIn("D-B", down)
+        self.assertNotIn("unnamed bytes", down)           # an elementary MOVE is not a group MOVE
+        # the padding bytes, followed up, end where the sender was shorter (unchanged)
+        self.assertIn("[end: truncated 12 -> 4]", self.flow("D-B", "--program", "PC", "--up"))
+        # a longer sender is cut: the whole shorter receiver, labelled
+        self.assertRegex(self.flow("WS-SMALL", "--program", "PA"), r"(?m)^1\s+MOVE -> WS-TXT; truncated 12 -> 4\s")
+
+    def test_fallback_labels_a_moved_or_passed_parent_group(self):
+        down = self.flow("S-PFX", "--program", "PA", db=self.old)
+        hops = _lines_of(down, "parent group WS-SRC used by MOVE")
+        self.assertEqual(len(hops.splitlines()), 2, down)    # MOVE WS-SRC TO WS-SMALL, MOVE WS-SRC TO WS-DST
+        self.assertIn("(reconstructed)", hops)
+        self.assertIn("[end: parent group not followed until re-parse]", hops)
+        self.assertNotIn("no further use", down)
+        up = self.flow("D-A", "--program", "PA", "--up", db=self.old)
+        self.assertRegex(up, r"parent group WS-DST set by MOVE: its bytes include D-A \(reconstructed\)\s+"
+                             r"PA:\d+ \"MOVE WS-SRC TO WS-DST\"\s+\[end: parent group not followed until re-parse\]")
+        self.assertNotIn("no further use", up)
+        # an item nobody moves or passes, alone or through a group, still ends as before
+        self.assertIn("[end: no further use in PC]", self.flow("WS-TXT", "--program", "PC", "--up", db=self.old))
+
+    def test_xctl_never_returns_the_commarea(self):
+        down = self.flow("WB-NEW", "--program", "XB")
+        self.assertNotRegex(down, r"back to XA\.")
+        self.assertRegex(down, r"LINKAGE COMMAREA: XA\.WS-CA was passed by XCTL\s+XA:\d+ \"XCTL PROGRAM\('XB'\) "
+                               r"COMMAREA\(WS-CA\"\s+\[end: XCTL does not return\]")
+        self.assertRegex(down, r"LINKAGE COMMAREA -> back to XL\.WL-CODE \(BY REFERENCE\)")   # LINK does return
+        up = self.flow("WA-CODE", "--program", "XA", "--up")
+        self.assertNotIn("written there, BY REFERENCE", up)
+        self.assertNotIn("WB-NEW", up)
+        self.assertIn("[end: XCTL does not return]", up)
+        self.assertRegex(self.flow("WL-CODE", "--program", "XL", "--up"), r"LINK XB COMMAREA <- XB\.CB-CODE\b.*written there")
+        # into the program XCTLed to, the COMMAREA still arrives
+        self.assertRegex(self.flow("WA-CODE", "--program", "XA"), r"XCTL XB arg 1 -> XB\.CB-CODE\b")
+        # before the re-parse: USING DFHCOMMAREA is a USING position, still not a way back through XCTL
+        old_down = self.flow("WC-NEW", "--program", "XC", db=self.old)
+        self.assertNotRegex(old_down, r"back to XD\.")
+        self.assertIn("[end: XCTL does not return]", _lines_of(old_down, "XD.WD-CA was passed by XCTL"))
+        old_up = self.flow("WD-CA", "--program", "XD", "--up", db=self.old)
+        self.assertNotRegex(old_up, r"<- XC\.")
+        self.assertIn("[end: XCTL does not return]", _lines_of(old_up, "XC.DFHCOMMAREA is written there"))
+
+
 class FlowIndex(unittest.TestCase):
 
     @classmethod
@@ -1478,6 +1608,55 @@ class FlowIndex(unittest.TestCase):
                 self.assertRegex(amb, r"is declared 2 times in FLOWSRC: .* - HUMAN MUST VERIFY which one")
                 self.assertNotIn("- defined", amb)
                 self.assertNotIn("MOVE SPACES", amb)
+
+    def test_fallback_never_ends_where_a_parent_group_carries_the_item(self):
+        # his index before the re-parse: WC-STATUS sits under WS-COMM, which is LINKed as the COMMAREA
+        old = os.path.join(self.td, "oldparent.db")
+        shutil.copy(self.db, old)
+        c = sqlite3.connect(old)
+        try:
+            c.executescript("DROP TABLE data_flow; DROP TABLE pfield; DROP TABLE call_arg; DROP TABLE param; "
+                            "DROP TABLE file_record;")
+        finally:
+            c.close()
+        cx = self.flow("WC-STATUS", "--program", "FLOWCICS", db=old)
+        self.assertRegex(cx, rf"parent group WS-COMM used by EXEC CICS LINK: its bytes include WC-STATUS \(reconstructed\)\s+"
+                             rf"FLOWCICS:{_line('FLOWCICS.cbl', 'LINK PROGRAM')}-\d+ \"[^\"]*COMMAREA\(WS-COMM\"\s+"
+                             r"\[end: parent group not followed until re-parse\]")
+        self.assertNotIn("no further use", cx)
+        # a copied item: the fallback cannot see its record, so it never claims the walk is complete
+        rd = self.flow("IR-STAT", "--program", "FLOWRDR", "--up", db=old)
+        self.assertNotIn("no further use", rd)
+        self.assertRegex(rd, rf"IF IR-LAPSED\s+FLOWRDR:{_line('FLOWRDR.cbl', 'IF IR-LAPSED')}\s+"
+                             r"\[end: copybook fields: not followed until re-parse\]")
+        conn = query.connect(old)
+        try:
+            lit = query.cmd_literal(conn, "LP")
+        finally:
+            conn.close()
+        sec = lit.split("**FLOWCICS.WC-STATUS**", 1)[1].split("**", 1)[0]
+        self.assertIn("parent group WS-COMM", sec)
+
+    def test_diff_never_starts_at_a_subscript(self):
+        from atlas import flow
+        for text, want in (("       MOVE WS-A TO WS-B (WS-I).", ["WS-B"]),
+                           ("       MOVE WS-A TO WS-B(WS-I:2).", ["WS-B"]),
+                           ("       MOVE WS-A TO WS-TBL(WS-IDX WS-J) WS-C.", ["WS-TBL", "WS-C"]),
+                           ("       CALL 'SUBX' USING WS-T (WS-I) WS-U.", ["WS-T", "WS-U"])):
+            with self.subTest(text):
+                self.assertEqual(flow.changed_targets([text], False), want)
+        # end to end: the changed MOVE's target is the table, never its index WS-I (guard 3)
+        new = os.path.join(self.td, "sub", "FLOWSRC.cbl")
+        os.makedirs(os.path.dirname(new), exist_ok=True)
+        with open(os.path.join(FIX, "FLOWSRC.cbl"), encoding="utf-8") as fh:
+            src = fh.read()
+        self.assertEqual(src.count("MOVE WS-STATUS TO WS-STAT-ENT (WS-I)"), 1)
+        with open(new, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(src.replace("MOVE WS-STATUS TO WS-STAT-ENT (WS-I)", "MOVE WS-RC     TO WS-STAT-ENT (WS-I)"))
+        d = query.cmd_diff(self.conn, "FLOWSRC", new)
+        self.assertIn("## Flow from the changed statements", d)
+        self.assertIn("**FLOWSRC.WS-STAT-ENT**", d)
+        self.assertNotIn("**FLOWSRC.WS-I**", d)
 
     def test_returning_item_goes_back_to_the_caller_in_the_fixtures(self):
         # FLOWSUB's RETURNING item comes back into FLOWSRC.WS-R at GOBACK (`CALL .. RETURNING WS-R`)

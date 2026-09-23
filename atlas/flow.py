@@ -34,6 +34,7 @@ from . import verify_citations as V
 FOOTER = "Flow-insensitive: statement order and IF guards are not evaluated; a hop is a copy that CAN happen."
 FALLBACK_HEADER = "index has no data_flow - reconstructed from field_ref; exact after the next re-parse"
 FALLBACK_COPY = "copybook fields: not followed until re-parse"
+FALLBACK_PARENT = "parent group not followed until re-parse"
 
 # Fixed end strings (plan section 5): each is a test assertion, so the words
 # never change. `{}` slots are filled per hop.
@@ -48,6 +49,7 @@ END_POS = "LINKAGE position out of range / count mismatch - HUMAN MUST VERIFY"
 END_LENGTH_OF = "callee receives LENGTH OF, not the bytes"
 END_NO_COMMAREA = "callee has no DFHCOMMAREA 01"
 END_CONTENT = "BY CONTENT: one-way"
+END_XCTL = "XCTL does not return"
 END_NO_READER = "no indexed reader"
 END_NO_WRITER = "no indexed writer"
 END_NO_FIELD = "reader layout has no field at bytes {lo}-{hi}"
@@ -738,13 +740,9 @@ class _Walker(_Report):
             a, b = (_picstr(dst), _picstr(src)) if reverse else (_picstr(src), _picstr(dst))
             labels.append(f"converted {a} -> {b}")
             return d0, d1, labels, None
-        if not src["is_group"] and not dst["is_group"] and (x0, x1) == (s0, s1) and not su:
-            # an elementary MOVE of the whole item fills the whole receiving item (padded or cut):
-            # never "bytes 1-2 of 20"; part of an item (bytes a group MOVE left there) keeps its place
-            trunc = None
-            if (dlen > slen) if reverse else (slen > dlen):
-                trunc = END_TRUNC.format(n=max(slen, dlen), m=min(slen, dlen))
-            return d0, d1, labels + ([trunc] if trunc else []), None
+        # an alphanumeric MOVE is left-justified: a shorter sender fills the first bytes of the
+        # receiver and the rest is padding, a longer one is cut - the value keeps its place, both
+        # ways (guard 6). Never the whole longer item: its padding / cut bytes never held the value
         rel0 = (x0 - s0) % su if su else x0 - s0
         rel1 = rel0 + min(x1 - x0, su - rel0) if su else x1 - s0
         # the copy runs original source -> original target: under --up that is dst -> src here
@@ -787,6 +785,15 @@ class _Walker(_Report):
         item's bytes a-b, not a group MOVE's unnamed bytes."""
         return [(row, a, b, "partial" if how == "unnamed" and not row["is_group"] else how)
                 for (row, a, b, how) in self.place(dst, lo, hi)]
+
+    def place_copy(self, src, dst, into, lo: int, hi: int) -> List[Tuple[sqlite3.Row, int, int, str]]:
+        """place() for a copy from `src` to `dst` landing in `into`: an
+        elementary MOVE between items of different lengths leaves the value
+        in bytes a-b of the named item (the rest padding or cut), never a
+        group MOVE's unnamed bytes."""
+        if not src["is_group"] and not dst["is_group"]:
+            return self.place_ref(into, lo, hi)
+        return self.place(into, lo, hi)
 
     # ---- edges: down ------------------------------------------------------------------
     def edges(self, node: _Node) -> List[_Edge]:
@@ -858,7 +865,7 @@ class _Walker(_Report):
                      f"fall outside it" if group_src else f"{lbl_verb} -> {self.base_name(pid, dst)}{subs}")
             return [_Edge(rank, node.pname, r["line"], label + self._lbls(labels), cites, r["guard"], end=end)]
         out = []
-        for (row, plo, phi, how) in self.place(dst, n_lo, n_hi):
+        for (row, plo, phi, how) in self.place_copy(src, dst, dst, n_lo, n_hi):
             ch = self.carry(node, self.child(pid, row, plo, phi, how, node.hop + 1))
             if group_src:
                 label = (f"group {lbl_verb} {src['name']} -> {dst['name']}: bytes {n_lo + 1}-{n_hi} land in "
@@ -926,7 +933,7 @@ class _Walker(_Report):
                     if end:
                         out.append(_Edge(9, node.pname, r["line"], head + self._lbls(labels), cites, r["guard"], end=end))
                         continue
-                    for (row, plo, phi, how) in self.place(x if up else y, n_lo, n_hi):
+                    for (row, plo, phi, how) in self.place_copy(x, y, x if up else y, n_lo, n_hi):
                         ch = self.carry(node, self.child(pid, row, plo, phi, how, node.hop + 1))
                         out.append(_Edge(9, node.pname, r["line"], f"{head} {arrow} {self.hop_prefix(ch)}{self.nm(ch)}"
                                          + self._lbls(labels), cites, r["guard"], child=ch))
@@ -1451,6 +1458,11 @@ class _Walker(_Report):
                     if mapped is None:
                         continue
                     n_lo, n_hi, labels, end = mapped
+                    if c["kind"] == "cics_xctl":
+                        # XCTL hands control over for good: the caller never sees what is written here
+                        out.append(_Edge(3, c["caller"], c["line"], f"LINKAGE {tag}: {c['caller']}.{a['name']} was passed by XCTL",
+                                         cites, end=END_XCTL))
+                        continue
                     if end:
                         out.append(_Edge(3, c["caller"], c["line"], f"LINKAGE {tag} -> back to {c['caller']}.{a['name']}"
                                          + self._lbls(labels), cites, end=end))
@@ -1490,7 +1502,7 @@ class _Walker(_Report):
                 out.append(_Edge(3, c["caller"], c["line"], f"RETURNING{tag} -> back to {c['caller']}.{c['returning_item']}"
                                  + self._lbls(labels), cites, end=end))
                 continue
-            for (row, plo, phi, how) in self.place(apf, n_lo, n_hi):
+            for (row, plo, phi, how) in self.place_copy(ppf, apf, apf, n_lo, n_hi):
                 ch = self.child(c["cpid"], row, plo, phi, how, node.hop + 1)
                 self.touch(c["cpid"])
                 out.append(_Edge(3, c["caller"], c["line"], f"RETURNING{tag} -> back to {c['caller']}.{self.nm(ch)} "
@@ -1852,7 +1864,7 @@ class _Walker(_Report):
         d0, d1 = self.extent(dst)
         group_dst = bool(dst["is_group"]) and (node.lo > d0 or node.hi < d1) and not derived
         out = []
-        for (row, plo, phi, how) in self.place(src, n_lo, n_hi):
+        for (row, plo, phi, how) in self.place_copy(src, dst, src, n_lo, n_hi):
             ch = self.carry(node, self.child(pid, row, plo, phi, how, node.hop + 1))
             if group_dst:
                 label = f"group {lbl_verb} {dst['name']} <- {src['name']}: bytes {n_lo + 1}-{n_hi} come from {self.nm(ch)}"
@@ -2017,6 +2029,11 @@ class _Walker(_Report):
                     # only the bytes the callee writes come back: CA-MESSAGE set there is not CA-STATUS
                     cids, _cl = self.closure_ids(ch)
                     if not self.written_here(ch, cids):
+                        continue
+                    if a["ckind"] == "cics_xctl":
+                        # written there, but XCTL never comes back: not an origin of this program's bytes
+                        out.append(_Edge(3, callee["program_id"], a["cline"], f"{callname} {tag}: {callee['program_id']}."
+                                         f"{self.nm(ch)} is written there", cites, end=END_XCTL))
                         continue
                     self.touch(callee["id"])
                     out.append(_Edge(3, callee["program_id"], a["cline"], f"{callname} {tag} <- {callee['program_id']}.{self.nm(ch)} "
@@ -2398,6 +2415,64 @@ class _Fallback(_Report):
             r = self.conn.execute("SELECT * FROM field WHERE id=?", (r["parent_id"],)).fetchone()
         return r
 
+    def copy_decls(self, pid: int, name: str) -> List[sqlite3.Row]:
+        """The name's rows in the copybooks this program COPYs (a copied
+        item has no field row of the program's own)."""
+        return self.conn.execute("""SELECT f.* FROM field f JOIN member m ON m.id=f.member_id
+                                    WHERE UPPER(f.name)=? AND m.kind='copybook' AND UPPER(m.name) IN
+                                    (SELECT UPPER(copybook) FROM copy_use WHERE member_id=?) ORDER BY f.id""",
+                                 (name.upper(), self.prog(pid)["member_id"])).fetchall()
+
+    def ancestor_names(self, node: _FNode) -> List[str]:
+        """The groups above the item: its own text's, or - a copied item - the
+        copybook's (the 01 the COPY sits under is not known before the
+        re-parse: FALLBACK_COPY says so)."""
+        out: List[str] = []
+        for r in ([node.frow] if node.frow is not None else self.copy_decls(node.pid, node.name)):
+            while r is not None and r["parent_id"]:
+                r = self.conn.execute("SELECT * FROM field WHERE id=?", (r["parent_id"],)).fetchone()
+                if r is not None and r["name"].upper() not in out and r["name"].upper() != "FILLER":
+                    out.append(r["name"].upper())
+        return out
+
+    def cond_names(self, node: _FNode) -> List[str]:
+        """The 88 names on the item: `IF IR-LAPSED` tests IR-STAT."""
+        rows = [node.frow] if node.frow is not None else self.copy_decls(node.pid, node.name)
+        ids = [r["id"] for r in rows]
+        if not ids:
+            return []
+        q = ",".join("?" * len(ids))
+        return sorted({r[0].upper() for r in self.conn.execute(f"SELECT name FROM cond88 WHERE field_id IN ({q})", ids)})
+
+    def parent_edges(self, node: _FNode) -> List[_Edge]:
+        """A group MOVE, a CALL argument or a COMMAREA that names a group above
+        the item carries its bytes too (guard 7). Before the re-parse field_ref
+        has no offsets to place them, so each is a labelled end - never a
+        silent `no further use`."""
+        anc = self.ancestor_names(node)
+        if not anc:
+            return []
+        q = ",".join("?" * len(anc))
+        up = self.o.up
+        out: List[_Edge] = []
+        seen: Set[Tuple[int, str]] = set()
+        for r in self.conn.execute(f"""SELECT line, name, stmt FROM field_ref WHERE program_id=? AND UPPER(name) IN ({q})
+                                       AND mode=? ORDER BY line, id""", (node.pid, *anc, "write" if up else "read")):
+            key = (r["line"], r["name"].upper())
+            if key in seen:
+                continue
+            seen.add(key)
+            stmt = (r["stmt"] or "?").upper()
+            verb = "CALL" if stmt.startswith("CALL-") else stmt
+            words = {"CALL-USING": "CALL USING", "CALL-RETURNING": "CALL RETURNING"}.get(
+                stmt, stmt.replace("EXEC-CICS-", "EXEC CICS ").replace("EXEC-SQL", "EXEC SQL"))
+            rank = 2 if stmt.startswith(("CALL-", "EXEC-CICS-")) else 9
+            label = (f"parent group {key[1]} {'set' if up else 'used'} by {words}: its bytes include {node.name} "
+                     f"(reconstructed)")
+            out.append(_Edge(rank, node.pname, r["line"], label, self.cite_stmt(node.pid, r["line"], verb, r["name"]),
+                             end=FALLBACK_PARENT))
+        return out
+
     def node(self, pid: int, name: str, hop: int) -> _FNode:
         return _FNode(pid, self.prog(pid)["program_id"], name.upper(), self.field_row(pid, name), hop)
 
@@ -2463,6 +2538,10 @@ class _Fallback(_Report):
                 args = Q._jl(c["using_args"])
                 if pos > len(args) or (node.via_call is not None and c["id"] != node.via_call):
                     continue
+                if c["kind"] == "cics_xctl":
+                    out.append(_Edge(3, c["caller"], c["line"], f"LINKAGE pos {pos}: {c['caller']}.{args[pos - 1]} was passed by XCTL "
+                                     f"(reconstructed)", self.cite_stmt(c["cpid"], c["line"], "XCTL", args[pos - 1]), end=END_XCTL))
+                    continue
                 ch = self.node(c["cpid"], args[pos - 1], node.hop + 1)
                 out.append(_Edge(3, c["caller"], c["line"], f"LINKAGE pos {pos} -> back to {c['caller']}.{ch.name} (reconstructed)"
                                  + self.call_modes(c["cpid"], c["line"]),
@@ -2475,6 +2554,7 @@ class _Fallback(_Report):
                 ch = self.carry(node, self.node(pid, wr, node.hop + 1))
                 out.append(_Edge(9, node.pname, ln, f"MOVE -> {self.pfx(ch)}{ch.name} (reconstructed)",
                                  self.cite_stmt(pid, ln, "MOVE", wr), child=ch))
+        out.extend(self.parent_edges(node))
         return out
 
     def edges_up(self, node: _FNode) -> List[_Edge]:
@@ -2516,6 +2596,11 @@ class _Fallback(_Report):
                     if not self.conn.execute("SELECT 1 FROM field_ref WHERE program_id=? AND UPPER(name)=? AND mode='write' "
                                              "AND stmt<>'CALL-USING' LIMIT 1", (callee["id"], pname.upper())).fetchone():
                         continue
+                    if c["kind"] == "cics_xctl":
+                        # written there, but XCTL never comes back (as _Walker.arg_back)
+                        out.append(_Edge(3, callee["program_id"], c["line"], f"XCTL {t} arg {pos}: {callee['program_id']}.{pname.upper()} "
+                                         f"is written there (reconstructed)", self.cite_stmt(pid, c["line"], "XCTL", name), end=END_XCTL))
+                        continue
                     ch = self.node(callee["id"], pname, node.hop + 1)
                     ch.via_call, ch.via_name = c["id"], ch.name
                     out.append(_Edge(3, callee["program_id"], c["line"], f"CALL {t} arg {pos} <- {callee['program_id']}.{ch.name} "
@@ -2527,6 +2612,7 @@ class _Fallback(_Report):
                 ch = self.carry(node, self.node(pid, rd, node.hop + 1))
                 out.append(_Edge(9, node.pname, ln, f"MOVE <- {self.pfx(ch)}{ch.name} (reconstructed)",
                                  self.cite_stmt(pid, ln, "MOVE", rd), child=ch))
+        out.extend(self.parent_edges(node))
         return out
 
     def call_modes(self, pid: int, exp_line: int) -> str:
@@ -2669,8 +2755,10 @@ class _Fallback(_Report):
 
     def uses(self, node: _FNode) -> Optional[str]:
         texts, cites = [], []
-        for r in self.conn.execute("SELECT * FROM field_ref WHERE program_id=? AND UPPER(name)=? AND mode IN ('test','display') ORDER BY line",
-                                   (node.pid, node.name)):
+        names = [node.name] + self.cond_names(node)
+        q = ",".join("?" * len(names))
+        for r in self.conn.execute(f"SELECT * FROM field_ref WHERE program_id=? AND UPPER(name) IN ({q}) AND mode IN ('test','display') "
+                                   "ORDER BY line", (node.pid, *names)):
             m, ln, depth, via = Q.origin(self.conn, node.pid, r["line"])
             if not m or ln is None:
                 continue
@@ -2681,7 +2769,7 @@ class _Fallback(_Report):
                 raw = self.raw(m, ln)
                 stmt = (r["stmt"] or "IF").upper()
                 mm = re.search(r"(?<![\w-])" + re.escape(stmt) + r"(?![\w-])", raw, re.I)
-                text = re.sub(r"\s+", " ", raw[mm.start():].strip() if mm else f"{stmt} {node.name}").rstrip(".")[:TOKEN_MAX]
+                text = re.sub(r"\s+", " ", raw[mm.start():].strip() if mm else f"{stmt} {r['name']}").rstrip(".")[:TOKEN_MAX]
             if (text, tag) in zip(texts, cites):
                 continue
             texts.append(text)
@@ -2724,12 +2812,13 @@ class _Fallback(_Report):
             tail = f"   ({len(edges)} edge(s) not followed)" + self.end(END_HOPS.format(n=self.o.hops), num)
             edges = []
         elif not edges and not uses:
-            tail = self.end(END_NO_USE.format(p=node.pname), num)
+            tail = self.end(FALLBACK_COPY if node.frow is None else END_NO_USE.format(p=node.pname), num)
         self.put(depth, self.fmt(num, depth, head + tail))
         for s in self.sets(node):
             self.put(depth, self.sub(depth, s))
         if uses:
-            self.put(depth, self.sub(depth, uses + ("" if edges else self.end(END_TESTED, num))))
+            self.put(depth, self.sub(depth, uses + ("" if edges else self.end(FALLBACK_COPY if node.frow is None else END_TESTED,
+                                                                              num))))
         self.children(node, edges, num, depth + 1)
 
     emit_dataset = _Walker.emit_dataset
@@ -2765,8 +2854,11 @@ class _Fallback(_Report):
         for s in self.sets(node):
             self.put(0, f"- {s}")
         uses = self.uses(node)
+        # a copied item: its own text's statements are not all it takes part in (FALLBACK_COPY)
         if uses:
-            self.put(0, f"- {uses}" + ("" if edges else self.end(END_TESTED, "root")))
+            self.put(0, f"- {uses}" + ("" if edges else self.end(FALLBACK_COPY if frow is None else END_TESTED, "root")))
+        elif not edges and frow is None:
+            self.put(0, f"- nothing more found in {p['program_id']}'s own statements" + self.end(FALLBACK_COPY, "root"))
         elif not edges:
             self.put(0, f"- {END_NO_USE.format(p=p['program_id'])}" + self.end(END_NO_USE.format(p=p["program_id"]), "root"))
         self.children(node, edges, "", 1)
@@ -3078,10 +3170,18 @@ def _targets_in(text: str) -> List[str]:
     def names_after(m_end: int, limit: int = 8) -> List[str]:
         got = []
         skip_next = False
+        depth = 0
         for tok in re.findall(r"[A-Z0-9][\w-]*|\(|\)|\.", text[m_end:]):
             if tok == ".":
                 break
-            if tok in ("(", ")"):
+            # a name inside a subscript or ref-mod parenthesis is an index, never a target (guard 3)
+            if tok == "(":
+                depth += 1
+                continue
+            if tok == ")":
+                depth = max(0, depth - 1)
+                continue
+            if depth:
                 continue
             if tok in _TARGET_STOP and tok not in _SKIP_ARG:
                 break
