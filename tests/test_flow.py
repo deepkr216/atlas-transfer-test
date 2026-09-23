@@ -637,6 +637,225 @@ class FlowSharedStorage(unittest.TestCase):
         self.assertRegex(txt, r"CALL SHPART arg 1 <- SHPART\.LK-P\b")
 
 
+class FlowWalkEdges(unittest.TestCase):
+    """Review fixes on the walk (inline, fictional): a node first reached at
+    the hop limit never hides the same node on a shorter path; a RETURNING
+    item goes back to the caller downstream as it does under --up; a temp
+    dataset in one PROC is not read by a step of another PROC (guard 17);
+    `diff` reads a changed line as its whole statement."""
+
+    HOPP = """       IDENTIFICATION DIVISION.
+       PROGRAM-ID. HOPP.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01  H-A                      PIC X(02).
+       01  H-B                      PIC X(02).
+       01  H-C                      PIC X(02).
+       01  H-D                      PIC X(02).
+       01  H-E                      PIC X(02).
+       PROCEDURE DIVISION.
+           MOVE H-A TO H-B.
+           MOVE H-A TO H-D.
+           MOVE H-B TO H-C.
+           MOVE H-C TO H-D.
+           MOVE H-D TO H-E.
+           DISPLAY H-E.
+           GOBACK.
+"""
+    RTS = """       IDENTIFICATION DIVISION.
+       PROGRAM-ID. RTS.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01  WS-CODE                  PIC X(02).
+       LINKAGE SECTION.
+       01  LK-IN                    PIC X(02).
+       01  LK-OUT                   PIC X(02).
+       PROCEDURE DIVISION USING LK-IN RETURNING LK-OUT.
+           MOVE WS-CODE TO LK-OUT.
+           GOBACK.
+"""
+    RTC = """       IDENTIFICATION DIVISION.
+       PROGRAM-ID. RTC.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01  WC-IN                    PIC X(02).
+       01  WC-OUT                   PIC X(02).
+       PROCEDURE DIVISION.
+           CALL 'RTS' USING WC-IN RETURNING WC-OUT.
+           DISPLAY WC-OUT.
+           GOBACK.
+"""
+    TPW = """       IDENTIFICATION DIVISION.
+       PROGRAM-ID. TPW.
+       ENVIRONMENT DIVISION.
+       INPUT-OUTPUT SECTION.
+       FILE-CONTROL.
+           SELECT OUT-F ASSIGN TO TMPOUT.
+       DATA DIVISION.
+       FILE SECTION.
+       FD  OUT-F.
+       01  OUT-REC.
+           05  OR-CODE              PIC X(04).
+       WORKING-STORAGE SECTION.
+       01  WS-CODE                  PIC X(04).
+       PROCEDURE DIVISION.
+           OPEN OUTPUT OUT-F.
+           MOVE WS-CODE TO OR-CODE.
+           WRITE OUT-REC.
+           CLOSE OUT-F.
+           GOBACK.
+"""
+    TPR = """       IDENTIFICATION DIVISION.
+       PROGRAM-ID. TPR.
+       ENVIRONMENT DIVISION.
+       INPUT-OUTPUT SECTION.
+       FILE-CONTROL.
+           SELECT IN-F ASSIGN TO TMPIN.
+       DATA DIVISION.
+       FILE SECTION.
+       FD  IN-F.
+       01  IN-REC.
+           05  IR-CODE              PIC X(04).
+       PROCEDURE DIVISION.
+           OPEN INPUT IN-F.
+           READ IN-F.
+           DISPLAY IR-CODE.
+           CLOSE IN-F.
+           GOBACK.
+"""
+    # the same temp DSN written in one PROC / job and read in another: never joined
+    JCL = (("PROCA.prc", "//PROCA   PROC\n//W1      EXEC PGM=TPW\n//TMPOUT  DD DSN=&&TMP,DISP=(NEW,PASS)\n"),
+           ("PROCB.prc", "//PROCB   PROC\n//R1      EXEC PGM=TPR\n//TMPIN   DD DSN=&&TMP,DISP=(OLD,DELETE)\n"),
+           ("JOBA.jcl", "//JOBA     JOB (ACCT),'A'\n//W1      EXEC PGM=TPW\n//TMPOUT  DD DSN=&&TMP,DISP=(NEW,PASS)\n"),
+           ("JOBB.jcl", "//JOBB     JOB (ACCT),'B'\n//R1      EXEC PGM=TPR\n//TMPIN   DD DSN=&&TMP,DISP=(OLD,DELETE)\n"),
+           # one job whose second step reads the first step's temp dataset: joined
+           ("JOBC.jcl", "//JOBC     JOB (ACCT),'C'\n//W1      EXEC PGM=TPW\n//TMPOUT  DD DSN=&&PASS1,DISP=(NEW,PASS)\n"
+                        "//R1      EXEC PGM=TPR\n//TMPIN   DD DSN=&&PASS1,DISP=(OLD,DELETE)\n"))
+    # a MOVE whose TO is on the next line
+    DFW = """       IDENTIFICATION DIVISION.
+       PROGRAM-ID. DFW.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01  WS-A                     PIC X(02).
+       01  WS-B                     PIC X(02).
+       01  WS-C                     PIC X(02).
+       01  WS-Z                     PIC X(02).
+       PROCEDURE DIVISION.
+           MOVE WS-A
+               TO WS-B.
+           MOVE WS-B TO WS-C.
+           DISPLAY WS-C WS-Z.
+           GOBACK.
+"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.td = tempfile.mkdtemp()
+        src = os.path.join(cls.td, "estate")
+        os.makedirs(src)
+        files = [("HOPP.cbl", cls.HOPP), ("RTS.cbl", cls.RTS), ("RTC.cbl", cls.RTC), ("TPW.cbl", cls.TPW),
+                 ("TPR.cbl", cls.TPR), ("DFW.cbl", cls.DFW)] + list(cls.JCL)
+        for name, text in files:
+            with open(os.path.join(src, name), "w", encoding="utf-8") as fh:
+                fh.write(text)
+        cls.db = os.path.join(cls.td, "t.db")
+        with contextlib.redirect_stdout(io.StringIO()):
+            build._main([src, "--db", cls.db, "--rebuild", "--quiet"])
+        cls.old = os.path.join(cls.td, "old.db")
+        shutil.copyfile(cls.db, cls.old)
+        c = sqlite3.connect(cls.old)
+        c.executescript("DROP TABLE data_flow; DROP TABLE pfield;")
+        c.close()
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.td, ignore_errors=True)
+
+    def flow(self, *args, db=None) -> str:
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = query._main(["--db", db or self.db, "flow", *args])
+        self.assertEqual(rc, 0, err.getvalue())
+        return out.getvalue()
+
+    def test_node_cut_at_the_hop_limit_is_expanded_on_a_shorter_path(self):
+        # H-A -> H-B -> H-C -> H-D reaches H-D at hop 3 (cut); H-A -> H-D reaches it at hop 1,
+        # and H-E is one more hop: it must be there, never hidden behind "(shown as 1.1.1)"
+        for db, tag in ((self.db, "exact"), (self.old, "reconstructed")):
+            with self.subTest(tag):
+                out = self.flow("H-A", "--program", "HOPP", db=db)
+                self.assertRegex(out, r"(?m)^1\.1\.1\s+MOVE -> H-D\b.*\[end: hop limit 3\]")
+                self.assertRegex(out, r"(?m)^2\s+MOVE -> H-D\b")
+                self.assertNotRegex(_lines_of(out, "MOVE -> H-D"), r"(?m)^2\s.*shown as")
+                self.assertRegex(out, r"(?m)^2\.1\s+MOVE -> H-E\b")
+                self.assertRegex(_lines_of(out, "DISPLAY"), r"HOPP:16")
+        # a node reached again at the same or a deeper hop is still shown once (cycles stop)
+        again = self.flow("H-B", "--program", "HOPP", "--hops", "5")
+        self.assertEqual(again.count("MOVE -> H-E"), 1, again)
+
+    def test_returning_item_goes_back_to_the_caller(self):
+        down = self.flow("WS-CODE", "--program", "RTS")
+        self.assertRegex(down, r"(?m)^1\s+MOVE -> LK-OUT \(LINKAGE")
+        self.assertRegex(down, r"(?m)^1\.1\s+RETURNING -> back to RTC\.WC-OUT\b.*RTC:8 \"CALL 'RTS' USING WC-IN RETURNING WC-OUT\"")
+        self.assertRegex(_lines_of(down, "DISPLAY"), r"RTC:9.*\[end: only tested/displayed here\]")
+        self.assertNotIn("no further use in RTS", down)
+        # the --up mirror, unchanged
+        up = self.flow("WC-OUT", "--program", "RTC", "--up")
+        self.assertRegex(up, r"RETURNING <- RTS\.LK-OUT\b")
+        self.assertRegex(up, r"MOVE <- RTS\.WS-CODE\b")
+        # an input parameter nobody writes back never reaches the RETURNING item's caller slot
+        self.assertNotIn("WC-OUT", self.flow("LK-IN", "--program", "RTS"))
+
+    def test_temp_dataset_stays_inside_one_job_or_proc(self):
+        out = self.flow("WS-CODE", "--program", "TPW")
+        # PROCA's &&TMP is not PROCB's, JOBA's is not JOBB's (guard 17)
+        self.assertNotIn("PROCB", out)
+        self.assertNotIn("JOBB", out)
+        for w in ("PROC PROCA W1 DD TMPOUT", "JOBA W1 DD TMPOUT"):
+            hop = out.split(w, 1)[1].split("\n", 2)[1]
+            self.assertIn("no step reads &&TMP", hop)
+            self.assertIn("[end: no indexed reader]", hop)
+        # inside one job the next step does read it
+        self.assertRegex(out, r"read by TPR\.IR-CODE bytes 1-4 \(JOBC R1 DD TMPIN")
+        up = self.flow("IR-CODE", "--program", "TPR", "--up")
+        self.assertNotIn("PROCA", up)
+        self.assertNotIn("JOBA", up)
+        self.assertRegex(up, r"written by TPW\.OR-CODE bytes 1-4 \(JOBC W1 DD TMPOUT")
+
+    def test_diff_reads_a_changed_line_as_its_whole_statement(self):
+        with open(os.path.join(self.td, "estate", "DFW.cbl"), encoding="utf-8") as fh:
+            src = fh.read()
+        conn = query.connect(self.db)
+        try:
+            for label, old, new in (("the MOVE line", "MOVE WS-A\n", "MOVE WS-Z\n"),
+                                    ("the TO line", "TO WS-B.\n", "TO WS-B .\n")):
+                with self.subTest(label):
+                    path = os.path.join(self.td, label.replace(" ", "_"), "DFW.cbl")
+                    os.makedirs(os.path.dirname(path), exist_ok=True)
+                    self.assertEqual(src.count(old), 1)
+                    with open(path, "w", encoding="utf-8", newline="\n") as fh:
+                        fh.write(src.replace(old, new))
+                    d = query.cmd_diff(conn, "DFW", path)
+                    self.assertIn("## Flow from the changed statements", d)
+                    self.assertIn("**DFW.WS-B**", d)
+                    self.assertRegex(d, r"MOVE -> WS-C\b")
+                    self.assertNotIn("**DFW.WS-C**", d)          # the unchanged MOVE below is not a start
+        finally:
+            conn.close()
+        # the same widening for a CALL whose USING is on a continuation line, and for a comment in between
+        from atlas import flow
+        text = ["000100     CALL 'SUBX'",
+                "000200*    A COMMENT LINE",
+                "000300         USING WS-P",
+                "000400               WS-Q.",
+                "000500     MOVE WS-R TO WS-S."]
+        self.assertEqual(flow.changed_targets(text, True, [0]), ["WS-P", "WS-Q"])
+        self.assertEqual(flow.changed_targets(text, True, [3]), ["WS-P", "WS-Q"])
+        self.assertEqual(flow.changed_targets(text, True, [4]), ["WS-S"])
+        # without the indexes, the lines are the text (as before)
+        self.assertEqual(flow.changed_targets(text[:1], True), [])
+
+
 class FlowIndex(unittest.TestCase):
 
     @classmethod
@@ -1014,6 +1233,37 @@ class FlowIndex(unittest.TestCase):
         self.assertIn("FLOWSUB.LK-STATUS", out)             # CALL from call_edge / linkage_using
         self.assertIn("POLICY_TBL.STATUS_CD", out)          # DB2 from sql_col_ref
         self.assertEqual(out.rstrip().splitlines()[-1], FOOTER)
+
+    def test_fallback_reader_from_a_copybook_is_not_a_layout_claim(self):
+        # the old-index shape (none of the five tables): FLOWRDR's IN-REC takes its items from COPY
+        # FLOWRDRC, which `field` does not hold for the program - so the fallback cannot follow them.
+        # It must say THAT, never "reader layout has no field at bytes 13-14" (IR-STAT is at 13-14)
+        old = os.path.join(self.td, "oldest.db")
+        shutil.copy(self.db, old)
+        c = sqlite3.connect(old)
+        try:
+            c.executescript("DROP TABLE data_flow; DROP TABLE pfield; DROP TABLE call_arg; DROP TABLE param; "
+                            "DROP TABLE file_record;")
+        finally:
+            c.close()
+        out = self.flow("WS-STATUS", "--program", "FLOWSRC", db=old)
+        hop = _lines_of(out, "FLOWRDR.IN-REC")
+        self.assertTrue(hop, out)
+        self.assertIn("[end: copybook fields: not followed until re-parse]", hop)
+        self.assertNotIn("reader layout has no field", out)
+        self.assertIn("copybook fields: not followed until re-parse:", out.split("## Ends", 1)[1])
+
+    def test_returning_item_goes_back_to_the_caller_in_the_fixtures(self):
+        # FLOWSUB's RETURNING item comes back into FLOWSRC.WS-R at GOBACK (`CALL .. RETURNING WS-R`)
+        out = self.flow("LK-RET", "--program", "FLOWSUB")
+        self.assertRegex(out, r"(?m)^1\s+RETURNING -> back to FLOWSRC\.WS-R\b")
+        self.assertNotIn("no further use in FLOWSUB", out)
+        cites = list(CITE.finditer(out))
+        self.assertTrue(cites, out)
+        answer = "\n".join(f'[[{m.group(1)} {m.group(2)}{"-" + m.group(3) if m.group(3) else ""} "{m.group(4)}"]]'
+                           for m in cites)
+        res, _u = verify_citations.check_answer(answer, db_path=self.db)
+        self.assertEqual([(r.raw, r.status) for r in res if r.status != "PASS"], [])
 
     def test_literal_pack_diff_use_flow(self):
         lit = query.cmd_literal(self.conn, "LP")

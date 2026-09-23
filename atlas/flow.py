@@ -433,6 +433,15 @@ def _note_file(note: Optional[str]) -> Optional[str]:
     return parts[1] if len(parts) > 1 and parts[0] == "file" else None
 
 
+def _same_run(d: dict, s) -> bool:
+    """A temp dataset (&&X) lives only inside one run: the same job, or -
+    for the steps of a PROC definition, which have no job - the same PROC.
+    Two PROCs (job_id NULL on both sides) are not one run (guard 17)."""
+    if d.get("job_id") is not None:
+        return s["job_id"] == d["job_id"]
+    return s["job_id"] is None and d.get("proc_id") is not None and s["proc_id"] == d.get("proc_id")
+
+
 def _numeric(row) -> bool:
     pic = (row["pic"] or "").upper()
     usage = (row["usage"] or "").upper()
@@ -460,7 +469,7 @@ class _Walker(_Report):
         self._prog: Dict[int, sqlite3.Row] = {}
         self._dup: Dict[Tuple[int, str], int] = {}
         self._aliases: Dict[int, Set[str]] = {}
-        self.visited: Dict[Tuple[int, int], List[Tuple[int, int, str, Optional[int]]]] = defaultdict(list)
+        self.visited: Dict[Tuple[int, int], List[Tuple[int, int, str, Optional[int], int]]] = defaultdict(list)
         self._partial_shown: Set[int] = set()
         self._layout: Dict[int, Optional[str]] = {}
 
@@ -665,14 +674,15 @@ class _Walker(_Report):
 
     def seen(self, node: _Node) -> Optional[str]:
         # a parameter walked as one CALL's storage (via_call) has fewer edges than the
-        # same parameter reached by a copy inside the callee: it never stands in for that
-        for (vlo, vhi, num, via) in self.visited[(node.pid, node.root)]:
-            if vlo <= node.lo and node.hi <= vhi and (via is None or node.via_call is not None):
+        # same parameter reached by a copy inside the callee: it never stands in for that.
+        # A visit at a DEEPER hop was cut sooner by --hops: a shorter path re-expands the node
+        for (vlo, vhi, num, via, vhop) in self.visited[(node.pid, node.root)]:
+            if vlo <= node.lo and node.hi <= vhi and (via is None or node.via_call is not None) and vhop <= node.hop:
                 return num
         return None
 
     def visit(self, node: _Node, num: str) -> None:
-        self.visited[(node.pid, node.root)].append((node.lo, node.hi, num, node.via_call))
+        self.visited[(node.pid, node.root)].append((node.lo, node.hi, num, node.via_call, node.hop))
 
     # ---- byte mapping between a source item and a destination item ------------------
     def map_bytes(self, node: _Node, src, src_refmod: Optional[str], dst, dst_refmod: Optional[str],
@@ -987,12 +997,12 @@ class _Walker(_Report):
             label = f"{verb} {rec} -> {s['dsn_resolved']} ({where}, {s['mode']}/{s['mode_source']})"
             cites = stmt_cite + "; " + self.cite_dd(s["member_name"], s["dd_line"], s["dd_name"], True)
             ds = _Node(pid, node.pname, node.root, node.lo, node.hi, node.pf, node.hop, kind="dataset",
-                       data={"dsn": s["dsn_resolved"], "job_id": s["job_id"], "is_temp": s["is_temp"],
+                       data={"dsn": s["dsn_resolved"], "job_id": s["job_id"], "proc_id": s["proc_id"], "is_temp": s["is_temp"],
                              "dd_id": s["dd_id"], "gdg": s["gdg_rel"], "writer_pf": node.pf})
             out.append(_Edge(1, node.pname, r["line"], label, cites, child=ds))
         if cf:
             ds = _Node(pid, node.pname, node.root, node.lo, node.hi, node.pf, node.hop, kind="dataset",
-                       data={"dsn": cf["dsname"], "job_id": None, "is_temp": 0, "dd_id": None, "gdg": None,
+                       data={"dsn": cf["dsname"], "job_id": None, "proc_id": None, "is_temp": 0, "dd_id": None, "gdg": None,
                              "writer_pf": node.pf})
             out.append(_Edge(1, node.pname, r["line"], f"{verb} {rec} -> {cf['dsname']} (CICS FILE {fd['assign_dd']})",
                              stmt_cite, child=ds))
@@ -1033,7 +1043,7 @@ class _Walker(_Report):
                 continue
             if s["mode"] not in want:
                 continue
-            if (d.get("is_temp") or s["is_temp"]) and s["job_id"] != d.get("job_id"):
+            if (d.get("is_temp") or s["is_temp"]) and not _same_run(d, s):
                 continue
             pgm = s["pgm"] or ""
             job = s["job_name"] or (f"PROC {s['proc_name']}" if s["proc_name"] else "?")
@@ -1071,7 +1081,7 @@ class _Walker(_Report):
                     line = (f"{s['step_name']} {what}{gdg} - bytes unchanged {arrow} {o['dsn_resolved']}",
                             self.cite_dd(s["member_name"], s["dd_line"], s["dd_name"], True))
                     nxt = _Node(ds.pid, ds.pname, ds.root, ds.lo, ds.hi, ds.pf, ds.hop, kind="dataset",
-                                data={"dsn": o["dsn_resolved"], "job_id": s["job_id"], "is_temp": o["is_temp"],
+                                data={"dsn": o["dsn_resolved"], "job_id": s["job_id"], "proc_id": s["proc_id"], "is_temp": o["is_temp"],
                                       "dd_id": o["dd_id"], "gdg": o["gdg_rel"], "writer_pf": d.get("writer_pf")})
                     leaves.extend(self.dataset_leaves(nxt, reader_fn, seen, path + [line]))
                 continue
@@ -1325,9 +1335,11 @@ class _Walker(_Report):
         return out
 
     # ---- rule 3: LINKAGE back ----------------------------------------------------------------------
-    def params_of_root(self, node: _Node) -> List[sqlite3.Row]:
-        return self.conn.execute("""SELECT pr.* FROM param pr JOIN pfield f ON f.id=pr.pfield
-                                    WHERE pr.program_id=? AND f.root_id=? AND pr.pos>0""", (node.pid, node.root)).fetchall()
+    def params_of_root(self, node: _Node, returning: bool = False) -> List[sqlite3.Row]:
+        # pos 0 is the RETURNING item: no caller passes it, the value goes back at GOBACK
+        return self.conn.execute(f"""SELECT pr.* FROM param pr JOIN pfield f ON f.id=pr.pfield
+                                     WHERE pr.program_id=? AND f.root_id=? AND pr.pos{'>=' if returning else '>'}0
+                                     ORDER BY pr.pos, pr.id""", (node.pid, node.root)).fetchall()
 
     def written_here(self, node: _Node, ids: Set[int]) -> bool:
         q = ",".join("?" * len(ids))
@@ -1369,11 +1381,19 @@ class _Walker(_Report):
         # reach another CALL's argument; every caller only when it got here by a copy (or is the start)
         if node.via_call is not None:
             return out
-        params = self.params_of_root(node)
-        if not params or not self.written_here(node, ids):
+        params = self.params_of_root(node, returning=True)
+        if not params:
             return out
+        written = self.written_here(node, ids)
         for prm in params:
             ppf = self.pf(prm["pfield"])
+            if prm["pos"] == 0:
+                # RETURNING: a copy back to each caller's RETURNING item at GOBACK (rule 9 `returning`),
+                # whoever wrote it - not shared storage, so no write is needed here
+                out.extend(self.returning_back(node, prm, ppf))
+                continue
+            if not written:
+                continue
             for c in self.callers_of(node.pname, prm["entry"]):
                 if prm["entry"] == "DFHCOMMAREA":
                     args = self.conn.execute("SELECT * FROM call_arg WHERE call_id=? AND how IN ('commarea')", (c["id"],)).fetchall()
@@ -1406,6 +1426,40 @@ class _Walker(_Report):
                         self.touch(c["cpid"])
                         out.append(_Edge(3, c["caller"], c["line"], f"LINKAGE {tag} -> back to {c['caller']}.{self.nm(ch)} "
                                          f"{self.desc(ch)} (BY REFERENCE)".replace("  ", " ") + self._lbls(labels), cites, child=ch))
+        return out
+
+    def returning_back(self, node: _Node, prm, ppf) -> List[_Edge]:
+        """The callee's RETURNING item -> every caller's `CALL .. RETURNING x`
+        (the caller's `returning` data_flow row names x's pfield); the --up
+        mirror is returning_up."""
+        out: List[_Edge] = []
+        for c in self.callers_of(node.pname, prm["entry"]):
+            if not c["returning_item"]:
+                continue
+            word = _CALL_WORD.get(c["kind"], "CALL")
+            cites = self.cite_stmt(c["cpid"], c["line"], word, c["returning_item"])
+            tag = "" if c["target"] else f" (CALL {c['via_var']}: {_how_resolved(c)} candidate)"
+            r = self.conn.execute("SELECT dst_pfield FROM data_flow WHERE program_id=? AND line=? AND kind='returning'",
+                                  (c["cpid"], c["line"])).fetchone()
+            apf = self.pf(r["dst_pfield"]) if r else None
+            if apf is None:
+                self.unlinked += 1
+                out.append(_Edge(3, c["caller"], c["line"], f"RETURNING{tag} -> back to {c['caller']}.{c['returning_item']}",
+                                 cites, end=END_AMBIGUOUS))
+                continue
+            mapped = self.map_bytes(node, ppf, None, apf, None)
+            if mapped is None:
+                continue
+            n_lo, n_hi, labels, end = mapped
+            if end:
+                out.append(_Edge(3, c["caller"], c["line"], f"RETURNING{tag} -> back to {c['caller']}.{c['returning_item']}"
+                                 + self._lbls(labels), cites, end=end))
+                continue
+            for (row, plo, phi, how) in self.place(apf, n_lo, n_hi):
+                ch = self.child(c["cpid"], row, plo, phi, how, node.hop + 1)
+                self.touch(c["cpid"])
+                out.append(_Edge(3, c["caller"], c["line"], f"RETURNING{tag} -> back to {c['caller']}.{self.nm(ch)} "
+                                 f"{self.desc(ch)} (pos 0)".replace("  ", " ") + self._lbls(labels), cites, child=ch))
         return out
 
     # ---- rule 4: DB2 -----------------------------------------------------------------------------
@@ -1532,7 +1586,7 @@ class _Walker(_Report):
                 dsn = cf["dsname"] if cf else None
             if dsn:
                 ds = _Node(pid, node.pname, node.root, node.lo, node.hi, node.pf, node.hop, kind="dataset",
-                           data={"dsn": dsn, "job_id": None, "is_temp": 0, "dd_id": None, "gdg": None, "writer_pf": node.pf})
+                           data={"dsn": dsn, "job_id": None, "proc_id": None, "is_temp": 0, "dd_id": None, "gdg": None, "writer_pf": node.pf})
                 out.append(_Edge(6, dsn, r["line"], f"{verb} {kind.upper()} {res} -> {dsn} (CICS {kind.upper()})", cites, child=ds))
         if not out:
             out.append(_Edge(6, "CICS", r["line"], f"{verb} {kind.upper()} {res} FROM {r['src_name']}", cites, end=END_NO_READER))
@@ -1599,7 +1653,7 @@ class _Walker(_Report):
             cf = self.conn.execute("SELECT dsname FROM cics_file WHERE UPPER(name)=? AND dsname IS NOT NULL", (res.upper(),)).fetchone()
             if cf:
                 ds = _Node(pid, node.pname, node.root, node.lo, node.hi, node.pf, node.hop, kind="dataset",
-                           data={"dsn": cf["dsname"], "job_id": None, "is_temp": 0, "dd_id": None, "gdg": None, "writer_pf": node.pf})
+                           data={"dsn": cf["dsname"], "job_id": None, "proc_id": None, "is_temp": 0, "dd_id": None, "gdg": None, "writer_pf": node.pf})
                 out.append(_Edge(6, cf["dsname"], r["line"], f"{verb} FILE {res} <- {cf['dsname']} (CICS FILE)", cites, child=ds))
         if not out:
             out.append(_Edge(6, "CICS", r["line"], f"{verb} {kind.upper()} {res} INTO {r['dst_name']}", cites, end=END_NO_WRITER))
@@ -1755,12 +1809,12 @@ class _Walker(_Report):
             label = f"{verb} {rec} <- {s['dsn_resolved']} ({where}, {s['mode']}/{s['mode_source']})"
             cites = stmt_cite + "; " + self.cite_dd(s["member_name"], s["dd_line"], s["dd_name"], True)
             ds = _Node(pid, node.pname, node.root, node.lo, node.hi, node.pf, node.hop, kind="dataset",
-                       data={"dsn": s["dsn_resolved"], "job_id": s["job_id"], "is_temp": s["is_temp"], "dd_id": s["dd_id"],
+                       data={"dsn": s["dsn_resolved"], "job_id": s["job_id"], "proc_id": s["proc_id"], "is_temp": s["is_temp"], "dd_id": s["dd_id"],
                              "gdg": s["gdg_rel"], "writer_pf": node.pf})
             out.append(_Edge(1, node.pname, r["line"], label, cites, child=ds))
         if cf:
             ds = _Node(pid, node.pname, node.root, node.lo, node.hi, node.pf, node.hop, kind="dataset",
-                       data={"dsn": cf["dsname"], "job_id": None, "is_temp": 0, "dd_id": None, "gdg": None, "writer_pf": node.pf})
+                       data={"dsn": cf["dsname"], "job_id": None, "proc_id": None, "is_temp": 0, "dd_id": None, "gdg": None, "writer_pf": node.pf})
             out.append(_Edge(1, node.pname, r["line"], f"{verb} {rec} <- {cf['dsname']} (CICS FILE {fd['assign_dd']})", stmt_cite,
                              child=ds))
         return out
@@ -2174,8 +2228,9 @@ class _Fallback(_Report):
         super().__init__(conn, opts)
         self.unpaired: Dict[int, int] = {}
         self.pairs: Dict[int, List[Tuple[int, str, str]]] = {}
-        self.visited: Dict[Tuple[int, str], str] = {}
-        self.via_only: Set[Tuple[int, str]] = set()    # visited only as one CALL's storage (_Walker.seen)
+        # (num, via_call, hop) per visit, as _Walker.seen: a CALL's storage never stands in for
+        # the item reached by a copy, and a visit cut sooner by --hops never hides a shorter path
+        self.visited: Dict[Tuple[int, str], List[Tuple[str, Optional[int], int]]] = defaultdict(list)
         self._prog: Dict[int, sqlite3.Row] = {}
 
     def prog(self, pid: int):
@@ -2438,7 +2493,7 @@ class _Fallback(_Report):
             label = f"{op} {root['name']} {arrow} {s['dsn_resolved']} ({where}, {s['mode']}/{s['mode_source']}) (reconstructed)"
             cites = stmt_cite + "; " + self.cite_dd(s["member_name"], s["dd_line"], s["dd_name"], True)
             ds = _Node(pid, node.pname, root["id"], lo, hi, None, node.hop, kind="dataset",
-                       data={"dsn": s["dsn_resolved"], "job_id": s["job_id"], "is_temp": s["is_temp"], "dd_id": s["dd_id"],
+                       data={"dsn": s["dsn_resolved"], "job_id": s["job_id"], "proc_id": s["proc_id"], "is_temp": s["is_temp"], "dd_id": s["dd_id"],
                              "gdg": s["gdg_rel"], "writer_pf": None})
             out.append(_Edge(1, node.pname, io["line"], label, cites, child=ds))
         if not steps:
@@ -2463,16 +2518,23 @@ class _Fallback(_Report):
             root = self.conn.execute("SELECT * FROM field WHERE member_id=? AND UPPER(name)=? AND parent_id IS NULL",
                                      (prog["member_id"], fd["fd_record"].upper())).fetchone()
             if root is None:
-                leaves.append(_Leaf([], f"{prog['program_id']} {fd['fd_record']} ({where}): {FALLBACK_COPY}", dd_cite,
-                                    end=END_NO_FIELD.format(lo=ds.lo + 1, hi=ds.hi)))
+                # the 01 itself comes from a copybook: field holds the program's own text only
+                leaves.append(_Leaf([], f"{prog['program_id']} {fd['fd_record']} ({where}): record from a copybook", dd_cite,
+                                    end=FALLBACK_COPY))
                 continue
+            # an elementary 01 is its own item; a group's items are its program-owned elementary children
             items = self.conn.execute("""WITH RECURSIVE sub(id) AS (SELECT ? UNION ALL SELECT f.id FROM field f JOIN sub ON f.parent_id=sub.id)
-                                         SELECT f.* FROM field f JOIN sub ON sub.id=f.id WHERE f.is_group=0 AND f.id<>?
+                                         SELECT f.* FROM field f JOIN sub ON sub.id=f.id WHERE f.is_group=0
                                          AND f.offset<? AND f.offset+f.length>? ORDER BY f.offset""",
-                                      (root["id"], root["id"], ds.hi, ds.lo)).fetchall()
+                                      (root["id"], ds.hi, ds.lo)).fetchall()
             if not items:
-                leaves.append(_Leaf([], f"{prog['program_id']}.{root['name']} ({where}): {FALLBACK_COPY}", dd_cite,
-                                    end=END_NO_FIELD.format(lo=ds.lo + 1, hi=ds.hi)))
+                if ds.lo >= root["offset"] + root["length"]:
+                    leaves.append(_Leaf([], f"{prog['program_id']}.{root['name']} ({where}): record is {root['length']} bytes",
+                                        dd_cite, end=END_NO_FIELD.format(lo=ds.lo + 1, hi=ds.hi)))
+                else:
+                    # bytes inside the record that no line of the program's own text names: a COPY's items
+                    leaves.append(_Leaf([], f"{prog['program_id']}.{root['name']} bytes {ds.lo + 1}-{min(ds.hi, root['offset'] + root['length'])} "
+                                            f"({where}): not in the program's own text", dd_cite, end=FALLBACK_COPY))
                 continue
             for r in items:
                 ch = _FNode(rpid, prog["program_id"], r["name"].upper(), r, ds.hop + 1)
@@ -2518,14 +2580,12 @@ class _Fallback(_Report):
         self.touch(node.pid)
         head = f"{e.label}   {e.cites}"
         key = (node.pid, node.name)
-        if key in self.visited and (key not in self.via_only or node.via_call is not None):
-            self.put(depth, self.fmt(num, depth, f"{head}   (shown as {self.visited[key]})"))
+        prev = next((n for (n, via, hop) in self.visited[key]
+                     if (via is None or node.via_call is not None) and hop <= node.hop), None)
+        if prev is not None:
+            self.put(depth, self.fmt(num, depth, f"{head}   (shown as {prev})"))
             return
-        self.visited[key] = num
-        if node.via_call is not None:
-            self.via_only.add(key)
-        else:
-            self.via_only.discard(key)
+        self.visited[key].append((num, node.via_call, node.hop))
         self.count += 1
         edges = self.edges(node)
         uses = self.uses(node)
@@ -2556,7 +2616,7 @@ class _Fallback(_Report):
         self.touch(pid)
         p = self.prog(pid)
         node = _FNode(pid, p["program_id"], name.upper(), frow, 0)
-        self.visited[(pid, node.name)] = "root"
+        self.visited[(pid, node.name)].append(("root", None, 0))
         if frow is not None:
             self.put(0, f"- defined {self.cite_def(frow, pid)} ({_picstr(frow)}; offsets as this program's own text declares them)")
         else:
@@ -2782,18 +2842,99 @@ _TARGET_STOP = {"ELSE", "END-IF", "END-EVALUATE", "END-PERFORM", "END-CALL", "EN
 _SKIP_ARG = {"BY", "REFERENCE", "CONTENT", "VALUE", "LENGTH", "OF", "ADDRESS", "OMITTED", "IN"}
 
 
-def changed_targets(lines: Sequence[str], fixed: bool) -> List[str]:
-    """The data items the changed lines set: MOVE / COMPUTE / STRING / CALL
-    USING (and the arithmetic verbs) - the starts of `diff`'s flow."""
-    code = []
-    for s in lines:
-        if fixed:
-            if len(s) > 6 and s[6] in "*/":
-                continue
-            code.append(s[7:72])
+# a line whose first word is one of these starts a statement (or a clause that ends the one before)
+_STMT_START = {"MOVE", "COMPUTE", "ADD", "SUBTRACT", "MULTIPLY", "DIVIDE", "STRING", "UNSTRING", "CALL", "IF", "ELSE",
+               "EVALUATE", "WHEN", "PERFORM", "DISPLAY", "SET", "READ", "WRITE", "REWRITE", "DELETE", "START", "RETURN",
+               "RELEASE", "SORT", "MERGE", "SEARCH", "EXEC", "INITIALIZE", "ACCEPT", "OPEN", "CLOSE", "GOBACK", "STOP",
+               "CONTINUE", "EXIT", "INSPECT", "GO", "NEXT", "ENTRY", "AT", "INVALID", "NOT", "ON", "END-IF", "END-EVALUATE",
+               "END-PERFORM", "END-CALL", "END-STRING", "END-UNSTRING", "END-ADD", "END-SUBTRACT", "END-MULTIPLY",
+               "END-DIVIDE", "END-COMPUTE", "END-READ", "END-WRITE", "END-REWRITE", "END-SEARCH", "END-EXEC"}
+
+
+def _code_of(s: str, fixed: bool) -> Optional[str]:
+    """The code area of a source line; None for a comment line."""
+    if fixed:
+        if len(s) > 6 and s[6] in "*/":
+            return None
+        return s[7:72]
+    return None if s.lstrip().startswith("*>") else s
+
+
+def _statement_spans(lines: Sequence[str], changed: Sequence[int], fixed: bool) -> List[List[str]]:
+    """Each changed line widened to its whole logical statement: back to
+    the line whose first word starts a statement, on to the line that ends
+    it (a period, or the next line starting a statement). A MOVE whose TO
+    sits on the next line, a changed `TO X` line alone and a CALL's USING
+    continuation all carry their targets this way."""
+    code = [_code_of(x, fixed) for x in lines]
+
+    def first(i: int) -> str:
+        m = re.match(r"\s*([A-Za-z][\w-]*)", code[i] or "")
+        return m.group(1).upper() if m else ""
+
+    def ends(i: int) -> bool:
+        return (code[i] or "").rstrip().endswith(".")
+
+    def blank(i: int) -> bool:
+        return code[i] is None or not code[i].strip()
+
+    spans: List[Tuple[int, int]] = []
+    for i in sorted(set(changed)):
+        if i < 0 or i >= len(code) or blank(i):
+            continue
+        a = i
+        for _k in range(20):
+            if first(a) in _STMT_START:
+                break
+            j = a - 1
+            while j >= 0 and blank(j):
+                j -= 1
+            if j < 0 or ends(j):
+                break
+            a = j
+        b = i
+        for _k in range(20):
+            if ends(b):
+                break
+            j = b + 1
+            while j < len(code) and blank(j):
+                j += 1
+            if j >= len(code) or first(j) in _STMT_START:
+                break
+            b = j
+        if spans and a <= spans[-1][1]:
+            spans[-1] = (spans[-1][0], max(spans[-1][1], b))
         else:
-            code.append(s)
-    text = re.sub(r"'[^']*'|\"[^\"]*\"", "'L'", " ".join(code).upper())
+            spans.append((a, b))
+    return [[code[k] for k in range(a, b + 1) if code[k] is not None] for (a, b) in spans]
+
+
+def changed_targets(lines: Sequence[str], fixed: bool, changed: Optional[Sequence[int]] = None) -> List[str]:
+    """The data items the changed lines set: MOVE / COMPUTE / STRING / CALL
+    USING (and the arithmetic verbs) - the starts of `diff`'s flow. With
+    `changed` (indexes into `lines`, the whole new text) each changed line
+    is read as part of its whole statement; without it `lines` is the text."""
+    if changed is None:
+        groups = [[c for c in (_code_of(x, fixed) for x in lines) if c is not None]]
+    else:
+        groups = _statement_spans(lines, changed, fixed)
+    out: List[str] = []
+    for code in groups:
+        out.extend(_targets_in(re.sub(r"'[^']*'|\"[^\"]*\"", "'L'", " ".join(code).upper())))
+    seen: Set[str] = set()
+    uniq = []
+    for n in out:
+        if n in seen or n in _TARGET_STOP or n in _SKIP_ARG:
+            continue
+        if "-" in n or (n.isalpha() and len(n) > 2):
+            seen.add(n)
+            uniq.append(n)
+    return uniq[:8]
+
+
+def _targets_in(text: str) -> List[str]:
+    """Target names of the MOVE / COMPUTE / STRING / arithmetic / CALL
+    statements in one upper-cased, literal-blanked piece of code."""
     out: List[str] = []
 
     def names_after(m_end: int, limit: int = 8) -> List[str]:
@@ -2829,12 +2970,4 @@ def changed_targets(lines: Sequence[str], fixed: bool) -> List[str]:
         out.extend(names_after(m.end()))
     for m in re.finditer(r"\bCALL\b.*?\bUSING\s", text):
         out.extend(names_after(m.end(), 12))
-    seen: Set[str] = set()
-    uniq = []
-    for n in out:
-        if n in seen or n in _TARGET_STOP or n in _SKIP_ARG:
-            continue
-        if "-" in n or (n.isalpha() and len(n) > 2):
-            seen.add(n)
-            uniq.append(n)
-    return uniq[:8]
+    return out

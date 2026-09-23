@@ -3276,7 +3276,8 @@ def cmd_diff(conn: sqlite3.Connection, old_ref: Optional[str] = None, new_ref: O
                    f"per environment the plain [[NAME line]] form checks the production copy only)\n")
 
     # ---- where the items set on a changed line of NEW go: `flow --hops 2` over the indexed copy's facts
-    flow_targets = flow.changed_targets([b[y] for _t, _i1, _i2, j1, j2 in ops for y in range(j1, j2)], fixed)
+    # each changed line read as its whole statement: a MOVE's TO, a CALL's USING may sit on an unchanged line
+    flow_targets = flow.changed_targets(b, fixed, [y for _t, _i1, _i2, j1, j2 in ops for y in range(j1, j2)])
     flow_section: List[str] = []
     walked = new if new["id"] is not None else old
     prow = conn.execute("SELECT id, program_id FROM program WHERE member_id=?", (walked["id"],)).fetchone() \
