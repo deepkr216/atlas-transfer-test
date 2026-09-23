@@ -1886,6 +1886,32 @@ class FlowKnownLimits(unittest.TestCase):
         "KQC1.cbl": H.format(p="KQC1") + L.format(n="LQC1") + "           CALL 'KQC2' USING LQC1.\n           GOBACK.\n",
         "KQC2.cbl": H.format(p="KQC2") + L.format(n="LQC2") + "           CALL 'KQC1' USING LQC2.\n           GOBACK.\n",
     })
+    # --up through a callee that hands its parameter on by EXEC CICS: KL1 LINKs it to KL2, which only shows
+    # its DFHCOMMAREA (no origin); KL3 LINKs it to KL4, which sets it (followed); KL5 XCTLs it to KL4
+    # (never comes back: no origin); KL6 names it only as the RESP of a LINK (a write there)
+    FILES.update({
+        "KLA.cbl": H.format(p="KLA") + (
+            "       01  WL-F                     PIC X(02).\n       01  WL-S                     PIC X(02).\n"
+            "       01  WL-X                     PIC X(02).\n       01  WL-R                     PIC X(02).\n"
+            "       PROCEDURE DIVISION.\n"
+            "           CALL 'KL1' USING WL-F.\n           CALL 'KL3' USING WL-S.\n"
+            "           CALL 'KL5' USING WL-X.\n           CALL 'KL6' USING WL-R.\n"
+            "           DISPLAY WL-F WL-S WL-X WL-R.\n           GOBACK.\n"),
+        "KL1.cbl": H.format(p="KL1") + L.format(n="LL1")
+            + "           EXEC CICS LINK PROGRAM('KL2') COMMAREA(LL1) END-EXEC.\n           GOBACK.\n",
+        "KL2.cbl": H.format(p="KL2") + ("       LINKAGE SECTION.\n       01  DFHCOMMAREA              PIC X(02).\n"
+                                        "       PROCEDURE DIVISION.\n           DISPLAY DFHCOMMAREA.\n"
+                                        "           EXEC CICS RETURN END-EXEC.\n"),
+        "KL3.cbl": H.format(p="KL3") + L.format(n="LL3")
+            + "           EXEC CICS LINK PROGRAM('KL4')\n                COMMAREA(LL3) END-EXEC.\n           GOBACK.\n",
+        "KL4.cbl": H.format(p="KL4") + ("       LINKAGE SECTION.\n       01  DFHCOMMAREA              PIC X(02).\n"
+                                        "       PROCEDURE DIVISION.\n           MOVE 'LL' TO DFHCOMMAREA.\n"
+                                        "           EXEC CICS RETURN END-EXEC.\n"),
+        "KL5.cbl": H.format(p="KL5") + L.format(n="LL5")
+            + "           EXEC CICS XCTL PROGRAM('KL4') COMMAREA(LL5) END-EXEC.\n           GOBACK.\n",
+        "KL6.cbl": H.format(p="KL6") + L.format(n="LL6")
+            + "           EXEC CICS LINK PROGRAM('KL2') RESP(LL6) END-EXEC.\n           GOBACK.\n",
+    })
     FILES["KDW.cbl"] =FILES["KCW.cbl"].replace("KCW", "KDW").replace("COUT", "DOUT").replace("C-CODE", "D-CODE") \
         .replace("CCODE", "DCODE")
     FILES["KDR.cbl"] = FILES["KCR.cbl"].replace("KCR", "KDR").replace("CIN", "DIN").replace("C-CODE", "D-CODE")
@@ -2270,6 +2296,28 @@ class FlowKnownLimits(unittest.TestCase):
                     self.assertRegex(a, r"(?m)^1\s+CALL KQ1 arg 1 <- KQ1\.LQ1-AREA: a field under it is passed on BY "
                                         r"REFERENCE there.*\[end: callee's fields under the parameter: not followed")
                 g = self.gate(e, h, a)
+                self.assertEqual({c: st for c, st in g.items() if st != "PASS"}, {}, g)
+
+    def test_up_a_link_or_xctl_commarea_is_a_hand_over_not_a_write(self):
+        # the parser stores a LINK / XCTL COMMAREA as a write: KL1, which only LINKs its parameter to a
+        # program that shows it, was printed as the origin (`written there`), and so was KL5, which XCTLs it
+        for db, tag in ((self.db, "exact"), (self.old, "reconstructed")):
+            with self.subTest(tag):
+                for f in ("WL-F", "WL-X"):
+                    t = self.flow(f, "--program", "KLA", "--up", "--all", db=db)
+                    self.assertNotRegex(t, r"(?m)^1\s", t)
+                    self.assertNotIn("written there", t)
+                    self.assertIn("[end: only tested/displayed here]", t)
+                # a LINK to a program that sets its DFHCOMMAREA is the way back: KL3 hands it on, KL4 sets it
+                s = self.flow("WL-S", "--program", "KLA", "--up", "--all", db=db)
+                self.assertRegex(s, r"(?m)^1\s+CALL KL3 arg 1 <- KL3\.LL3 .*\(passed on BY REFERENCE there\)")
+                self.assertRegex(s, r"(?m)^1\.1\s+LINK KL4 (COMMAREA|arg 1) <- KL4\.DFHCOMMAREA .*\(written there")
+                self.assertRegex(s, r"also set here: MOVE 'LL'.*KL4:\d+ \"MOVE 'LL' TO DFHCOMMAREA\"")
+                self.assertNotIn("also written by", s)
+                # RESP(x) on a LINK is a write of x, not a hand-over
+                r = self.flow("WL-R", "--program", "KLA", "--up", "--all", db=db)
+                self.assertRegex(r, r"(?m)^1\s+CALL KL6 arg 1 <- KL6\.LL6 .*\(written there")
+                g = self.gate(s, r)
                 self.assertEqual({c: st for c, st in g.items() if st != "PASS"}, {}, g)
 
     def test_an_idcams_step_cites_its_own_exec_line(self):

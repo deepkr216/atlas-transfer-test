@@ -91,6 +91,18 @@ _DD_MEMBER = """COALESCE(CASE WHEN s.from_proc IS NOT NULL AND COALESCE(d.is_ove
                               WHERE UPPER(pc.proc_name)=UPPER(s.from_proc) AND pc.instream=0)) END,
                 m.name)"""
 
+# The parser stores the COMMAREA of EXEC CICS LINK / XCTL / RETURN as a write too (the program it goes to
+# may change it), as it stores a CALL argument. Either is a hand-over, never a statement of this program
+# that sets the bytes: a program that only hands its parameter on is no origin (--up) and wrote nothing
+# (rule 3). A LINK is a way back only when passes_on finds one; XCTL and RETURN never come back. The row is
+# matched to its own statement (same line, the name in its COMMAREA), so RESP(x) on a LINK stays a write.
+_CA_HANDOVER = ("(field_ref.stmt IN ('EXEC-CICS-LINK','EXEC-CICS-XCTL','EXEC-CICS-RETURN') AND EXISTS ("
+                "SELECT 1 FROM call_edge ce WHERE ce.program_id=field_ref.program_id AND ce.line=field_ref.line "
+                "AND ce.kind IN ('cics_link','cics_xctl','cics_return') "
+                "AND UPPER(ce.using_args) LIKE '%\"' || UPPER(field_ref.name) || '\"%'))")
+# a field_ref write that sets the bytes here (the query reads field_ref under its own name)
+_SETS_HERE = f"mode='write' AND stmt<>'CALL-USING' AND NOT {_CA_HANDOVER}"
+
 COPY_KINDS = ("move", "move_corr", "set", "read_into", "write_from")
 DERIVED_KINDS = ("arith", "string", "unstring", "function", "inspect")
 SET_KINDS = ("literal", "figurative", "initialize", "accept")
@@ -1521,8 +1533,8 @@ class _Walker(_Report):
         if self.conn.execute(f"SELECT 1 FROM data_flow WHERE program_id=? AND dst_pfield IN ({q}) LIMIT 1",
                              (node.pid, *ids)).fetchone():
             return True
-        return bool(self.conn.execute(f"""SELECT 1 FROM field_ref WHERE program_id=? AND pfield_id IN ({q}) AND mode='write'
-                                          AND stmt NOT IN ('CALL-USING') LIMIT 1""", (node.pid, *ids)).fetchone())
+        return bool(self.conn.execute(f"""SELECT 1 FROM field_ref WHERE program_id=? AND pfield_id IN ({q})
+                                          AND {_SETS_HERE} LIMIT 1""", (node.pid, *ids)).fetchone())
 
     def callers_of(self, pname: str, entry: Optional[str], via_call: Optional[int] = None,
                    transid: bool = False) -> List[sqlite3.Row]:
@@ -2335,7 +2347,7 @@ class _Walker(_Report):
         lines = {r[0] for r in self.conn.execute(f"SELECT DISTINCT line FROM data_flow WHERE program_id=? AND dst_pfield IN ({q})",
                                                   (node.pid, *ids))}
         lines |= {r[0] for r in self.conn.execute(f"""SELECT DISTINCT line FROM field_ref WHERE program_id=? AND pfield_id IN ({q})
-                                                       AND mode='write' AND stmt NOT IN ('CALL-USING')""", (node.pid, *ids))}
+                                                       AND {_SETS_HERE}""", (node.pid, *ids))}
         return len(lines - exclude)
 
     def set_from(self, node: _Node, ids: Set[int]) -> List[Tuple[int, str]]:
@@ -2752,8 +2764,8 @@ class _Fallback(_Report):
                                   self.conn.execute("SELECT alias, linkage_using FROM program_alias WHERE program_id=?", (pid,))]
         if node.via_call is not None and node.name == node.via_name:
             entries = []
-        written = bool(self.conn.execute("SELECT 1 FROM field_ref WHERE program_id=? AND UPPER(name)=? AND mode='write' "
-                                         "AND stmt<>'CALL-USING' LIMIT 1", (pid, name)).fetchone())
+        written = bool(self.conn.execute(f"SELECT 1 FROM field_ref WHERE program_id=? AND UPPER(name)=? AND {_SETS_HERE} "
+                                         "LIMIT 1", (pid, name)).fetchone())
         for (entry, using) in entries:
             if name not in using or not written:
                 continue
@@ -2881,8 +2893,8 @@ class _Fallback(_Report):
                     ch = self.node(callee["id"], pname, node.hop + 1)
                     ch.via_call, ch.via_name = c["id"], ch.name
                     how_set = "written there"
-                    if not self.conn.execute("SELECT 1 FROM field_ref WHERE program_id=? AND UPPER(name)=? AND mode='write' "
-                                             "AND stmt<>'CALL-USING' LIMIT 1", (callee["id"], pname.upper())).fetchone():
+                    if not self.conn.execute(f"SELECT 1 FROM field_ref WHERE program_id=? AND UPPER(name)=? AND {_SETS_HERE} "
+                                             "LIMIT 1", (callee["id"], pname.upper())).fetchone():
                         if self.passes_on(ch):
                             # handed on BY REFERENCE by its own name to a program that sets it (or that cannot
                             # be followed): the callee is on the path back, as the down walker's CALL
@@ -2977,8 +2989,8 @@ class _Fallback(_Report):
             return None
         q = ",".join("?" * len(subs))
         # a CALL argument is recorded as a write too (BY REFERENCE): up, only a statement that sets it counts
-        where = ("stmt='CALL-USING'" if passed else
-                 "mode='write' AND stmt<>'CALL-USING'" if up else "mode IN ('read','test','display')")
+        where = (f"(stmt='CALL-USING' OR (stmt='EXEC-CICS-LINK' AND {_CA_HANDOVER}))" if passed else
+                 _SETS_HERE if up else "mode IN ('read','test','display')")
         return self.conn.execute(f"SELECT 1 FROM field_ref WHERE program_id=? AND UPPER(name) IN ({q}) AND {where} LIMIT 1",
                                  (pid, *subs)).fetchone() is not None
 
