@@ -1861,7 +1861,32 @@ class FlowKnownLimits(unittest.TestCase):
                       "//SYSUT1   DD DSN=TEST.KD.EXT,DISP=SHR\n//SYSUT2   DD DSN=TEST.KD.IN,DISP=(NEW,CATLG,DELETE)\n"
                       "//R1       EXEC PGM=KDR\n//DIN      DD DSN=TEST.KD.IN,DISP=SHR\n"),
     }
-    FILES["KDW.cbl"] = FILES["KCW.cbl"].replace("KCW", "KDW").replace("COUT", "DOUT").replace("C-CODE", "D-CODE") \
+    # --up through a callee that hands its parameter on BY REFERENCE: KQ3 passes LQ3 (and KQ1 a field under
+    # LQ1-AREA) to KQ2, which sets it; KQ5 passes to KQ6, which only shows it (no origin); KQ7 passes to a
+    # program not in the index; KQC1 and KQC2 pass it round in a circle and nobody sets it
+    L = "       LINKAGE SECTION.\n       01  {n:<24} PIC X(02).\n       PROCEDURE DIVISION USING {n}.\n"
+    FILES.update({
+        "KQA.cbl": H.format(p="KQA") + (
+            "       01  WQ-AREA.\n           05  WQ-A                 PIC X(02).\n"
+            "           05  WQ-B                 PIC X(02).\n       01  WQ-E                     PIC X(02).\n"
+            "       01  WQ-G                     PIC X(02).\n       01  WQ-H                     PIC X(02).\n"
+            "       01  WQ-I                     PIC X(02).\n       PROCEDURE DIVISION.\n"
+            "           CALL 'KQ1' USING WQ-AREA.\n           CALL 'KQ3' USING WQ-E.\n           CALL 'KQ5' USING WQ-G.\n"
+            "           CALL 'KQ7' USING WQ-H.\n           CALL 'KQC1' USING WQ-I.\n"
+            "           DISPLAY WQ-AREA WQ-E WQ-G WQ-H WQ-I.\n           GOBACK.\n"),
+        "KQ1.cbl": H.format(p="KQ1") + (
+            "       LINKAGE SECTION.\n       01  LQ1-AREA.\n           05  LQ1-A                PIC X(02).\n"
+            "           05  LQ1-B                PIC X(02).\n       PROCEDURE DIVISION USING LQ1-AREA.\n"
+            "           CALL 'KQ2' USING LQ1-B.\n           GOBACK.\n"),
+        "KQ2.cbl": H.format(p="KQ2") + L.format(n="LQ2") + "           MOVE 'ZZ' TO LQ2.\n           GOBACK.\n",
+        "KQ3.cbl": H.format(p="KQ3") + L.format(n="LQ3") + "           CALL 'KQ2' USING LQ3.\n           GOBACK.\n",
+        "KQ5.cbl": H.format(p="KQ5") + L.format(n="LQ5") + "           CALL 'KQ6' USING LQ5.\n           GOBACK.\n",
+        "KQ6.cbl": H.format(p="KQ6") + L.format(n="LQ6") + "           DISPLAY LQ6.\n           GOBACK.\n",
+        "KQ7.cbl": H.format(p="KQ7") + L.format(n="LQ7") + "           CALL 'KQNONE' USING LQ7.\n           GOBACK.\n",
+        "KQC1.cbl": H.format(p="KQC1") + L.format(n="LQC1") + "           CALL 'KQC2' USING LQC1.\n           GOBACK.\n",
+        "KQC2.cbl": H.format(p="KQC2") + L.format(n="LQC2") + "           CALL 'KQC1' USING LQC2.\n           GOBACK.\n",
+    })
+    FILES["KDW.cbl"] =FILES["KCW.cbl"].replace("KCW", "KDW").replace("COUT", "DOUT").replace("C-CODE", "D-CODE") \
         .replace("CCODE", "DCODE")
     FILES["KDR.cbl"] = FILES["KCR.cbl"].replace("KCR", "KDR").replace("CIN", "DIN").replace("C-CODE", "D-CODE")
 
@@ -2211,6 +2236,41 @@ class FlowKnownLimits(unittest.TestCase):
         # a copy that does reach a reader is unchanged: the copy line is a path line, the reader the leaf
         down = self.flow("WS-GCODE", "--program", "KGW")
         self.assertNotRegex(down, r"C1 ICEGENER copy .*\[end:")
+
+    def test_up_follows_a_callee_that_passes_the_parameter_on(self):
+        # KQ3 does not set LQ3 but CALLs KQ2 with it BY REFERENCE, and KQ2 sets it: KQ3 is on the way back
+        # and the walk goes on into KQ2, as the down walker's CALL does. Before, both walkers printed only
+        # the DISPLAY and `only tested/displayed here` - a false, silent end
+        using_e = next(i for i, ln in enumerate(self.FILES["KQA.cbl"].splitlines(), 1) if "USING WQ-E" in ln)
+        for db, tag in ((self.db, "exact"), (self.old, "reconstructed")):
+            with self.subTest(tag):
+                e = self.flow("WQ-E", "--program", "KQA", "--up", "--all", db=db)
+                self.assertRegex(e, rf"(?m)^1\s+CALL KQ3 arg 1 <- KQ3\.LQ3 .*\(passed on BY REFERENCE there\).*"
+                                    rf"KQA:{using_e} \"CALL 'KQ3' USING WQ-E\"")
+                self.assertRegex(e, r"(?m)^1\.1\s+CALL KQ2 arg 1 <- KQ2\.LQ2 .*\(written there.*KQ3:8 \"CALL 'KQ2' USING LQ3\"")
+                self.assertRegex(e, r"also set here: MOVE 'ZZ'.*KQ2:8 \"MOVE 'ZZ' TO LQ2\"")
+                self.assertNotIn("only tested/displayed here", e)
+                # a program not in the index further on is its labelled end, one hop on
+                h = self.flow("WQ-H", "--program", "KQA", "--up", "--all", db=db)
+                self.assertRegex(h, r"(?m)^1\s+CALL KQ7 arg 1 <- KQ7\.LQ7 .*\(passed on BY REFERENCE there\)")
+                self.assertRegex(h, r"(?m)^1\.1\s+CALL KQNONE arg 1 <- KQNONE may set it.*\[end: callee not in index\]")
+                # handed on to a program that only shows it, or round a circle where nobody sets it: no origin
+                for f in ("WQ-G", "WQ-I"):
+                    t = self.flow(f, "--program", "KQA", "--up", "--all", db=db)
+                    self.assertNotRegex(t, r"(?m)^1\s", t)
+                    self.assertIn("[end: only tested/displayed here]", t)
+                # a field under the group is handed on: the exact walker follows those bytes; before the
+                # re-parse the fallback cannot place them - a labelled end, never nothing
+                a = self.flow("WQ-AREA", "--program", "KQA", "--up", "--all", db=db)
+                if db == self.db:
+                    self.assertRegex(a, r"(?m)^1\s+CALL KQ1 arg 1 <- KQ1\.LQ1-B \(LINKAGE LQ1-AREA bytes 3-4.*"
+                                        r"\(passed on BY REFERENCE there\)")
+                    self.assertRegex(a, r"(?m)^1\.1\s+CALL KQ2 arg 1 <- KQ2\.LQ2 .*KQ1:10 \"CALL 'KQ2' USING LQ1-B\"")
+                else:
+                    self.assertRegex(a, r"(?m)^1\s+CALL KQ1 arg 1 <- KQ1\.LQ1-AREA: a field under it is passed on BY "
+                                        r"REFERENCE there.*\[end: callee's fields under the parameter: not followed")
+                g = self.gate(e, h, a)
+                self.assertEqual({c: st for c, st in g.items() if st != "PASS"}, {}, g)
 
     def test_an_idcams_step_cites_its_own_exec_line(self):
         # every pseudo-DD cite knows its step, so the *REPRO* rows on C5's EXEC line quote that EXEC and pass

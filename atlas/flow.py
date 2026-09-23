@@ -528,6 +528,7 @@ class _Walker(_Report):
         self._partial_shown: Set[int] = set()
         self._layout: Dict[int, Optional[str]] = {}
         self._names: Dict[int, Set[str]] = {}
+        self._passing: Set[Tuple[int, int, int, int]] = set()
 
     # ---- lookups -------------------------------------------------------------
     def pf(self, pf_id: Optional[int]):
@@ -2215,18 +2216,48 @@ class _Walker(_Report):
                     ch.via_call, ch.via_root = a["cid"], ppf["root_id"]
                     # only the bytes the callee writes come back: CA-MESSAGE set there is not CA-STATUS
                     cids, _cl = self.closure_ids(ch)
-                    if not self.written_here(ch, cids):
+                    # the callee may also hand the bytes on BY REFERENCE to a program that sets them (or
+                    # that cannot be followed): that callee is on the path back, as the down walker's CALL
+                    written = self.written_here(ch, cids)
+                    if not written and not self.passes_on(ch, cids):
                         continue
+                    how_set = "written there" if written else "passed on BY REFERENCE there"
                     if a["ckind"] == "cics_xctl":
                         # written there, but XCTL never comes back: not an origin of this program's bytes
                         out.append(_Edge(3, callee["program_id"], a["cline"], f"{callname} {tag}: {callee['program_id']}."
-                                         f"{self.nm(ch)} is written there", cites, end=END_XCTL))
+                                         f"{self.nm(ch)} is {how_set}", cites, end=END_XCTL))
                         continue
                     self.touch(callee["id"])
                     out.append(_Edge(3, callee["program_id"], a["cline"], f"{callname} {tag} <- {callee['program_id']}.{self.nm(ch)} "
-                                     f"{self.desc(ch)} (written there, BY REFERENCE)".replace("  ", " ") + self._lbls(labels),
-                                     cites, child=ch))
+                                     f"{self.desc(ch)} ({'written there, BY REFERENCE' if written else how_set})".replace("  ", " ")
+                                     + self._lbls(labels), cites, child=ch))
         return out
+
+    def passes_on(self, node: _Node, ids: Set[int]) -> bool:
+        """Does the program pass the node's bytes BY REFERENCE to a callee
+        that sets them, or that --up cannot follow (a labelled end there)?
+        XCTL never comes back, so it is no way back. Past the hop limit the
+        CALL alone counts: the node is printed there with its edges not
+        followed. A CALL chain that comes back to a node being asked about
+        is no origin."""
+        q = ",".join("?" * len(ids))
+        if not self.conn.execute(f"""SELECT 1 FROM call_arg a JOIN call_edge c ON c.id=a.call_id
+                                     WHERE a.program_id=? AND a.pfield IN ({q}) AND a.how IN ('reference','commarea')
+                                     AND c.kind NOT IN ('cics_return','cics_start','cics_xctl') LIMIT 1""",
+                                 (node.pid, *ids)).fetchone():
+            return False
+        if node.hop > self.o.hops:
+            return True
+        key = (node.pid, node.root, node.lo, node.hi)
+        if key in self._passing:
+            return False
+        self._passing.add(key)
+        programs, members = set(self.programs), set(self.members)
+        try:
+            return any(e.end != END_XCTL for e in self.arg_back(node, ids))
+        finally:
+            self._passing.discard(key)
+            self.programs, self.members = programs, members     # asking prints nothing: touches nothing
 
     # ---- per-node information: sets, uses, writers -------------------------------------------------------
     def sets(self, node: _Node, ids: Set[int]) -> List[str]:
@@ -2518,6 +2549,7 @@ class _Fallback(_Report):
         self.visited: Dict[Tuple[int, str], List[Tuple[str, Optional[int], int]]] = defaultdict(list)
         self._prog: Dict[int, sqlite3.Row] = {}
         self._partial_shown: Set[int] = set()
+        self._passing: Set[Tuple[int, str]] = set()
 
     def prog(self, pid: int):
         if pid not in self._prog:
@@ -2784,6 +2816,22 @@ class _Fallback(_Report):
                 out.append(_Edge(2, c["caller"], c["line"], f"{tag} arg {pos} <- {c['caller']}.{ch.name} (reconstructed)"
                                  + self.call_modes(c["cpid"], c["line"]),
                                  self.cite_stmt(c["cpid"], c["line"], word, args[pos - 1]), child=ch))
+        out.extend(self.arg_back(node))
+        out.extend(self.sql_edges(node, "read"))
+        for (ln, rd, wr) in self.move_pairs(pid):
+            if wr == name:
+                ch = self.carry(node, self.node(pid, rd, node.hop + 1))
+                out.append(_Edge(9, node.pname, ln, f"MOVE <- {self.pfx(ch)}{ch.name} (reconstructed)",
+                                 self.cite_stmt(pid, ln, "MOVE", rd), child=ch))
+        out.extend(self.parent_edges(node))
+        return out
+
+    def arg_back(self, node: _FNode) -> List[_Edge]:
+        """--up: what a callee the node is passed to BY REFERENCE writes into
+        it (as _Walker.arg_back), or a labelled end where that cannot be
+        followed."""
+        out: List[_Edge] = []
+        pid, name = node.pid, node.name
         for c in self.conn.execute("SELECT * FROM call_edge WHERE program_id=? AND using_args IS NOT NULL ORDER BY line", (pid,)):
             if c["kind"] in ("cics_return", "cics_start"):
                 continue            # RETURN / START TRANSID: the next task gets a copy, nothing comes back
@@ -2830,36 +2878,58 @@ class _Fallback(_Report):
                                              end=END_POS))
                         continue
                     pname = lk2[pos - 1]
+                    ch = self.node(callee["id"], pname, node.hop + 1)
+                    ch.via_call, ch.via_name = c["id"], ch.name
+                    how_set = "written there"
                     if not self.conn.execute("SELECT 1 FROM field_ref WHERE program_id=? AND UPPER(name)=? AND mode='write' "
                                              "AND stmt<>'CALL-USING' LIMIT 1", (callee["id"], pname.upper())).fetchone():
-                        # not written by its own name: a field under it may be, which field_ref cannot place
-                        # in the argument's bytes before the re-parse - a labelled end, never a silent drop
-                        under = None if xctl else self.used_under(callee["id"], pname, True)
-                        if not xctl and under is not False:
-                            what = "COMMAREA" if c["kind"] == "cics_link" else f"arg {pos}"
-                            how = ("a field under it is written there" if under else
-                                   f"its fields are not all in {callee['program_id']}'s own text")
-                            out.append(_Edge(3, callee["program_id"], c["line"], f"{callname} {what} <- "
-                                             f"{callee['program_id']}.{pname.upper()}: {how}, {may}", cites,
-                                             end=FALLBACK_PARAM))
-                        continue
+                        if self.passes_on(ch):
+                            # handed on BY REFERENCE by its own name to a program that sets it (or that cannot
+                            # be followed): the callee is on the path back, as the down walker's CALL
+                            how_set = "passed on BY REFERENCE there"
+                        else:
+                            # not written by its own name: a field under it may be (or be passed on), which
+                            # field_ref cannot place in the argument's bytes before the re-parse - a labelled
+                            # end, never a silent drop
+                            under = None if xctl else self.used_under(callee["id"], pname, True)
+                            passed = not xctl and under is False and bool(self.used_under(callee["id"], pname, True, passed=True))
+                            if not xctl and (under is not False or passed):
+                                what = "COMMAREA" if c["kind"] == "cics_link" else f"arg {pos}"
+                                how = ("a field under it is written there" if under else
+                                       "a field under it is passed on BY REFERENCE there" if passed else
+                                       f"its fields are not all in {callee['program_id']}'s own text")
+                                out.append(_Edge(3, callee["program_id"], c["line"], f"{callname} {what} <- "
+                                                 f"{callee['program_id']}.{pname.upper()}: {how}, {may}", cites,
+                                                 end=FALLBACK_PARAM))
+                            continue
                     if c["kind"] == "cics_xctl":
                         # written there, but XCTL never comes back (as _Walker.arg_back)
                         out.append(_Edge(3, callee["program_id"], c["line"], f"{callname} arg {pos}: {callee['program_id']}.{pname.upper()} "
-                                         f"is written there (reconstructed)", self.cite_stmt(pid, c["line"], "XCTL", name), end=END_XCTL))
+                                         f"is {how_set} (reconstructed)", self.cite_stmt(pid, c["line"], "XCTL", name), end=END_XCTL))
                         continue
-                    ch = self.node(callee["id"], pname, node.hop + 1)
-                    ch.via_call, ch.via_name = c["id"], ch.name
                     out.append(_Edge(3, callee["program_id"], c["line"], f"{callname} arg {pos} <- {callee['program_id']}.{ch.name} "
-                                     f"(written there) (reconstructed){modes}", cites, child=ch))
-        out.extend(self.sql_edges(node, "read"))
-        for (ln, rd, wr) in self.move_pairs(pid):
-            if wr == name:
-                ch = self.carry(node, self.node(pid, rd, node.hop + 1))
-                out.append(_Edge(9, node.pname, ln, f"MOVE <- {self.pfx(ch)}{ch.name} (reconstructed)",
-                                 self.cite_stmt(pid, ln, "MOVE", rd), child=ch))
-        out.extend(self.parent_edges(node))
+                                     f"({how_set}) (reconstructed){modes}", cites, child=ch))
         return out
+
+    def passes_on(self, node: _FNode) -> bool:
+        """As _Walker.passes_on, by name: is the item an argument of a CALL /
+        LINK in its program whose callee sets it or cannot be followed?"""
+        if not any(node.name in [a.upper() for a in Q._jl(c["using_args"])] for c in self.conn.execute(
+                "SELECT using_args FROM call_edge WHERE program_id=? AND using_args IS NOT NULL "
+                "AND kind NOT IN ('cics_return','cics_start','cics_xctl')", (node.pid,))):
+            return False
+        if node.hop > self.o.hops:
+            return True
+        key = (node.pid, node.name)
+        if key in self._passing:
+            return False
+        self._passing.add(key)
+        programs, members = set(self.programs), set(self.members)
+        try:
+            return any(e.end != END_XCTL for e in self.arg_back(node))
+        finally:
+            self._passing.discard(key)
+            self.programs, self.members = programs, members     # asking prints nothing: touches nothing
 
     def call_modes(self, pid: int, exp_line: int) -> str:
         """call_edge.using_args has no BY CONTENT / LENGTH OF: when the CALL's
@@ -2879,9 +2949,10 @@ class _Fallback(_Report):
             return " (this CALL passes BY CONTENT / VALUE / LENGTH OF: the position may be one-way or a length - HUMAN MUST VERIFY)"
         return ""
 
-    def used_under(self, pid: int, name: str, up: bool) -> Optional[bool]:
+    def used_under(self, pid: int, name: str, up: bool, passed: bool = False) -> Optional[bool]:
         """Is a field under the item written (up) or read, tested or shown
-        (down) in the program? True: one in its own text is; False: it is
+        (down) in the program - or, with `passed`, named in a CALL USING
+        there? True: one in its own text is; False: it is
         elementary, or a group none of whose own-text fields is; None: the
         fallback cannot tell (declared in a copybook or twice, or a group
         whose fields come from a COPY)."""
@@ -2906,7 +2977,8 @@ class _Fallback(_Report):
             return None
         q = ",".join("?" * len(subs))
         # a CALL argument is recorded as a write too (BY REFERENCE): up, only a statement that sets it counts
-        where = "mode='write' AND stmt<>'CALL-USING'" if up else "mode IN ('read','test','display')"
+        where = ("stmt='CALL-USING'" if passed else
+                 "mode='write' AND stmt<>'CALL-USING'" if up else "mode IN ('read','test','display')")
         return self.conn.execute(f"SELECT 1 FROM field_ref WHERE program_id=? AND UPPER(name) IN ({q}) AND {where} LIMIT 1",
                                  (pid, *subs)).fetchone() is not None
 
