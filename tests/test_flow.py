@@ -1784,6 +1784,17 @@ class FlowKnownLimits(unittest.TestCase):
                        "//SYSUT1   DD DSN=TEST.KG.RAW,DISP=SHR\n"
                        "//SYSUT2   DD DSN=TEST.KG.GEN,DISP=(NEW,CATLG,DELETE)\n"
                        "//R2       EXEC PGM=KGR\n//GIN      DD DSN=TEST.KG.GEN,DISP=SHR\n"),
+        # ICEGENER / IEBGENER with SYSIN from a card member the estate does not hold: the cards are unknown
+        "KGJOB3.jcl": ("//KGJOB3   JOB (ACCT),'GEN'\n//C3       EXEC PGM=ICEGENER\n//SYSPRINT DD SYSOUT=*\n"
+                       "//SYSIN    DD DSN=TEST.CTL.LIB(GENCTL),DISP=SHR\n"
+                       "//SYSUT1   DD DSN=TEST.KG.RAW,DISP=SHR\n"
+                       "//SYSUT2   DD DSN=TEST.KG.C3,DISP=(NEW,CATLG,DELETE)\n"
+                       "//R3       EXEC PGM=KGR\n//GIN      DD DSN=TEST.KG.C3,DISP=SHR\n"
+                       "//C4       EXEC PGM=IEBGENER\n//SYSPRINT DD SYSOUT=*\n"
+                       "//SYSIN    DD DSN=TEST.CTL.SEQ,DISP=SHR\n"
+                       "//SYSUT1   DD DSN=TEST.KG.RAW,DISP=SHR\n"
+                       "//SYSUT2   DD DSN=TEST.KG.C4,DISP=(NEW,CATLG,DELETE)\n"
+                       "//R4       EXEC PGM=KGR\n//GIN      DD DSN=TEST.KG.C4,DISP=SHR\n"),
     }
 
     @classmethod
@@ -1982,6 +1993,20 @@ class FlowKnownLimits(unittest.TestCase):
                 self.assertRegex(up, r"written by KGW\.OR-CODE bytes 1-4 \(KGJOB W1 DD GOUT")
                 self.assertNotIn("KGJOB C1 ICEGENER   ", up)
                 self.assertRegex(up, r"KGJOB2 C2 IEBGENER has RECORD control statements\s.*\[end: utility step - bytes not modelled\]")
+                # SYSIN from a dataset whose cards are not indexed: a labelled stop at the SYSIN DD, as SORT
+                job3 = self.FILES["KGJOB3.jcl"].splitlines()
+                sysin = [i + 1 for i, ln in enumerate(job3) if ln.startswith("//SYSIN")]
+                for step, launcher, ln, dsn in (("C3", "ICEGENER", sysin[0], "TEST.CTL.LIB"), ("C4", "IEBGENER", sysin[1], "TEST.CTL.SEQ")):
+                    want = (rf'KGJOB3 {step} {launcher}: control cards not indexed\s+KGJOB3:{ln} "//SYSIN DD DSN={re.escape(dsn)}"\s+'
+                            r"\[end: utility step - bytes not modelled\]")
+                    self.assertRegex(down, want)
+                    self.assertRegex(up, want)
+                self.assertNotIn("KGJOB3 R3", down)
+                self.assertNotIn("KGJOB3 R4", down)
+                self.assertNotRegex(down + up, r"C[34] (ICE|IEB)GENER copy")
+                up3 = self.flow("IR-GCODE", "--program", "KGR", "--up", "--all", db=db)
+                self.assertNotRegex(up3, r"C[34] (ICE|IEB)GENER copy")
+                self.assertRegex(up3, r"KGJOB3 C3 ICEGENER: control cards not indexed")
                 cites = [m for t in (down, up) for m in CITE.finditer(t)]
                 answer = "\n".join(f'[[{m.group(1)} {m.group(2)}{"-" + m.group(3) if m.group(3) else ""} "{m.group(4)}"]]'
                                    for m in cites)

@@ -1125,6 +1125,13 @@ class _Walker(_Report):
                         leaves.append(_Leaf(list(path), f"{job} {s['step_name']} {launcher} has {gen} control statements",
                                             self.cite_card(s["step_id"], gen), end=END_UTILITY))
                         continue
+                    # a SYSIN that is not DUMMY holds control statements; when their text is not indexed
+                    # (DSN=LIB(MEMBER) not in the estate) the copy is not known to be plain - as SORT
+                    blind = self.unindexed_sysin(s["step_id"])
+                    if blind is not None:
+                        leaves.append(_Leaf(list(path), f"{job} {s['step_name']} {launcher}: control cards not indexed",
+                                            self.cite_dd(s["member_name"], blind, "SYSIN", True), end=END_UTILITY))
+                        continue
                 other = "input" if up else "output"
                 outs = [x for x in self.dds_on_step(s["step_id"]) if x["mode"] == other and x["dsn_resolved"] != dsn]
                 if not outs:
@@ -1156,6 +1163,18 @@ class _Walker(_Report):
             leaves.append(_Leaf(list(path), f"{dsn} {kind}", self.cite_dd(mem, ln, "", False) if mem and ln else "",
                                 end=END_INTERFACE.format(x=kind)))
         return leaves
+
+    def unindexed_sysin(self, step_id: int) -> Optional[int]:
+        """The line of the step's SYSIN DD (or a dataset concatenated to it)
+        that is not DUMMY and whose control-card text is not indexed; None
+        when every SYSIN is DUMMY or indexed, or there is none."""
+        cur = ""
+        for r in self.conn.execute("SELECT dd_name, mode, dsn_resolved, sysin_text, line FROM dd WHERE step_id=? "
+                                   "ORDER BY line, concat_seq", (step_id,)):
+            cur = (r["dd_name"] or cur).upper().split(".")[-1]
+            if cur == "SYSIN" and r["mode"] != "dummy" and r["sysin_text"] is None:
+                return r["line"]
+        return None
 
     def dds_on_step(self, step_id: int) -> List[sqlite3.Row]:
         return self.conn.execute("SELECT id AS dd_id, dd_name, dsn_resolved, mode, gdg_rel, is_temp FROM dd "
@@ -3008,6 +3027,7 @@ class _Fallback(_Report):
     dataset_leaves = _Walker.dataset_leaves
     dds_on = _Walker.dds_on
     dds_on_step = _Walker.dds_on_step
+    unindexed_sysin = _Walker.unindexed_sysin
     step_cards = _Walker.step_cards
     interfaces_on = _Walker.interfaces_on
     cite_card = _Report.cite_card
