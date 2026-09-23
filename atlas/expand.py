@@ -81,6 +81,9 @@ class Expansion:
     # REPLACING renamed a copybook field: (copybook, name as stored, name in this program, copybook line).
     # Without this, every reference to LK-POLICY-STATUS is invisible to `field PM-POLICY-STATUS`.
     aliases: List[Tuple[str, str, str, int]] = dc_field(default_factory=list)
+    # expanded lines of a copied 01/77 renamed by "01 X COPY Y." (OS/VS): the
+    # entry carries the program's name, so it is the program's field
+    renamed: List[int] = dc_field(default_factory=list)
 
     def run_at(self, exp_line: int) -> Optional["Run"]:
         """The run holding an expanded line - by bisection over the runs'
@@ -188,6 +191,40 @@ def apply_replacing(code: str, pairs: Sequence[Tuple[str, ...]]) -> str:
 
 _LEVEL_NAME = re.compile(r"^\s*\d{1,2}\s+([A-Z0-9][A-Z0-9\-_]*)", re.I)
 
+# OS/VS COBOL "01 data-name COPY text." (also 77, FD, SD): the compiler copies the
+# library text and puts data-name in place of the library's own 01 / 77 / FD / SD
+# name. Group 1 is the level or FD/SD, group 2 the name; the text must end there
+# (the COPY follows it, on this line or the next).
+_OSVS_HEAD = re.compile(r"(?:^|\.\s)\s*(0?1|77|FD|SD)\s+([A-Z0-9@#$][A-Z0-9@#$\-_]*)\s*$", re.I)
+_ENTRY_HEAD = re.compile(r"^(\s*)(\d{1,2}|FD|SD)(\s+)([A-Z0-9@#$][A-Z0-9@#$\-_]*)", re.I)
+
+
+def _entry_kind(word: str) -> str:
+    """'01'/'1' -> '01', '77', 'FD', 'SD'; anything else as written."""
+    w = word.upper()
+    return "01" if w in ("1", "01") else w
+
+
+def _osvs_rename(sub: Expansion, kind: str, new_name: str, copybook: str,
+                 aliases: List[Tuple[str, str, str, int]]) -> Optional[int]:
+    """Rename the first entry of the copied text to new_name when it is at
+    `kind`'s level: its line in `sub` (1-based). 0 when the text starts with
+    something else (a fragment); None when it holds no entry at all."""
+    for k, sl in enumerate(sub.lines):
+        if sl.is_comment or not sl.code.strip():
+            continue
+        m = _ENTRY_HEAD.match(sl.code)
+        if not m or _entry_kind(m.group(2)) != kind:
+            return 0
+        old = m.group(4).upper()
+        if old != new_name.upper():
+            sl.code = sl.code[:m.start(4)] + new_name + sl.code[m.end(4):]
+            r = sub.run_at(k + 1)
+            _mem, src_no, _d = sub.origin(k + 1)
+            aliases.append(((r.via_copy if r and r.via_copy else copybook), old, new_name.upper(), src_no or 0))
+        return k + 1
+    return None
+
 
 # --------------------------------------------------------------------------
 # expansion
@@ -201,6 +238,7 @@ def expand(lines: Sequence[Line], member_id: int, resolver: Resolver,
     warnings: List[str] = []
     copies: List[Tuple[str, Optional[str], Optional[str], int, Optional[int]]] = []
     aliases: List[Tuple[str, str, str, int]] = []
+    renamed: List[int] = []
 
     def emit(src_line: Line, code: str, src_member: int, src_no: int, d: int,
              indicator: Optional[str] = None, via: Optional[str] = None) -> None:
@@ -218,6 +256,7 @@ def expand(lines: Sequence[Line], member_id: int, resolver: Resolver,
             runs.append(Run(exp_start=no, exp_end=no, src_member=src_member,
                             src_start=src_no, depth=d, via_copy=via))
 
+    last_live: Optional[int] = None      # index in `out` of the last program line emitted as code
     i, n = 0, len(lines)
     while i < n:
         ln = lines[i]
@@ -237,8 +276,25 @@ def expand(lines: Sequence[Line], member_id: int, resolver: Resolver,
         msql = _SQL_INCLUDE_START.search(masked)
         if not m and not msql:
             emit(ln, code, member_id, ln.no, depth)
+            last_live = len(out) - 1
             i += 1
             continue
+
+        # "01 X COPY Y." (OS/VS): the text before COPY in the same statement is
+        # a level 01/77 or FD/SD and one name - on this line, or alone on the
+        # last code line before it ("01 X" / "COPY Y.")
+        osvs = None                      # (kind, program's name, index in out of a live "01 X" line)
+        if m and not msql and m.group(1).upper() == "COPY":
+            before = code[:m.start(1)]
+            if before.strip():
+                h = _OSVS_HEAD.search(before)
+                if h:
+                    osvs = (_entry_kind(h.group(1)), h.group(2), None, before[:h.end(2)])
+            elif last_live is not None:
+                h = _OSVS_HEAD.search(out[last_live].code)
+                if h:
+                    osvs = (_entry_kind(h.group(1)), h.group(2), last_live, None)
+        last_live = None
 
         # ---- gather the whole COPY statement (may span lines) --------------
         j = i
@@ -299,7 +355,30 @@ def expand(lines: Sequence[Line], member_id: int, resolver: Resolver,
         warnings.extend(f"(in COPY {name}) {w}" for w in sub.warnings)
         copies.extend(sub.copies)
         aliases.extend(sub.aliases)
+        at = None
+        if osvs:
+            kind, pname, prev, head = osvs
+            at = _osvs_rename(sub, kind, pname, name, aliases)
+            if at:
+                # the library's own 01 now carries the program's name and is the
+                # definition (cited in the copybook); the program's "01 X" line goes
+                if prev is not None:
+                    pl = out[prev]
+                    pl.indicator, pl.is_comment, pl.is_blank = "*", True, False
+            else:
+                # a fragment (starts at 05, or with clauses): the program's own entry
+                # stays as code and the fragment hangs under it. Clauses (PIC ...,
+                # an FD's RECORDING MODE) continue the entry, so no period then.
+                first = next((sl.code for sl in sub.lines if not sl.is_comment and sl.code.strip()), "")
+                period = "" if first and not re.match(r"\s*\d{1,2}\s", first) else "."
+                if prev is not None:
+                    out[prev].code = out[prev].code.rstrip() + period
+                else:
+                    emit(ln, head + period, member_id, ln.no, depth, indicator=" ")
         base = len(out)
+        renamed.extend(base + x for x in sub.renamed)
+        if at and kind in ("01", "77"):
+            renamed.append(base + at)
         for r in sub.runs:
             runs.append(Run(exp_start=base + r.exp_start, exp_end=base + r.exp_end,
                             src_member=r.src_member, src_start=r.src_start,
@@ -310,7 +389,7 @@ def expand(lines: Sequence[Line], member_id: int, resolver: Resolver,
                             is_debug=sl.is_debug, is_blank=sl.is_blank))
         i = j + 1
 
-    return Expansion(lines=out, runs=runs, warnings=warnings, copies=copies, aliases=aliases)
+    return Expansion(lines=out, runs=runs, warnings=warnings, copies=copies, aliases=aliases, renamed=renamed)
 
 
 def expanded_text(exp: Expansion) -> str:

@@ -1321,8 +1321,10 @@ def index_cobol(ctx: Ctx, mem: Mem) -> None:
 
     # Fields: keep this program's own data items, plus any copybook brought in
     # with REPLACING (its names are program-specific). Plain copybook fields
-    # are reached through copy_use -> the copybook's own field rows.
+    # are reached through copy_use -> the copybook's own field rows. A copied
+    # 01/77 renamed by "01 X COPY Y." (OS/VS) is the program's own name.
     replaced = {name for (name, _l, rep, _ln, _r) in exp.copies if rep}
+    renamed = set(exp.renamed)
     logical = reader.join_cobol_continuations(exp.lines)
     roots, warns = copybook.parse_data_division(logical)
     keep: List[copybook.Field] = []
@@ -1331,7 +1333,7 @@ def index_cobol(ctx: Ctx, mem: Mem) -> None:
             continue
         run = exp.run_at(fld.line)
         depth = run.depth if run else 0
-        if depth == 0 or (run and run.via_copy in replaced):
+        if depth == 0 or (run and run.via_copy in replaced) or fld.line in renamed:
             keep.append(fld)
     _insert_fields(conn, mem.id, keep)
     conn.executemany(

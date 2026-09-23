@@ -176,6 +176,14 @@ shipped alone and cost one such night; these still wait for the next one:
    ... GIVING, and RETURNING on a CALL is lost): `_ARITH` in cobol.py stops at TO/FROM/BY/INTO and
    never sees GIVING, so `field C` lists the statement under 'read' and an impact search for who
    sets C misses it. Found by the value-flow review (LESSONS 174); the fix is in the plan, step 2.4.
+16. **OS/VS `01 data-name COPY text.`** (also `77 ... COPY`, `FD file-name COPY`, `SD ... COPY`; the
+   COPY may sit on the next line): the compiler copies the library text and puts data-name in place of
+   the library's own 01 / 77 / FD / SD name. expand.py commented out the whole line, so the program's
+   name vanished and the library's 01 name took its place - every MOVE, READ INTO, DL/I I/O area
+   (his `-SEG` areas) and CALL USING naming it pointed at nothing, in `field` and in `flow`. Now the
+   library's first entry is renamed as REPLACING would (cited in the copybook, a `field_alias` row both
+   ways, the program's `field` row); a library that starts at 05 hangs under the program's own 01,
+   kept as code. `01 X.` with the COPY after the period is unchanged (LESSONS 177).
 
 ## What the tool was not built for - scenario audit (2026-09-21)
 

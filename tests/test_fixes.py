@@ -350,6 +350,201 @@ class CopybookExpansion(unittest.TestCase):
         self.assertTrue(any("recursive" in w for w in res.warnings))
 
 
+class OsvsLevelCopy(unittest.TestCase):
+    """OS/VS "01 X COPY Y." (also 77, FD, SD): the compiler puts X in place of
+    the library's own 01 name. The whole line used to become a comment, so X
+    vanished and every MOVE / READ INTO / DL/I I/O area naming it pointed at
+    nothing, while the library's own 01 name took its place (LESSONS 177)."""
+
+    FULL = ("       01  LIB-REC.\n"
+            "           05  AAAA-KEY          PIC X(10).\n"
+            "           05  AAAA-STAT         PIC X(02).\n")
+    FRAG = ("           05  AAAA-KEY          PIC X(10).\n"
+            "           05  AAAA-STAT         PIC X(02).\n")
+
+    def _lines(self, text):
+        lines, _ = reader.read_cobol_lines(text, fixed=True)
+        return lines
+
+    def _expand(self, prog, lib, name="ABCDE"):
+        cb = self._lines(lib)
+        return expand.expand(self._lines(prog), 1, lambda n, l: (2, cb, None) if n == name else None)
+
+    def _tree(self, res):
+        from atlas import copybook
+        roots, _w = copybook.parse_data_division(reader.join_cobol_continuations(res.lines))
+        return {f.name: f for f in copybook.flatten(roots)}
+
+    def _code(self, res):
+        return [(ln.indicator, ln.code.strip()) for ln in res.lines if ln.indicator != " " or ln.code.strip()]
+
+    def test_library_01_takes_the_programs_name(self):
+        prog = ("       WORKING-STORAGE SECTION.\n"
+                "       01  ABCD-SEG   COPY  'ABCDE'.\n"
+                "       01  WS-AFTER PIC X.\n")
+        res = self._expand(prog, self.FULL)
+        code = self._code(res)
+        self.assertIn(("*", "01  ABCD-SEG   COPY  'ABCDE'."), code, "the COPY line stays as a comment")
+        self.assertIn((" ", "01  ABCD-SEG."), code)
+        self.assertNotIn("LIB-REC", expand.expanded_text(res).replace("*", ""))
+        exp_line = next(ln.no for ln in res.lines if ln.code.strip() == "01  ABCD-SEG.")
+        self.assertEqual(res.origin(exp_line)[:2], (2, 1), "the renamed line cites the copybook's line 1")
+        self.assertEqual(res.aliases, [("ABCDE", "LIB-REC", "ABCD-SEG", 1)])
+        self.assertEqual(res.renamed, [exp_line])
+        tree = self._tree(res)
+        self.assertIn("ABCD-SEG", tree)
+        self.assertNotIn("LIB-REC", tree)
+        self.assertEqual(tree["AAAA-STAT"].parent.name, "ABCD-SEG")
+        self.assertEqual((tree["ABCD-SEG"].length, tree["AAAA-STAT"].offset), (12, 10))
+        after = next(ln.no for ln in res.lines if "WS-AFTER" in ln.code)
+        self.assertEqual(res.origin(after)[:2], (1, 3))
+
+    def test_a_bare_name_and_the_parser_see_the_programs_name(self):
+        prog = ("       IDENTIFICATION DIVISION.\n       PROGRAM-ID. OSVSP.\n       DATA DIVISION.\n"
+                "       WORKING-STORAGE SECTION.\n"
+                "       01  ABCD-SEG   COPY  ABCDE.\n"
+                "       01  WS-X PIC X(12).\n"
+                "       PROCEDURE DIVISION.\n"
+                "           MOVE WS-X TO ABCD-SEG.\n"
+                "           GOBACK.\n")
+        res = self._expand(prog, self.FULL)
+        self.assertEqual(res.aliases, [("ABCDE", "LIB-REC", "ABCD-SEG", 1)])
+        f = cobol.parse_program(expand.expanded_text(res))
+        self.assertIn(("ABCD-SEG", "write"), {(n, m) for (n, m, _s, _l) in f.field_refs})
+        self.assertIn(("WS-X", "ABCD-SEG"), {(r.src_name, r.dst_name) for r in f.flows if r.kind == "move"})
+
+    def test_the_build_keeps_the_programs_name(self):
+        import shutil
+        import sqlite3
+        from atlas import build
+        td = tempfile.mkdtemp()
+        try:
+            src = os.path.join(td, "estate")
+            os.makedirs(src)
+            with open(os.path.join(src, "OSVSPGM.cbl"), "w", encoding="utf-8") as fh:
+                fh.write("       IDENTIFICATION DIVISION.\n       PROGRAM-ID. OSVSPGM.\n       DATA DIVISION.\n"
+                         "       WORKING-STORAGE SECTION.\n"
+                         "       01  ABCD-SEG   COPY  'ABCDE'.\n"
+                         "       01  WS-X PIC X(12).\n"
+                         "       PROCEDURE DIVISION.\n"
+                         "           MOVE WS-X TO ABCD-SEG.\n"
+                         "           GOBACK.\n")
+            with open(os.path.join(src, "ABCDE.cpy"), "w", encoding="utf-8") as fh:
+                fh.write(self.FULL)
+            db = os.path.join(td, "t.db")
+            import contextlib
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                build._main([src, "--db", db, "--rebuild", "--quiet"])
+            conn = sqlite3.connect(db)
+            try:
+                c = conn.execute
+                # the program's own field row, not the copybook's children (copy_use reaches those)
+                self.assertEqual(c("SELECT f.name, f.length FROM field f JOIN member m ON m.id=f.member_id "
+                                   "WHERE m.name='OSVSPGM' ORDER BY f.id").fetchall(), [("ABCD-SEG", 12), ("WS-X", 12)])
+                pf = {r[0]: r[1:] for r in c(
+                    "SELECT p.name, p.offset, p.length, par.name, m.name, p.src_line, p.copy_field_id IS NOT NULL "
+                    "FROM pfield p LEFT JOIN pfield par ON par.id=p.parent_id JOIN member m ON m.id=p.src_member")}
+                self.assertEqual(pf["ABCD-SEG"], (0, 12, None, "ABCDE", 1, 1), "cited in the copybook, linked to its row")
+                self.assertEqual(pf["AAAA-STAT"][:3], (10, 2, "ABCD-SEG"))
+                self.assertNotIn("LIB-REC", pf)
+                row = c("SELECT d.dst_pfield, p.name FROM data_flow d JOIN pfield p ON p.id=d.dst_pfield "
+                        "WHERE d.kind='move' AND d.src_name='WS-X'").fetchall()
+                self.assertEqual([r[1] for r in row], ["ABCD-SEG"], "the MOVE target resolves")
+                self.assertEqual(c("SELECT copybook, orig_name, new_name, line FROM field_alias").fetchall(),
+                                 [("ABCDE", "LIB-REC", "ABCD-SEG", 1)])
+            finally:
+                conn.close()
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
+
+    def test_a_fragment_hangs_under_the_programs_01(self):
+        prog = ("       WORKING-STORAGE SECTION.\n"
+                "       01  ABCD-SEG   COPY  'ABCDE'.\n"
+                "       01  WS-AFTER PIC X.\n")
+        res = self._expand(prog, self.FRAG)
+        code = self._code(res)
+        k = code.index(("*", "01  ABCD-SEG   COPY  'ABCDE'."))
+        self.assertEqual(code[k + 1], (" ", "01  ABCD-SEG."), "kept as code, the COPY clause blanked")
+        self.assertEqual(res.origin(k + 2)[:2], (1, 2), "the kept line cites the program's own line")
+        self.assertEqual((res.aliases, res.renamed), ([], []))
+        tree = self._tree(res)
+        self.assertEqual(tree["AAAA-KEY"].parent.name, "ABCD-SEG")
+        self.assertEqual(tree["ABCD-SEG"].length, 12)
+        after = next(ln.no for ln in res.lines if "WS-AFTER" in ln.code)
+        self.assertEqual(res.origin(after)[:2], (1, 3))
+
+    def test_77_form(self):
+        res = self._expand("       77  WS-CTR COPY CTRLIB.\n", "       77  LIB-CTR  PIC S9(4) COMP.\n", "CTRLIB")
+        self.assertIn((" ", "77  WS-CTR  PIC S9(4) COMP."), self._code(res))
+        self.assertEqual(res.aliases, [("CTRLIB", "LIB-CTR", "WS-CTR", 1)])
+        self.assertEqual(len(res.renamed), 1)
+        # a 77 over a library that starts at 01 is not renamed: the program's 77 is kept
+        res = self._expand("       77  WS-CTR COPY CTRLIB.\n", self.FULL, "CTRLIB")
+        self.assertIn((" ", "77  WS-CTR."), self._code(res))
+        self.assertEqual(res.aliases, [])
+        # library text that is clauses continues the program's entry: no period after the name
+        res = self._expand("       WORKING-STORAGE SECTION.\n       01  WS-AMT COPY PICLIB.\n",
+                           "                   PIC S9(7)V99 COMP-3.\n", "PICLIB")
+        self.assertIn((" ", "01  WS-AMT"), self._code(res))
+        self.assertEqual(self._tree(res)["WS-AMT"].length, 5)
+
+    def test_fd_form(self):
+        prog = ("       FILE SECTION.\n"
+                "       FD  POL-FILE  COPY POLFD.\n"
+                "       WORKING-STORAGE SECTION.\n")
+        lib = ("       FD  LIB-FILE\n"
+               "           RECORDING MODE IS F.\n"
+               "       01  LIB-FILE-REC      PIC X(80).\n")
+        res = self._expand(prog, lib, "POLFD")
+        self.assertIn((" ", "FD  POL-FILE"), self._code(res))
+        self.assertEqual(res.aliases, [("POLFD", "LIB-FILE", "POL-FILE", 1)])
+        self.assertEqual(res.renamed, [], "an FD is not a field")
+        # FD clauses as the library text: they continue the program's FD entry, no period
+        res = self._expand(prog, "           RECORDING MODE IS F.\n       01  LIB-FILE-REC      PIC X(80).\n", "POLFD")
+        self.assertIn((" ", "FD  POL-FILE"), self._code(res))
+        # 01 records as the library text: the program's FD entry ends before them
+        res = self._expand(prog, "       01  LIB-FILE-REC      PIC X(80).\n", "POLFD")
+        self.assertIn((" ", "FD  POL-FILE."), self._code(res))
+        # SD the same way
+        res = self._expand("       SD  SRT-FILE COPY POLFD.\n", "       SD  LIB-SORT.\n       01  SR PIC X.\n", "POLFD")
+        self.assertIn((" ", "SD  SRT-FILE."), self._code(res))
+
+    def test_copy_after_a_closed_01_is_unchanged(self):
+        # "01 X." then COPY on its own line: the 01 statement is closed, the copy is its children
+        prog = "       01  WS-REC.\n           COPY ABCDE.\n"
+        res = self._expand(prog, self.FULL)
+        self.assertEqual(self._code(res), [(" ", "01  WS-REC."), ("*", "COPY ABCDE."), (" ", "01  LIB-REC."),
+                                           (" ", "05  AAAA-KEY          PIC X(10)."),
+                                           (" ", "05  AAAA-STAT         PIC X(02).")])
+        self.assertEqual((res.aliases, res.renamed), ([], []))
+        res = self._expand("       01  WS-REC.  COPY ABCDE.\n", self.FULL)
+        self.assertEqual(res.aliases, [], "a period ends the 01 before the COPY")
+
+    def test_copy_on_the_next_line_is_the_same_statement(self):
+        # "01 X" / "COPY Y.": the text before COPY in the same statement is "01 X" - the OS/VS form
+        prog = ("       01  ABCD-SEG\n"
+                "      * the segment area\n"
+                "               COPY 'ABCDE'.\n"
+                "       01  WS-AFTER PIC X.\n")
+        res = self._expand(prog, self.FULL)
+        code = self._code(res)
+        self.assertEqual(code[0], ("*", "01  ABCD-SEG"), "the program line gives way to the renamed library 01")
+        self.assertTrue(res.lines[0].is_comment)
+        self.assertEqual(code[2], ("*", "COPY 'ABCDE'."))
+        self.assertEqual(code[3], (" ", "01  ABCD-SEG."))
+        self.assertEqual(res.origin(4)[:2], (2, 1))
+        self.assertEqual(res.aliases, [("ABCDE", "LIB-REC", "ABCD-SEG", 1)])
+        self.assertIn("ABCD-SEG", self._tree(res))
+        after = next(ln.no for ln in res.lines if "WS-AFTER" in ln.code)
+        self.assertEqual(res.origin(after)[:2], (1, 4), "line accounting unchanged")
+        res = self._expand(prog, self.FRAG)
+        code = self._code(res)
+        self.assertEqual(code[0], (" ", "01  ABCD-SEG."), "a fragment: the program's 01 stays, closed")
+        tree = self._tree(res)
+        self.assertEqual(tree["AAAA-STAT"].parent.name, "ABCD-SEG")
+        self.assertEqual(res.aliases, [])
+
+
 class DocumentExtraction(unittest.TestCase):
 
     def test_docx_headings_tables_images(self):
