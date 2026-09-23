@@ -856,6 +856,221 @@ class FlowWalkEdges(unittest.TestCase):
         self.assertEqual(flow.changed_targets(text[:1], True), [])
 
 
+class FlowCarriersAndInvocations(unittest.TestCase):
+    """Second review of the walk (inline, fictional): an MQ queue is its
+    WHOLE name (APP.REQ is not APP.REQ.BACKOUT); an ISRT / GU on the I/O PCB
+    is the terminal's message, not a database another program's I/O PCB
+    shares; a CICS queue named by a variable the parser could not resolve
+    is no queue name at all (two programs' WS-QNAME are two queues, guard
+    1); RETURN TRANSID .. COMMAREA has its --up mirror; a value that came
+    into a callee through ONE CALL and was copied into another parameter or
+    the RETURNING item goes back to THAT caller only; and before the
+    re-parse, a twice-declared name is listed, never picked (guard 4)."""
+
+    H = ("       IDENTIFICATION DIVISION.\n       PROGRAM-ID. {p}.\n       DATA DIVISION.\n"
+         "       WORKING-STORAGE SECTION.\n")
+    MQ = ("       01  WS-MQOD.\n           05  MQOD-OBJECTNAME PIC X(48) VALUE '{q}'.\n"
+          "       01  HCONN PIC S9(9) COMP.\n       01  HOBJ PIC S9(9) COMP.\n       01  OPTS PIC S9(9) COMP.\n"
+          "       01  CC PIC S9(9) COMP.\n       01  RC PIC S9(9) COMP.\n       01  MQMD PIC X(324).\n"
+          "       01  PMO PIC X(128).\n       01  BUFLEN PIC S9(9) COMP.\n")
+    MQGET = ("       01  WS-IN.\n           05  WS-IN-CODE PIC X(02).\n       PROCEDURE DIVISION.\n"
+             "           CALL 'MQOPEN' USING HCONN WS-MQOD OPTS HOBJ CC RC.\n"
+             "           CALL 'MQGET' USING HCONN HOBJ MQMD PMO BUFLEN WS-IN CC RC.\n"
+             "           DISPLAY WS-IN-CODE.\n           GOBACK.\n")
+    FILES = {
+        "MQP.cbl": H.format(p="MQP") + MQ.format(q="APP.REQ") + (
+            "       01  WS-MSG.\n           05  WS-M-CODE PIC X(02).\n       PROCEDURE DIVISION.\n"
+            "           CALL 'MQOPEN' USING HCONN WS-MQOD OPTS HOBJ CC RC.\n"
+            "           CALL 'MQPUT' USING HCONN HOBJ MQMD PMO BUFLEN WS-MSG CC RC.\n           GOBACK.\n"),
+        "MQG1.cbl": H.format(p="MQG1") + MQ.format(q="APP.REQ.BACKOUT") + MQGET,
+        "MQG2.cbl": H.format(p="MQG2") + MQ.format(q="APP.REQ") + MQGET,
+        # the queue name is built at run time: QUEUE(WS-QNAME) is not a name; 'FIXQ' is
+        "CQW.cbl": H.format(p="CQW") + (
+            "       01  WS-TERM PIC X(4).\n       01  WS-QNAME PIC X(8).\n"
+            "       01  WS-REC.\n           05  WS-R-CODE PIC X(02).\n       PROCEDURE DIVISION.\n"
+            "           STRING 'CQW' WS-TERM DELIMITED BY SIZE INTO WS-QNAME.\n"
+            "           EXEC CICS WRITEQ TS QUEUE(WS-QNAME) FROM(WS-REC) END-EXEC.\n"
+            "           EXEC CICS WRITEQ TS QUEUE('FIXQ') FROM(WS-REC) END-EXEC.\n           GOBACK.\n"),
+        "CQR.cbl": H.format(p="CQR") + (
+            "       01  WS-TERM PIC X(4).\n       01  WS-QNAME PIC X(8).\n"
+            "       01  WS-IN.\n           05  WS-IN-CODE PIC X(02).\n       PROCEDURE DIVISION.\n"
+            "           STRING 'CQR' WS-TERM DELIMITED BY SIZE INTO WS-QNAME.\n"
+            "           EXEC CICS READQ TS QUEUE(WS-QNAME) INTO(WS-IN) END-EXEC.\n"
+            "           EXEC CICS READQ TS QUEUE('FIXQ') INTO(WS-IN) END-EXEC.\n"
+            "           DISPLAY WS-IN-CODE.\n           GOBACK.\n"),
+        # RETURN TRANSID('TR02') COMMAREA: TR02 runs CSN (CSD), which gets it as DFHCOMMAREA
+        "CST.cbl": H.format(p="CST") + (
+            "       01  WS-CA.\n           05  WS-CA-CODE PIC X(02).\n       01  WS-D-CODE PIC X(02).\n"
+            "       PROCEDURE DIVISION.\n           MOVE WS-D-CODE TO WS-CA-CODE.\n"
+            "           EXEC CICS RETURN TRANSID('TR02') COMMAREA(WS-CA) END-EXEC.\n           GOBACK.\n"),
+        "CSN.cbl": H.format(p="CSN") + (
+            "       LINKAGE SECTION.\n       01  DFHCOMMAREA.\n           05  CA-CODE PIC X(02).\n"
+            "       PROCEDURE DIVISION.\n           DISPLAY CA-CODE.\n           EXEC CICS RETURN END-EXEC.\n"),
+        "CSD1.csd": "DEFINE TRANSACTION(TR02) GROUP(G1) PROGRAM(CSN)\n",
+        # a parameter copied into the RETURNING item / into another parameter: one caller's
+        "RTS.cbl": H.format(p="RTS") + (
+            "       LINKAGE SECTION.\n       01  LK-IN PIC X(02).\n       01  LK-OUT PIC X(02).\n"
+            "       PROCEDURE DIVISION USING LK-IN RETURNING LK-OUT.\n           MOVE LK-IN TO LK-OUT.\n"
+            "           GOBACK.\n"),
+        "LKS.cbl": H.format(p="LKS") + (
+            "       LINKAGE SECTION.\n       01  LK-A PIC X(02).\n       01  LK-B PIC X(02).\n"
+            "       PROCEDURE DIVISION USING LK-A LK-B.\n           MOVE LK-A TO LK-B.\n           GOBACK.\n"),
+        # a name declared twice (qualified where it is written)
+        "AMB.cbl": H.format(p="AMB") + (
+            "       01  AM-SRC PIC X(02).\n       01  A-1.\n           05  AM-X PIC X(02).\n"
+            "       01  A-2.\n           05  AM-X PIC X(02).\n       PROCEDURE DIVISION.\n"
+            "           MOVE AM-SRC TO AM-X OF A-2.\n           DISPLAY AM-X OF A-1.\n           GOBACK.\n"),
+        # two MPPs, each GU its input message and ISRT its reply on its own I/O PCB
+        "MPA.psb": ("         PCB   TYPE=DB,DBDNAME=POLDBD,PROCOPT=G,KEYLEN=12\n"
+                    "         SENSEG NAME=POLICY,PARENT=0\n         PSBGEN LANG=COBOL,PSBNAME=MPA\n"),
+        "MPB.psb": ("         PCB   TYPE=DB,DBDNAME=POLDBD,PROCOPT=G,KEYLEN=12\n"
+                    "         SENSEG NAME=POLICY,PARENT=0\n         PSBGEN LANG=COBOL,PSBNAME=MPB\n"),
+        "STG1.imsgen": ("         APPLCTN PSB=MPA,PGMTYPE=TP\n         TRANSACT CODE=TRA\n"
+                        "         APPLCTN PSB=MPB,PGMTYPE=TP\n         TRANSACT CODE=TRB\n"),
+    }
+    for _c in ("RTX", "RTY"):
+        FILES[f"{_c}.cbl"] = H.format(p=_c) + (
+            "       01  WC-IN PIC X(02).\n       01  WC-OUT PIC X(02).\n       PROCEDURE DIVISION.\n"
+            "           CALL 'RTS' USING WC-IN RETURNING WC-OUT.\n           DISPLAY WC-OUT.\n           GOBACK.\n")
+    for _c, _p in (("LKX", "WX"), ("LKY", "WY")):
+        FILES[f"{_c}.cbl"] = H.format(p=_c) + (
+            f"       01  {_p}-A PIC X(02).\n       01  {_p}-B PIC X(02).\n       PROCEDURE DIVISION.\n"
+            f"           CALL 'LKS' USING {_p}-A {_p}-B.\n           DISPLAY {_p}-B.\n           GOBACK.\n")
+    for _c in ("MPA", "MPB"):
+        FILES[f"{_c}.cbl"] = H.format(p=_c) + (
+            "       01  WS-GU PIC X(4) VALUE 'GU  '.\n       01  WS-ISRT PIC X(4) VALUE 'ISRT'.\n"
+            "       01  WS-IN.\n           05  WS-IN-CODE PIC X(02).\n"
+            "       01  WS-OUT.\n           05  WS-OUT-CODE PIC X(02).\n"
+            "       LINKAGE SECTION.\n       01  IO-PCB PIC X(20).\n       01  DB-PCB PIC X(40).\n"
+            "       PROCEDURE DIVISION USING IO-PCB DB-PCB.\n"
+            "           CALL 'CBLTDLI' USING WS-GU IO-PCB WS-IN.\n"
+            "           MOVE WS-IN-CODE TO WS-OUT-CODE.\n"
+            "           CALL 'CBLTDLI' USING WS-ISRT IO-PCB WS-OUT.\n           GOBACK.\n")
+    del _c, _p
+
+    @classmethod
+    def setUpClass(cls):
+        cls.td = tempfile.mkdtemp()
+        src = os.path.join(cls.td, "estate")
+        os.makedirs(src)
+        for name, text in cls.FILES.items():
+            with open(os.path.join(src, name), "w", encoding="utf-8") as fh:
+                fh.write(text)
+        cls.db = os.path.join(cls.td, "t.db")
+        with contextlib.redirect_stdout(io.StringIO()):
+            build._main([src, "--db", cls.db, "--rebuild", "--quiet"])
+        # his work index before the re-parse: none of the five tables
+        cls.old = os.path.join(cls.td, "old.db")
+        shutil.copyfile(cls.db, cls.old)
+        c = sqlite3.connect(cls.old)
+        c.executescript("DROP TABLE data_flow; DROP TABLE pfield; DROP TABLE call_arg; DROP TABLE param; "
+                        "DROP TABLE file_record;")
+        c.close()
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.td, ignore_errors=True)
+
+    def flow(self, *args, db=None) -> str:
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = query._main(["--db", db or self.db, "flow", *args])
+        self.assertEqual(rc, 0, err.getvalue())
+        return out.getvalue()
+
+    def test_mq_queue_is_its_whole_name(self):
+        down = self.flow("WS-MSG", "--program", "MQP")
+        self.assertRegex(down, r"MQ APP\.REQ -> MQG2\.WS-IN-CODE\b")
+        self.assertNotIn("MQG1", down)                      # reads APP.REQ.BACKOUT
+        up = self.flow("WS-IN-CODE", "--program", "MQG1", "--up")
+        self.assertNotIn("MQP", up)
+        self.assertIn("[end: no indexed writer]", up)
+        self.assertRegex(self.flow("WS-IN-CODE", "--program", "MQG2", "--up"), r"MQ APP\.REQ <- MQP\.WS-M-CODE\b")
+
+    def test_io_pcb_message_is_the_terminal_not_a_database(self):
+        down = self.flow("WS-IN-CODE", "--program", "MPA")
+        self.assertIn("[end: IMS message to the terminal / I/O PCB - not a database]", down)
+        self.assertNotIn("MPB", down)
+        self.assertNotIn("*IO-PCB*", down)
+        self.assertNotIn("matched by DBD", down)
+        up = self.flow("WS-OUT-CODE", "--program", "MPA", "--up")
+        self.assertIn("[end: IMS message from the terminal / I/O PCB - not a database]", up)
+        self.assertNotIn("MPB", up)
+
+    def test_cics_queue_named_by_a_variable_is_not_joined(self):
+        down = self.flow("WS-REC", "--program", "CQW")
+        hop = _lines_of(down, "QUEUE(WS-QNAME)")
+        self.assertIn("[end: queue name not resolvable (variable WS-QNAME)]", hop)
+        self.assertNotIn("CQR:11", down)                    # CQR's own WS-QNAME: another queue
+        self.assertRegex(down, r"WRITEQ TSQ FIXQ -> READQ into CQR\.WS-IN-CODE\b")   # a literal name still joins
+        up = self.flow("WS-IN-CODE", "--program", "CQR", "--up")
+        self.assertIn("[end: queue name not resolvable (variable WS-QNAME)]", _lines_of(up, "QUEUE(WS-QNAME)"))
+        self.assertNotIn("CQW:11", up)
+        self.assertRegex(up, r"READQ TSQ FIXQ <- WRITEQ from CQW\.WS-R-CODE\b")
+
+    def test_return_transid_commarea_has_its_up_mirror(self):
+        down = self.flow("WS-D-CODE", "--program", "CST")
+        self.assertRegex(down, r"RETURN TR02 -> CSN\.CA-CODE \(LINKAGE DFHCOMMAREA bytes 1-2, X\(02\)\); by CICS convention")
+        up = self.flow("CA-CODE", "--program", "CSN", "--up")
+        self.assertRegex(up, r"(?m)^1\s+RETURN TR02 COMMAREA <- CST\.WS-CA-CODE; by CICS convention\s+"
+                             r"CST:\d+ \"RETURN TRANSID\('TR02'\) COMMAREA\(WS-CA\"")
+        self.assertRegex(up, r"MOVE <- CST\.WS-D-CODE\b")
+
+    def test_a_parameter_copied_inside_the_callee_goes_back_to_its_own_caller(self):
+        # RETURNING: RTX's value reaches RTX.WC-OUT, never RTY's (RTY's LK-IN is RTY's argument)
+        down = self.flow("WC-IN", "--program", "RTX")
+        self.assertRegex(down, r"MOVE -> RTS\.LK-OUT\b")
+        self.assertRegex(down, r"RETURNING -> back to RTX\.WC-OUT\b")
+        self.assertNotIn("RTY", down)
+        up = self.flow("WC-OUT", "--program", "RTX", "--up")
+        self.assertRegex(up, r"CALL RTS arg 1 <- RTX\.WC-IN\b")
+        self.assertNotIn("RTY", up)
+        # started AT the item nobody called through: whatever is in it goes back to every caller (rule 3)
+        at = self.flow("LK-OUT", "--program", "RTS")
+        for c in ("RTX", "RTY"):
+            self.assertRegex(at, rf"RETURNING -> back to {c}\.WC-OUT\b")
+        # LINKAGE position 2, reached by MOVE from position 1: the same invocation, exact and reconstructed
+        for db, tag in ((self.db, "exact"), (self.old, "reconstructed")):
+            with self.subTest(tag):
+                lk = self.flow("WX-A", "--program", "LKX", db=db)
+                self.assertRegex(lk, r"LINKAGE pos 2 -> back to LKX\.WX-B\b")
+                self.assertNotIn("LKY", lk)
+                lk_up = self.flow("WX-B", "--program", "LKX", "--up", db=db)
+                self.assertRegex(lk_up, r"CALL LKS arg 1 <- LKX\.WX-A\b")
+                self.assertNotIn("LKY", lk_up)
+                at = self.flow("LK-B", "--program", "LKS", db=db)
+                for arg in ("LKX.WX-B", "LKY.WY-B"):
+                    self.assertRegex(at, rf"LINKAGE pos 2 -> back to {re.escape(arg)}\b")
+
+    def test_fallback_twice_declared_name_is_listed_not_picked(self):
+        # guard 4 before the re-parse: field_ref drops OF/IN, so no statement on AM-X is either one's
+        out = self.flow("AM-X", "--program", "AMB", db=self.old)
+        self.assertRegex(out, r"AM-X is declared 2 times in AMB: A-1\.AM-X \(AMB:\d+ \"05  AM-X\"\), "
+                              r"A-2\.AM-X \(AMB:\d+ \"05  AM-X\"\) - HUMAN MUST VERIFY")
+        self.assertNotIn("- defined", out)
+        self.assertNotIn("DISPLAY", out)
+        self.assertIn("[end: ambiguous name - HUMAN MUST VERIFY]", out)
+        # a qualified start is defined at ITS line, and still not followed (its statements are both items')
+        q = self.flow("AM-X OF A-2", "--program", "AMB", db=self.old)
+        self.assertIn(f'- defined AMB:{self.line("AMB.cbl", "A-2.") + 1} "05  AM-X"', q)
+        self.assertIn("not followed until re-parse", q)
+        self.assertNotIn("DISPLAY", q)
+        # reached by a MOVE: the hop ends there, nothing of A-1's AM-X is attributed to it
+        hop = self.flow("AM-SRC", "--program", "AMB", db=self.old)
+        self.assertRegex(hop, r"MOVE -> AM-X \(reconstructed\).*\(AM-X is declared 2 times in AMB\)\s+"
+                              r"\[end: ambiguous name - HUMAN MUST VERIFY\]")
+        self.assertNotIn("DISPLAY", hop)
+        # the exact walker on the same names (unchanged)
+        self.assertIn("HUMAN MUST VERIFY", self.flow("AM-X", "--program", "AMB"))
+        self.assertIn(f'- defined AMB:{self.line("AMB.cbl", "A-1.") + 1} "05  AM-X"', self.flow("AM-X OF A-1", "--program", "AMB"))
+
+    def line(self, member: str, needle: str) -> int:
+        for i, ln in enumerate(self.FILES[member].splitlines(), 1):
+            if needle in ln:
+                return i
+        raise AssertionError(needle)
+
+
 class FlowIndex(unittest.TestCase):
 
     @classmethod
@@ -1252,6 +1467,17 @@ class FlowIndex(unittest.TestCase):
         self.assertIn("[end: copybook fields: not followed until re-parse]", hop)
         self.assertNotIn("reader layout has no field", out)
         self.assertIn("copybook fields: not followed until re-parse:", out.split("## Ends", 1)[1])
+        # guard 4 in the same shape: WS-CODE OF WS-CORR-B is line 44, never WS-CORR-A's line 41;
+        # an unqualified WS-X / WS-CODE lists both declarations and follows neither
+        q = self.flow("WS-CODE OF WS-CORR-B", "--program", "FLOWSRC", db=old)
+        self.assertIn(f'- defined FLOWSRC:{_line("FLOWSRC.cbl", "01  WS-CORR-B") + 1} "05  WS-CODE"', q)
+        self.assertNotIn(f'FLOWSRC:{_line("FLOWSRC.cbl", "01  WS-CORR-A") + 1} "05  WS-CODE"', q)
+        for args in (("WS-X", "--program", "FLOWSRC"), ("WS-CODE",)):
+            with self.subTest(args):
+                amb = self.flow(*args, db=old)
+                self.assertRegex(amb, r"is declared 2 times in FLOWSRC: .* - HUMAN MUST VERIFY which one")
+                self.assertNotIn("- defined", amb)
+                self.assertNotIn("MOVE SPACES", amb)
 
     def test_returning_item_goes_back_to_the_caller_in_the_fixtures(self):
         # FLOWSUB's RETURNING item comes back into FLOWSRC.WS-R at GOBACK (`CALL .. RETURNING WS-R`)

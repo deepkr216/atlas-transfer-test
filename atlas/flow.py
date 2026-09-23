@@ -59,6 +59,9 @@ END_NO_DB2_READER = "DB2 column: no static reader"
 END_NO_DB2_WRITER = "DB2 column: no static writer"
 END_PCB = "PCB unresolved"
 END_SEGMENT = "segment not resolved (RM-03)"
+END_IO_PCB_OUT = "IMS message to the terminal / I/O PCB - not a database"
+END_IO_PCB_IN = "IMS message from the terminal / I/O PCB - not a database"
+END_RES_VAR = "{what} name not resolvable (variable {v})"
 END_SCREEN = "screen field - a human sees it"
 END_MQ = "MQ PUT to {q} (peer from manifest)"
 END_ODO = "offset is a maximum (ODO)"
@@ -74,6 +77,8 @@ SET_KINDS = ("literal", "figurative", "initialize", "accept")
 TOKEN_MAX = 40
 _CALL_WORD = {"static": "CALL", "dynamic": "CALL", "cics_link": "LINK", "cics_xctl": "XCTL", "cics_start": "START",
               "cics_return": "RETURN", "proc_call": "CALL"}
+# CICS carriers whose resource the parser may hold as a variable's name (QUEUE(x), FILE(x), CONTAINER(x))
+_CICS_CARRIERS = {"tsq": "queue", "tdq": "queue", "queue": "queue", "file": "file", "container": "container"}
 _REFMOD = re.compile(r"^\(\s*(\d+)\s*:\s*(\d+)\s*\)$")
 _STOP_WORDS = {"ELSE", "END-IF", "END-EVALUATE", "END-PERFORM", "END-CALL", "END-STRING", "END-UNSTRING",
                "IF", "MOVE", "PERFORM", "GO", "CALL", "DISPLAY", "COMPUTE", "ADD", "SUBTRACT", "MULTIPLY",
@@ -110,18 +115,24 @@ def has_flow_tables(conn: sqlite3.Connection) -> bool:
 
 class _Node:
     """`via_call`: the call_edge id when the node is a callee's parameter
-    reached THROUGH that CALL (or, under --up, written back through it). The
-    parameter then IS that caller's storage: the value cannot reach another
-    invocation's argument, and back through the same CALL is the argument
-    it came from - so such a node has no LINKAGE-back / param-in edges, and
-    its subtree is the same whichever CALL it came through."""
-    __slots__ = ("pid", "pname", "root", "lo", "hi", "pf", "hop", "unnamed", "kind", "data", "name", "via_call")
+    reached THROUGH that CALL (or, under --up, written back through it), and
+    `via_root` that parameter's 01. The parameter then IS that caller's
+    storage: the value cannot reach another invocation's argument, and back
+    through the same CALL is the argument it came from - so the parameter
+    itself has no LINKAGE-back / param-in edges. A copy inside the callee
+    into LINKAGE or LOCAL-STORAGE keeps `via_call` (the same invocation):
+    from there LINKAGE-back / RETURNING / param-in take that one CALL, never
+    every caller. WORKING-STORAGE outlives the invocation, so a copy there
+    drops it."""
+    __slots__ = ("pid", "pname", "root", "lo", "hi", "pf", "hop", "unnamed", "kind", "data", "name", "via_call",
+                 "via_root")
 
     def __init__(self, pid: int, pname: str, root: int, lo: int, hi: int, pf, hop: int,
                  unnamed: bool = False, kind: str = "field", data=None, name: Optional[str] = None) -> None:
         self.pid, self.pname, self.root, self.lo, self.hi, self.pf, self.hop = pid, pname, root, lo, hi, pf, hop
         self.unnamed, self.kind, self.data, self.name = unnamed, kind, data, name
         self.via_call: Optional[int] = None
+        self.via_root: Optional[int] = None
 
 
 class _Edge:
@@ -472,6 +483,7 @@ class _Walker(_Report):
         self.visited: Dict[Tuple[int, int], List[Tuple[int, int, str, Optional[int], int]]] = defaultdict(list)
         self._partial_shown: Set[int] = set()
         self._layout: Dict[int, Optional[str]] = {}
+        self._names: Dict[int, Set[str]] = {}
 
     # ---- lookups -------------------------------------------------------------
     def pf(self, pf_id: Optional[int]):
@@ -672,12 +684,22 @@ class _Walker(_Report):
     def child(self, pid: int, row, lo: int, hi: int, how: str, hop: int) -> _Node:
         return _Node(pid, self.prog(pid)["program_id"], row["root_id"], lo, hi, row, hop, unnamed=(how == "unnamed"))
 
+    @staticmethod
+    def carry(frm: _Node, ch: _Node) -> _Node:
+        """A copy inside one invocation (LINKAGE, LOCAL-STORAGE) keeps the
+        CALL the value came through; WORKING-STORAGE outlives it (_Node)."""
+        if frm.via_call is not None and ch.pid == frm.pid and ch.pf is not None \
+                and ch.pf["section"] in ("LINKAGE", "LOCAL-STORAGE"):
+            ch.via_call, ch.via_root = frm.via_call, frm.via_root
+        return ch
+
     def seen(self, node: _Node) -> Optional[str]:
         # a parameter walked as one CALL's storage (via_call) has fewer edges than the
-        # same parameter reached by a copy inside the callee: it never stands in for that.
+        # same parameter reached by a copy inside the callee: it never stands in for that,
+        # nor for the same parameter reached through ANOTHER call (its edges take that call).
         # A visit at a DEEPER hop was cut sooner by --hops: a shorter path re-expands the node
         for (vlo, vhi, num, via, vhop) in self.visited[(node.pid, node.root)]:
-            if vlo <= node.lo and node.hi <= vhi and (via is None or node.via_call is not None) and vhop <= node.hop:
+            if vlo <= node.lo and node.hi <= vhi and (via is None or via == node.via_call) and vhop <= node.hop:
                 return num
         return None
 
@@ -837,7 +859,7 @@ class _Walker(_Report):
             return [_Edge(rank, node.pname, r["line"], label + self._lbls(labels), cites, r["guard"], end=end)]
         out = []
         for (row, plo, phi, how) in self.place(dst, n_lo, n_hi):
-            ch = self.child(pid, row, plo, phi, how, node.hop + 1)
+            ch = self.carry(node, self.child(pid, row, plo, phi, how, node.hop + 1))
             if group_src:
                 label = (f"group {lbl_verb} {src['name']} -> {dst['name']}: bytes {n_lo + 1}-{n_hi} land in "
                          f"{self.nm(ch)}")
@@ -905,7 +927,7 @@ class _Walker(_Report):
                         out.append(_Edge(9, node.pname, r["line"], head + self._lbls(labels), cites, r["guard"], end=end))
                         continue
                     for (row, plo, phi, how) in self.place(x if up else y, n_lo, n_hi):
-                        ch = self.child(pid, row, plo, phi, how, node.hop + 1)
+                        ch = self.carry(node, self.child(pid, row, plo, phi, how, node.hop + 1))
                         out.append(_Edge(9, node.pname, r["line"], f"{head} {arrow} {self.hop_prefix(ch)}{self.nm(ch)}"
                                          + self._lbls(labels), cites, r["guard"], child=ch))
 
@@ -1253,7 +1275,7 @@ class _Walker(_Report):
                     continue
                 for (row, plo, phi, how) in self.place_ref(ppf, n_lo, n_hi):
                     ch = self.child(callee["id"], row, plo, phi, how, node.hop + 1)
-                    ch.via_call = a["cid"]
+                    ch.via_call, ch.via_root = a["cid"], ppf["root_id"]
                     self.touch(callee["id"])
                     label = f"{callname} arg {a['pos']} -> {cname}.{self.nm(ch)} {self.desc(ch)}".rstrip() + self._lbls(labels)
                     out.append(_Edge(2, cname, a["cline"], label, cites, child=ch, extra=extra))
@@ -1349,13 +1371,23 @@ class _Walker(_Report):
         return bool(self.conn.execute(f"""SELECT 1 FROM field_ref WHERE program_id=? AND pfield_id IN ({q}) AND mode='write'
                                           AND stmt NOT IN ('CALL-USING') LIMIT 1""", (node.pid, *ids)).fetchone())
 
-    def callers_of(self, pname: str, entry: Optional[str]) -> List[sqlite3.Row]:
+    def callers_of(self, pname: str, entry: Optional[str], via_call: Optional[int] = None,
+                   transid: bool = False) -> List[sqlite3.Row]:
+        """The CALL / LINK / XCTL edges that reach this program (or ENTRY);
+        `via_call`: that one edge only (the invocation the value is in);
+        `transid`: also RETURN TRANSID edges to a transaction that runs it
+        (its DFHCOMMAREA is that COMMAREA - --up only: the returning task is
+        gone, nothing comes back to it)."""
         # DFHCOMMAREA is the program's own LINK / XCTL target, not an entry name
         name = (pname if entry in (None, "DFHCOMMAREA") else entry).upper()
-        return self.conn.execute("""SELECT c.*, q.program_id AS caller, q.id AS cpid, ? AS callee_name
-                                    FROM call_edge c JOIN program q ON q.id=c.program_id
-                                    WHERE (UPPER(c.target)=? OR c.resolved LIKE ?) ORDER BY q.program_id, c.line""",
-                                 (name, name, f'%"{name}"%')).fetchall()
+        tran = ("""OR (c.kind='cics_return' AND UPPER(c.target) IN
+                       (SELECT UPPER(tran_code) FROM transaction_def WHERE UPPER(program)=?))""" if transid else "")
+        args: List = [name, name, f'%"{name}"%'] + ([name] if transid else [])
+        rows = self.conn.execute(f"""SELECT c.*, q.program_id AS caller, q.id AS cpid, ? AS callee_name
+                                     FROM call_edge c JOIN program q ON q.id=c.program_id
+                                     WHERE (UPPER(c.target)=? OR c.resolved LIKE ? {tran}) ORDER BY q.program_id, c.line""",
+                                 args).fetchall()
+        return [c for c in rows if via_call is None or c["id"] == via_call]
 
     @staticmethod
     def pos_tag(prm, c) -> str:
@@ -1378,8 +1410,10 @@ class _Walker(_Report):
     def linkage_back(self, node: _Node, ids: Set[int]) -> List[_Edge]:
         out: List[_Edge] = []
         # reached through one CALL: the parameter is that caller's storage, so the value cannot
-        # reach another CALL's argument; every caller only when it got here by a copy (or is the start)
-        if node.via_call is not None:
+        # reach another CALL's argument, and back at the same position is where it came from;
+        # copied from there into another parameter: back through that CALL only (_Node);
+        # every caller only when it got here by a copy of other storage (or is the start)
+        if node.via_call is not None and node.root == node.via_root:
             return out
         params = self.params_of_root(node, returning=True)
         if not params:
@@ -1394,7 +1428,7 @@ class _Walker(_Report):
                 continue
             if not written:
                 continue
-            for c in self.callers_of(node.pname, prm["entry"]):
+            for c in self.callers_of(node.pname, prm["entry"], node.via_call):
                 if prm["entry"] == "DFHCOMMAREA":
                     args = self.conn.execute("SELECT * FROM call_arg WHERE call_id=? AND how IN ('commarea')", (c["id"],)).fetchall()
                 else:
@@ -1430,10 +1464,11 @@ class _Walker(_Report):
 
     def returning_back(self, node: _Node, prm, ppf) -> List[_Edge]:
         """The callee's RETURNING item -> every caller's `CALL .. RETURNING x`
-        (the caller's `returning` data_flow row names x's pfield); the --up
-        mirror is returning_up."""
+        (the caller's `returning` data_flow row names x's pfield) - or, when
+        the value came in through one CALL (via_call), that caller's only;
+        the --up mirror is returning_up."""
         out: List[_Edge] = []
-        for c in self.callers_of(node.pname, prm["entry"]):
+        for c in self.callers_of(node.pname, prm["entry"], node.via_call):
             if not c["returning_item"]:
                 continue
             word = _CALL_WORD.get(c["kind"], "CALL")
@@ -1511,6 +1546,11 @@ class _Walker(_Report):
         if call is None or not call["dbd_name"]:
             return [_Edge(5, "IMS", r["line"], f"{func} via {call['pcb_arg'] if call else '?'}", cites, end=END_PCB)]
         dbd = call["dbd_name"]
+        if dbd == "*IO-PCB*":
+            # the build's marker for the I/O PCB: a reply to (or input from) the terminal, never
+            # another program's GU / ISRT on its own I/O PCB
+            return [_Edge(5, "IMS", r["line"], f"{func} via {call['pcb_arg'] or 'I/O PCB'} (I/O PCB)", cites,
+                          end=END_IO_PCB_IN if up else END_IO_PCB_OUT)]
         other = "dli_out" if up else "dli_in"
         peers = self.conn.execute(f"""SELECT d.*, p.program_id AS pname, c.func FROM data_flow d JOIN program p ON p.id=d.program_id
                                       JOIN dli_call c ON c.program_id=d.program_id AND c.line=d.line
@@ -1541,6 +1581,38 @@ class _Walker(_Report):
             out.append(_Edge(5, "IMS", r["line"], f"{func} {dbd}", cites, end=END_NO_WRITER if up else END_NO_READER))
         return out
 
+    def data_names(self, pid: int) -> Set[str]:
+        if pid not in self._names:
+            self._names[pid] = {x[0].upper() for x in self.conn.execute(
+                "SELECT name FROM pfield WHERE program_id=? UNION SELECT name FROM field_ref WHERE program_id=?", (pid, pid))}
+        return self._names[pid]
+
+    def res_var(self, pid: int, kind: str, res: str) -> Optional[str]:
+        """The data item a queue / file / container name really is: the
+        parser keeps QUEUE(x)'s variable name when no literal reaches x, and
+        two programs' WS-QNAME are two different queues (guard 1)."""
+        if kind not in _CICS_CARRIERS:
+            return None
+        names = self.data_names(pid)
+        return next((x for x in res.upper().split("/") if x in names), None)
+
+    def cics_peers(self, pkind: str, kind: str, res: str) -> List[sqlite3.Row]:
+        """The other side of a CICS carrier: the same resource kind and the
+        whole resource name (never LIKE: `_` and a longer name are not it),
+        and a resource that names a literal in the peer too."""
+        rows = self.conn.execute("""SELECT d.*, p.program_id AS pname FROM data_flow d JOIN program p ON p.id=d.program_id
+                                    WHERE d.kind=? AND UPPER(d.note) LIKE ? ORDER BY p.program_id, d.line""",
+                                 (pkind, f"% {kind.upper()} %")).fetchall()
+        out = []
+        for p in rows:
+            parts = (p["note"] or "").split(" ", 2)
+            if len(parts) < 3 or parts[1].lower() != kind.lower() or parts[2].upper() != res.upper():
+                continue
+            if self.res_var(p["program_id"], kind, parts[2]):
+                continue
+            out.append(p)
+        return out
+
     def cics_out_edges(self, node: _Node, r) -> List[_Edge]:
         pid = node.pid
         parts = (r["note"] or "").split(" ", 2)
@@ -1554,10 +1626,12 @@ class _Walker(_Report):
             return [_Edge(6, "screen", r["line"], f"{verb} {kind.upper()} {res} FROM {r['src_name']} ({carrier} bytes "
                           f"{node.lo + 1}-{node.hi})", cites, end=END_SCREEN)]
         out: List[_Edge] = []
+        var = self.res_var(pid, kind, res)
+        if var:
+            return [_Edge(6, "CICS", r["line"], f"{verb} {kind.upper()} {res} FROM {r['src_name']}", cites,
+                          end=END_RES_VAR.format(what=_CICS_CARRIERS[kind], v=var))]
         if kind in ("tsq", "tdq", "container", "file", "channel"):
-            peers = self.conn.execute("""SELECT d.*, p.program_id AS pname FROM data_flow d JOIN program p ON p.id=d.program_id
-                                         WHERE d.kind='cics_in' AND UPPER(d.note) LIKE ? ORDER BY p.program_id, d.line""",
-                                      (f"% {kind.upper()} {res.upper()}",)).fetchall()
+            peers = self.cics_peers("cics_in", kind, res)
             for p in peers:
                 tpf = self.pf(p["dst_pfield"])
                 if tpf is None or src is None:
@@ -1628,9 +1702,11 @@ class _Walker(_Report):
                                      child=ch))
             return out
         out: List[_Edge] = []
-        peers = self.conn.execute("""SELECT d.*, p.program_id AS pname FROM data_flow d JOIN program p ON p.id=d.program_id
-                                     WHERE d.kind='cics_out' AND UPPER(d.note) LIKE ? ORDER BY p.program_id, d.line""",
-                                  (f"% {kind.upper()} {res.upper()}",)).fetchall()
+        var = self.res_var(pid, kind, res)
+        if var:
+            return [_Edge(6, "CICS", r["line"], f"{verb} {kind.upper()} {res} INTO {r['dst_name']}", cites,
+                          end=END_RES_VAR.format(what=_CICS_CARRIERS[kind], v=var))]
+        peers = self.cics_peers("cics_out", kind, res) if kind else []
         for p in peers:
             spf = self.pf(p["src_pfield"])
             if spf is None or dst is None:
@@ -1667,9 +1743,10 @@ class _Walker(_Report):
         item = r["dst_name"] if up else r["src_name"]
         cites = self.cite_stmt(pid, r["line"], "CALL", item)
         other = "mq_out" if up else "mq_in"
+        # the whole queue name: APP.REQ is not APP.REQ.BACKOUT
         peers = self.conn.execute("""SELECT d.*, p.program_id AS pname FROM data_flow d JOIN program p ON p.id=d.program_id
-                                     WHERE d.kind=? AND UPPER(d.note) LIKE ? ORDER BY p.program_id, d.line""",
-                                  (other, f"%QUEUE {queue.upper()}%")).fetchall() if "(" not in queue else []
+                                     WHERE d.kind=? AND UPPER(TRIM(d.note))=? ORDER BY p.program_id, d.line""",
+                                  (other, f"QUEUE {queue.upper()}")).fetchall() if "(" not in queue else []
         mine = self.pf(r["dst_pfield"] if up else r["src_pfield"])
         out = []
         for p in peers:
@@ -1776,7 +1853,7 @@ class _Walker(_Report):
         group_dst = bool(dst["is_group"]) and (node.lo > d0 or node.hi < d1) and not derived
         out = []
         for (row, plo, phi, how) in self.place(src, n_lo, n_hi):
-            ch = self.child(pid, row, plo, phi, how, node.hop + 1)
+            ch = self.carry(node, self.child(pid, row, plo, phi, how, node.hop + 1))
             if group_dst:
                 label = f"group {lbl_verb} {dst['name']} <- {src['name']}: bytes {n_lo + 1}-{n_hi} come from {self.nm(ch)}"
             else:
@@ -1841,6 +1918,8 @@ class _Walker(_Report):
                 continue
             ppf = self.pf(prm["pfield"])
             ch = self.child(callee["id"], ppf, *self.extent(ppf), "exact", node.hop + 1)
+            # the RETURNING item of THIS call: a parameter copied into it came from this caller only
+            ch.via_call, ch.via_root = c["id"], ppf["root_id"]
             self.touch(callee["id"])
             out.append(_Edge(2, callee["program_id"], r["line"], f"RETURNING <- {callee['program_id']}.{self.nm(ch)} "
                              f"{self.desc(ch)} (pos 0)".replace("  ", " "), cites, child=ch))
@@ -1853,11 +1932,12 @@ class _Walker(_Report):
         caller's argument at that position (BY CONTENT included: the value
         does arrive)."""
         out: List[_Edge] = []
-        if node.via_call is not None:
+        if node.via_call is not None and node.root == node.via_root:
             return out          # written back through one CALL: its argument is where the walk came from
         for prm in self.params_of_root(node):
             ppf = self.pf(prm["pfield"])
-            for c in self.callers_of(node.pname, prm["entry"]):
+            # RETURN TRANSID(t) COMMAREA(x): the next task's program gets x as DFHCOMMAREA (tran_edges)
+            for c in self.callers_of(node.pname, prm["entry"], node.via_call, transid=prm["entry"] == "DFHCOMMAREA"):
                 if prm["entry"] == "DFHCOMMAREA":
                     args = self.conn.execute("SELECT * FROM call_arg WHERE call_id=? AND how IN ('commarea','start_from')",
                                              (c["id"],)).fetchall()
@@ -1933,7 +2013,7 @@ class _Walker(_Report):
                 tag = "COMMAREA" if a["how"] == "commarea" else f"arg {a['pos']}"
                 for (row, plo, phi, how) in self.place_ref(ppf, n_lo, n_hi):
                     ch = self.child(callee["id"], row, plo, phi, how, node.hop + 1)
-                    ch.via_call = a["cid"]
+                    ch.via_call, ch.via_root = a["cid"], ppf["root_id"]
                     # only the bytes the callee writes come back: CA-MESSAGE set there is not CA-STATUS
                     cids, _cl = self.closure_ids(ch)
                     if not self.written_here(ch, cids):
@@ -2209,12 +2289,13 @@ class _Walker(_Report):
 # ---------------------------------------------------------------------------
 
 class _FNode:
-    __slots__ = ("pid", "pname", "name", "frow", "hop", "kind", "via_call")
+    __slots__ = ("pid", "pname", "name", "frow", "hop", "kind", "via_call", "via_name")
 
     def __init__(self, pid: int, pname: str, name: str, frow, hop: int) -> None:
         self.pid, self.pname, self.name, self.frow, self.hop = pid, pname, name, frow, hop
         self.kind = "field"
         self.via_call: Optional[int] = None        # as _Node.via_call
+        self.via_name: Optional[str] = None        # as _Node.via_root: the parameter the CALL reached
 
 
 class _Fallback(_Report):
@@ -2263,10 +2344,53 @@ class _Fallback(_Report):
         self.unpaired[pid] = bad
         return pairs
 
-    def field_row(self, pid: int, name: str):
+    def decls(self, pid: int, name: str) -> List[sqlite3.Row]:
+        """Every declaration of the name in the program's own text."""
         p = self.prog(pid)
-        return self.conn.execute("SELECT * FROM field WHERE member_id=? AND UPPER(name)=? ORDER BY id LIMIT 1",
-                                 (p["member_id"], name.upper())).fetchone()
+        return self.conn.execute("SELECT * FROM field WHERE member_id=? AND UPPER(name)=? ORDER BY id",
+                                 (p["member_id"], name.upper())).fetchall()
+
+    def field_row(self, pid: int, name: str):
+        # a twice-declared name is none of them: field_ref cannot say which one a statement names (guard 4)
+        rows = self.decls(pid, name)
+        return rows[0] if len(rows) == 1 else None
+
+    def params(self, pid: int) -> Set[str]:
+        """The program's USING parameters (PROCEDURE DIVISION and every ENTRY)."""
+        out = {a.upper() for a in Q._jl(self.prog(pid)["linkage_using"])}
+        for r in self.conn.execute("SELECT linkage_using FROM program_alias WHERE program_id=?", (pid,)):
+            out |= {a.upper() for a in Q._jl(r["linkage_using"])}
+        return out
+
+    def carry(self, frm: _FNode, ch: _FNode) -> _FNode:
+        """As _Walker.carry: a copy into another parameter stays in the
+        invocation the value came through (the fallback cannot see
+        LOCAL-STORAGE: parameters only)."""
+        if frm.via_call is not None and ch.pid == frm.pid and ch.name in self.params(ch.pid):
+            ch.via_call, ch.via_name = frm.via_call, frm.via_name
+        return ch
+
+    def start(self, pid: int, name: str) -> Tuple[Optional[sqlite3.Row], Optional[str], bool]:
+        """(field row, problem, follow) for a start name with its OF/IN
+        qualifiers: a twice-declared name lists its declarations and follows
+        none, as the exact walker does (guard 4); a qualified one is defined
+        at the right line but still not followed - field_ref drops the
+        qualifier, so its statements are both declarations' statements."""
+        base, quals = _split_name(name)
+        rows = self.decls(pid, base)
+        pname = self.prog(pid)["program_id"]
+        cands = [r for r in rows if all(q in (r["qualified"] or "").upper().split(".") for q in quals)] if quals else rows
+        if quals and not cands and rows:
+            return None, f"{base} in {pname}: no declaration matches the qualifier {' OF '.join(quals)}", False
+        if len(cands) > 1:
+            return None, (f"{base} is declared {len(cands)} times in {pname}: "
+                          + ", ".join(f"{c['qualified']} ({self.cite_def(c, pid)})" for c in cands)
+                          + " - HUMAN MUST VERIFY which one; run `flow \"" + base + " OF <group>\"`"), False
+        if len(rows) > 1:
+            return cands[0], (f"{base} is declared {len(rows)} times in {pname}; before the re-parse field_ref names it "
+                              "without the qualifier, so their statements cannot be told apart - not followed until "
+                              "re-parse - HUMAN MUST VERIFY"), False
+        return (cands[0] if cands else None), None, True
 
     def root_of(self, frow):
         r = frow
@@ -2317,14 +2441,14 @@ class _Fallback(_Report):
                                          f"parameter(s)) (reconstructed)", cites, end=END_POS))
                         continue
                     ch = self.node(callee["id"], lk[pos - 1], node.hop + 1)
-                    ch.via_call = c["id"]
+                    ch.via_call, ch.via_name = c["id"], ch.name
                     out.append(_Edge(2, callee["program_id"], c["line"], f"{callname} arg {pos} -> {callee['program_id']}.{ch.name} "
                                      f"(reconstructed){self.call_modes(pid, c['line'])}", cites, child=ch))
         # 3. LINKAGE back (never for a parameter reached through a CALL: _Node.via_call)
         lk = [a.upper() for a in Q._jl(self.prog(pid)["linkage_using"])]
         entries = [(None, lk)] + [(r["alias"], [a.upper() for a in Q._jl(r["linkage_using"])]) for r in
                                   self.conn.execute("SELECT alias, linkage_using FROM program_alias WHERE program_id=?", (pid,))]
-        if node.via_call is not None:
+        if node.via_call is not None and node.name == node.via_name:
             entries = []
         written = bool(self.conn.execute("SELECT 1 FROM field_ref WHERE program_id=? AND UPPER(name)=? AND mode='write' "
                                          "AND stmt<>'CALL-USING' LIMIT 1", (pid, name)).fetchone())
@@ -2337,7 +2461,7 @@ class _Fallback(_Report):
                                           WHERE (UPPER(c.target)=? OR c.resolved LIKE ?) ORDER BY q.program_id, c.line""",
                                        (cname, f'%"{cname}"%')):
                 args = Q._jl(c["using_args"])
-                if pos > len(args):
+                if pos > len(args) or (node.via_call is not None and c["id"] != node.via_call):
                     continue
                 ch = self.node(c["cpid"], args[pos - 1], node.hop + 1)
                 out.append(_Edge(3, c["caller"], c["line"], f"LINKAGE pos {pos} -> back to {c['caller']}.{ch.name} (reconstructed)"
@@ -2348,7 +2472,7 @@ class _Fallback(_Report):
         # 9. local copies
         for (ln, rd, wr) in self.move_pairs(pid):
             if rd == name:
-                ch = self.node(pid, wr, node.hop + 1)
+                ch = self.carry(node, self.node(pid, wr, node.hop + 1))
                 out.append(_Edge(9, node.pname, ln, f"MOVE -> {self.pfx(ch)}{ch.name} (reconstructed)",
                                  self.cite_stmt(pid, ln, "MOVE", wr), child=ch))
         return out
@@ -2360,7 +2484,7 @@ class _Fallback(_Report):
         lk = [a.upper() for a in Q._jl(self.prog(pid)["linkage_using"])]
         entries = [(None, lk)] + [(r["alias"], [a.upper() for a in Q._jl(r["linkage_using"])]) for r in
                                   self.conn.execute("SELECT alias, linkage_using FROM program_alias WHERE program_id=?", (pid,))]
-        if node.via_call is not None:
+        if node.via_call is not None and node.name == node.via_name:
             entries = []
         for (entry, using) in entries:
             if name not in using:
@@ -2371,7 +2495,7 @@ class _Fallback(_Report):
                                           WHERE (UPPER(c.target)=? OR c.resolved LIKE ?) ORDER BY q.program_id, c.line""",
                                        (cname, f'%"{cname}"%')):
                 args = Q._jl(c["using_args"])
-                if pos > len(args):
+                if pos > len(args) or (node.via_call is not None and c["id"] != node.via_call):
                     continue
                 ch = self.node(c["cpid"], args[pos - 1], node.hop + 1)
                 out.append(_Edge(2, c["caller"], c["line"], f"CALL {cname} arg {pos} <- {c['caller']}.{ch.name} (reconstructed)"
@@ -2393,14 +2517,14 @@ class _Fallback(_Report):
                                              "AND stmt<>'CALL-USING' LIMIT 1", (callee["id"], pname.upper())).fetchone():
                         continue
                     ch = self.node(callee["id"], pname, node.hop + 1)
-                    ch.via_call = c["id"]
+                    ch.via_call, ch.via_name = c["id"], ch.name
                     out.append(_Edge(3, callee["program_id"], c["line"], f"CALL {t} arg {pos} <- {callee['program_id']}.{ch.name} "
                                      f"(written there) (reconstructed){self.call_modes(pid, c['line'])}",
                                      self.cite_stmt(pid, c["line"], "CALL", name), child=ch))
         out.extend(self.sql_edges(node, "read"))
         for (ln, rd, wr) in self.move_pairs(pid):
             if wr == name:
-                ch = self.node(pid, rd, node.hop + 1)
+                ch = self.carry(node, self.node(pid, rd, node.hop + 1))
                 out.append(_Edge(9, node.pname, ln, f"MOVE <- {self.pfx(ch)}{ch.name} (reconstructed)",
                                  self.cite_stmt(pid, ln, "MOVE", rd), child=ch))
         return out
@@ -2581,12 +2705,18 @@ class _Fallback(_Report):
         head = f"{e.label}   {e.cites}"
         key = (node.pid, node.name)
         prev = next((n for (n, via, hop) in self.visited[key]
-                     if (via is None or node.via_call is not None) and hop <= node.hop), None)
+                     if (via is None or via == node.via_call) and hop <= node.hop), None)
         if prev is not None:
             self.put(depth, self.fmt(num, depth, f"{head}   (shown as {prev})"))
             return
         self.visited[key].append((num, node.via_call, node.hop))
         self.count += 1
+        n_decl = len(self.decls(node.pid, node.name))
+        if n_decl > 1:
+            # field_ref drops OF/IN: the statements on this name are every declaration's (guard 4)
+            self.put(depth, self.fmt(num, depth, f"{head}   ({node.name} is declared {n_decl} times in {node.pname})"
+                                     + self.end(END_AMBIGUOUS, num)))
+            return
         edges = self.edges(node)
         uses = self.uses(node)
         tail = ""
@@ -2611,7 +2741,7 @@ class _Fallback(_Report):
     interfaces_on = _Walker.interfaces_on
     cite_card = _Report.cite_card
 
-    def run(self, pid: int, name: str, frow) -> None:
+    def run(self, pid: int, name: str, frow, problem: Optional[str] = None, follow: bool = True) -> None:
         self.root_pid = pid
         self.touch(pid)
         p = self.prog(pid)
@@ -2619,7 +2749,11 @@ class _Fallback(_Report):
         self.visited[(pid, node.name)].append(("root", None, 0))
         if frow is not None:
             self.put(0, f"- defined {self.cite_def(frow, pid)} ({_picstr(frow)}; offsets as this program's own text declares them)")
-        else:
+        if not follow:
+            # guard 4: candidates listed, none followed
+            self.put(0, f"- {problem}" + self.end(END_AMBIGUOUS, "root"))
+            return
+        if frow is None:
             cb = self.conn.execute("""SELECT m.name, f.offset, f.length, f.pic FROM field f JOIN member m ON m.id=f.member_id
                                       WHERE UPPER(f.name)=? AND m.kind='copybook' LIMIT 1""", (node.name,)).fetchone()
             if cb:
@@ -2778,7 +2912,8 @@ def _render_fallback(conn: sqlite3.Connection, name: str, program: Optional[str]
     shown = progs if (opts.show_all or program) else progs[:opts.width]
     for p in shown:
         w = _Fallback(conn, opts)
-        w.run(p["id"], base, w.field_row(p["id"], base))
+        frow, problem, follow = w.start(p["id"], name)
+        w.run(p["id"], base, frow, problem, follow)
         w.budget_cut()
         body = [f"# Flow of {p['program_id']}.{base} ({'upstream' if opts.up else 'downstream'}; reconstructed)",
                 f"- {FALLBACK_HEADER}"]
@@ -2816,7 +2951,10 @@ def lines_from(conn: sqlite3.Connection, pid: int, name: str, hops: int = 2, wid
     opts = Opts(hops=hops, width=width, nodes=nodes, header=False)
     if not has_flow_tables(conn):
         w = _Fallback(conn, opts)
-        w.run(pid, name, w.field_row(pid, name))
+        frow, problem, follow = w.start(pid, name)
+        if not follow:
+            return [f"- {problem}"]
+        w.run(pid, _split_name(name)[0], frow)
         lines = [t for d, t in w.lines if d > 0]
         return ([f"- {FALLBACK_HEADER}", "```"] + lines + ["```"]) if lines else []
     pname = conn.execute("SELECT program_id FROM program WHERE id=?", (pid,)).fetchone()
