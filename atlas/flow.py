@@ -2394,6 +2394,7 @@ class _Fallback(_Report):
         # the item reached by a copy, and a visit cut sooner by --hops never hides a shorter path
         self.visited: Dict[Tuple[int, str], List[Tuple[str, Optional[int], int]]] = defaultdict(list)
         self._prog: Dict[int, sqlite3.Row] = {}
+        self._partial_shown: Set[int] = set()
 
     def prog(self, pid: int):
         if pid not in self._prog:
@@ -2905,6 +2906,7 @@ class _Fallback(_Report):
             # field_ref drops OF/IN: the statements on this name are every declaration's (guard 4)
             self.put(depth, self.fmt(num, depth, f"{head}   ({node.name} is declared {n_decl} times in {node.pname})"
                                      + self.end(END_AMBIGUOUS, num)))
+            self.show_partial(node.pid, depth)
             return
         edges = self.edges(node)
         uses = self.uses(node)
@@ -2915,12 +2917,23 @@ class _Fallback(_Report):
         elif not edges and not uses:
             tail = self.end(FALLBACK_COPY if node.frow is None else END_NO_USE.format(p=node.pname), num)
         self.put(depth, self.fmt(num, depth, head + tail))
+        self.show_partial(node.pid, depth)
         for s in self.sets(node):
             self.put(depth, self.sub(depth, s))
         if uses:
             self.put(depth, self.sub(depth, uses + ("" if edges else self.end(FALLBACK_COPY if node.frow is None else END_TESTED,
                                                                               num))))
         self.children(node, edges, num, depth + 1)
+
+    partial_note = _Walker.partial_note
+
+    def show_partial(self, pid: int, depth: int) -> None:
+        """[program partial: ...] once per program, under its first node (guard 23), as _Walker does:
+        a program with a missing copybook never looks complete in the tree."""
+        part = self.partial_note(pid) if pid not in self._partial_shown else None
+        if part:
+            self._partial_shown.add(pid)
+            self.put(depth, f"- {part}" if depth == 0 else self.sub(depth, part))
 
     emit_dataset = _Walker.emit_dataset
     children = _Walker.children
@@ -2939,6 +2952,7 @@ class _Fallback(_Report):
         self.visited[(pid, node.name)].append(("root", None, 0))
         if frow is not None:
             self.put(0, f"- defined {self.cite_def(frow, pid)} ({_picstr(frow)}; offsets as this program's own text declares them)")
+        self.show_partial(pid, 0)
         if not follow:
             # guard 4: candidates listed, none followed
             self.put(0, f"- {problem}" + self.end(END_AMBIGUOUS, "root"))

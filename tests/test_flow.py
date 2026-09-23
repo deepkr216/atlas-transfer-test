@@ -1867,6 +1867,22 @@ class FlowKnownLimits(unittest.TestCase):
                         if f'FLOWSRC:{dyn} "CALL WS-PGM' in ln:
                             self.assertIn("candidate", ln, ln)
 
+    def test_fallback_says_a_program_is_partial(self):
+        # guard 23 before the re-parse: ERRPGM's COPY POLDCL is not in the fixtures, so the root says
+        # so before any hop, as the exact walker does - not only the Unresolved table at the bottom
+        fx, old = self.fixture_dbs()
+        for db, tag in ((fx, "exact"), (old, "reconstructed")):
+            with self.subTest(tag):
+                out = self.flow("WS-ERR-CD", "--program", "ERRPGM", db=db)
+                self.assertRegex(out, r"(?m)^- \[program partial: [^\]]*POLDCL[^\]]*\]$")
+                self.assertLess(out.index("[program partial:"), re.search(r"(?m)^1\s", out).start())
+                self.assertEqual(out.count("[program partial:"), 1, out)
+        # a node in another program (KMISS: COPY KNOCPY missing) says it under that node, once
+        up = self.flow("WU-CODE", "--program", "KUP", "--up", db=self.old)
+        node = re.search(r"(?m)^\d+\s+CALL KMISS arg 1 <- KMISS\.LK-MISS .*\n\s+\[program partial: [^\]]*KNOCPY[^\]]*\]$", up)
+        self.assertIsNotNone(node, up)
+        self.assertEqual(up.count("[program partial:"), 1, up)
+
     def test_up_ends_at_the_fixture_callees_it_cannot_follow(self):
         # the fixtures' own shapes (ROADMAP example): ERRLOG is not in the index and may set WS-ERR-CD;
         # FLOWSUB declares 2 parameters and is passed WS-EXTRA third
