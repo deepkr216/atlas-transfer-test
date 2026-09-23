@@ -1912,6 +1912,22 @@ class FlowKnownLimits(unittest.TestCase):
         "KL6.cbl": H.format(p="KL6") + L.format(n="LL6")
             + "           EXEC CICS LINK PROGRAM('KL2') RESP(LL6) END-EXEC.\n           GOBACK.\n",
     })
+    # BY CONTENT hands a copy on, never a way back: KB1 passes its parameter BY CONTENT to KQ2, which sets its
+    # own copy; KB2 passes it twice to KB9, BY CONTENT first and BY REFERENCE second, and KB9 sets the second
+    FILES.update({
+        "KBA.cbl": H.format(p="KBA") + (
+            "       01  WB-C                     PIC X(02).\n       01  WB-M                     PIC X(02).\n"
+            "       PROCEDURE DIVISION.\n"
+            "           CALL 'KB1' USING WB-C.\n           CALL 'KB2' USING WB-M.\n"
+            "           DISPLAY WB-C WB-M.\n           GOBACK.\n"),
+        "KB1.cbl": H.format(p="KB1") + L.format(n="LB1") + "           CALL 'KQ2' USING BY CONTENT LB1.\n           GOBACK.\n",
+        "KB2.cbl": H.format(p="KB2") + L.format(n="LB2")
+            + "           CALL 'KB9' USING BY CONTENT LB2\n                BY REFERENCE LB2.\n           GOBACK.\n",
+        "KB9.cbl": H.format(p="KB9") + (
+            "       LINKAGE SECTION.\n       01  LB9-A                    PIC X(02).\n"
+            "       01  LB9-B                    PIC X(02).\n       PROCEDURE DIVISION USING LB9-A LB9-B.\n"
+            "           MOVE 'BB' TO LB9-B.\n           DISPLAY LB9-A.\n           GOBACK.\n"),
+    })
     FILES["KDW.cbl"] =FILES["KCW.cbl"].replace("KCW", "KDW").replace("COUT", "DOUT").replace("C-CODE", "D-CODE") \
         .replace("CCODE", "DCODE")
     FILES["KDR.cbl"] = FILES["KCR.cbl"].replace("KCR", "KDR").replace("CIN", "DIN").replace("C-CODE", "D-CODE")
@@ -2319,6 +2335,23 @@ class FlowKnownLimits(unittest.TestCase):
                 self.assertRegex(r, r"(?m)^1\s+CALL KL6 arg 1 <- KL6\.LL6 .*\(written there")
                 g = self.gate(s, r)
                 self.assertEqual({c: st for c, st in g.items() if st != "PASS"}, {}, g)
+
+    def test_up_a_by_content_argument_is_no_way_back(self):
+        # before the re-parse the fallback took KB1's `CALL 'KQ2' USING BY CONTENT LB1` as a pass-on and printed
+        # KB1 as `passed on BY REFERENCE there`, with KQ2's own copy as the origin
+        for db, tag in ((self.db, "exact"), (self.old, "reconstructed")):
+            with self.subTest(tag):
+                c = self.flow("WB-C", "--program", "KBA", "--up", "--all", db=db)
+                self.assertNotRegex(c, r"(?m)^1\s", c)
+                self.assertNotIn("passed on BY REFERENCE", c)
+                self.assertIn("[end: only tested/displayed here]", c)
+                # the same item BY CONTENT and BY REFERENCE in one CALL: only the BY REFERENCE position is a way back
+                m = self.flow("WB-M", "--program", "KBA", "--up", "--all", db=db)
+                self.assertRegex(m, r"(?m)^1\s+CALL KB2 arg 1 <- KB2\.LB2 .*\(passed on BY REFERENCE there\)")
+                self.assertRegex(m, r"(?m)^1\.1\s+CALL KB9 arg 2 <- KB9\.LB9-B .*\(written there")
+                self.assertNotIn("CALL KB9 arg 1", m)
+                g = self.gate(m)
+                self.assertEqual({k: st for k, st in g.items() if st != "PASS"}, {}, g)
 
     def test_up_asks_each_callee_once_not_once_per_path(self):
         # a lattice of callees: each program of a level CALLs all 4 of the next with its parameter, the last

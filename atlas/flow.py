@@ -28,6 +28,7 @@ import sqlite3
 from collections import defaultdict
 from typing import Callable, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
+from . import cobol
 from . import query as Q
 from . import verify_citations as V
 
@@ -2896,7 +2897,10 @@ class _Fallback(_Report):
             args = [a.upper() for a in Q._jl(c["using_args"])]
             xctl = c["kind"] == "cics_xctl"
             word = _CALL_WORD.get(c["kind"], "CALL")
+            hows = self.arg_hows(pid, c, args) if name in args else None
             for pos in [i + 1 for i, a in enumerate(args) if a == name]:
+                if hows is not None and hows[pos - 1] != "reference":
+                    continue        # BY CONTENT / VALUE, LENGTH OF, ADDRESS OF: never a way back (as _Walker.arg_back)
                 # a callee that may write the position but cannot be followed is a labelled end (as
                 # _Walker.arg_back); XCTL never comes back, so there it is no origin at all
                 modes = self.call_modes(pid, c["line"])
@@ -2981,6 +2985,34 @@ class _Fallback(_Report):
             return True
         return self.pass_search((node.pid, node.name), self.o.hops - node.hop, lambda: self.arg_back_iter(node))
 
+    def arg_hows(self, pid: int, c, args: List[str]) -> Optional[List[str]]:
+        """How a CALL passes each of its call_edge.using_args (reference,
+        content, value, length_of, address_of), read from the statement's own
+        text as the parser reads it - an index built before the re-parse
+        stores a BY CONTENT argument as a write, as it does a BY REFERENCE
+        one. None when that is not a CALL, or its text does not give the
+        same names in the same order: then every position may be BY
+        REFERENCE (call_modes says so on the hop)."""
+        if c["kind"].startswith("cics_"):
+            return None
+        m, ln, _d, _v = Q.origin(self.conn, pid, c["line"])
+        if not m or ln is None:
+            return None
+        text = []
+        for k in range(12):
+            raw = self.raw(m, ln + k)
+            text.append(raw)
+            if raw.rstrip().endswith("."):
+                break
+        t = " ".join(text)
+        mc = re.search(r"(?<![\w-])CALL(?![\w-])", t, re.I)
+        if not mc:
+            return None
+        named = [a for a in cobol._parse_using_detail(t[mc.start():])[0] if a.name]
+        if [a.name.upper() for a in named] != args:
+            return None
+        return [a.how for a in named]
+
     def call_modes(self, pid: int, exp_line: int) -> str:
         """call_edge.using_args has no BY CONTENT / LENGTH OF: when the CALL's
         own text holds one, a position may be one-way or a length - said on
@@ -3027,7 +3059,8 @@ class _Fallback(_Report):
             return None
         q = ",".join("?" * len(subs))
         # a CALL argument is recorded as a write too (BY REFERENCE): up, only a statement that sets it counts
-        where = (f"(stmt='CALL-USING' OR (stmt='EXEC-CICS-LINK' AND {_CA_HANDOVER}))" if passed else
+        # passed on: a BY REFERENCE argument (the parser stores BY CONTENT as a read only) or a LINK COMMAREA
+        where = (f"((stmt='CALL-USING' AND mode='write') OR (stmt='EXEC-CICS-LINK' AND {_CA_HANDOVER}))" if passed else
                  _SETS_HERE if up else "mode IN ('read','test','display')")
         return self.conn.execute(f"SELECT 1 FROM field_ref WHERE program_id=? AND UPPER(name) IN ({q}) AND {where} LIMIT 1",
                                  (pid, *subs)).fetchone() is not None
