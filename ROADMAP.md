@@ -193,6 +193,31 @@ shipped alone and cost one such night; these still wait for the next one:
    ways, the program's `field` row); a library that starts at 05 hangs under the program's own 01,
    kept as code. `01 X.` with the COPY after the period is unchanged (LESSONS 177).
 
+### flow: known limits (open after review)
+
+Left open after the review of `flow --up` (the LINK / XCTL COMMAREA origin, the per-path cost of
+`passes_on` and the fallback's BY CONTENT pass-on are fixed, each with its test in
+tests/test_flow.py FlowKnownLimits). None needs a re-parse (atlas/flow.py only).
+
+- **A concatenated DD with a long DSN cites only the DSN.** On a continuation line (`//  DD
+  DSN=...`) longer than the 40-character token, the cite keeps the tail - the DSN - and loses the
+  `// DD` statement words; the DSN is on that line, so the cite still PASSES the gate.
+- **At the hop limit a pass-on is counted without checking the chain.** A callee that only hands the
+  parameter on is printed on the way back when the program it hands it to lies past `--hops`, even
+  if nobody further on sets it; the line ends `[end: hop limit N]`, so it is labelled, not silent.
+- **JUSTIFIED RIGHT receivers are not modelled.** Every alphanumeric MOVE is taken as
+  left-justified, so a shorter value moved into a `JUSTIFIED RIGHT` item is placed in the wrong
+  bytes of it (the hop and its cite are right, the byte range is not).
+- **A circle of programs that pass the parameter among themselves is slow when nobody sets it.** A
+  `no` cut short by the cycle guard is not kept (the same question asked from elsewhere may have its
+  way through the item being asked about), so with `--hops` larger than the circle the time grows
+  with the number of paths round it: 12 programs each CALLing 4 of the others, `--hops 14`, takes
+  about 23 seconds.
+- **The fallback's `HUMAN MUST VERIFY` one-way note stays on a position it has proven BY
+  REFERENCE.** Before the re-parse, a CALL whose text holds BY CONTENT anywhere carries the note on
+  every hop through it, even on a position its own text shows is BY REFERENCE (noise, not a wrong
+  answer).
+
 ## What the tool was not built for - scenario audit (2026-09-21)
 
 docs/AUDIT-scenarios-2026-09-21.md lists the scenarios a month of real analysis asks (change impact, abends,
