@@ -193,38 +193,6 @@ shipped alone and cost one such night; these still wait for the next one:
    ways, the program's `field` row); a library that starts at 05 hangs under the program's own 01,
    kept as code. `01 X.` with the COPY after the period is unchanged (LESSONS 177).
 
-### flow: known limits (open after review)
-
-Found by the reviewer of the `flow` engine and left open after four fix rounds; each is a wrong or
-missing answer to know about before the merge. None needs a re-parse to fix (atlas/flow.py only).
-
-- **`diff` misses a changed MOVE whose sender ends in `-TO`, and takes the wrong target on ADD ...
-  TO ... GIVING.** `changed_targets` matches `\bMOVE\b.*?\bTO\s`, and `\b` matches after a
-  hyphen: `MOVE WS-BILL-TO TO OUT-BILL-TO` gives no target, so `diff` prints no "Flow from the
-  changed statements" section; `ADD WS-A TO WS-B GIVING WS-C` gives WS-B, which that statement
-  does not change (the LESSONS 174 shape). Fix: `(?<![\w-])` on the keywords, as cobol.py does,
-  and GIVING replaces the TO operands.
-- **`--up` silently drops a BY REFERENCE argument to a callee that can write it but cannot be
-  followed**: a callee not in the index, an unresolved dynamic CALL, a `(+N more)` candidate list,
-  a position out of range. Downstream ends each with a labelled `[end: ...]`; upstream prints
-  nothing, so the origins look complete. Example: `flow WS-ERR-CD --program ERRPGM --up` never
-  mentions `CALL 'ERRLOG' USING WS-ERR-CD`, and ERRLOG may set the field. Both walkers (exact and
-  fallback).
-- **The cite on an FTP / NDM step fails the gate.** The interface pseudo-DD (`*FTP*`) sits on the
-  EXEC line, but the cite quotes `"//*FTP* DD"`, which is not on that line: `verify_citations`
-  says FAIL. Any value that reaches a dataset sent by FTP or NDM prints it (the fixtures have no
-  FTP step, so the gate test does not see it). Fix: quote the EXEC text, or cite the line with no
-  token.
-- **Fallback `--up` (index before the re-parse) prints a dynamic CALL as a static one**:
-  `CALL FLOWSUB arg 2 <- ...` where the exact walker says `CALL FLOWSUB (candidate: resolved via
-  MOVE literal)`. The cite still shows `CALL WS-PGM`, so a reader can see it.
-- **Fallback nodes never print `[program partial: ...]`** (guard 23): on the index before the
-  re-parse a program with a missing copybook looks complete in the tree; only the `Unresolved in
-  scope` table lists the missing COPY.
-- **ICEGENER ends as `utility step - bytes not modelled`**, while IEBGENER (the same plain copy
-  SYSUT1 -> SYSUT2 in jcl.py) passes the bytes through to the reader. The end is labelled, so
-  nothing wrong is claimed; the readers after an ICEGENER copy are not reached.
-
 ## What the tool was not built for - scenario audit (2026-09-21)
 
 docs/AUDIT-scenarios-2026-09-21.md lists the scenarios a month of real analysis asks (change impact, abends,
