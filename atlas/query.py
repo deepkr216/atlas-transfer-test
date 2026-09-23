@@ -2714,6 +2714,32 @@ def cmd_segment(conn: sqlite3.Connection, name: str) -> str:
     return "".join(out)
 
 
+def _osvs_library_root(conn: sqlite3.Connection, mid: int,
+                       root: sqlite3.Row) -> Optional[Tuple[str, int, sqlite3.Row]]:
+    """A program's 01 with no children that "01 X COPY Y." (OS/VS) renamed
+    from the library's own 01: (program id, copybook member, the copybook's
+    01 row - it holds the fields). None for anything else."""
+    has_kids = "SELECT 1 FROM field WHERE parent_id=? LIMIT 1"
+    if conn.execute(has_kids, (root["id"],)).fetchone():
+        return None
+    for a in conn.execute("""SELECT p.program_id, a.copybook, a.orig_name FROM field_alias a
+                             JOIN program p ON p.id=a.program_id
+                             WHERE p.member_id=? AND UPPER(a.new_name)=?""", (mid, root["name"].upper())):
+        book = (a["copybook"] or "").upper()
+        cb = conn.execute("""SELECT resolved_member_id FROM copy_use WHERE member_id=? AND UPPER(copybook)=?
+                             AND resolved_member_id IS NOT NULL""", (mid, book)).fetchone()
+        if not cb:
+            # copied from inside another copybook: the member by name
+            cb = conn.execute("SELECT id FROM member WHERE UPPER(name)=? AND kind='copybook'", (book,)).fetchone()
+        if not cb:
+            continue
+        lib = conn.execute("SELECT * FROM field WHERE member_id=? AND parent_id IS NULL AND UPPER(name)=?",
+                           (cb[0], a["orig_name"].upper())).fetchone()
+        if lib and conn.execute(has_kids, (lib["id"],)).fetchone():
+            return a["program_id"], cb[0], lib
+    return None
+
+
 def cmd_layout(conn: sqlite3.Connection, name: str, program: Optional[str] = None) -> str:
     """The byte layout of a copybook / 01 record from the parser's numbers:
     offsets, lengths, PIC, usage, OCCURS/ODO/REDEFINES, 88 values, record
@@ -2766,6 +2792,27 @@ def cmd_layout(conn: sqlite3.Connection, name: str, program: Optional[str] = Non
     if not members:
         return out[0] + "\n**NOT FOUND** - no copybook member or 01 level with this name is indexed.\n"
 
+    # OS/VS "01 X COPY Y.": the program keeps only its renamed 01 (no children);
+    # the fields are the library's own rows, shown under X's name.
+    renames: Dict[int, List[Tuple[str, str, int]]] = {}   # library 01 id -> (X, program, level)
+    swapped: List[Tuple[int, sqlite3.Row]] = []
+    for mid, root in members:
+        lib = _osvs_library_root(conn, mid, root)
+        if not lib:
+            swapped.append((mid, root))
+            continue
+        pname, cb_mid, cb_root = lib
+        if cb_root["id"] not in renames:
+            renames[cb_root["id"]] = []
+            swapped.append((cb_mid, cb_root))
+        if (root["name"], pname, root["level"]) not in renames[cb_root["id"]]:
+            renames[cb_root["id"]].append((root["name"], pname, root["level"]))
+    members = swapped
+
+    def shown(r: sqlite3.Row) -> str:
+        names = {x for (x, _p, _l) in renames.get(r["id"], [])}
+        return names.pop() if len(names) == 1 else r["name"]
+
     # A copybook FRAGMENT (a run of 05s with the 01 in the including program)
     # is one layout, not one table per 05.
     groups: List[Tuple[int, List[sqlite3.Row]]] = []
@@ -2777,7 +2824,7 @@ def cmd_layout(conn: sqlite3.Connection, name: str, program: Optional[str] = Non
     for mid, roots in groups:
         mem = conn.execute("SELECT name, path, kind FROM member WHERE id=?", (mid,)).fetchone()
         root = roots[0]
-        title = root["name"] if len(roots) == 1 else f"(fragment: {len(roots)} top-level items, 01 is in the including program)"
+        title = shown(root) if len(roots) == 1 else f"(fragment: {len(roots)} top-level items, 01 is in the including program)"
         out.append(f"\n## {title}  in `{mem['name']}` ({mem['kind']})  line {root['line']}\n")
         out.append("```\n")
         out.append(f"{'OFF':>6} {'LEN':>4} {'LVL':>3}  {'FIELD':<34} {'PIC':<16} {'USAGE':<8}\n")
@@ -2789,7 +2836,7 @@ def cmd_layout(conn: sqlite3.Connection, name: str, program: Optional[str] = Non
             occ = f"  OCCURS {f['occurs_max']}" if f["occurs_max"] else ""
             odo = f" DEPENDING ON {f['odo_on']}" if f["odo_on"] else ""
             red = f"  REDEFINES {f['redefines']}" if f["redefines"] else ""
-            nm = f["name"]
+            nm = shown(f) if depth == 0 else f["name"]
             out.append(f"{f['offset']:>6} {f['length']:>4} {f['level']:>3}  {(ind + nm):<34} {(f['pic'] or ''):<16} "
                        f"{(f['usage'] or ''):<8}{occ}{odo}{red}\n")
             if f["odo_on"]:
@@ -2808,8 +2855,13 @@ def cmd_layout(conn: sqlite3.Connection, name: str, program: Optional[str] = Non
         out.append("```\n")
         for w in warn:
             out.append(f"- {w}\n")
+        for (x, pname, lvl) in renames.get(root["id"], []):
+            out.append(f"- `{lvl:02d} {x} COPY {mem['name']}.` in {pname} (OS/VS): {x} is this copybook's "
+                       f"{root['name']} under the program's name; these are its fields\n")
         aliases = conn.execute("SELECT p.program_id, a.new_name, a.orig_name FROM field_alias a JOIN program p ON p.id=a.program_id "
                                "WHERE UPPER(a.copybook)=? LIMIT 12", (mem["name"].upper(),)).fetchall()
+        osvs = {(p, x) for (x, p, _l) in renames.get(root["id"], [])}   # said above, not REPLACING
+        aliases = [a for a in aliases if (a["program_id"], a["new_name"]) not in osvs]
         if aliases:
             out.append("- REPLACING in: " + "; ".join(f"{a['program_id']} ({a['orig_name']} -> {a['new_name']})" for a in aliases[:6]) + "\n")
     out.append("\n> Offsets are 0-based bytes from the parser (COMP-3 packed, COMP 2/4/8, SIGN SEPARATE +1); SYNC "

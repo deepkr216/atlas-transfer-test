@@ -413,29 +413,33 @@ class OsvsLevelCopy(unittest.TestCase):
         self.assertIn(("ABCD-SEG", "write"), {(n, m) for (n, m, _s, _l) in f.field_refs})
         self.assertIn(("WS-X", "ABCD-SEG"), {(r.src_name, r.dst_name) for r in f.flows if r.kind == "move"})
 
+    def _build(self, td):
+        """OSVSPGM ("01 ABCD-SEG COPY 'ABCDE'.") and ABCDE.cpy built into td/t.db."""
+        import contextlib
+        from atlas import build
+        src = os.path.join(td, "estate")
+        os.makedirs(src)
+        with open(os.path.join(src, "OSVSPGM.cbl"), "w", encoding="utf-8") as fh:
+            fh.write("       IDENTIFICATION DIVISION.\n       PROGRAM-ID. OSVSPGM.\n       DATA DIVISION.\n"
+                     "       WORKING-STORAGE SECTION.\n"
+                     "       01  ABCD-SEG   COPY  'ABCDE'.\n"
+                     "       01  WS-X PIC X(12).\n"
+                     "       PROCEDURE DIVISION.\n"
+                     "           MOVE WS-X TO ABCD-SEG.\n"
+                     "           GOBACK.\n")
+        with open(os.path.join(src, "ABCDE.cpy"), "w", encoding="utf-8") as fh:
+            fh.write(self.FULL)
+        db = os.path.join(td, "t.db")
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            build._main([src, "--db", db, "--rebuild", "--quiet"])
+        return db
+
     def test_the_build_keeps_the_programs_name(self):
         import shutil
         import sqlite3
-        from atlas import build
         td = tempfile.mkdtemp()
         try:
-            src = os.path.join(td, "estate")
-            os.makedirs(src)
-            with open(os.path.join(src, "OSVSPGM.cbl"), "w", encoding="utf-8") as fh:
-                fh.write("       IDENTIFICATION DIVISION.\n       PROGRAM-ID. OSVSPGM.\n       DATA DIVISION.\n"
-                         "       WORKING-STORAGE SECTION.\n"
-                         "       01  ABCD-SEG   COPY  'ABCDE'.\n"
-                         "       01  WS-X PIC X(12).\n"
-                         "       PROCEDURE DIVISION.\n"
-                         "           MOVE WS-X TO ABCD-SEG.\n"
-                         "           GOBACK.\n")
-            with open(os.path.join(src, "ABCDE.cpy"), "w", encoding="utf-8") as fh:
-                fh.write(self.FULL)
-            db = os.path.join(td, "t.db")
-            import contextlib
-            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-                build._main([src, "--db", db, "--rebuild", "--quiet"])
-            conn = sqlite3.connect(db)
+            conn = sqlite3.connect(self._build(td))
             try:
                 c = conn.execute
                 # the program's own field row, not the copybook's children (copy_use reaches those)
@@ -452,6 +456,35 @@ class OsvsLevelCopy(unittest.TestCase):
                 self.assertEqual([r[1] for r in row], ["ABCD-SEG"], "the MOVE target resolves")
                 self.assertEqual(c("SELECT copybook, orig_name, new_name, line FROM field_alias").fetchall(),
                                  [("ABCDE", "LIB-REC", "ABCD-SEG", 1)])
+            finally:
+                conn.close()
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
+
+    def test_layout_of_the_renamed_record_lists_its_fields(self):
+        # the program's ABCD-SEG row has no children (the fields are the copybook's
+        # rows): layout used to print one 12-byte group with nothing under it
+        import re
+        import shutil
+        from atlas import query
+        td = tempfile.mkdtemp()
+        try:
+            conn = query.connect(self._build(td))
+            try:
+                for args in (("ABCDE", "OSVSPGM"), ("ABCD-SEG", "OSVSPGM"), ("ABCD-SEG", None),
+                             ("LIB-REC", "OSVSPGM")):
+                    out = query.cmd_layout(conn, *args)
+                    rows = [tuple(ln.split()[:4]) for ln in out.splitlines() if re.match(r"\s*\d+\s+\d+\s+\d+\s", ln)]
+                    self.assertEqual([r[3] for r in rows], ["ABCD-SEG", "AAAA-KEY", "AAAA-STAT"], (args, out))
+                    self.assertEqual([r[:2] for r in rows], [("0", "12"), ("0", "10"), ("10", "2")], args)
+                    self.assertIn("## ABCD-SEG  in `ABCDE` (copybook)", out, args)
+                    self.assertIn("COPY ABCDE.` in OSVSPGM (OS/VS)", out, args)
+                    self.assertIn("record length: 12 bytes", out, args)
+                    self.assertNotIn("REPLACING in", out, "the OS/VS rename is not a REPLACING")
+                # the copybook alone still shows its own 01
+                out = query.cmd_layout(conn, "ABCDE")
+                self.assertIn("## LIB-REC  in `ABCDE`", out)
+                self.assertIn("AAAA-STAT", out)
             finally:
                 conn.close()
         finally:
