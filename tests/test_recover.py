@@ -106,7 +106,503 @@ def ibm_listing(program_records, copybooks, ruler=True, flag="C", prefix_lines=0
     return "\n".join(ln.rstrip() for ln in text.splitlines()) + "\n" if strip else text
 
 
+OSVS_BANNER = "1PP 5740-CB1 RELEASE 2.4          IBM OS/VS COBOL  JULY 1, 1982                          14.31.19       DATE FEB  5,1992"
+OSVS_PAGE = "1  {page}        TESTPGM         14.31.19        FEB  5,1992"
+
+
+def osvs_listing(program_records, copybooks, mark="apart", page_lines=0, banner=True, headers=True, seq=None, start=1, asa=False):
+    """What the older compilers (OS/VS COBOL) print: a FIVE-digit count of
+    every line read, the copy mark C apart from it (or attached, or none), the
+    80-column record from column 17, a page header of page number, program,
+    time and date - and after the source a data map, the diagnostics (which
+    cite earlier line numbers, one with a C after it) and the cross-reference
+    dictionary. `seq` rewrites columns 1-6 of every record (blank, a tag)."""
+    out = ([OSVS_BANNER] if banner else []) + ([OSVS_PAGE.format(page=1)] if headers else [])
+    n = start - 1
+    on_page = 0
+    page = 1
+
+    def emit(num, flag, rec):
+        nonlocal on_page, page
+        if seq is not None:
+            rec = seq(rec)
+        if page_lines and on_page >= page_lines:
+            page += 1
+            if headers:
+                out.append(OSVS_PAGE.format(page=page))
+            on_page = 0
+        if asa:                                                       # carriage control in column 1, the number from column 2:
+            out.append(f"{'0' if on_page == 0 else ' '}{num:05d} {flag:<8}{rec}")   # '0' (skip a line) glued to the first number
+        elif mark == "attached":
+            out.append(f"  {num:05d}{flag:<9}{rec}")
+        else:
+            out.append(f"  {num:05d} {flag:<8}{rec}")
+        on_page += 1
+
+    for rec in program_records:
+        n += 1
+        emit(n, "", rec)
+        found = recover.copy_in(rec[7:72] if len(rec) > 7 else "")
+        if found and found[0] in copybooks:
+            for crec in copybooks[found[0]]:
+                n += 1
+                emit(n, "" if mark == "none" else "C", crec)
+    if headers:
+        out.append(OSVS_PAGE.format(page=page + 1))
+    out.append("   INTRNL NAME   LVL  SOURCE NAME          BASE    DISPL  INTRNL NAME   DEFINITION   USAGE")
+    out += [f"   DNM=1-{100 + i:03d}     05   AAAA-FLD-{i:02d}          BL=1    {i * 4:03X}    DNM=1-{100 + i:03d}     DS 4C        DISP"
+            for i in range(30)]
+    out.append("  CARD   ERROR MESSAGE")
+    out.append(f"  {start + 4:05d}C  IKF2133I-W   A COPY STATEMENT ... WORDS IN A MESSAGE")   # cites an earlier line, a C after it
+    out += [f"  {start + 5 + i:05d}   IKF2133I-W   COPY WORD SEEN IN A MESSAGE {i}" for i in range(5)]
+    out.append("   CROSS-REFERENCE DICTIONARY")
+    out.append("   DATA NAMES                      DEFN    REFERENCE")
+    return "\n".join(out) + "\n"
+
+
+def blank_seq(rec):
+    return "      " + rec[6:]
+
+
+def tag_seq(rec):
+    return "CHG001" + rec[6:]
+
+
+def translator_front(prog, width=18):
+    """A translator's or precompiler's own listing, printed in front: five-digit
+    numbers of its own, its record at another column, its own heading."""
+    pad = " " * (width - 7)
+    return [f"  {i:05d}{pad}{r}" for i, r in enumerate(prog * 3, 1)] + ["   Diagnostic Messages", "   none"]
+
+
+class OlderListings(unittest.TestCase):
+    """His line (2026-09-23), names changed: 03008   00854  01  XXXX-SEG   COPY  'XXXXX'. - many programs, the
+    copybook expanded under it, and the report said 'not in any expanded text': the tool read only six-digit line
+    numbers, and a listing from an older compiler gave it no lines at all (LESSONS 176). The review of the first
+    fix showed how easily a wider pattern takes a plain expanded source for a listing, or reads a listing one
+    column off - so each case here either IS an older listing and must come out exact, or is NOT one and must
+    come out as it did before."""
+
+    def setUp(self):
+        self.pmast = records_of(os.path.join(FIX, "PMASTREC.cpy"))
+        self.poldcl = POLDCL.splitlines()
+        self.prog = list(PROG)
+        self.prog[6] = "000700 01  WS-POL-SEG     COPY 'POLDCL'."           # the level-01 form, name in quotes
+        del self.prog[7]
+        self.books = {"PMASTREC": self.pmast, "POLDCL": self.poldcl}
+
+    def exact(self, regions, stats, label, seq=None):
+        by = {r.name: r for r in regions}
+        self.assertEqual(set(by), {"PMASTREC", "POLDCL"}, (label, stats))
+        fix = seq or (lambda r: r)
+        self.assertEqual([r.rstrip() for r in by["PMASTREC"].records], [fix(r).rstrip() for r in self.pmast], label)
+        self.assertEqual([r.rstrip() for r in by["POLDCL"].records], [fix(r).rstrip() for r in self.poldcl], label)
+        self.assertEqual(stats.get("flagged lines with no COPY before them", 0), 0, (label, stats))
+        self.assertFalse(any(r.suspect for r in regions), (label, [r.suspect for r in regions]))
+
+    def test_an_older_compiler_listing_with_five_digit_line_numbers(self):
+        for mark in ("apart", "attached"):
+            text = osvs_listing(self.prog, self.books, mark=mark, page_lines=9, start=3001)
+            self.assertIn("1  2        TESTPGM", text, "page headers of the older layout between the lines")
+            fmt, regions, stats = recover.extract(text, "TESTPGM.lst", set())
+            self.assertEqual(fmt, "older compiler listing", (mark, stats))
+            self.exact(regions, stats, mark)
+            self.assertEqual(stats["source column"], 17, (mark, stats))
+            self.assertEqual(stats["flagged lines"], len(self.pmast) + len(self.poldcl),
+                             "the diagnostics after the source, one with a C, add nothing")
+
+    def test_no_banner_no_numeric_sequence_areas_no_page_headers(self):
+        # the page headers alone say 'older listing'; without them the copy marks do
+        for label, kw in (("blank columns 1-6", dict(banner=False, seq=blank_seq)),
+                          ("a tag in columns 1-6", dict(banner=False, seq=tag_seq)),
+                          ("no banner, no headers, marks only", dict(banner=False, headers=False))):
+            text = osvs_listing(self.prog, self.books, page_lines=9, **kw)
+            fmt, regions, stats = recover.extract(text, "TESTPGM.lst", set())
+            self.assertEqual(fmt, "older compiler listing", (label, stats))
+            self.exact(regions, stats, label, seq=kw.get("seq"))
+
+    def test_no_copy_marks_lines_up_with_the_program(self):
+        text = osvs_listing(self.prog, self.books, mark="none")
+        fmt, regions, _stats = recover.extract(text, "TESTPGM.lst", set(), original=self.prog)
+        self.assertEqual(fmt, "older compiler listing, copied lines not flagged, lined up with the program")
+        self.assertEqual({r.name for r in regions}, {"PMASTREC", "POLDCL"})
+
+    def test_a_translator_listing_in_front_never_sets_the_column(self):
+        # a job's print output: the translator's listing first (its own numbers, its record elsewhere), then
+        # the compiler's (record at column 17) - read one column late, a copybook's comments turn into code and
+        # still pass every check, so the column must come from the compiler's own lines
+        for width in (18, 16, 25):
+            for mark in ("apart", "none"):
+                text = "\n".join(translator_front(self.prog, width)) + "\n" + osvs_listing(self.prog, self.books, mark=mark, page_lines=50)
+                fmt, regions, stats = recover.extract(text, "TESTPGM.lst", set(), original=self.prog if mark == "none" else None)
+                if mark == "apart":
+                    self.assertEqual(fmt, "older compiler listing", (width, stats))
+                    self.assertEqual(stats["source column"], 17, (width, stats))
+                    self.exact(regions, stats, f"translator at {width}")
+                else:
+                    self.assertEqual(fmt, "older compiler listing, copied lines not flagged, lined up with the program", (width, stats))
+                    by = {r.name: r for r in regions}
+                    self.assertEqual(set(by), {"PMASTREC", "POLDCL"}, width)
+                    self.assertEqual([r.rstrip() for r in by["POLDCL"].records], [r.rstrip() for r in self.poldcl], width)
+
+    def test_a_header_one_column_off_is_corrected_by_the_comment_lines(self):
+        # IDENTIFICATION DIVISION written in column 9, blank columns 1-6: the header's guess is one column late,
+        # and the shape check passes that too (column 7 of every record is then a blank column 8) - the comment
+        # indicators in column 7 decide
+        prog = [blank_seq(r) for r in self.prog]
+        prog[0] = "        IDENTIFICATION DIVISION."
+        books = {k: [blank_seq(r) for r in v] for k, v in self.books.items()}
+        text = osvs_listing(prog, books, banner=False)
+        fmt, regions, stats = recover.extract(text, "TESTPGM.lst", set())
+        self.assertEqual((fmt, stats["source column"]), ("older compiler listing", 17), stats)
+        by = {r.name: r for r in regions}
+        self.assertEqual([r.rstrip() for r in by["PMASTREC"].records], [blank_seq(r).rstrip() for r in self.pmast])
+
+    def test_an_editor_ruler_comment_inside_an_older_listing(self):
+        # the editor's COLS line kept as a comment in the program prints after the line number, where a listing's
+        # ruler would be: the current-layout path finds no six-digit line, and the older layout is tried next
+        prog = list(self.prog)
+        prog.insert(4, "000450*----+-*A-1-B--+----2----+----3----+----4----+----5----+----6----+----7--")
+        text = osvs_listing(prog, self.books, page_lines=9)
+        self.assertTrue(any("----+-*A" in ln for ln in text.splitlines()))
+        self.assertFalse(any(recover._ruler_at(ln) for ln in text.splitlines()), "no LineID heading: not a listing's ruler")
+        fmt, regions, stats = recover.extract(text, "TESTPGM.lst", set())
+        self.assertEqual(fmt, "older compiler listing", stats)
+        self.assertEqual(stats["ruler line"], 0, stats)
+        self.exact(regions, stats, "ruler comment")
+
+    def test_numbers_that_do_not_count_up_by_one_are_not_a_listing(self):
+        # a print that numbers its lines in steps (a compare report, a sequence-numbered print): read as it was before
+        text = osvs_listing(self.prog, self.books)
+        stepped = []
+        k = 0
+        for ln in text.splitlines():
+            m = recover._OLD_LINE.match(ln)
+            if m:
+                k += 10
+                ln = ln[:m.start(1)] + f"{k:05d}" + ln[m.end(1):]
+            stepped.append(ln)
+        self.assertIsNone(recover.older_layout(stepped))
+        self.assertIsNotNone(recover.older_layout(text.splitlines()))
+
+    def never_shifted(self, text, label, books=None):
+        """Either exact, or nothing: a block read at another column than 17 must never come out."""
+        books = books or self.books
+        _fmt, regions, stats = recover.extract(text, "TESTPGM.lst", set())
+        for r in regions:
+            self.assertEqual([x.rstrip() for x in r.records], [x.rstrip() for x in books[r.name]], (label, r.name, stats))
+        if regions:
+            self.assertEqual(stats.get("source column"), 17, (label, stats))
+        return regions
+
+    def test_sequence_numbers_decide_the_column_whatever_the_header(self):
+        for col in (9, 10, 11):
+            prog = list(self.prog)
+            prog[0] = "000100" + " " * (col - 7) + "IDENTIFICATION DIVISION."
+            text = osvs_listing(prog, self.books, banner=False)
+            old = recover.older_layout(text.splitlines())
+            self.assertEqual((old["off"], old["how"]), (16, "sequence numbers in columns 1-6"), col)
+            fmt, regions, stats = recover.extract(text, "TESTPGM.lst", set())
+            self.assertEqual(fmt, "older compiler listing", (col, stats))
+            self.exact(regions, stats, f"header in column {col}")
+
+    def test_a_six_digit_column_that_is_not_the_record_proves_nothing(self):
+        # a listing printing its own six-digit statement number between the line number and the record: those digits
+        # line up with an indicator after them on every line, but the headers sit nine columns further - the sequence
+        # numbers must not decide there; the comment lines and headers find the record, nine columns later
+        books = {k: [blank_seq(r) for r in v] for k, v in self.books.items()}     # the only six digits: the extra column
+        text = osvs_listing([blank_seq(r) for r in self.prog], books, banner=False)
+        extra = []
+        for k, ln in enumerate(text.splitlines(), 1):
+            m = recover._OLD_LINE.match(ln)
+            extra.append(ln[:m.end()] + f"  {k:06d} " + ln[m.end():] if m else ln)
+        old = recover.older_layout(extra)
+        self.assertEqual((old["off"], old["how"]), (25, "comment lines and division headers agree"))
+        fmt, regions, stats = recover.extract("\n".join(extra) + "\n", "TESTPGM.lst", set())
+        self.assertEqual((fmt, stats["source column"]), ("older compiler listing", 26), stats)
+        self.exact(regions, stats, "an extra six-digit column", seq=blank_seq)
+        # without comment lines, nothing can prove the column: nothing is read
+        bare = [ln for ln in extra if not re.match(r"^  \d{5}\s+(C\s+)?\d{6}\*", ln[:40]) and "*" not in ln[25:32]]
+        self.assertIsNone(recover.older_layout(bare))
+
+    def test_comment_borders_and_change_flags_never_shift_the_column(self):
+        # round two: borders starting in column 4-6 and a '*' change flag in column 6 pulled the comment count
+        # one to three columns early; the count now takes comment TEXT only, and must agree with the headers
+        base = [blank_seq(r) for r in self.prog]
+        books = {k: [blank_seq(r) for r in v] for k, v in self.books.items()}
+        for start in (4, 5, 6):
+            border = " " * (start - 1) + "*" * (72 - start + 1)
+            box = [border, "      *  POLICY UPDATE - READS THE MASTER ONCE", border] * 5    # more border lines than text
+            text = osvs_listing(base[:4] + box + base[4:], books, banner=False)
+            regions = self.never_shifted(text, f"borders from column {start}", books)
+            self.assertEqual({r.name for r in regions}, {"PMASTREC", "POLDCL"}, f"borders from column {start}")
+        # '**' comments: the asterisk in column 8 as well - read one column late they look like comment text. With
+        # almost nothing in column 8 (fields in area B), that later column passes the shape check too
+        stars = ["      **  POLICY UPDATE - STEP " + str(k) for k in range(10)]
+        real = ["      *  POLICY UPDATE - NOTE " + str(k) for k in range(3)]
+        filler = ["           DISPLAY 'FILLER LINE'." for _ in range(200)]
+        only = {"POLDCL": books["POLDCL"]}
+        text = osvs_listing(base[:4] + stars + real + base[4:] + filler, only, banner=False)
+        late = [ln[17:97] for ln in text.splitlines() if recover._OLD_LINE.match(ln)]
+        self.assertGreaterEqual(recover.shaped(late), recover.FALLBACK_OK, "one column late passes the shape check")
+        regions = self.never_shifted(text, "'**' comments", only)
+        self.assertEqual({r.name for r in regions}, {"POLDCL"}, "'**' comments")
+        flagged = [r[:5] + "*" + r[6:] if r[6:7] == " " and r[7:].strip() and i % 2 else r for i, r in enumerate(base)]
+        self.never_shifted(osvs_listing(flagged, books, banner=False), "change flags in column 6", books)
+
+    def test_without_sequence_numbers_or_comments_nothing_is_read_and_the_report_says_why(self):
+        # round three: headers alone agreed with each other one to three columns off when a program writes all of
+        # area A in column 9-11 - so headers alone prove nothing; the copybooks are named as unreadable, not missing
+        base = [blank_seq(r) for r in self.prog]
+        books = {k: [blank_seq(r) for r in v if not r[6:7] == "*"] for k, v in self.books.items()}
+        for label, prog in (("area A in column 8", base),
+                            ("area A in column 9", [" " + r if r.strip() and r[7:8] != " " else r for r in base])):
+            text = osvs_listing(prog, books, banner=False)
+            self.assertIsNone(recover.older_layout(text.splitlines()), label)
+            fmt, regions, stats = recover.extract(text, "TESTPGM.lst", set())
+            self.assertEqual((fmt, regions), (recover.UNPROVABLE, []), label)
+            self.assertEqual(stats["named"], ["PMASTREC", "POLDCL"], label)
+            self.assertEqual(stats["why"], "no sequence numbers in columns 1-6 and too few comment lines to prove the column")
+
+    def test_a_letter_touching_the_record_is_no_copy_mark(self):
+        m = recover._OLD_LINE.match("  00007        CHG001     05  X  PIC X.")
+        self.assertEqual(recover._old_flag("  00007        CHG001     05  X  PIC X.", m, 16), "",
+                         "one column late, the C of CHG001 sits in the gap - but it touches the record")
+        m = recover._OLD_LINE.match("  00007 C      CHG001     05  X  PIC X.")
+        self.assertEqual(recover._old_flag("  00007 C      CHG001     05  X  PIC X.", m, 15), "C")
+
+    def test_a_short_run_says_so_in_the_trace(self):
+        short = osvs_listing(list(PROG[:4]) + ["000500 01  WS-POL.", "000600     COPY POLDCL."] + list(PROG[8:]), {"POLDCL": self.poldcl})
+        self.assertIsNone(recover.older_layout(short.splitlines()))
+        self.assertRegex(recover.older_why_not(short.splitlines()), r"^the numbering run is \d+ lines, fewer than 20$")
+
+    def test_headers_all_indented_the_same_are_no_proof(self):
+        # every division and section header in column 10, the level numbers in column 8, no sequence numbers, no
+        # comments: the headers agree with each other, but the records do not look like source at their column
+        base = [blank_seq(r) for r in self.prog]
+        base = ["         " + r.strip() if recover._HEADER_WORD.search(r) else r for r in base]
+        books = {k: [blank_seq(r) for r in v if not r[6:7] == "*"] for k, v in self.books.items()}
+        text = osvs_listing(base, books, banner=False)
+        self.assertIsNone(recover.older_layout(text.splitlines()))
+        self.never_shifted(text, "headers all in column 10", books)
+
+    def test_carriage_control_glued_to_the_number(self):
+        # '0' (skip a line) in column 1 straight before the five-digit number reads as a SIX-digit line number; on
+        # enough pages those few lines made the text a current-layout listing and the copybook came out cut
+        text = osvs_listing(self.prog, self.books, page_lines=2, asa=True)
+        self.assertGreaterEqual(sum(1 for ln in text.splitlines() if recover._LISTING_SHAPE.match(ln)), 5)
+        fmt, regions, stats = recover.extract(text, "TESTPGM.lst", set())
+        self.assertEqual(fmt, "older compiler listing", stats)
+        self.assertEqual(stats["source column"], 16, stats)
+        by = {r.name: r for r in regions}
+        self.assertEqual([r.rstrip() for r in by["PMASTREC"].records], [r.rstrip() for r in self.pmast])
+
+    def test_a_line_printed_again_does_not_cut_the_copybook(self):
+        text = osvs_listing(self.prog, self.books, page_lines=9).splitlines()
+        k = next(i for i, ln in enumerate(text) if ln.startswith("  ") and " C " in ln[:16] and "PM-POLICY-STATUS" in ln)
+        text.insert(k + 1, text[k])                                    # a page eject prints the line again
+        fmt, regions, stats = recover.extract("\n".join(text) + "\n", "TESTPGM.lst", set())
+        self.assertEqual(fmt, "older compiler listing", stats)
+        self.exact(regions, stats, "line printed twice")
+
+    def test_a_comment_or_literal_naming_a_division_is_no_header(self):
+        # enough comments naming divisions, at one column, to outvote the four real headers if they counted
+        prog = (["000050*  RC 12 = INVALID DIVISION CODE ON THE POLICY", "000060*  THE PROCEDURE DIVISION READS POLMAST ONCE",
+                 "000070*  THE DATA DIVISION HOLDS NO TABLES", "000080*  THE LINKAGE SECTION IS EMPTY",
+                 "000090*  THE FILE SECTION NAMES TWO FILES", "000095*  THE ENVIRONMENT DIVISION NAMES NO DEVICES"]
+                + list(self.prog))
+        for p in (prog, [blank_seq(r) for r in prog]):
+            books = self.books if p is prog else {k: [blank_seq(r) for r in v] for k, v in self.books.items()}
+            text = osvs_listing(p, books, banner=False)
+            fmt, regions, stats = recover.extract(text, "TESTPGM.lst", set())
+            self.assertEqual(fmt, "older compiler listing", stats)
+            self.exact(regions, stats, "a comment naming a division", seq=None if p is prog else blank_seq)
+
+    def test_two_compile_units_the_one_with_more_copy_marks_is_read(self):
+        prog_b = (list(PROG[:5]) + ["000700 01  WS-POL.", "000800     COPY POLDCL."] + list(PROG[8:])
+                  + [f"0013{k:02d}     DISPLAY 'B'." for k in range(16)])         # long enough to count, fewer marks
+        prog_a = [r for r in PROG if "POLDCL" not in r]
+        a = osvs_listing(prog_a, {"PMASTREC": self.pmast})
+        b = osvs_listing(prog_b, {"POLDCL": self.poldcl})
+        for text in (a + b, b + a):
+            _fmt, regions, stats = recover.extract(text, "TESTPGM.lst", set())
+            self.assertEqual([r.name for r in regions], ["PMASTREC"], stats)
+
+    def test_a_precompiler_listing_in_front_of_a_current_listing_without_a_ruler(self):
+        # the current layout keeps reading six-digit lines only: a five-digit listing in front changes nothing
+        text = ibm_listing(list(PROG), self.books, ruler=False)
+        text = text.replace("    XREF(FULL)\n", "    XREF(FULL)\n" + "\n".join(translator_front(PROG, 11)) + "\n", 1)
+        fmt, regions, stats = recover.extract(text, "TESTPGM.lst", set())
+        self.assertEqual(fmt, "compiler listing", stats)
+        self.assertEqual(stats["source column"], 19, stats)
+        self.assertEqual([r.rstrip() for r in {r.name: r for r in regions}["PMASTREC"].records], [r.rstrip() for r in self.pmast])
+
+    def test_the_banner_and_page_header_shapes(self):
+        self.assertTrue(recover._OLD_PAGE.match("1  17        PROGANNM        14.31.19        FEB  5,1923"), "his header, names changed")
+        self.assertTrue(recover._OLD_BANNER.match(OSVS_BANNER))
+        self.assertTrue(recover._OLD_BANNER.match("1PP NO. 5746-CB1 RELEASE 3.0   IBM DOS/VS COBOL"))
+        self.assertFalse(recover._OLD_BANNER.match("           PP 5740-CB1 OS/VS COBOL, CONVERTED TO VS COBOL II."), "a REMARKS line")
+        self.assertFalse(recover._OLD_PAGE.match("000100 01  WS-TIME   PIC X(8) VALUE '14.31.19'."))
+
+
+class PlainSourcesStayPlain(unittest.TestCase):
+    """Expanded sources that are NOT listings: what the review of the first fix found a wider pattern would
+    misread (a copybook's lines dropped, a shortened copybook written, or nothing recovered)."""
+
+    POLSEG = [body.ljust(72) + "POLSEG" for body in (       # the copybook's name in columns 73-80
+        "000100     05  PS-KEY              PIC X(10).",
+        "           05  PS-STATUS           PIC X(02).",
+        "               88  PS-ACTIVE       VALUE 'AC'.",
+        "000400     05  PS-AMT              PIC S9(7)V99 COMP-3.")]
+
+    def program(self, extra, body):
+        return (["000100 IDENTIFICATION DIVISION.", "000200 PROGRAM-ID. POLUPD."] + extra +
+                ["000900 DATA DIVISION.", "001000 WORKING-STORAGE SECTION.", "001100 01  WS-POL.", "001200     COPY POLSEG."]
+                + body + ["001300 PROCEDURE DIVISION."])
+
+    def test_change_logs_paragraph_numbers_and_add_statements(self):
+        cases = {
+            "change log CR 12345": [f"00{3 + i}00*  CR {12345 + i * 1111}  JDOE  2019-01-15  CHANGE {i}" for i in range(5)],
+            "change log 12345": [f"00{3 + i}00*  {12345 + i * 1111}  JDOE  2019-01-15  CHANGE {i}" for i in range(5)],
+            "ADD 10000": [f"00{3 + i}00     ADD 10000 TO WS-TOTAL-{i}." for i in range(5)],
+            "paragraphs 10000-INIT": [f"00{3 + i}00 {i}0000-PARA-{i}." for i in range(6)],
+        }
+        for label, extra in cases.items():
+            text = "\n".join(self.program(extra, self.POLSEG)) + "\n"
+            fmt, regions, _stats = recover.extract(text, "POLUPD.exp", {"POLSEG"})
+            self.assertEqual(fmt, "columns 73-80", label)
+            self.assertEqual([r.rstrip() for r in regions[0].records], [r.rstrip() for r in self.POLSEG], label)
+
+    def test_consecutive_five_digit_sequence_numbers_are_a_source_not_a_listing(self):
+        # the program's own lines numbered 00001, 00002, ... in columns 1-5, the copied lines unnumbered: the number
+        # is part of the record, so this is no listing - read as one, the unnumbered copybook lines would be lost
+        book = ["      " + r[6:] for r in self.POLSEG]
+        lines = self.program([], [])
+        numbered = [f"{k:05d} " + ln[6:] for k, ln in enumerate(lines, 1)]
+        at = next(i for i, ln in enumerate(numbered) if "COPY POLSEG" in ln) + 1
+        text = "\n".join(numbered[:at] + book + numbered[at:] + [f"{k:05d}     DISPLAY 'X'." for k in range(len(lines) + 1, 30)]) + "\n"
+        self.assertIsNone(recover.older_layout(text.splitlines()))
+        fmt, regions, _stats = recover.extract(text, "POLUPD.exp", {"POLSEG"})
+        self.assertEqual(fmt, "columns 73-80")
+        self.assertEqual([r.rstrip() for r in regions[0].records], [r.rstrip() for r in book])
+
+    def test_a_remarks_line_naming_the_compiler_and_a_column_ruler_comment(self):
+        body = ["      *COPY POLDCL"] + ["      " + r[6:] for r in POLDCL.splitlines()] + ["      *END COPY POLDCL"]
+        prog = ["       IDENTIFICATION DIVISION.", "       PROGRAM-ID. POLUPD.", "       REMARKS.",
+                "           PP 5740-CB1 OS/VS COBOL, CONVERTED TO VS COBOL II.", "       DATA DIVISION.",
+                "       WORKING-STORAGE SECTION.", "       01  WS-POL."] + body + ["       PROCEDURE DIVISION.", "           GOBACK."]
+        fmt, regions, _stats = recover.extract("\n".join(prog) + "\n", "POLUPD.exp", set())
+        self.assertEqual(fmt, "marker comments")
+        self.assertEqual(len(regions[0].records), 4)
+        # the editor's column ruler kept as a comment inside a copybook
+        cols = "----+-*A-1-B--+----2----+----3----+----4----+----5----+----6----+----7-|--"[:72] + "POLSEG"   # '*' in column 7
+        book = [self.POLSEG[0], cols] + self.POLSEG[1:]
+        fmt, regions, _stats = recover.extract("\n".join(self.program([], book)) + "\n", "POLUPD.exp", {"POLSEG"})
+        self.assertEqual(fmt, "columns 73-80")
+        # before: the ruler made the source pass for a listing, only its numbered lines were read, and the copybook
+        # came out with 2 of its 5 lines - trusted, and written
+        self.assertEqual([r.rstrip() for r in regions[0].records], [r.rstrip() for r in book], "every line of the copybook")
+        self.assertIsNone(recover._ruler_at(cols))
+        self.assertIsNotNone(recover._ruler_at(RULER), "a listing's ruler after the line number still counts")
+
+    def test_a_numbered_procedure_copybook_inside_a_plain_source(self):
+        # round two: a procedure copybook carrying its own consecutive numbers 00001.. and a comment and a literal
+        # naming a division made a plain source pass for an older listing, and every copybook was lost
+        errdiv = [(f"{k:05d}      " + body).ljust(72)[:72] + "ERRDIV" for k, body in enumerate(
+            ["9000-ERROR-RTN."] + [f"    DISPLAY 'POLUPD STEP {k}'." for k in range(1, 18)]
+            + ["    DISPLAY 'POLICY REJECTED: INVALID DIVISION CODE'.", "*   PERFORMED FROM THE PROCEDURE DIVISION",
+               "    MOVE 16 TO RETURN-CODE.", "    GOBACK."], 1)]
+        lines = self.program([], self.POLSEG) + ["001400     COPY ERRDIV."] + errdiv
+        self.assertIsNone(recover.older_layout(lines))
+        fmt, regions, _stats = recover.extract("\n".join(lines) + "\n", "POLUPD.exp", {"POLSEG", "ERRDIV"})
+        self.assertEqual(fmt, "columns 73-80")
+        by = {r.name: r for r in regions}
+        self.assertEqual([r.rstrip() for r in by["POLSEG"].records], [r.rstrip() for r in self.POLSEG])
+        self.assertEqual(len(by["ERRDIV"].records), len(errdiv))
+
+    def test_a_numbered_print_of_a_copybook_inside_a_plain_source_is_no_listing(self):
+        # a copybook kept as a numbered print (five-digit number, then its 80-column record) inside a plain
+        # expanded source: its column is provable, but without a copy mark, page header or banner it is a small
+        # part of the text, not a listing - read as one, the rest of the source would be lost
+        printed = [f"{k:05d}   " + (f"{k * 10:06d}     05  LK-FIELD-{k:02d}          PIC X(4).").ljust(72)[:72] + "LKPRINT"
+                   for k in range(1, 23)]
+        printed[0] = "00001   " + "000010 LINKAGE SECTION.".ljust(72) + "LKPRINT"
+        lines = self.program([], self.POLSEG) + printed
+        self.assertIsNone(recover.older_layout(lines))
+        fmt, regions, _stats = recover.extract("\n".join(lines) + "\n", "POLUPD.exp", {"POLSEG"})
+        self.assertEqual(fmt, "columns 73-80")
+        self.assertEqual([r.rstrip() for r in {r.name: r for r in regions}["POLSEG"].records], [r.rstrip() for r in self.POLSEG])
+
+    def test_a_ruler_in_a_comment_at_any_column(self):
+        for lead in ("000350*", "      * ", "      *  ", "000350*   "):
+            cols = (lead + "----+-*A-1-B--+----2----+----3----+----4----+----5----+----6----+----7-|--")[:72] + "POLSEG"
+            book = [self.POLSEG[0], cols] + self.POLSEG[1:]
+            fmt, regions, _stats = recover.extract("\n".join(self.program([], book)) + "\n", "POLUPD.exp", {"POLSEG"})
+            self.assertEqual(fmt, "columns 73-80", lead)
+            self.assertEqual([r.rstrip() for r in regions[0].records], [r.rstrip() for r in book], lead)
+
+    def test_a_six_digit_change_log_in_a_plain_source_keeps_every_copybook_line(self):
+        # round three (and the committed version before it): five change-log comments with six-digit numbers made the
+        # text a listing, the column was guessed as 1 - no room for a line number - and only the numbered copybook
+        # lines were kept. A guessed column must leave room for the number; else the text is read as source
+        log = [f"000{3 + i}00*  {102340 + i}  01/05/1998  CHANGE {i}" for i in range(5)]
+        text = "\n".join(self.program(log, self.POLSEG)) + "\n"
+        self.assertEqual(recover.reading(text.splitlines())["kind"], "source")
+        fmt, regions, _stats = recover.extract(text, "POLUPD.exp", {"POLSEG"})
+        self.assertEqual(fmt, "columns 73-80")
+        self.assertEqual([r.rstrip() for r in regions[0].records], [r.rstrip() for r in self.POLSEG])
+
+    def test_a_listing_only_by_the_shape_of_some_lines_falls_back_to_source(self):
+        # five change-log comments with six-digit numbers look like listing lines to the shape test; with no ruler
+        # and no banner, and no readable source column, the text is read as the source it is
+        pmast = records_of(os.path.join(FIX, "PMASTREC.cpy"))
+        log = [f"0000{2 + i}0*  {102340 + i}  01/05/1998  CHANGE {i}" for i in range(5)]
+        prog = ["       IDENTIFICATION DIVISION.", "       PROGRAM-ID. TESTPGM.", "       DATA DIVISION.",
+                "       WORKING-STORAGE SECTION.", "       01  WS-REC.", "           COPY PMASTREC.",
+                "       PROCEDURE DIVISION.", "           GOBACK."]
+        expanded = prog[:6] + log + pmast + prog[6:]
+        fmt, regions, _stats = recover.extract("\n".join(expanded) + "\n", "TESTPGM.exp", {"PMASTREC"}, original=prog)
+        self.assertEqual(fmt, "expanded source, lined up with the program")
+        self.assertEqual(len(regions[0].records), len(log) + len(pmast))
+
+
 class Formats(unittest.TestCase):
+
+    def test_a_translator_listing_before_the_ruler_does_not_end_the_reading(self):
+        # a job's print output often holds the CICS translator's or the precompiler's listing first, with
+        # five-digit line numbers and its own headings: the current layout reads six-digit lines only
+        pmast = records_of(os.path.join(FIX, "PMASTREC.cpy"))
+        text = ibm_listing(list(PROG), {"PMASTREC": pmast, "POLDCL": POLDCL.splitlines()})
+        text = text.replace("    XREF(FULL)\n", "    XREF(FULL)\n" + "\n".join(translator_front(PROG)) + "\n", 1)
+        self.assertIn("Diagnostic Messages", text.split("----+-*A")[0], "the heading sits before the ruler")
+        fmt, regions, stats = recover.extract(text, "TESTPGM.lst", set())
+        self.assertEqual(fmt, "compiler listing", stats)
+        self.assertEqual({r.name for r in regions}, {"PMASTREC", "POLDCL"}, stats)
+        self.assertEqual([r.rstrip() for r in {r.name: r for r in regions}["PMASTREC"].records], [r.rstrip() for r in pmast])
+
+    def test_a_listing_without_a_readable_column_says_so(self):
+        books = {"PMASTREC": records_of(os.path.join(FIX, "PMASTREC.cpy")), "POLDCL": POLDCL.splitlines()}
+        # with its banner, no division header to guess the column from
+        fmt, regions, _stats = recover.extract(ibm_listing(PROG[2:8], books, ruler=False), "TESTPGM.lst", set())
+        self.assertEqual((fmt, regions), ("compiler listing without a readable source column", []))
+        # no banner and no ruler, but copy marks: still a listing, and the report must not say 'no copy marks'
+        prog = ["000100 ID DIVISION.", "000200 PROGRAM-ID. TESTPGM.", "000250*  CALLED BY POLDRV. THE PROCEDURE DIVISION READS IT."] + PROG[2:]
+        text = "\n".join(ln for ln in ibm_listing(prog, books, ruler=False).splitlines() if "IBM Enterprise" not in ln) + "\n"
+        fmt, regions, _stats = recover.extract(text, "TESTPGM.lst", set())
+        self.assertEqual((fmt, regions), ("compiler listing without a readable source column", []))
+
+    def test_an_unflagged_current_listing_with_a_translator_in_front_lines_up(self):
+        books = {"PMASTREC": records_of(os.path.join(FIX, "PMASTREC.cpy")), "POLDCL": POLDCL.splitlines()}
+        text = ibm_listing(list(PROG), books, flag="")
+        text = text.replace("    XREF(FULL)\n", "    XREF(FULL)\n" + "\n".join(translator_front(PROG)) + "\n", 1)
+        fmt, regions, _stats = recover.extract(text, "TESTPGM.lst", set(), original=list(PROG))
+        self.assertEqual(fmt, "compiler listing, copied lines not flagged, lined up with the program")
+        self.assertEqual({r.name: len(r.records) for r in regions}, {"PMASTREC": len(books["PMASTREC"]), "POLDCL": 4})
+
+    def test_a_program_comment_naming_an_old_compiler_is_no_listing_banner(self):
+        prog = ["000100* CONVERTED FROM IBM OS/VS COBOL - COMPILED WITH VS COBOL II"] + list(PROG)
+        fmt, _regions, _stats = recover.extract("\n".join(prog) + "\n", "TESTPGM.exp", set())
+        self.assertTrue(fmt.startswith("expanded source") or fmt == "no COPY statements", fmt)
 
     def setUp(self):
         self.prog = list(PROG)
@@ -779,6 +1275,71 @@ class EndToEnd(unittest.TestCase):
             rc = recover.main(["--db", self.db, "--trace", "NOSUCH"])
         self.assertEqual(rc, 2)
         self.assertIn("no expanded text named NOSUCH", out.getvalue())
+
+    def test_an_older_listing_among_current_ones_is_recovered_and_traced(self):
+        # SAMPPGM's listing from the older compiler, banner-less, with the translator's listing in front
+        prog = records_of(os.path.join(FIX, "SAMPPGM.cbl"))
+        text = ("\n".join(translator_front(prog)) + "\n"
+                + osvs_listing(prog, {"PMASTREC": self.pmast, "POLDCL": POLDCL.splitlines()}, banner=False, page_lines=20))
+        with open(os.path.join(self.lst, "SAMPPGM.lst"), "w", encoding="utf-8") as fh:
+            fh.write(text)
+        said = []
+        stats = recover.run(self.db, dry_run=True, log=said.append, report=self.report)
+        self.assertEqual(stats["written"], 2, said)
+        self.assertTrue(any(s.startswith("formats seen: ") and "older compiler listing in 1" in s and "compiler listing in 1" in s
+                            for s in said), said)
+        self.assertTrue(any("17 (older layout, proven) in 1" in s for s in said), said)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = recover.main(["--db", self.db, "--trace", "SAMPPGM"])
+        t = out.getvalue()
+        self.assertEqual(rc, 0, t)
+        self.assertIn("read as: an older compiler listing", t)
+        self.assertRegex(t, r"older compiler listing: file lines \d+-\d+ \(\d+ numbered lines in that run; 3 numbering run\(s\) in "
+                            r"the file\); source column: 17 \(sequence numbers in columns 1-6\); copy marks: 30")
+        self.assertRegex(t, r"the reading ends where the numbering run ends, file line \d+ of \d+")
+        self.assertNotIn("read to the end of the file", t)
+        self.assertIn("result: older compiler listing; blocks: 1 - PMASTREC (", t)
+        self.assertNotIn("PM-POLICY", t, "nothing from the estate")
+
+    def test_an_older_listing_whose_column_cannot_be_proven_is_named_not_missing(self):
+        # no sequence numbers and no comments: nothing is read - but the copybook is IN the listing, and the report
+        # must not send him to fetch a library for it (the very symptom LESSONS 176 started from)
+        prog = [blank_seq(r) for r in records_of(os.path.join(FIX, "SAMPPGM.cbl")) if r[6:7] != "*"]
+        book = [blank_seq(r) for r in self.pmast if r[6:7] != "*"]
+        with open(os.path.join(self.lst, "SAMPPGM.lst"), "w", encoding="utf-8") as fh:
+            fh.write(osvs_listing(prog, {"PMASTREC": book}, banner=False, page_lines=20))
+        said = []
+        stats = recover.run(self.db, dry_run=True, log=said.append, report=self.report)
+        self.assertEqual(stats["written"], 1, said)
+        self.assertTrue(any(s.startswith("recovered: 1 of 2") and "0 in no expanded text" in s
+                            and "1 in older listings whose source column could not be proven" in s for s in said), said)
+        with open(self.report, encoding="utf-8") as fh:
+            rep = fh.read()
+        self.assertIn("## In an older listing whose source column could not be proven", rep)
+        self.assertIn("| PMASTREC | 1 | SAMPPGM.lst | no sequence numbers in columns 1-6 and too few comment lines", rep)
+        self.assertNotIn("## Not in any expanded text", rep)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            recover.main(["--db", self.db, "--trace", "SAMPPGM"])
+        t = out.getvalue()
+        self.assertIn("not taken as an older listing: no sequence numbers in columns 1-6 and too few comment lines", t)
+        self.assertIn(f"result: {recover.UNPROVABLE}; blocks: 0", t)
+
+    def test_the_trace_reads_a_text_as_the_reader_does(self):
+        # a text only the shape of some lines calls a listing, with no column: read as source - and traced as source
+        log = [f"0000{2 + i}0*  {102340 + i}  01/05/1998  CHANGE {i}" for i in range(5)]
+        prog = records_of(os.path.join(FIX, "SAMPPGM.cbl"))
+        at = next(i for i, r in enumerate(prog) if "COPY PMASTREC" in r) + 1
+        text = [("      " + r[6:]) for r in prog[:at]] + log + ["      " + r[6:] for r in self.pmast] + ["      " + r[6:] for r in prog[at:]]
+        with open(os.path.join(self.lst, "SAMPPGM.lst"), "w", encoding="utf-8") as fh:
+            fh.write("\n".join(text) + "\n")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            recover.main(["--db", self.db, "--trace", "SAMPPGM"])
+        t = out.getvalue()
+        self.assertIn("read as: an expanded source", t)
+        self.assertRegex(t, r"result: expanded source, lined up with the program; blocks: 1 - PMASTREC")
 
     def test_no_listings_and_a_relative_root_are_explained(self):
         conn = sqlite3.connect(self.db)

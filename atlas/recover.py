@@ -81,6 +81,20 @@ _LISTING_LINE = re.compile(r"^[ 01\-+]?\s*(\d{6})([^\s\d]*)(?=\s|$)")
 _LISTING_SHAPE = re.compile(r"^[ 01\-+]?\s*\d{6}[^\s\d]*\s+\d{6}[ *\-/D]")
 _LISTING_HEAD = re.compile(r"^\s*LineID\s+PL\s+SL\b|IBM Enterprise COBOL|^1?PP\s+5655-", re.I | re.M)
 _RULER = re.compile(r"-{3,}\+-\*A")
+RULER_MIN_COL = 9          # a listing prints its ruler after the line number; an editor's COLS line kept in a source starts in column 1-8
+_RULER_HEAD = re.compile(r"\bLine\s*I[Dd]\b|\bLINE\b", re.I)   # the ruler line's own heading: LineID / LineId / LINE
+
+
+def _ruler_at(ln: str) -> "Optional[re.Match[str]]":
+    """The listing's own ruler on this line - after the line-number columns
+    and under its own heading (LineID  PL SL  ----+-*A-1-B...). Never the
+    editor's column ruler a program or copybook keeps as a comment, anywhere
+    on the line: it made a plain source pass for a listing, only its numbered
+    lines were read, and a copybook lost its other lines."""
+    m = _RULER.search(ln)
+    if not m or m.start() < RULER_MIN_COL or not _RULER_HEAD.search(ln[:m.start()]):
+        return None
+    return m
 _NAME = re.compile(r"^[A-Z0-9@#$][A-Z0-9@#$\-_]{0,7}$")
 # marker comments: groups are (quote, name) - a commented-out COPY 'NAME'. is a marker too
 _START_MARK = re.compile(r"^\s*\*?\s*(?:\+\+INCLUDE|-INC|BEGIN(?:NING)?\s+(?:OF\s+)?COPY(?:BOOK)?|COPY(?:BOOK)?)\s+"
@@ -219,11 +233,12 @@ def listing_offset(lines: Sequence[str]) -> Optional[int]:
     too and are not source records. Every recovered block is checked for
     its shape again on its own before it is written."""
     for ln in lines:
-        m = _RULER.search(ln)
+        m = _ruler_at(ln)
         if m:
             return m.start()
     base: Optional[int] = None
     start = 0
+    number_end = 0
     for i, ln in enumerate(lines):
         m = _LISTING_LINE.match(ln)
         if not m:
@@ -233,6 +248,7 @@ def listing_offset(lines: Sequence[str]) -> Optional[int]:
         if k >= 0:
             base = m.end() + k - 7                                         # area A starts at source column 8
             start = i
+            number_end = m.end()
             break
     if base is None:
         return None
@@ -246,21 +262,248 @@ def listing_offset(lines: Sequence[str]) -> Optional[int]:
                 break
     best, best_score = None, 0.0
     for off in (base, base - 1, base + 1, base - 2, base + 2, base - 3, base + 3):
-        if off < 0:
-            continue
+        if off <= number_end:
+            continue                                                   # the record starts after the line number: a guess of
+                                                                       # column 1 is a plain source with sequence numbers
         score = shaped([ln[off:off + 80] for ln in sample])
         if score > best_score:
             best, best_score = off, score
     return best if best is not None and best_score >= FALLBACK_OK else None
 
 
-def listing_records(lines: Sequence[str]) -> Tuple[List[Tuple[str, str, int]], Optional[int]]:
+# --------------------------------------------------------------------------
+# 1b. an older compiler's listing: five-digit line numbers, no ruler
+# --------------------------------------------------------------------------
+
+# OS/VS COBOL and DOS/VS COBOL number every line they read - the program's and every copied one - with a
+# FIVE-digit count (03008), print the 80-column record after it, and head each page with the page number,
+# the program, the time and the date: "1  17  PROGNAME  14.31.19  FEB  5,1992" (LESSONS 176). They share
+# nothing else with the Enterprise layout, so they are recognised on their own terms, and strictly: a
+# plain expanded source must never pass for one, and the record's column must be PROVEN, never guessed -
+# a copybook read one column off turns its comments into code and still passes every later check, and a
+# missing copybook is better than that.
+_OLD_LINE = re.compile(r"^[ 01\-+]?\s{0,4}(\d{5})([^\s\d]*)(?=\s|$)")
+_OLD_PAGE = re.compile(r"^[1 ]?\s*\d{1,5}\s+\S{1,8}\s+\d\d\.\d\d\.\d\d\s+[A-Z]{3}\s+\d{1,2},\s?\d{2,4}\s*$", re.I)
+_OLD_BANNER = re.compile(r"^[1 ]?\s?PP\s+(?:NO\.\s*)?57\d\d-", re.I)
+_GAP_FLAG = re.compile(r"^[A-Z+*]{1,3}$", re.I)
+# a division or section header, as a whole word
+_HEADER_WORD = re.compile(r"(?<![A-Z0-9\-])(?:(?:IDENTIFICATION|ID|ENVIRONMENT|DATA|PROCEDURE)\s+DIVISION|"
+                          r"(?:CONFIGURATION|INPUT-OUTPUT|FILE|WORKING-STORAGE|LOCAL-STORAGE|LINKAGE)\s+SECTION)"
+                          r"(?![A-Z0-9\-])", re.I)
+OLD_MIN_LINES = 20        # numbered lines a run needs before it can be a program's listing
+OLD_STEP_OK = 0.8         # share of successive numbered lines whose number goes up by exactly one
+OLD_GAP_MAX = 20          # columns between the end of the line number and column 1 of the record, at most
+OLD_SAMPLE = 400          # numbered lines the column tests look at
+OLD_COVER = 0.8           # without a copy mark, page header or banner, the run must hold this share of the text
+
+
+def _old_flag(ln: str, m: "re.Match[str]", off: int) -> str:
+    """The copy mark of an older listing line: attached to the number
+    (03008C) or printed apart from it, alone in the gap before the record."""
+    flag = m.group(2) or ""
+    if not flag and off > m.end() and ln[off - 1:off] == " ":         # a mark stands apart from the record too: a letter
+        gap = [t for t in ln[m.end():off].split() if not t.isdigit()]  # touching column 1 is the record's own (CHG001);
+                                                                       # a number in the gap is never a mark
+        if len(gap) == 1 and _GAP_FLAG.match(gap[0]):
+            flag = gap[0]
+    return flag
+
+
+def _is_mark(flag: str) -> bool:
+    return flag.replace("*", "").upper() in ("C", "+")
+
+
+def _seq_hits(recs: Sequence[str]) -> int:
+    """Records with six digits in columns 1-6 and an indicator in column 7:
+    the sequence numbers line up at the true column only - a record read one
+    column either way has a blank or a letter among its first six."""
+    return sum(1 for r in recs if len(r) > 6 and r[:6].isdigit() and r[6] in INDICATORS)
+
+
+def _comment_hits(recs: Sequence[str]) -> int:
+    """Comment lines with text: the indicator in column 7, no asterisk in
+    column 6 or 8. Border lines (*****) count nowhere, whichever column they
+    start in; a comment's text counts at the true column only."""
+    return sum(1 for r in recs if len(r) > 7 and r[6] in "*/" and r[5] != "*" and r[7] not in "*/" and r[7:].strip())
+
+
+def _header_votes(lines: Sequence[str], run: Sequence[Tuple[int, int, "re.Match[str]"]], after_number: int) -> Counter:
+    """{record column: division / section headers that start column 8 there}.
+    A header counts only where the record would begin after the line number
+    and nothing before it on the line is a comment mark or a quote - a
+    comment or a literal naming a division is no header."""
+    votes: Counter = Counter()
+    for i, _n, _m in run:
+        ln = lines[i]
+        for h in _HEADER_WORD.finditer(ln, after_number):
+            off = h.start() - 7
+            if ln[off + 6:h.start()].strip():
+                continue                                               # column 7 must be blank: no comment, no continuation
+            if any(ch in ln[after_number:h.start()] for ch in "*/'\""):
+                continue
+            votes[off] += 1
+            break
+    return votes
+
+
+def _old_column(lines: Sequence[str], run: Sequence[Tuple[int, int, "re.Match[str]"]]) -> Tuple[Optional[int], str]:
+    """(column of record column 1, how it was proven) or (None, why not).
+    Six-digit sequence numbers decide alone; without them, the comment lines
+    (the indicator must be in column 7) and the majority of the division and
+    section headers must agree. Headers alone prove nothing: area A runs from
+    column 8 to 11, and a program that writes all of it in column 9 agrees
+    with itself one column off."""
+    sample = [lines[i] for i, _n, _m in run[:OLD_SAMPLE]]
+    after_number = max(m.start(1) + 5 for _i, _n, m in run[:OLD_SAMPLE])
+    votes = _header_votes(lines, run, after_number)
+    if not votes:
+        return None, "no division or section header in the numbered lines"
+    cands = [c for c in range(after_number + 1, after_number + 1 + OLD_GAP_MAX)
+             if shaped([ln[c:c + 80] for ln in sample]) >= FALLBACK_OK]
+    if not cands:
+        return None, "no column where the records look like 80-column source"
+    (hcol, hn), = votes.most_common(1)
+    seq = {c: _seq_hits([ln[c:c + 80] for ln in sample]) for c in cands}
+    best = max(seq.values())
+    if best >= max(5, len(sample) // 5) and list(seq.values()).count(best) == 1:
+        scol = max(seq, key=seq.get)
+        if 0 <= hcol - scol <= 3:                                      # the headers in area A (columns 8-11) of that record
+            return scol, "sequence numbers in columns 1-6"
+        # six digits that do not fit the headers are some other column of the listing: let the comments decide
+    header_ok = hn >= 2 and hn >= 0.6 * sum(votes.values())
+    com = {c: _comment_hits([ln[c:c + 80] for ln in sample]) for c in cands}
+    cbest = max(com.values())
+    if cbest >= 2 and list(com.values()).count(cbest) == 1:
+        ccol = max(com, key=com.get)
+        if header_ok and ccol == hcol:
+            return ccol, "comment lines and division headers agree"
+        return None, "the comment lines and the division headers point to different columns"
+    return None, "no sequence numbers in columns 1-6 and too few comment lines to prove the column"
+
+
+def _older_scan(lines: Sequence[str]) -> Tuple[Optional[Dict[str, object]], str, List[Tuple[int, int]]]:
+    """(layout or None, why none was taken, the file lines of the runs seen
+    as an older listing whose column could not be proven). The layout: where an older compiler's own
+    listing sits in the file - the file lines (0-based, inclusive) of its
+    numbering run, the record column, the copy marks in it. A run is a
+    stretch of five-digit numbers that go up (a line printed again under the
+    same number - a page eject, an overprint - is passed over); a new run
+    starts where they go back: the next listing, or the diagnostics after the
+    source, which cite earlier line numbers. The run chosen is the one with
+    the most copy marks, the later on a tie (the compiler prints after the
+    translator and the precompiler). Without a copy mark, a page header or a
+    banner in the file, the run must hold most of the text - a numbered
+    stretch inside a plain source is no listing."""
+    nums: List[Tuple[int, int, "re.Match[str]"]] = []
+    for i, ln in enumerate(lines):
+        m = _OLD_LINE.match(ln)
+        if m:
+            nums.append((i, int(m.group(1)), m))
+    if len(nums) < OLD_MIN_LINES:
+        return None, f"fewer than {OLD_MIN_LINES} lines start with a five-digit number", []
+    runs: List[List[Tuple[int, int, "re.Match[str]"]]] = [[nums[0]]]
+    for item in nums[1:]:
+        last = runs[-1][-1][1]
+        if item[1] == last:
+            continue                                                   # the same line printed again
+        if item[1] < last:
+            runs.append([item])
+        else:
+            runs[-1].append(item)
+    signs = any(_OLD_PAGE.match(ln) or _OLD_BANNER.match(ln) for ln in lines)
+    text_lines = sum(1 for ln in lines if ln.strip())
+    best = None
+    reasons: List[Tuple[int, str]] = []                               # (run length, why it was not taken)
+    refused: List[Tuple[int, int]] = []
+    for run in runs:
+        if len(run) < OLD_MIN_LINES:
+            reasons.append((len(run), f"the numbering run is {len(run)} lines, fewer than {OLD_MIN_LINES}"))
+            continue
+        steps = sum(1 for a, b in zip(run, run[1:]) if b[1] - a[1] == 1)
+        if steps < OLD_STEP_OK * (len(run) - 1):
+            reasons.append((len(run), f"{steps:,} of {len(run) - 1:,} steps between the numbers are +1 - a listing counts by one"))
+            continue                                                   # sequence numbers step by 10 or 100; a listing counts
+        off, how = _old_column(lines, run)
+        if off is None:
+            reasons.append((len(run), how))
+            if signs:
+                refused.append((run[0][0], run[-1][0]))
+            continue
+        marks = sum(1 for i, _n, m in run if _is_mark(_old_flag(lines[i], m, off)))
+        if not marks and not signs and len(run) < OLD_COVER * text_lines:
+            reasons.append((len(run), "no copy mark, page header or banner, and the numbered lines are a small part of the text"))
+            continue
+        key = (marks, run[0][0])
+        if best is None or key > best[0]:
+            best = (key, run, off, marks, how)
+    if best is None:
+        return None, max(reasons)[1] if reasons else "no numbering run", refused
+    _key, run, off, marks, how = best
+    return ({"start": run[0][0], "end": run[-1][0], "off": off, "marks": marks, "runs": len(runs), "lines": len(run),
+             "how": how}, "", [])
+
+
+def older_layout(lines: Sequence[str]) -> Optional[Dict[str, object]]:
+    """Where an older compiler's own listing sits in the file, or None (_older_scan)."""
+    return _older_scan(lines)[0]
+
+
+def older_why_not(lines: Sequence[str]) -> str:
+    """For trace: why no older layout was taken - the reason of the longest numbering run."""
+    return _older_scan(lines)[1]
+
+
+def reading(lines: Sequence[str]) -> Dict[str, object]:
+    """How a text is read - the one choice extract() and trace() both make:
+    'older' (an older compiler's listing), 'current' (the Enterprise layout)
+    or 'source' (an expanded source). 'unprovable': an older listing is there
+    (numbers counting up, a page header or banner) but its record column
+    could not be proven - its copybooks are in the text, only unreadable."""
+    head = "\n".join(lines[:400])
+    ruled = any(_ruler_at(ln) for ln in lines[:400])
+    banner = bool(_LISTING_HEAD.search(head))
+    shape = sum(1 for ln in lines[:2000] if _LISTING_SHAPE.match(ln))
+    # a carriage-control 0 glued to a five-digit number (003008) reads as a six-digit line too; a current
+    # listing's six-digit lines never read as five-digit ones - so six-digit lines that are not also
+    # five-digit lines belong to a current listing
+    n6_own = sum(1 for ln in lines if _LISTING_LINE.match(ln) and not _OLD_LINE.match(ln))
+    old, why, refused = _older_scan(lines)
+    if old is not None and (n6_own == 0 or int(old["lines"]) > 2 * n6_own):  # type: ignore[call-overload]
+        kind = "older"
+    elif ruled or banner or shape >= 5:
+        kind = "current"
+        marked = any(_is_mark(m.group(2) or "") for ln in lines for m in [_LISTING_LINE.match(ln)] if m)
+        if not ruled and not banner and not marked and listing_offset(lines) is None:
+            kind = "source"                    # only the shape of some lines said 'listing' (a change log 'CR 102345'
+                                               # can), no column, no copy mark: the source it is
+    else:
+        kind = "source"
+    return {"kind": kind, "old": old if kind == "older" else None, "why_not_older": why,
+            "unprovable": refused if kind != "older" else [], "ruled": ruled, "banner": banner, "shape": shape}
+
+
+def listing_records(lines: Sequence[str], layout: Optional[Dict[str, int]] = None) -> Tuple[List[Tuple[str, str, int]], Optional[int]]:
     """[(flag, 80-column record, file line number)] for every source line of
     a listing - and only the source: after the program end the listing goes
     on with the data division map and the cross-reference tables, whose
     lines carry line numbers too, some followed by a letter, and where the
     copybook names appear again (LESSONS 170). A heading that opens one of
-    those sections ends the reading."""
+    those sections ends the reading. With `layout` (older_layout), only
+    that numbering run is read, at its own column."""
+    if layout is not None:
+        off = int(layout["off"])
+        out_old: List[Tuple[str, str, int]] = []
+        last = -1
+        for i in range(int(layout["start"]), int(layout["end"]) + 1):
+            ln = lines[i]
+            m = _OLD_LINE.match(ln)
+            if m:
+                if int(m.group(1)) == last:
+                    continue                                           # printed again: a page eject, an overprint
+                last = int(m.group(1))
+                out_old.append((_old_flag(ln, m, off), ln[off:off + 80].rstrip("\r\n"), i + 1))
+        return out_old, off                                            # the run ends where the source does: the
+                                                                       # diagnostics after it cite earlier numbers
     off = listing_offset(lines)
     if off is None:
         return [], None
@@ -281,15 +524,18 @@ def masked(text: str) -> str:
     return re.sub(r"[A-Za-z]", "A", re.sub(r"\d", "9", (text or "").rstrip()))
 
 
-def from_ibm_listing(lines: Sequence[str], source: str, system: Optional[str]) -> Tuple[List[Region], Dict[str, int]]:
+def from_ibm_listing(lines: Sequence[str], source: str, system: Optional[str],
+                     layout: Optional[Dict[str, int]] = None) -> Tuple[List[Region], Dict[str, int]]:
     """A compiler listing: each source line carries a line number; a copied
-    line carries a C after it."""
-    recs, off = listing_records(lines)
+    line carries a C after it (with `layout`, an older compiler's listing)."""
+    recs, off = listing_records(lines, layout)
     stats: Dict[str, int] = Counter()
     if off is None:
         return [], {"no ruler": 1}
     stats["source column"] = off + 1                                   # 1-based, for the report
-    ruler_line = next((i for i, ln in enumerate(lines, 1) if _RULER.search(ln)), 0)
+    if layout is not None:
+        stats["older layout"] = 1                                      # the column proven, not guessed
+    ruler_line = 0 if layout is not None else next((i for i, ln in enumerate(lines, 1) if _ruler_at(ln)), 0)
     stats["ruler line"] = ruler_line
     last_plain: Tuple[int, str] = (0, "")                              # the last program line seen (line, shape)
     closer: Tuple[int, str, str] = (0, "", "")                          # the program line that closed the last block: (line, copybook, shape)
@@ -553,28 +799,37 @@ def split_lines(text: str) -> List[str]:
     return lines
 
 
+UNPROVABLE = "older compiler listing, source column not provable"
+
+
 def extract(text: str, source: str, wanted: Set[str], original: Optional[Sequence[str]] = None,
             system: Optional[str] = None) -> Tuple[str, List[Region], Dict[str, int]]:
     """(format seen, regions, notes) for one expanded text."""
     lines = split_lines(text)
-    head = "\n".join(lines[:400])
-    listing = _RULER.search(head) or _LISTING_HEAD.search(head) or sum(1 for ln in lines[:2000] if _LISTING_SHAPE.match(ln)) >= 5
-    records: List[str]
+    how = reading(lines)
+    records: List[str] = [ln.rstrip("\r\n") for ln in lines]
+    fmt_base = "expanded source"
     carried: Dict[str, int] = {}                                       # the listing's own notes, whatever is found later
-    if listing:
+    if how["kind"] == "older":
+        old = how["old"]
+        regions, stats = from_ibm_listing(lines, source, system, layout=old)          # type: ignore[arg-type]
+        if regions:
+            return "older compiler listing", regions, stats
+        carried = stats
+        records = [r for _f, r, _n in listing_records(lines, old)[0]]                 # type: ignore[arg-type]
+        fmt_base = ("older compiler listing, copied lines not tied to a COPY statement" if stats.get("flagged lines")
+                    else "older compiler listing, copied lines not flagged")
+    elif how["kind"] == "current":
         regions, stats = from_ibm_listing(lines, source, system)
         if regions:
             return "compiler listing", regions, stats
-        carried = stats
         recs, off = listing_records(lines)
         if off is None:
             return "compiler listing without a readable source column", [], stats
+        carried = stats
         records = [r for _f, r, _n in recs]
         fmt_base = ("compiler listing, copied lines not tied to a COPY statement" if stats.get("flagged lines")
                     else "compiler listing, copied lines not flagged")
-    else:
-        records = [ln.rstrip("\r\n") for ln in lines]
-        fmt_base = "expanded source"
     if original:
         regions, stats = from_alignment(original, records, source, system)
         if regions:
@@ -587,6 +842,12 @@ def extract(text: str, source: str, wanted: Set[str], original: Optional[Sequenc
         return "marker comments", regions, carried
     if carried.get("flagged lines"):
         return fmt_base, [], carried
+    if how["unprovable"]:
+        # an older listing whose record column could not be proven: its copybooks ARE in the text, and the
+        # report must say so rather than send the reader to fetch libraries (LESSONS 176)
+        named = sorted({c[0] for a, b in how["unprovable"] for ln in lines[a:b + 1]                # type: ignore[union-attr]
+                        for c in [copy_in(ln)] if c and (not wanted or c[0] in wanted)})
+        return (UNPROVABLE, [], {"why": how["why_not_older"], "named": named})               # type: ignore[dict-item]
     has_copy = any(not _is_comment(r) and copy_in(r[7:72] if len(r) > 7 else "") for r in records)
     if not has_copy:
         return "no COPY statements", [], carried
@@ -999,6 +1260,8 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
     formats: Counter = Counter()
     by_name: Dict[str, List[Region]] = defaultdict(list)
     nested_in: Dict[str, Counter] = defaultdict(Counter)                 # inner copybook -> {outer copybook: listings}
+    unprovable: Dict[str, List[str]] = defaultdict(list)                 # copybook -> older listings naming it, column unproven
+    unprovable_why: Dict[str, str] = {}                                  # listing -> why its column could not be proven
     unattached = 0
     lined_up = 0
     look_untied: List[Tuple[str, int, int, str, list, str]] = []        # (listing, untied line, program line before, its shape, lines before, why)
@@ -1028,7 +1291,12 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
         formats[fmt] += 1
         unattached += stats.get("flagged lines with no COPY before them", 0)
         if stats.get("source column"):
-            columns[(stats["source column"], bool(stats.get("ruler line")))] += 1
+            columns[(stats["source column"], "ruler" if stats.get("ruler line")
+                     else "older layout, proven" if stats.get("older layout") else "guessed")] += 1
+        if fmt == UNPROVABLE:
+            for n in stats.get("named", []):                             # type: ignore[union-attr]
+                unprovable[n].append(path)
+            unprovable_why[path] = str(stats.get("why", ""))
         if stats.get("untied") and len(look_untied) < 2:
             first = stats["untied"][0]                                  # type: ignore[index]
             look_untied.append((path, first[0], first[1], first[2], first[3], first[4]))
@@ -1043,8 +1311,7 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
     if formats.get("unreadable"):
         log(f"  {formats['unreadable']:,} could not be read from disk - is the estate where the build saw it?")
     if columns:
-        log("  source column: " + ", ".join(f"{col}{' (ruler)' if ruler else ' (guessed)'} in {n:,}"
-                                             for (col, ruler), n in columns.most_common(4)))
+        log("  source column: " + ", ".join(f"{col} ({how}) in {n:,}" for (col, how), n in columns.most_common(4)))
     if unattached:
         log(f"  {unattached:,} copied line(s) could not be tied to a COPY statement - the report's 'Please look' "
             "section names a listing and the line to open")
@@ -1114,7 +1381,8 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
             if ents or os.path.isdir(d):
                 _save_marker(d, ents)
     seen_names = set(by_name) | have_now
-    not_found = sorted(n for n in missing if n not in seen_names)
+    unread = sorted(n for n in missing if n not in seen_names and n in unprovable)   # in a listing, column unproven
+    not_found = sorted(n for n in missing if n not in seen_names and n not in unprovable)
     no_marks = sum(n for f, n in formats.items() if "no copy marks" in f or "not flagged" in f)
 
     lines = [f"# Recovered copybooks - {time.strftime('%Y-%m-%d %H:%M')}\n",
@@ -1122,7 +1390,8 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
              + ", ".join(f"{f} in {n}" for f, n in formats.most_common()),
              f"\n- written: {len(written)}" + (" (dry run: nothing written)" if dry_run else "")
              + f"; already there: {kept}; unconfirmed: {len(unconfirmed)}; rejected: {len(rejected)}; removed (real member arrived): {len(removed)}",
-             f"\n- not in any expanded text: {len(not_found)}\n"]
+             f"\n- not in any expanded text: {len(not_found)}"
+             + (f"; in an older listing whose source column could not be proven: {len(unread)}" if unread else "") + "\n"]
     if written:
         lines.append("\n## Written\n\n| copybook | programs copying it | folder | how |\n|---|---|---|---|\n")
         lines += [f"| {n} | {missing.get(n, 0)} | {os.path.relpath(f, root) if root else f} | {how} |\n" for n, f, how in written]
@@ -1144,6 +1413,14 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
             inside = ", ".join(f"{o} ({k} listing{'s' if k != 1 else ''})" for o, k in nested_in[n].most_common(3)) if nested_in.get(n) else "-"
             lines.append(f"| {n} | {p} program{'s' if p != 1 else ''}, {b} copybook{'s' if b != 1 else ''} | "
                          f"{users.get(n, '?')} | {inside} |\n")
+    if unread:
+        lines.append("\n## In an older listing whose source column could not be proven\n\nThe copybook IS in the listing, but "
+                     "the tool could not prove at which column the listing's records start, so it read nothing rather than "
+                     "risk a copybook shifted by a column. `--trace PROGRAM` shows what it saw in one listing.\n\n"
+                     "| copybook | listings | first listing | why |\n|---|---|---|---|\n")
+        for n in unread:
+            first = unprovable[n][0]
+            lines.append(f"| {n} | {len(unprovable[n])} | {os.path.basename(first)} | {unprovable_why.get(first, '')} |\n")
     if stale:
         lines.append("\n## Recovered on an earlier run, still missing in the index\n\nThe file exists but the index does not "
                      "list it: either the build has not run since, or the build did not see the folder (it must sit under the "
@@ -1184,6 +1461,7 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
             + f"; {agree:,} confirmed by 2+ programs, {differ:,} differ between programs (most common taken)"
             + (f", {per_system:,} written per system" if per_system else "")
             + f", {len(unconfirmed):,} unconfirmed, {len(rejected):,} rejected, {len(not_found):,} in no expanded text"
+            + (f", {len(unread):,} in older listings whose source column could not be proven (see the report)" if unread else "")
             + (f"; {lined_up:,} text(s) read by lining up with the program" if lined_up else "")
             + (f"; {kept:,} already recovered earlier" if kept else ""))
     if nested_only:
@@ -1238,32 +1516,50 @@ def trace(db: str, name: str, folders: Sequence[str] = (), log=print) -> int:
         log(f"   {len(lines):,} lines, decoded as {enc}, {os.path.getsize(path):,} bytes")
         head = "\n".join(lines[:400])
         log(f"   listing banner in the first 400 lines: {'yes' if _LISTING_HEAD.search(head) else 'no'}; "
-            f"ruler in the first 400 lines: {'yes' if _RULER.search(head) else 'no'}; "
+            f"ruler in the first 400 lines: {'yes' if any(_ruler_at(ln) for ln in lines[:400]) else 'no'}; "
             f"numbered lines in the first 2,000: {sum(1 for ln in lines[:2000] if _LISTING_SHAPE.match(ln)):,}")
-        ruler_line = next((i for i, ln in enumerate(lines, 1) if _RULER.search(ln)), 0)
-        off = listing_offset(lines)
-        log(f"   ruler: {'line ' + str(ruler_line) if ruler_line else 'none'}; source column: "
-            f"{off + 1 if off is not None else 'not found'}")
-        if off is None:
-            continue
-        recs, _off = listing_records(lines)
-        numbered_all = sum(1 for ln in lines if _LISTING_LINE.match(ln))
-        first_l = recs[0][2] if recs else 0
-        last_l = recs[-1][2] if recs else 0
-        stop = next((i for i, ln in enumerate(lines[last_l:], last_l + 1) if _section_heading(ln)), 0) if recs else 0
-        log(f"   numbered lines in the file: {numbered_all:,}; taken as source: {len(recs):,} (file lines {first_l}-{last_l})"
-            + (f"; reading stopped at line {stop}: `{masked(lines[stop - 1])[:60]}`" if stop else "; read to the end of the file"))
-        flagged = [(n, f) for f, r, n in recs if f.replace('*', '')]
-        copies = [n for f, r, n in recs if not f.replace('*', '') and not _is_comment(r) and copy_in(r[7:72] if len(r) > 7 else "")]
-        flags = Counter(f.replace('*', '').upper() for f, r, n in recs if f.replace('*', ''))
-        log(f"   COPY statements found: {len(copies):,}" + (f" (first at file lines {', '.join(str(n) for n in copies[:5])})" if copies else "")
-            + f"; lines with a mark after the line number: {len(flagged):,}"
-            + (f" (marks: {', '.join(f'{k!r} x{v:,}' for k, v in flags.most_common(4))}; first at line {flagged[0][0]})" if flagged else ""))
-        sample = next((r for f, r, n in recs if not _is_comment(r) and r.strip()), "")
-        log(f"   first source record, masked: `{masked(sample)[:72]}` (columns 1-6 `{masked(sample[:6])}`, column 7 `{sample[6:7] or ' '}`)")
-        if flagged:
-            frec = next(r for f, r, n in recs if f.replace('*', ''))
-            log(f"   first marked record, masked: `{masked(frec)[:72]}`")
+        how = reading(lines)
+        old = how["old"] if how["kind"] == "older" else None
+        n_old = sum(1 for ln in lines if _OLD_LINE.match(ln))
+        log(f"   lines starting with a five-digit number (an older compiler's layout): {n_old:,}; page headers of that "
+            f"layout: {sum(1 for ln in lines if _OLD_PAGE.match(ln)):,}; its banner: "
+            f"{'yes' if any(_OLD_BANNER.match(ln) for ln in lines) else 'no'}")
+        log(f"   read as: {'an older compiler listing' if old else 'a compiler listing' if how['kind'] == 'current' else 'an expanded source'}")
+        if old is not None:
+            log(f"   older compiler listing: file lines {int(old['start']) + 1}-{int(old['end']) + 1} ({int(old['lines']):,} numbered "
+                f"lines in that run; {int(old['runs']):,} numbering run(s) in the file); source column: {int(old['off']) + 1} "
+                f"({old['how']}); copy marks: {int(old['marks']):,}")
+            recs = listing_records(lines, old)[0]                                          # type: ignore[arg-type]
+        else:
+            if n_old >= OLD_MIN_LINES:
+                log(f"   not taken as an older listing: {older_why_not(lines)}")
+            ruler_line = next((i for i, ln in enumerate(lines, 1) if _ruler_at(ln)), 0)
+            off = listing_offset(lines) if how["kind"] == "current" else None
+            log(f"   ruler: {'line ' + str(ruler_line) if ruler_line else 'none'}; source column: "
+                f"{off + 1 if off is not None else 'not found'}")
+            recs = listing_records(lines)[0] if off is not None else []
+        if recs:
+            first_l = recs[0][2]
+            last_l = recs[-1][2]
+            if old is not None:
+                log(f"   taken as source: {len(recs):,} numbered lines (file lines {first_l}-{last_l}); the reading ends where "
+                    f"the numbering run ends, file line {int(old['end']) + 1} of {len(lines):,}")
+            else:
+                numbered_all = sum(1 for ln in lines if _LISTING_LINE.match(ln))
+                stop = next((i for i, ln in enumerate(lines[last_l:], last_l + 1) if _section_heading(ln)), 0)
+                log(f"   numbered lines in the file: {numbered_all:,}; taken as source: {len(recs):,} (file lines {first_l}-{last_l})"
+                    + (f"; reading stopped at line {stop}: `{masked(lines[stop - 1])[:60]}`" if stop else "; read to the end of the file"))
+            flagged = [(n, f) for f, r, n in recs if f.replace('*', '')]
+            copies = [n for f, r, n in recs if not f.replace('*', '') and not _is_comment(r) and copy_in(r[7:72] if len(r) > 7 else "")]
+            flags = Counter(f.replace('*', '').upper() for f, r, n in recs if f.replace('*', ''))
+            log(f"   COPY statements found: {len(copies):,}" + (f" (first at file lines {', '.join(str(n) for n in copies[:5])})" if copies else "")
+                + f"; lines with a mark after the line number: {len(flagged):,}"
+                + (f" (marks: {', '.join(f'{k!r} x{v:,}' for k, v in flags.most_common(4))}; first at line {flagged[0][0]})" if flagged else ""))
+            sample = next((r for f, r, n in recs if not _is_comment(r) and r.strip()), "")
+            log(f"   first source record, masked: `{masked(sample)[:72]}` (columns 1-6 `{masked(sample[:6])}`, column 7 `{sample[6:7] or ' '}`)")
+            if flagged:
+                frec = next(r for f, r, n in recs if f.replace('*', ''))
+                log(f"   first marked record, masked: `{masked(frec)[:72]}`")
         original = None
         orig_path = pick_original(want, path, system, index)
         if orig_path:
