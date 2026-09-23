@@ -1694,5 +1694,85 @@ class FlowIndex(unittest.TestCase):
         self.assertNotIn("no fact the index tracks changed", d)
 
 
+class FlowKnownLimits(unittest.TestCase):
+    """The review's open findings on the walk (ROADMAP "flow: known limits",
+    inline and fictional): `diff` reads a keyword as a whole COBOL word and
+    takes the GIVING target; every branch --up cannot follow into a callee
+    prints a labelled end, in both walkers."""
+
+    H = ("       IDENTIFICATION DIVISION.\n       PROGRAM-ID. {p}.\n       DATA DIVISION.\n"
+         "       WORKING-STORAGE SECTION.\n")
+    FILES = {
+        # a sender whose name ends in -TO, and an ADD .. TO .. GIVING that changes only its GIVING target
+        "KDIFF.cbl": H.format(p="KDIFF") + (
+            "       01  WS-BILL-TO               PIC X(04).\n       01  OUT-BILL-TO              PIC X(04).\n"
+            "       01  WS-A                     PIC 9(04).\n       01  WS-B                     PIC 9(04).\n"
+            "       01  WS-C                     PIC 9(04).\n       PROCEDURE DIVISION.\n"
+            "           MOVE WS-BILL-TO TO OUT-BILL-TO.\n           ADD WS-A TO WS-B GIVING WS-C.\n"
+            "           DISPLAY OUT-BILL-TO WS-B WS-C.\n           GOBACK.\n"),
+    }
+
+    @classmethod
+    def setUpClass(cls):
+        cls.td = tempfile.mkdtemp()
+        src = os.path.join(cls.td, "estate")
+        os.makedirs(src)
+        for name, text in cls.FILES.items():
+            with open(os.path.join(src, name), "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(text)
+        cls.db = os.path.join(cls.td, "t.db")
+        with contextlib.redirect_stdout(io.StringIO()):
+            build._main([src, "--db", cls.db, "--rebuild", "--quiet"])
+        cls.old = os.path.join(cls.td, "old.db")
+        shutil.copyfile(cls.db, cls.old)
+        c = sqlite3.connect(cls.old)
+        c.executescript("DROP TABLE data_flow; DROP TABLE pfield; DROP TABLE call_arg; DROP TABLE param; "
+                        "DROP TABLE file_record;")
+        c.close()
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.td, ignore_errors=True)
+
+    def flow(self, *args, db=None) -> str:
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = query._main(["--db", db or self.db, "flow", *args])
+        self.assertEqual(rc, 0, err.getvalue())
+        return out.getvalue()
+
+    def test_diff_keywords_are_whole_words_and_giving_is_the_target(self):
+        from atlas import flow
+        for text, want in (("       MOVE WS-BILL-TO TO OUT-BILL-TO.", ["OUT-BILL-TO"]),
+                           ("       MOVE WS-MOVE-A TO WS-B.", ["WS-B"]),
+                           ("       ADD WS-A TO WS-B GIVING WS-C.", ["WS-C"]),
+                           ("       ADD WS-A WS-B GIVING WS-C.", ["WS-C"]),
+                           ("       ADD 1 TO WS-B ROUNDED WS-C ON SIZE ERROR MOVE WS-A TO WS-D END-ADD.",
+                            ["WS-D", "WS-B", "WS-C"]),
+                           ("       SUBTRACT WS-A FROM WS-B.", ["WS-B"]),
+                           ("       MULTIPLY WS-A BY WS-B.", ["WS-B"]),
+                           ("       DIVIDE WS-A INTO WS-B.", ["WS-B"]),
+                           ("       DIVIDE WS-A BY WS-B GIVING WS-C REMAINDER WS-D.", ["WS-C", "WS-D"]),
+                           ("       SUBTRACT WS-A FROM WS-B. DISPLAY WS-SENT-TO.", ["WS-B"])):
+            with self.subTest(text):
+                self.assertEqual(flow.changed_targets([text], False), want)
+        # end to end: both changed statements start a flow at what they change, never at WS-B
+        with open(os.path.join(self.td, "estate", "KDIFF.cbl"), encoding="utf-8") as fh:
+            src = fh.read()
+        new = os.path.join(self.td, "new", "KDIFF.cbl")
+        os.makedirs(os.path.dirname(new), exist_ok=True)
+        with open(new, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(src.replace("MOVE WS-BILL-TO TO", "MOVE WS-BILL-TO  TO").replace("TO WS-B GIVING", "TO WS-B  GIVING"))
+        conn = query.connect(self.db)
+        try:
+            d = query.cmd_diff(conn, "KDIFF", new)
+        finally:
+            conn.close()
+        self.assertIn("## Flow from the changed statements", d)
+        self.assertIn("**KDIFF.OUT-BILL-TO**", d)
+        self.assertIn("**KDIFF.WS-C**", d)
+        self.assertNotIn("**KDIFF.WS-B**", d)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

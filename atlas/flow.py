@@ -3167,11 +3167,11 @@ def _targets_in(text: str) -> List[str]:
     statements in one upper-cased, literal-blanked piece of code."""
     out: List[str] = []
 
-    def names_after(m_end: int, limit: int = 8) -> List[str]:
+    def names_after(m_end: int, limit: int = 8, src: Optional[str] = None) -> List[str]:
         got = []
         skip_next = False
         depth = 0
-        for tok in re.findall(r"[A-Z0-9][\w-]*|\(|\)|\.", text[m_end:]):
+        for tok in re.findall(r"[A-Z0-9][\w-]*|\(|\)|\.", (text if src is None else src)[m_end:]):
             if tok == ".":
                 break
             # a name inside a subscript or ref-mod parenthesis is an index, never a target (guard 3)
@@ -3183,6 +3183,8 @@ def _targets_in(text: str) -> List[str]:
                 continue
             if depth:
                 continue
+            if tok == "ROUNDED" and src is not None:
+                continue                    # ADD A TO B ROUNDED C ROUNDED: each target may carry it
             if tok in _TARGET_STOP and tok not in _SKIP_ARG:
                 break
             if skip_next:
@@ -3198,14 +3200,30 @@ def _targets_in(text: str) -> List[str]:
                 break
         return got
 
-    for m in re.finditer(r"\bMOVE\b.*?\bTO\s", text):
+    # `\b` matches after a hyphen: WS-BILL-TO holds a `\bTO\b`, so every keyword is a whole COBOL word (as cobol.py's B)
+    def kw(words: str) -> str:
+        return r"(?<![\w-])(?:" + words + r")(?![\w-])"
+
+    for m in re.finditer(kw("MOVE") + r".*?" + kw("TO") + r"\s", text):
         out.extend(names_after(m.end()))
-    for m in re.finditer(r"\bCOMPUTE\s+([A-Z0-9][\w-]*)", text):
+    for m in re.finditer(kw("COMPUTE") + r"\s+([A-Z0-9][\w-]*)", text):
         out.append(m.group(1))
-    for m in re.finditer(r"\b(?:STRING|UNSTRING)\b.*?\bINTO\s", text):
+    for m in re.finditer(kw("STRING|UNSTRING") + r".*?" + kw("INTO") + r"\s", text):
         out.extend(names_after(m.end()))
-    for m in re.finditer(r"\b(?:ADD|SUBTRACT|MULTIPLY|DIVIDE)\b.*?\b(?:TO|GIVING)\s", text):
-        out.extend(names_after(m.end()))
-    for m in re.finditer(r"\bCALL\b.*?\bUSING\s", text):
+    # the arithmetic verbs, one statement at a time: GIVING replaces the TO / FROM / BY / INTO operand as the
+    # target (ADD A TO B GIVING C changes C, never B), and REMAINDER is one more target
+    ends = re.compile(r"\.(?:\s|$)|" + kw("|".join(sorted(_STMT_START))))
+    keyword = {"ADD": "TO", "SUBTRACT": "FROM", "MULTIPLY": "BY", "DIVIDE": "INTO"}
+    for m in re.finditer(kw("ADD|SUBTRACT|MULTIPLY|DIVIDE"), text):
+        e = ends.search(text, m.end())
+        stmt = text[m.end():e.start() if e else len(text)]
+        giving = re.search(kw("GIVING") + r"\s", stmt)
+        into = giving or re.search(kw(keyword[m.group(0)]) + r"\s", stmt)
+        if into:
+            out.extend(names_after(into.end(), src=stmt))
+        rem = re.search(kw("REMAINDER") + r"\s", stmt)
+        if rem:
+            out.extend(names_after(rem.end(), 1, src=stmt))
+    for m in re.finditer(kw("CALL") + r".*?" + kw("USING") + r"\s", text):
         out.extend(names_after(m.end(), 12))
     return out
