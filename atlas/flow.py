@@ -362,20 +362,27 @@ class _Report:
         """MEMBER:line "//NAME DD" for a DD. A pseudo-DD the JCL parser adds
         on the EXEC line (`*FTP*`, `*NDM*`: the dataset an FTP / NDM step
         sends) quotes the EXEC text there only when that EXEC is the step's
-        own (its label is the last part of `step`). Anything else quotes the
+        own (its label is the last part of `step`). A concatenated dataset's
+        line has no name field and quotes its own `// DD DSN=...`. Anything else quotes the
         statement the cite claims (`//NAME DD`, `//STEP EXEC`), so a line
         that does not hold it FAILS the citation gate visibly - never the
         text of whatever other statement is on that line, never no token."""
         if not member or not line:
             return f"{member or '?'}:{line or '?'}"
         raw = self.raw(member, line)
-        dd_name = dd_name or ""                 # a concatenation continuation has no name
+        dd_name = dd_name or ""
         if dd_name.startswith("*"):
             label = (step or "?").rpartition(".")[2].upper()
             ex = re.match(r"//(\S*)\s+EXEC\s+[^\s,]+", raw)
             if ex and ex.group(1).upper() == label:
                 return f'{member}:{line} "{self._tok(ex.group(0))}"'
             return f'{member}:{line} "//{label} EXEC"'
+        # a concatenated dataset (`//   DD DSN=B` under `//QIN DD DSN=A`) is stored under the
+        # previous DD's name (concat_seq > 0) with its own line, which has no name field: quote
+        # that line's own statement and operand, whitespace collapsed as the gate compares it
+        cm = re.match(r"//\s+DD(?![\w-])(?:\s+([^,\s]+))?", raw)
+        if cm:
+            return f'{member}:{line} "{self._tok("// DD" + (" " + cm.group(1) if cm.group(1) else ""))}"'
         # the DD on the line must be this one (an override //S1.GIN DD is GIN): another DD there
         # would pass the gate with a name the flow never meant
         mm = re.match(r"//(\S*)\s+DD\b", raw)

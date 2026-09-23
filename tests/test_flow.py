@@ -1821,6 +1821,31 @@ class FlowKnownLimits(unittest.TestCase):
                       "get stat.txt 'TEST.KP.IN'\nquit\n/*\n//S1       EXEC FTPPROC\n"),
         "FTPPROC.prc": ("//FTPPROC  PROC\n//P1       EXEC PGM=FTP,PARM='PEERHOST (EXIT'\n//INPUT    DD *\n"
                         "put 'TEST.KP.RAW' raw.txt\nquit\n/*\n//         PEND\n"),
+        # concatenated DDs: R1 and KCPROC's P1 read TEST.KC.RAW as the second dataset of CIN, C2's SYSIN
+        # is DUMMY plus a card dataset the estate does not hold. The parser stores each continuation under
+        # the previous DD's name with its own line, which has no name field
+        "KCW.cbl": ("       IDENTIFICATION DIVISION.\n       PROGRAM-ID. KCW.\n       ENVIRONMENT DIVISION.\n"
+                    "       INPUT-OUTPUT SECTION.\n       FILE-CONTROL.\n           SELECT OUT-F ASSIGN TO COUT.\n"
+                    "       DATA DIVISION.\n       FILE SECTION.\n       FD  OUT-F.\n       01  OUT-REC.\n"
+                    "           05  OC-CODE              PIC X(04).\n       WORKING-STORAGE SECTION.\n"
+                    "       01  WS-CCODE                 PIC X(04).\n       PROCEDURE DIVISION.\n"
+                    "           OPEN OUTPUT OUT-F.\n           MOVE WS-CCODE TO OC-CODE.\n           WRITE OUT-REC.\n"
+                    "           CLOSE OUT-F.\n           GOBACK.\n"),
+        "KCR.cbl": ("       IDENTIFICATION DIVISION.\n       PROGRAM-ID. KCR.\n       ENVIRONMENT DIVISION.\n"
+                    "       INPUT-OUTPUT SECTION.\n       FILE-CONTROL.\n           SELECT IN-F ASSIGN TO CIN.\n"
+                    "       DATA DIVISION.\n       FILE SECTION.\n       FD  IN-F.\n       01  IN-REC.\n"
+                    "           05  IC-CODE              PIC X(04).\n       PROCEDURE DIVISION.\n"
+                    "           OPEN INPUT IN-F.\n           READ IN-F.\n           DISPLAY IC-CODE.\n"
+                    "           CLOSE IN-F.\n           GOBACK.\n"),
+        "KCJOB.jcl": ("//KCJOB    JOB (ACCT),'C'\n//W1       EXEC PGM=KCW\n"
+                      "//COUT     DD DSN=TEST.KC.RAW,DISP=(NEW,CATLG,DELETE)\n"
+                      "//R1       EXEC PGM=KCR\n//CIN      DD DSN=TEST.KC.OTHER,DISP=SHR\n"
+                      "//         DD DSN=TEST.KC.RAW,DISP=SHR\n"
+                      "//C2       EXEC PGM=IEBGENER\n//SYSPRINT DD SYSOUT=*\n//SYSIN    DD DUMMY\n"
+                      "//         DD DSN=TEST.CTL.KCSEQ,DISP=SHR\n//SYSUT1   DD DSN=TEST.KC.RAW,DISP=SHR\n"
+                      "//SYSUT2   DD DSN=TEST.KC.C2,DISP=(NEW,CATLG,DELETE)\n//S3       EXEC KCPROC\n"),
+        "KCPROC.prc": ("//KCPROC   PROC\n//P1       EXEC PGM=KCR\n//CIN      DD DSN=TEST.KC.OTHER,DISP=SHR\n"
+                       "//         DD DSN=TEST.KC.RAW,DISP=SHR\n//         PEND\n"),
     }
 
     @classmethod
@@ -2103,6 +2128,41 @@ class FlowKnownLimits(unittest.TestCase):
             self.assertEqual([c for c, st in g.items() if st != "PASS"], [], g)
             self.assertNotIn("KPJOB 5", " ".join(g))
             self.assertNotIn("KFJOB 2", " ".join(g))
+
+    def test_a_concatenated_dd_cites_its_own_line_and_passes_the_gate(self):
+        # a continuation row carries the previous DD's name (CIN, SYSIN) but its line has no name field:
+        # quoting `//CIN DD` there FAILED a correct hop; the line's own `// DD DSN=...` is the fact
+        job = self.FILES["KCJOB.jcl"].splitlines()
+        cin2 = job.index("//         DD DSN=TEST.KC.RAW,DISP=SHR") + 1
+        sysin2 = job.index("//         DD DSN=TEST.CTL.KCSEQ,DISP=SHR") + 1
+        from atlas import flow
+        conn = query.connect(self.db)
+        try:
+            w = flow._Walker(conn, flow.Opts())
+            self.assertEqual(w.cite_dd("KCJOB", cin2, "CIN", False, "R1"), f'KCJOB:{cin2} "// DD DSN=TEST.KC.RAW"')
+            self.assertEqual(w.cite_dd("KCJOB", cin2, "CIN", True, "R1"), f'KCJOB:{cin2} "// DD DSN=TEST.KC.RAW"')
+            self.assertEqual(w.cite_dd("KCPROC", 4, "CIN", False, "S3.P1"), 'KCPROC:4 "// DD DSN=TEST.KC.RAW"')
+            # the first DD of the concatenation keeps its name
+            self.assertEqual(w.cite_dd("KCJOB", cin2 - 1, "CIN", True, "R1"), f'KCJOB:{cin2 - 1} "//CIN DD DSN=TEST.KC.OTHER"')
+        finally:
+            conn.close()
+        self.assertEqual(self.gate(f'KCJOB:{cin2} "//CIN DD"'), {f'[[KCJOB {cin2} "//CIN DD"]]': "FAIL"})
+        for db, tag in ((self.db, "exact"), (self.old, "reconstructed")):
+            with self.subTest(tag):
+                down = self.flow("WS-CCODE", "--program", "KCW", db=db)
+                self.assertRegex(down, rf'read by KCR\.IC-CODE bytes 1-4 \(KCJOB R1 DD CIN\b.*KCJOB:{cin2} "// DD DSN=TEST\.KC\.RAW"')
+                self.assertRegex(down, r'read by KCR\.IC-CODE bytes 1-4 \((PROC KCPROC|KCJOB S3)\.?\S* DD CIN\b.*'
+                                       r'KCPROC:4 "// DD DSN=TEST\.KC\.RAW"')
+                self.assertRegex(down, rf'KCJOB C2 IEBGENER: control cards not indexed\s+KCJOB:{sysin2} '
+                                       r'"// DD DSN=TEST\.CTL\.KCSEQ"\s+\[end: utility step - bytes not modelled\]')
+                self.assertNotRegex(down, r'"//(CIN|SYSIN) DD"')
+                up = self.flow("IC-CODE", "--program", "KCR", "--up", "--all", db=db)
+                self.assertRegex(up, rf'READ IN-REC <- TEST\.KC\.RAW \(KCJOB R1 DD CIN\b.*KCJOB:{cin2} "// DD DSN=TEST\.KC\.RAW"')
+                self.assertRegex(up, r'READ IN-REC <- TEST\.KC\.RAW .*KCPROC:4 "// DD DSN=TEST\.KC\.RAW"')
+                g = self.gate(down, up)
+                self.assertEqual({c: st for c, st in g.items() if st != "PASS"}, {}, g)
+                self.assertIn(f'[[KCJOB {cin2} "// DD DSN=TEST.KC.RAW"]]', g)
+                self.assertIn(f'[[KCJOB {sysin2} "// DD DSN=TEST.CTL.KCSEQ"]]', g)
 
     def test_an_idcams_step_cites_its_own_exec_line(self):
         # every pseudo-DD cite knows its step, so the *REPRO* rows on C5's EXEC line quote that EXEC and pass
