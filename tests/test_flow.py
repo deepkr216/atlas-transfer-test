@@ -1738,6 +1738,26 @@ class FlowKnownLimits(unittest.TestCase):
         "KNOCA.cbl": H.format(p="KNOCA") + (
             "       01  WN-X                     PIC X(02).\n       PROCEDURE DIVISION.\n"
             "           MOVE 'NO' TO WN-X.\n           EXEC CICS RETURN END-EXEC.\n"),
+        # a group passed to callees that write (KCE) or read (KCN) only a field under their parameter, and
+        # LINKed to a CICS program that has USING DFHCOMMAREA (KCU): before the re-parse, labelled ends
+        "KCA.cbl": H.format(p="KCA") + (
+            "       01  WK-AREA.\n           05  WK-A                 PIC X(02).\n"
+            "           05  WK-B                 PIC X(02).\n       PROCEDURE DIVISION.\n"
+            "           CALL 'KCE' USING WK-AREA.\n           CALL 'KCN' USING WK-AREA.\n"
+            "           EXEC CICS LINK PROGRAM('KCU') COMMAREA(WK-AREA) END-EXEC.\n"
+            "           DISPLAY WK-AREA.\n           GOBACK.\n"),
+        "KCE.cbl": ("       IDENTIFICATION DIVISION.\n       PROGRAM-ID. KCE.\n       DATA DIVISION.\n"
+                    "       LINKAGE SECTION.\n       01  LK-AREA.\n           05  LK-A                 PIC X(02).\n"
+                    "           05  LK-B                 PIC X(02).\n       PROCEDURE DIVISION USING LK-AREA.\n"
+                    "           MOVE 'XX' TO LK-B.\n           GOBACK.\n"),
+        "KCN.cbl": ("       IDENTIFICATION DIVISION.\n       PROGRAM-ID. KCN.\n       DATA DIVISION.\n"
+                    "       LINKAGE SECTION.\n       01  LN-AREA.\n           05  LN-A                 PIC X(02).\n"
+                    "           05  LN-B                 PIC X(02).\n       PROCEDURE DIVISION USING LN-AREA.\n"
+                    "           DISPLAY LN-A.\n           GOBACK.\n"),
+        "KCU.cbl": ("       IDENTIFICATION DIVISION.\n       PROGRAM-ID. KCU.\n       DATA DIVISION.\n"
+                    "       LINKAGE SECTION.\n       01  DFHCOMMAREA.\n           05  CU-A                 PIC X(02).\n"
+                    "           05  CU-B                 PIC X(02).\n       PROCEDURE DIVISION USING DFHCOMMAREA.\n"
+                    "           MOVE 'YY' TO CU-B.\n           EXEC CICS RETURN END-EXEC.\n"),
         # KGW writes a file that ICEGENER copies (SYSUT1 -> SYSUT2, as IEBGENER) to the file KGR reads
         "KGW.cbl": ("       IDENTIFICATION DIVISION.\n       PROGRAM-ID. KGW.\n       ENVIRONMENT DIVISION.\n"
                     "       INPUT-OUTPUT SECTION.\n       FILE-CONTROL.\n           SELECT OUT-F ASSIGN TO GOUT.\n"
@@ -1908,6 +1928,41 @@ class FlowKnownLimits(unittest.TestCase):
         node = re.search(r"(?m)^\d+\s+CALL KMISS arg 1 <- KMISS\.LK-MISS .*\n\s+\[program partial: [^\]]*KNOCPY[^\]]*\]$", up)
         self.assertIsNotNone(node, up)
         self.assertEqual(up.count("[program partial:"), 1, up)
+
+    def test_fallback_finds_the_dfhcommarea_and_the_fields_under_a_parameter(self):
+        # FLOWCOMM has `01 DFHCOMMAREA.` (fields from COPY FLOWCOMC) and no PROCEDURE DIVISION USING, the usual
+        # CICS shape: before the re-parse the LINK is a labelled "not followed", never "callee has no DFHCOMMAREA"
+        fx, old = self.fixture_dbs()
+        up = self.flow("WS-COMM", "--program", "FLOWCICS", "--up", db=old)
+        self.assertRegex(_lines_of(up, "LINK FLOWCOMM"),
+                         r"LINK FLOWCOMM COMMAREA <- FLOWCOMM\.DFHCOMMAREA: its fields are not all in FLOWCOMM's own text, "
+                         r"may set it \(reconstructed\).*\[end: callee's fields under the parameter: not followed until re-parse\]")
+        self.assertNotIn("no DFHCOMMAREA", up)
+        down = self.flow("WS-COMM", "--program", "FLOWCICS", db=old)
+        self.assertRegex(_lines_of(down, "LINK FLOWCOMM"), r"LINK FLOWCOMM arg 1 -> FLOWCOMM\.DFHCOMMAREA \(reconstructed\).*"
+                                                           r"\[end: fields under the group: not followed until re-parse\]")
+        self.assertNotIn("callee declares 0", down)
+        # the exact walker follows the same COMMAREA to the field FLOWCOMM writes
+        self.assertRegex(self.flow("WS-COMM", "--program", "FLOWCICS", "--up", db=fx),
+                         r"LINK FLOWCOMM COMMAREA <- FLOWCOMM\.CA-MESSAGE .*written there, BY REFERENCE")
+        # a group parameter written only through a field under it: a labelled end (it was dropped), both for
+        # a CALL and for USING DFHCOMMAREA; a callee that writes nothing under it is no origin at all
+        up = self.flow("WK-AREA", "--program", "KCA", "--up", db=self.old)
+        self.assertRegex(_lines_of(up, "CALL KCE"), r"CALL KCE arg 1 <- KCE\.LK-AREA: a field under it is written there, may set "
+                                                    r"it \(reconstructed\).*\[end: callee's fields under the parameter: not "
+                                                    r"followed until re-parse\]")
+        self.assertRegex(_lines_of(up, "LINK KCU"), r"LINK KCU COMMAREA <- KCU\.DFHCOMMAREA: a field under it is written there.*"
+                                                    r"\[end: callee's fields under the parameter: not followed until re-parse\]")
+        self.assertNotIn("KCN", up)
+        # exact: the same two are followed to the field written
+        ex = self.flow("WK-AREA", "--program", "KCA", "--up")
+        self.assertRegex(ex, r"CALL KCE arg 1 <- KCE\.LK-B\b.*written there")
+        self.assertRegex(ex, r"LINK KCU COMMAREA <- KCU\.CU-B\b.*written there")
+        # down: a callee that reads a field under its parameter is not "no further use"
+        down = self.flow("WK-AREA", "--program", "KCA", db=self.old)
+        self.assertRegex(_lines_of(down, "CALL KCN"), r"CALL KCN arg 1 -> KCN\.LN-AREA \(reconstructed\).*"
+                                                      r"\[end: fields under the group: not followed until re-parse\]")
+        self.assertIn("[end: no further use in KCE]", _lines_of(down, "CALL KCE"))     # KCE only writes LK-B
 
     def test_icegener_copies_the_bytes_as_iebgener_does(self):
         job = "KGJOB.jcl"

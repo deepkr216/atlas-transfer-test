@@ -35,6 +35,8 @@ FOOTER = "Flow-insensitive: statement order and IF guards are not evaluated; a h
 FALLBACK_HEADER = "index has no data_flow - reconstructed from field_ref; exact after the next re-parse"
 FALLBACK_COPY = "copybook fields: not followed until re-parse"
 FALLBACK_PARENT = "parent group not followed until re-parse"
+FALLBACK_PARAM = "callee's fields under the parameter: not followed until re-parse"
+FALLBACK_GROUP = "fields under the group: not followed until re-parse"
 
 # Fixed end strings (plan section 5): each is a test assertion, so the words
 # never change. `{}` slots are filled per hop.
@@ -2585,6 +2587,13 @@ class _Fallback(_Report):
                         continue
                     callee = progs[0]
                     lk = self.linkage_of(callee, t)
+                    if not lk and c["kind"] in ("cics_link", "cics_xctl"):
+                        # the COMMAREA arrives as the DFHCOMMAREA 01, USING or not (as edges_up)
+                        if not self.decls(callee["id"], "DFHCOMMAREA"):
+                            out.append(_Edge(2, callee["program_id"], c["line"], f"{callname} COMMAREA -> {callee['program_id']} "
+                                             f"(reconstructed)", cites, end=END_NO_COMMAREA))
+                            continue
+                        lk = ["DFHCOMMAREA"]
                     if pos > len(lk):
                         out.append(_Edge(2, callee["program_id"], c["line"], f"{callname} arg {pos} (callee declares {len(lk)} "
                                          f"parameter(s)) (reconstructed)", cites, end=END_POS))
@@ -2695,9 +2704,13 @@ class _Fallback(_Report):
                     callee = progs[0]
                     lk2 = self.linkage_of(callee, t)
                     if not lk2 and c["kind"] == "cics_link":
-                        out.append(_Edge(3, callee["program_id"], c["line"], f"{callname} COMMAREA <- {callee['program_id']} "
-                                         f"(reconstructed)", cites, end=END_NO_COMMAREA))
-                        continue
+                        # a CICS program gets its COMMAREA as DFHCOMMAREA with or without a PROCEDURE DIVISION
+                        # USING (usually without): the 01 declared is the parameter, only no 01 is none
+                        if not self.decls(callee["id"], "DFHCOMMAREA"):
+                            out.append(_Edge(3, callee["program_id"], c["line"], f"{callname} COMMAREA <- {callee['program_id']} "
+                                             f"(reconstructed)", cites, end=END_NO_COMMAREA))
+                            continue
+                        lk2 = ["DFHCOMMAREA"]
                     if pos > len(lk2):
                         if not xctl:
                             out.append(_Edge(3, callee["program_id"], c["line"], f"{callname} arg {pos} <- {callee['program_id']} "
@@ -2707,6 +2720,16 @@ class _Fallback(_Report):
                     pname = lk2[pos - 1]
                     if not self.conn.execute("SELECT 1 FROM field_ref WHERE program_id=? AND UPPER(name)=? AND mode='write' "
                                              "AND stmt<>'CALL-USING' LIMIT 1", (callee["id"], pname.upper())).fetchone():
+                        # not written by its own name: a field under it may be, which field_ref cannot place
+                        # in the argument's bytes before the re-parse - a labelled end, never a silent drop
+                        under = None if xctl else self.used_under(callee["id"], pname, True)
+                        if not xctl and under is not False:
+                            what = "COMMAREA" if c["kind"] == "cics_link" else f"arg {pos}"
+                            how = ("a field under it is written there" if under else
+                                   f"its fields are not all in {callee['program_id']}'s own text")
+                            out.append(_Edge(3, callee["program_id"], c["line"], f"{callname} {what} <- "
+                                             f"{callee['program_id']}.{pname.upper()}: {how}, {may}", cites,
+                                             end=FALLBACK_PARAM))
                         continue
                     if c["kind"] == "cics_xctl":
                         # written there, but XCTL never comes back (as _Walker.arg_back)
@@ -2743,6 +2766,37 @@ class _Fallback(_Report):
         if re.search(r"(?<![\w-])(?:CONTENT|VALUE|LENGTH\s+OF)(?![\w-])", t):
             return " (this CALL passes BY CONTENT / VALUE / LENGTH OF: the position may be one-way or a length - HUMAN MUST VERIFY)"
         return ""
+
+    def used_under(self, pid: int, name: str, up: bool) -> Optional[bool]:
+        """Is a field under the item written (up) or read, tested or shown
+        (down) in the program? True: one in its own text is; False: it is
+        elementary, or a group none of whose own-text fields is; None: the
+        fallback cannot tell (declared in a copybook or twice, or a group
+        whose fields come from a COPY)."""
+        frow = self.field_row(pid, name)
+        if frow is None:
+            return None
+        if not frow["is_group"]:
+            return False
+        # a COPY between the group and the next item at its level or above puts fields under it
+        # that the program's own text does not declare
+        nxt = self.conn.execute("SELECT MIN(line) FROM field WHERE member_id=? AND line>? AND level<=? AND level<>88",
+                                (frow["member_id"], frow["line"], frow["level"])).fetchone()[0]
+        if self.conn.execute("SELECT 1 FROM copy_use WHERE member_id=? AND line>? AND line<? LIMIT 1",
+                             (frow["member_id"], frow["line"], nxt if nxt is not None else 1 << 30)).fetchone():
+            return None
+        subs = [r[0].upper() for r in self.conn.execute(
+            """WITH RECURSIVE sub(id) AS (SELECT id FROM field WHERE parent_id=? UNION ALL
+                                          SELECT f.id FROM field f JOIN sub ON f.parent_id=sub.id)
+               SELECT f.name FROM field f JOIN sub ON sub.id=f.id""", (frow["id"],))
+                if r[0] and r[0].upper() != "FILLER"]
+        if not subs:
+            return None
+        q = ",".join("?" * len(subs))
+        # a CALL argument is recorded as a write too (BY REFERENCE): up, only a statement that sets it counts
+        where = "mode='write' AND stmt<>'CALL-USING'" if up else "mode IN ('read','test','display')"
+        return self.conn.execute(f"SELECT 1 FROM field_ref WHERE program_id=? AND UPPER(name) IN ({q}) AND {where} LIMIT 1",
+                                 (pid, *subs)).fetchone() is not None
 
     def linkage_of(self, callee, target: str) -> List[str]:
         t = target.upper()
@@ -2924,7 +2978,12 @@ class _Fallback(_Report):
             tail = f"   ({len(edges)} edge(s) not followed)" + self.end(END_HOPS.format(n=self.o.hops), num)
             edges = []
         elif not edges and not uses:
-            tail = self.end(FALLBACK_COPY if node.frow is None else END_NO_USE.format(p=node.pname), num)
+            # a group's own name unused is not its bytes unused: the fields under it (a callee's
+            # parameter, a DFHCOMMAREA) are not placed in the value's bytes before the re-parse
+            under = (self.used_under(node.pid, node.name, self.o.up)
+                     if node.frow is not None and node.frow["is_group"] else False)
+            tail = self.end(FALLBACK_COPY if node.frow is None else FALLBACK_GROUP if under is not False
+                            else END_NO_USE.format(p=node.pname), num)
         self.put(depth, self.fmt(num, depth, head + tail))
         self.show_partial(node.pid, depth)
         for s in self.sets(node):
