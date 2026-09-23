@@ -2602,14 +2602,18 @@ class _Fallback(_Report):
                 args = Q._jl(c["using_args"])
                 if pos > len(args) or (node.via_call is not None and c["id"] != node.via_call):
                     continue
+                # a dynamic CALL says so, as _Walker.pos_tag: never printed as a static one
+                dyn = ((f" of ENTRY {entry.upper()}" if entry else "")
+                       + ("" if c["target"] else f" (CALL {c['via_var']}: {_how_resolved(c)} candidate)"))
                 if c["kind"] == "cics_xctl":
-                    out.append(_Edge(3, c["caller"], c["line"], f"LINKAGE pos {pos}: {c['caller']}.{args[pos - 1]} was passed by XCTL "
+                    out.append(_Edge(3, c["caller"], c["line"], f"LINKAGE pos {pos}{dyn}: {c['caller']}.{args[pos - 1]} was passed by XCTL "
                                      f"(reconstructed)", self.cite_stmt(c["cpid"], c["line"], "XCTL", args[pos - 1]), end=END_XCTL))
                     continue
                 ch = self.node(c["cpid"], args[pos - 1], node.hop + 1)
-                out.append(_Edge(3, c["caller"], c["line"], f"LINKAGE pos {pos} -> back to {c['caller']}.{ch.name} (reconstructed)"
+                out.append(_Edge(3, c["caller"], c["line"], f"LINKAGE pos {pos}{dyn} -> back to {c['caller']}.{ch.name} (reconstructed)"
                                  + self.call_modes(c["cpid"], c["line"]),
-                                 self.cite_stmt(c["cpid"], c["line"], "CALL", args[pos - 1]), child=ch))
+                                 self.cite_stmt(c["cpid"], c["line"], _CALL_WORD.get(c["kind"], "CALL"), args[pos - 1]),
+                                 child=ch))
         # 4. DB2
         out.extend(self.sql_edges(node, "write"))
         # 9. local copies
@@ -2642,9 +2646,13 @@ class _Fallback(_Report):
                 if pos > len(args) or (node.via_call is not None and c["id"] != node.via_call):
                     continue
                 ch = self.node(c["cpid"], args[pos - 1], node.hop + 1)
-                out.append(_Edge(2, c["caller"], c["line"], f"CALL {cname} arg {pos} <- {c['caller']}.{ch.name} (reconstructed)"
+                word = _CALL_WORD.get(c["kind"], "CALL")
+                # a dynamic CALL says so, as _Walker.call_tag: never printed as a static one
+                tag = (f"{word} {cname}" if c["target"] else
+                       f"{word} {c['via_var']} = {cname} (candidate: resolved via {_how_resolved(c)})")
+                out.append(_Edge(2, c["caller"], c["line"], f"{tag} arg {pos} <- {c['caller']}.{ch.name} (reconstructed)"
                                  + self.call_modes(c["cpid"], c["line"]),
-                                 self.cite_stmt(c["cpid"], c["line"], "CALL", args[pos - 1]), child=ch))
+                                 self.cite_stmt(c["cpid"], c["line"], word, args[pos - 1]), child=ch))
         for c in self.conn.execute("SELECT * FROM call_edge WHERE program_id=? AND using_args IS NOT NULL ORDER BY line", (pid,)):
             if c["kind"] in ("cics_return", "cics_start"):
                 continue            # RETURN / START TRANSID: the next task gets a copy, nothing comes back
@@ -2692,14 +2700,13 @@ class _Fallback(_Report):
                         continue
                     if c["kind"] == "cics_xctl":
                         # written there, but XCTL never comes back (as _Walker.arg_back)
-                        out.append(_Edge(3, callee["program_id"], c["line"], f"XCTL {t} arg {pos}: {callee['program_id']}.{pname.upper()} "
+                        out.append(_Edge(3, callee["program_id"], c["line"], f"{callname} arg {pos}: {callee['program_id']}.{pname.upper()} "
                                          f"is written there (reconstructed)", self.cite_stmt(pid, c["line"], "XCTL", name), end=END_XCTL))
                         continue
                     ch = self.node(callee["id"], pname, node.hop + 1)
                     ch.via_call, ch.via_name = c["id"], ch.name
-                    out.append(_Edge(3, callee["program_id"], c["line"], f"CALL {t} arg {pos} <- {callee['program_id']}.{ch.name} "
-                                     f"(written there) (reconstructed){self.call_modes(pid, c['line'])}",
-                                     self.cite_stmt(pid, c["line"], "CALL", name), child=ch))
+                    out.append(_Edge(3, callee["program_id"], c["line"], f"{callname} arg {pos} <- {callee['program_id']}.{ch.name} "
+                                     f"(written there) (reconstructed){modes}", cites, child=ch))
         out.extend(self.sql_edges(node, "read"))
         for (ln, rd, wr) in self.move_pairs(pid):
             if wr == name:

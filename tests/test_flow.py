@@ -1831,18 +1831,46 @@ class FlowKnownLimits(unittest.TestCase):
         self.assertRegex(_lines_of(old, "LINK KNOCA"), r"LINK KNOCA COMMAREA <- KNOCA \(reconstructed\)\s.*"
                                                        r"\[end: callee has no DFHCOMMAREA 01\]")
 
+    def fixture_dbs(self):
+        """The fixtures' index, and the same before the re-parse (the fallback walker)."""
+        fx = os.path.join(self.td, "fx.db")
+        old = os.path.join(self.td, "fxold.db")
+        if not os.path.exists(old):
+            with contextlib.redirect_stdout(io.StringIO()):
+                build._main([FIX, "--db", fx, "--rebuild", "--quiet"])
+            shutil.copyfile(fx, old)
+            c = sqlite3.connect(old)
+            c.executescript("DROP TABLE data_flow; DROP TABLE pfield; DROP TABLE call_arg; DROP TABLE param; "
+                            "DROP TABLE file_record;")
+            c.close()
+        return fx, old
+
+    def test_fallback_names_a_dynamic_call_as_the_exact_walker_does(self):
+        # FLOWSRC's `CALL WS-PGM` reaches FLOWSUB and its ENTRY FLOWENT through MOVE literals: before the
+        # re-parse too, each hop through it says it is a candidate, never `CALL FLOWSUB` as if static
+        fx, old = self.fixture_dbs()
+        dyn = _line("FLOWSRC.cbl", "CALL WS-PGM USING")
+        for db, tag in ((fx, "exact"), (old, "reconstructed")):
+            with self.subTest(tag):
+                rc = self.flow("WS-RC", "--program", "FLOWSRC", "--up", db=db)
+                self.assertRegex(rc, rf"(?m)^2\s+CALL FLOWSUB \(candidate: resolved via MOVE literal\) arg 2 <- FLOWSUB\.LK-RC\b"
+                                     rf".*FLOWSRC:{dyn} \"CALL WS-PGM")
+                lk = self.flow("LK-RC", "--program", "FLOWSUB", "--up", db=db)
+                self.assertRegex(lk, rf"CALL WS-PGM = FLOWSUB \(candidate: resolved via MOVE literal\) arg 2 <- FLOWSRC\.WS-RC\b"
+                                     rf".*FLOWSRC:{dyn} \"CALL WS-PGM")
+                self.assertRegex(lk, rf"CALL WS-PGM = FLOWENT \(candidate: resolved via MOVE literal\) arg 1 <- FLOWSRC\.WS-STATUS\b")
+                down = self.flow("LK-RC", "--program", "FLOWSUB", db=db)
+                self.assertRegex(down, r"LINKAGE pos 2 \(CALL WS-PGM: MOVE literal candidate\) -> back to FLOWSRC\.WS-RC\b")
+                self.assertRegex(down, r"LINKAGE pos 1 of ENTRY FLOWENT -> back to FLOWSRC\.WS-RC\b")
+                for text in (rc, lk, down):
+                    for ln in text.splitlines():
+                        if f'FLOWSRC:{dyn} "CALL WS-PGM' in ln:
+                            self.assertIn("candidate", ln, ln)
+
     def test_up_ends_at_the_fixture_callees_it_cannot_follow(self):
         # the fixtures' own shapes (ROADMAP example): ERRLOG is not in the index and may set WS-ERR-CD;
         # FLOWSUB declares 2 parameters and is passed WS-EXTRA third
-        fx = os.path.join(self.td, "fx.db")
-        with contextlib.redirect_stdout(io.StringIO()):
-            build._main([FIX, "--db", fx, "--rebuild", "--quiet"])
-        old = os.path.join(self.td, "fxold.db")
-        shutil.copyfile(fx, old)
-        c = sqlite3.connect(old)
-        c.executescript("DROP TABLE data_flow; DROP TABLE pfield; DROP TABLE call_arg; DROP TABLE param; "
-                        "DROP TABLE file_record;")
-        c.close()
+        fx, old = self.fixture_dbs()
         for db, tag in ((fx, "exact"), (old, "reconstructed")):
             with self.subTest(tag):
                 err = self.flow("WS-ERR-CD", "--program", "ERRPGM", "--up", db=db)
