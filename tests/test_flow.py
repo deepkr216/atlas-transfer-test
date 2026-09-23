@@ -2320,6 +2320,49 @@ class FlowKnownLimits(unittest.TestCase):
                 g = self.gate(s, r)
                 self.assertEqual({c: st for c, st in g.items() if st != "PASS"}, {}, g)
 
+    def test_up_asks_each_callee_once_not_once_per_path(self):
+        # a lattice of callees: each program of a level CALLs all 4 of the next with its parameter, the last
+        # level only shows it. passes_on asked every callee again on every path (4 ** hops); now each item
+        # is asked once per hop count, and the answer is the same: nobody sets it
+        import time
+        td = tempfile.mkdtemp()
+        try:
+            src = os.path.join(td, "estate")
+            os.makedirs(src)
+            head = "       IDENTIFICATION DIVISION.\n       PROGRAM-ID. {p}.\n       DATA DIVISION.\n"
+            calls = lambda k, v: "".join(f"           CALL 'KZ{s}{k}' USING {v}.\n" for s in "ABCD")
+            files = {"KZROOT.cbl": head.format(p="KZROOT") + "       WORKING-STORAGE SECTION.\n"
+                     "       01  WZ-R                     PIC X(02).\n       PROCEDURE DIVISION.\n"
+                     + calls(1, "WZ-R") + "           DISPLAY WZ-R.\n           GOBACK.\n"}
+            for k in range(1, 9):
+                for s in "ABCD":
+                    files[f"KZ{s}{k}.cbl"] = (head.format(p=f"KZ{s}{k}") + "       LINKAGE SECTION.\n"
+                                              "       01  LZ                       PIC X(02).\n"
+                                              "       PROCEDURE DIVISION USING LZ.\n"
+                                              + (calls(k + 1, "LZ") if k < 8 else "           DISPLAY LZ.\n")
+                                              + "           GOBACK.\n")
+            for name, text in files.items():
+                with open(os.path.join(src, name), "w", encoding="utf-8", newline="\n") as fh:
+                    fh.write(text)
+            db, old = os.path.join(td, "t.db"), os.path.join(td, "old.db")
+            with contextlib.redirect_stdout(io.StringIO()):
+                build._main([src, "--db", db, "--rebuild", "--quiet"])
+            shutil.copyfile(db, old)
+            c = sqlite3.connect(old)
+            c.executescript("DROP TABLE data_flow; DROP TABLE pfield; DROP TABLE call_arg; DROP TABLE param; "
+                            "DROP TABLE file_record;")
+            c.close()
+            for d, tag in ((db, "exact"), (old, "reconstructed")):
+                with self.subTest(tag):
+                    t0 = time.perf_counter()
+                    up = self.flow("WZ-R", "--program", "KZROOT", "--up", "--hops", "8", db=d)
+                    took = time.perf_counter() - t0
+                    self.assertLess(took, 2.0, f"{tag}: --up --hops 8 took {took:.1f}s")
+                    self.assertNotRegex(up, r"(?m)^1\s", up)
+                    self.assertIn("[end: only tested/displayed here]", up)
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
+
     def test_an_idcams_step_cites_its_own_exec_line(self):
         # every pseudo-DD cite knows its step, so the *REPRO* rows on C5's EXEC line quote that EXEC and pass
         for db in (self.db, self.old):

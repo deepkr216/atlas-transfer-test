@@ -26,7 +26,7 @@ import json
 import re
 import sqlite3
 from collections import defaultdict
-from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Callable, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
 from . import query as Q
 from . import verify_citations as V
@@ -102,6 +102,8 @@ _CA_HANDOVER = ("(field_ref.stmt IN ('EXEC-CICS-LINK','EXEC-CICS-XCTL','EXEC-CIC
                 "AND UPPER(ce.using_args) LIKE '%\"' || UPPER(field_ref.name) || '\"%'))")
 # a field_ref write that sets the bytes here (the query reads field_ref under its own name)
 _SETS_HERE = f"mode='write' AND stmt<>'CALL-USING' AND NOT {_CA_HANDOVER}"
+
+_NO_CUT = 1 << 30                   # passes_on: no cut ran into an item being asked about
 
 COPY_KINDS = ("move", "move_corr", "set", "read_into", "write_from")
 DERIVED_KINDS = ("arith", "string", "unstring", "function", "inspect")
@@ -210,6 +212,52 @@ class _Report:
         self.root_pid: int = 0
         self._member_tag: Dict[int, str] = {}
         self._raw: Dict[Tuple[str, int], str] = {}
+        # passes_on (--up): the items being asked about (key -> depth), the answers kept, the
+        # shallowest asked-about item a cut ran into, and the way back of the last `yes`
+        self._passing: Dict[Tuple, int] = {}
+        self._pass_memo: Dict[Tuple, Tuple[bool, Tuple]] = {}
+        self._pass_low = _NO_CUT
+        self._witness: Tuple = ()
+
+    def pass_search(self, key: Tuple, left: int, edges: Callable[[], Iterator[Tuple[_Edge, Tuple]]]) -> bool:
+        """passes_on's search, both walkers: is there a way back (an edge of
+        arg_back other than an XCTL end) from the item `key` with `left` hops
+        to go? It stops at the first. A way that comes back to an item being
+        asked about is none (the cut). Each answer is kept per (key, left),
+        so a lattice of callees is asked once per item, not once per path: a
+        `no` only when no cut reached an item asked about further up (the
+        same question from elsewhere may have its way through there), a
+        `yes` with the items its way goes through - taken again only while
+        none of them is being asked about, as the walk without the answers
+        kept would find it."""
+        if key in self._passing:
+            self._pass_low = min(self._pass_low, self._passing[key])
+            return False
+        mkey = key + (left,)
+        kept = self._pass_memo.get(mkey)
+        if kept is not None and (not kept[0] or not any(k in self._passing for k in kept[1])):
+            self._witness = kept[1]
+            return kept[0]
+        depth = len(self._passing)
+        self._passing[key] = depth
+        outer_low, self._pass_low = self._pass_low, _NO_CUT
+        programs, members = set(self.programs), set(self.members)
+        found, way = False, ()
+        try:
+            for e, w in edges():
+                if e.end != END_XCTL:
+                    found, way = True, (key,) + w
+                    break
+        finally:
+            del self._passing[key]
+            self.programs, self.members = programs, members     # asking prints nothing: touches nothing
+            low, self._pass_low = self._pass_low, outer_low
+        if low < depth and not found:
+            self._pass_low = min(self._pass_low, low)       # a `yes` holds whatever was cut
+        if found or low >= depth:
+            self._pass_memo[mkey] = (found, way)
+        self._witness = way
+        return found
 
     # ---- output ----------------------------------------------------------
     def put(self, depth: int, text: str) -> None:
@@ -540,7 +588,6 @@ class _Walker(_Report):
         self._partial_shown: Set[int] = set()
         self._layout: Dict[int, Optional[str]] = {}
         self._names: Dict[int, Set[str]] = {}
-        self._passing: Set[Tuple[int, int, int, int]] = set()
 
     # ---- lookups -------------------------------------------------------------
     def pf(self, pf_id: Optional[int]):
@@ -2151,6 +2198,11 @@ class _Walker(_Report):
     def arg_back(self, node: _Node, ids: Set[int]) -> List[_Edge]:
         """--up mirror of rule 3: a BY REFERENCE argument holds what the callee
         wrote into the parameter (only when the callee writes it)."""
+        return [e for e, _w in self.arg_back_iter(node, ids)]
+
+    def arg_back_iter(self, node: _Node, ids: Set[int]) -> Iterator[Tuple[_Edge, Tuple]]:
+        """arg_back's edges one by one, each with the passes_on keys its way
+        back goes through (passes_on stops at the first that qualifies)."""
         pid = node.pid
         q = ",".join("?" * len(ids))
         rows = self.conn.execute(f"""SELECT a.*, c.kind AS ckind, c.target, c.via_var, c.resolved, c.resolution, c.line AS cline,
@@ -2158,7 +2210,6 @@ class _Walker(_Report):
                                      FROM call_arg a JOIN call_edge c ON c.id=a.call_id
                                      WHERE a.program_id=? AND a.pfield IN ({q}) AND a.how IN ('reference','commarea')
                                      ORDER BY c.line, a.pos""", (pid, *ids)).fetchall()
-        out: List[_Edge] = []
         for a in rows:
             if a["ckind"] in ("cics_return", "cics_start"):
                 continue                # RETURN / START TRANSID: the next task gets a copy, nothing comes back
@@ -2176,21 +2227,21 @@ class _Walker(_Report):
             xctl = a["ckind"] == "cics_xctl"
             may = "may set it (BY REFERENCE)"
             if not targets and not xctl:
-                out.append(_Edge(3, "?", a["cline"], f"{word} {a['via_var']} {tag} <- ? {may}", cites,
-                                 end=END_DYNAMIC.format(x=a["via_var"])))
+                yield _Edge(3, "?", a["cline"], f"{word} {a['via_var']} {tag} <- ? {may}", cites,
+                            end=END_DYNAMIC.format(x=a["via_var"])), ()
                 continue
             for (t, cand) in targets:
                 if t.startswith("(+"):
                     if not xctl:
-                        out.append(_Edge(3, "?", a["cline"], f"{word} {a['via_var']} {tag} <- {t} candidate(s) not "
-                                         f"listed, each {may}", cites, end=END_DYNAMIC.format(x=a["via_var"])))
+                        yield _Edge(3, "?", a["cline"], f"{word} {a['via_var']} {tag} <- {t} candidate(s) not "
+                                    f"listed, each {may}", cites, end=END_DYNAMIC.format(x=a["via_var"])), ()
                     continue
                 callname = f"{word} {t}" + (f" ({cand})" if cand else "")
                 progs = Q.programs_named(self.conn, t)
                 if not progs:
                     if not xctl:
-                        out.append(_Edge(3, t.upper(), a["cline"], f"{callname} {tag} <- {t.upper()} {may}", cites,
-                                         end=END_NO_CALLEE))
+                        yield _Edge(3, t.upper(), a["cline"], f"{callname} {tag} <- {t.upper()} {may}", cites,
+                                    end=END_NO_CALLEE), ()
                     continue
                 callee = progs[0]
                 cname = callee["program_id"]
@@ -2203,18 +2254,18 @@ class _Walker(_Report):
                     if xctl:
                         continue
                     if a["how"] == "commarea":
-                        out.append(_Edge(3, cname, a["cline"], f"{callname} {tag} <- {cname}", cites, end=END_NO_COMMAREA))
+                        yield _Edge(3, cname, a["cline"], f"{callname} {tag} <- {cname}", cites, end=END_NO_COMMAREA), ()
                         continue
                     n = self.conn.execute("SELECT COUNT(*) FROM param WHERE program_id=? AND entry IS ? AND pos>0",
                                           (callee["id"], self.entry_for(callee, t))).fetchone()[0]
-                    out.append(_Edge(3, cname, a["cline"], f"{callname} {tag} <- {cname} (callee declares {n} parameter(s))",
-                                     cites, end=END_POS))
+                    yield _Edge(3, cname, a["cline"], f"{callname} {tag} <- {cname} (callee declares {n} parameter(s))",
+                                cites, end=END_POS), ()
                     continue
                 if prm["pfield"] is None:
                     if xctl:
                         continue
-                    out.append(_Edge(3, cname, a["cline"], f"{callname} {tag} <- {cname}.{prm['name']} {may}", cites,
-                                     end=END_MISSING.format(x=self.missing_copy(callee))))
+                    yield _Edge(3, cname, a["cline"], f"{callname} {tag} <- {cname}.{prm['name']} {may}", cites,
+                                end=END_MISSING.format(x=self.missing_copy(callee))), ()
                     continue
                 ppf = self.pf(prm["pfield"])
                 mapped = self.overlay(node, apf, ppf)
@@ -2233,17 +2284,17 @@ class _Walker(_Report):
                     written = self.written_here(ch, cids)
                     if not written and not self.passes_on(ch, cids):
                         continue
+                    way = () if written else self._witness
                     how_set = "written there" if written else "passed on BY REFERENCE there"
                     if a["ckind"] == "cics_xctl":
                         # written there, but XCTL never comes back: not an origin of this program's bytes
-                        out.append(_Edge(3, callee["program_id"], a["cline"], f"{callname} {tag}: {callee['program_id']}."
-                                         f"{self.nm(ch)} is {how_set}", cites, end=END_XCTL))
+                        yield _Edge(3, callee["program_id"], a["cline"], f"{callname} {tag}: {callee['program_id']}."
+                                    f"{self.nm(ch)} is {how_set}", cites, end=END_XCTL), ()
                         continue
                     self.touch(callee["id"])
-                    out.append(_Edge(3, callee["program_id"], a["cline"], f"{callname} {tag} <- {callee['program_id']}.{self.nm(ch)} "
-                                     f"{self.desc(ch)} ({'written there, BY REFERENCE' if written else how_set})".replace("  ", " ")
-                                     + self._lbls(labels), cites, child=ch))
-        return out
+                    yield _Edge(3, callee["program_id"], a["cline"], f"{callname} {tag} <- {callee['program_id']}.{self.nm(ch)} "
+                                f"{self.desc(ch)} ({'written there, BY REFERENCE' if written else how_set})".replace("  ", " ")
+                                + self._lbls(labels), cites, child=ch), way
 
     def passes_on(self, node: _Node, ids: Set[int]) -> bool:
         """Does the program pass the node's bytes BY REFERENCE to a callee
@@ -2251,7 +2302,7 @@ class _Walker(_Report):
         XCTL never comes back, so it is no way back. Past the hop limit the
         CALL alone counts: the node is printed there with its edges not
         followed. A CALL chain that comes back to a node being asked about
-        is no origin."""
+        is no origin. Each item is asked once per hop count (pass_search)."""
         q = ",".join("?" * len(ids))
         if not self.conn.execute(f"""SELECT 1 FROM call_arg a JOIN call_edge c ON c.id=a.call_id
                                      WHERE a.program_id=? AND a.pfield IN ({q}) AND a.how IN ('reference','commarea')
@@ -2259,17 +2310,10 @@ class _Walker(_Report):
                                  (node.pid, *ids)).fetchone():
             return False
         if node.hop > self.o.hops:
+            self._witness = ()
             return True
-        key = (node.pid, node.root, node.lo, node.hi)
-        if key in self._passing:
-            return False
-        self._passing.add(key)
-        programs, members = set(self.programs), set(self.members)
-        try:
-            return any(e.end != END_XCTL for e in self.arg_back(node, ids))
-        finally:
-            self._passing.discard(key)
-            self.programs, self.members = programs, members     # asking prints nothing: touches nothing
+        return self.pass_search((node.pid, node.root, node.lo, node.hi), self.o.hops - node.hop,
+                                lambda: self.arg_back_iter(node, ids))
 
     # ---- per-node information: sets, uses, writers -------------------------------------------------------
     def sets(self, node: _Node, ids: Set[int]) -> List[str]:
@@ -2561,7 +2605,6 @@ class _Fallback(_Report):
         self.visited: Dict[Tuple[int, str], List[Tuple[str, Optional[int], int]]] = defaultdict(list)
         self._prog: Dict[int, sqlite3.Row] = {}
         self._partial_shown: Set[int] = set()
-        self._passing: Set[Tuple[int, str]] = set()
 
     def prog(self, pid: int):
         if pid not in self._prog:
@@ -2842,7 +2885,10 @@ class _Fallback(_Report):
         """--up: what a callee the node is passed to BY REFERENCE writes into
         it (as _Walker.arg_back), or a labelled end where that cannot be
         followed."""
-        out: List[_Edge] = []
+        return [e for e, _w in self.arg_back_iter(node)]
+
+    def arg_back_iter(self, node: _FNode) -> Iterator[Tuple[_Edge, Tuple]]:
+        """arg_back's edges one by one, with their way back (_Walker.arg_back_iter)."""
         pid, name = node.pid, node.name
         for c in self.conn.execute("SELECT * FROM call_edge WHERE program_id=? AND using_args IS NOT NULL ORDER BY line", (pid,)):
             if c["kind"] in ("cics_return", "cics_start"):
@@ -2858,20 +2904,20 @@ class _Fallback(_Report):
                 cites = self.cite_stmt(pid, c["line"], word, name)
                 targets = [c["target"]] if c["target"] else [t for t, _c in _candidates(c)]
                 if not targets and not xctl:
-                    out.append(_Edge(3, "?", c["line"], f"{word} {c['via_var']} arg {pos} <- ? {may}", cites,
-                                     end=END_DYNAMIC.format(x=c["via_var"])))
+                    yield _Edge(3, "?", c["line"], f"{word} {c['via_var']} arg {pos} <- ? {may}", cites,
+                                end=END_DYNAMIC.format(x=c["via_var"])), ()
                 for t in targets:
                     if t.startswith("(+"):
                         if not xctl:
-                            out.append(_Edge(3, "?", c["line"], f"{word} {c['via_var']} arg {pos} <- {t} candidate(s) not "
-                                             f"listed, each {may}", cites, end=END_DYNAMIC.format(x=c["via_var"])))
+                            yield _Edge(3, "?", c["line"], f"{word} {c['via_var']} arg {pos} <- {t} candidate(s) not "
+                                        f"listed, each {may}", cites, end=END_DYNAMIC.format(x=c["via_var"])), ()
                         continue
                     callname = f"{word} {t}" + ("" if c["target"] else f" (candidate: resolved via {_how_resolved(c)})")
                     progs = Q.programs_named(self.conn, t)
                     if not progs:
                         if not xctl:
-                            out.append(_Edge(3, t.upper(), c["line"], f"{callname} arg {pos} <- {t.upper()} {may}", cites,
-                                             end=END_NO_CALLEE))
+                            yield _Edge(3, t.upper(), c["line"], f"{callname} arg {pos} <- {t.upper()} {may}", cites,
+                                        end=END_NO_CALLEE), ()
                         continue
                     callee = progs[0]
                     lk2 = self.linkage_of(callee, t)
@@ -2879,23 +2925,24 @@ class _Fallback(_Report):
                         # a CICS program gets its COMMAREA as DFHCOMMAREA with or without a PROCEDURE DIVISION
                         # USING (usually without): the 01 declared is the parameter, only no 01 is none
                         if not self.decls(callee["id"], "DFHCOMMAREA"):
-                            out.append(_Edge(3, callee["program_id"], c["line"], f"{callname} COMMAREA <- {callee['program_id']} "
-                                             f"(reconstructed)", cites, end=END_NO_COMMAREA))
+                            yield _Edge(3, callee["program_id"], c["line"], f"{callname} COMMAREA <- {callee['program_id']} "
+                                        f"(reconstructed)", cites, end=END_NO_COMMAREA), ()
                             continue
                         lk2 = ["DFHCOMMAREA"]
                     if pos > len(lk2):
                         if not xctl:
-                            out.append(_Edge(3, callee["program_id"], c["line"], f"{callname} arg {pos} <- {callee['program_id']} "
-                                             f"(callee declares {len(lk2)} parameter(s)) (reconstructed){modes}", cites,
-                                             end=END_POS))
+                            yield _Edge(3, callee["program_id"], c["line"], f"{callname} arg {pos} <- {callee['program_id']} "
+                                        f"(callee declares {len(lk2)} parameter(s)) (reconstructed){modes}", cites,
+                                        end=END_POS), ()
                         continue
                     pname = lk2[pos - 1]
                     ch = self.node(callee["id"], pname, node.hop + 1)
                     ch.via_call, ch.via_name = c["id"], ch.name
-                    how_set = "written there"
+                    how_set, way = "written there", ()
                     if not self.conn.execute(f"SELECT 1 FROM field_ref WHERE program_id=? AND UPPER(name)=? AND {_SETS_HERE} "
                                              "LIMIT 1", (callee["id"], pname.upper())).fetchone():
                         if self.passes_on(ch):
+                            way = self._witness
                             # handed on BY REFERENCE by its own name to a program that sets it (or that cannot
                             # be followed): the callee is on the path back, as the down walker's CALL
                             how_set = "passed on BY REFERENCE there"
@@ -2910,18 +2957,17 @@ class _Fallback(_Report):
                                 how = ("a field under it is written there" if under else
                                        "a field under it is passed on BY REFERENCE there" if passed else
                                        f"its fields are not all in {callee['program_id']}'s own text")
-                                out.append(_Edge(3, callee["program_id"], c["line"], f"{callname} {what} <- "
-                                                 f"{callee['program_id']}.{pname.upper()}: {how}, {may}", cites,
-                                                 end=FALLBACK_PARAM))
+                                yield _Edge(3, callee["program_id"], c["line"], f"{callname} {what} <- "
+                                            f"{callee['program_id']}.{pname.upper()}: {how}, {may}", cites,
+                                            end=FALLBACK_PARAM), ()
                             continue
                     if c["kind"] == "cics_xctl":
                         # written there, but XCTL never comes back (as _Walker.arg_back)
-                        out.append(_Edge(3, callee["program_id"], c["line"], f"{callname} arg {pos}: {callee['program_id']}.{pname.upper()} "
-                                         f"is {how_set} (reconstructed)", self.cite_stmt(pid, c["line"], "XCTL", name), end=END_XCTL))
+                        yield _Edge(3, callee["program_id"], c["line"], f"{callname} arg {pos}: {callee['program_id']}.{pname.upper()} "
+                                    f"is {how_set} (reconstructed)", self.cite_stmt(pid, c["line"], "XCTL", name), end=END_XCTL), ()
                         continue
-                    out.append(_Edge(3, callee["program_id"], c["line"], f"{callname} arg {pos} <- {callee['program_id']}.{ch.name} "
-                                     f"({how_set}) (reconstructed){modes}", cites, child=ch))
-        return out
+                    yield _Edge(3, callee["program_id"], c["line"], f"{callname} arg {pos} <- {callee['program_id']}.{ch.name} "
+                                f"({how_set}) (reconstructed){modes}", cites, child=ch), way
 
     def passes_on(self, node: _FNode) -> bool:
         """As _Walker.passes_on, by name: is the item an argument of a CALL /
@@ -2931,17 +2977,9 @@ class _Fallback(_Report):
                 "AND kind NOT IN ('cics_return','cics_start','cics_xctl')", (node.pid,))):
             return False
         if node.hop > self.o.hops:
+            self._witness = ()
             return True
-        key = (node.pid, node.name)
-        if key in self._passing:
-            return False
-        self._passing.add(key)
-        programs, members = set(self.programs), set(self.members)
-        try:
-            return any(e.end != END_XCTL for e in self.arg_back(node))
-        finally:
-            self._passing.discard(key)
-            self.programs, self.members = programs, members     # asking prints nothing: touches nothing
+        return self.pass_search((node.pid, node.name), self.o.hops - node.hop, lambda: self.arg_back_iter(node))
 
     def call_modes(self, pid: int, exp_line: int) -> str:
         """call_edge.using_args has no BY CONTENT / LENGTH OF: when the CALL's
