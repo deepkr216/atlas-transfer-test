@@ -15,7 +15,7 @@
 
 The fixtures are the FLOW* members: FLOWSRC writes WS-STATUS to a file that
 FLOWJOB sorts and FLOWRDR reads (through a DIFFERENT copybook, one prefix
-byte off), calls FLOWSUB by name, by ENTRY alias with the parameters swapped
+byte off) and FLOWJOB's STEP4 sends by FTP, calls FLOWSUB by name, by ENTRY alias with the parameters swapped
 and through a variable with two candidates, and updates POLICY_TBL; FLOWCICS
 LINKs to FLOWCOMM with a COMMAREA, which answers through a TS queue; FLOWJOB2
 re-arranges the bytes with OUTREC on the way to the same reader. FLOWSRC also
@@ -1528,6 +1528,14 @@ class FlowIndex(unittest.TestCase):
                  self.flow("WS-I", "--program", "FLOWSRC")]
         cites = [m for t in texts for m in CITE.finditer(t)]
         self.assertGreaterEqual(len(cites), 12)
+        # FLOWJOB STEP4 sends TEST.STAT.SORTED by FTP: the pseudo-DD `*FTP*` sits on the EXEC line, so the
+        # cite quotes the EXEC text there (never "//*FTP* DD", which is on no line), and the step is the interface
+        ftp = _line("FLOWJOB.jcl", "EXEC PGM=FTP")
+        self.assertRegex(texts[0], rf'FLOWJOB STEP4 FTP\s+FLOWJOB:{ftp} "//STEP4\s+EXEC PGM=FTP"\s+'
+                                   r"\[end: dataset leaves the mainframe \(interfaces: ftp\)\]")
+        self.assertRegex(texts[2], rf'TEST\.STAT\.SORTED ftp\s+FLOWJOB:{ftp} "//STEP4\s+EXEC PGM=FTP"')
+        self.assertNotIn("*FTP* DD", "\n".join(texts))
+        self.assertEqual(texts[0].count("interfaces: ftp)]"), 1, texts[0])      # the step, not the step and its edge
         call_line = _line("FLOWSRC.cbl", "CALL 'FLOWSUB' USING WS-STATUS")
         # the operand WS-RC sits on the CALL's continuation line: cited as a range
         self.assertTrue(any(m.group(1) == "FLOWSRC" and m.group(2) == str(call_line) and m.group(3) == str(call_line + 1)

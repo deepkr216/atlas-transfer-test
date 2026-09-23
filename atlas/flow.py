@@ -341,13 +341,17 @@ class _Report:
         return f'{rng}{via} "{tok}"'
 
     def cite_dd(self, member: Optional[str], line: Optional[int], dd_name: str, with_dsn: bool) -> str:
+        """MEMBER:line "//NAME DD" for a DD; a pseudo-DD the JCL parser adds
+        on the EXEC line (`*FTP*`, `*NDM*`: the dataset an FTP / NDM step
+        sends) quotes the EXEC text that is there, never a DD that is not."""
         if not member or not line:
             return f"{member or '?'}:{line or '?'}"
         raw = self.raw(member, line)
-        tok = f"//{dd_name} DD"
         mm = re.match(r"//(\S+)\s+DD\b", raw)
-        if mm:
-            tok = f"//{mm.group(1)} DD"
+        if not mm:
+            ex = re.match(r"//\S*\s+EXEC\s+[^\s,]+", raw)
+            return f'{member}:{line} "{self._tok(ex.group(0))}"' if ex else f"{member}:{line}"
+        tok = f"//{mm.group(1)} DD"
         if with_dsn:
             dm = re.search(r"DSN(?:AME)?=([^,\s(]+)", raw, re.I)
             if dm and len(tok) + 5 + len(dm.group(1)) <= TOKEN_MAX:
@@ -1037,14 +1041,17 @@ class _Walker(_Report):
                              stmt_cite, child=ds))
         return out
 
-    def interfaces_on(self, dsn: str) -> List[str]:
-        out = []
-        for r in self.conn.execute("SELECT kind, detail, peer_system FROM interface_edge WHERE UPPER(detail) LIKE ?",
+    def interfaces_on(self, dsn: str) -> List[Tuple[str, Optional[str], Optional[int]]]:
+        """(kind, member, line) per interface on the DSN: an interface_edge
+        row (its JCL member and line) or a manifest row (no source line)."""
+        out: List[Tuple[str, Optional[str], Optional[int]]] = []
+        for r in self.conn.execute("""SELECT i.kind, i.detail, i.peer_system, i.line, m.name AS mem FROM interface_edge i
+                                      LEFT JOIN member m ON m.id=i.member_id WHERE UPPER(i.detail) LIKE ?""",
                                    (f"%{dsn.upper()}%",)):
-            out.append(f"{r['kind']}" + (f" to {r['peer_system']}" if r["peer_system"] else ""))
+            out.append((f"{r['kind']}" + (f" to {r['peer_system']}" if r["peer_system"] else ""), r["mem"], r["line"]))
         for r in self.conn.execute("SELECT kind, peer, direction FROM external_interface WHERE UPPER(target)=?",
                                    (dsn.upper(),)):
-            out.append(f"{r['kind']}" + (f" {r['direction'] or ''} {r['peer'] or ''}".rstrip()))
+            out.append((f"{r['kind']}" + (f" {r['direction'] or ''} {r['peer'] or ''}".rstrip()), None, None))
         return out
 
     def step_cards(self, step_id: int) -> Set[str]:
@@ -1065,6 +1072,7 @@ class _Walker(_Report):
             return []
         seen.add(dsn)
         leaves: List[_Leaf] = []
+        iface_at: Set[Tuple[str, int]] = set()
         rows = self.dds_on(dsn)
         want = ("output", "mod", "unknown") if up else ("input", "mod", "unknown")
         for s in rows:
@@ -1081,6 +1089,14 @@ class _Walker(_Report):
             if d.get("gdg") is not None and s["gdg_rel"] is not None and d.get("gdg") != s["gdg_rel"]:
                 gdg = f"; GDG {d.get('gdg')} vs {s['gdg_rel']}: generation not modelled"
             launcher = (s["launcher"] or "").upper()
+            if pgm in ("*FTP*", "*NDM*", "*USSSH*"):
+                # the step that sends (or, upstream, receives) the dataset: the bytes leave the estate here
+                kind = pgm.strip("*").lower()
+                iface_at.add((s["member_name"], s["dd_line"]))
+                leaves.append(_Leaf(list(path), f"{job} {s['step_name']} {launcher or kind.upper()}",
+                                    self.cite_dd(s["member_name"], s["dd_line"], s["dd_name"], False),
+                                    end=END_INTERFACE.format(x=kind)))
+                continue
             if pgm.startswith("*") or launcher in ("SORT", "ICETOOL", "SYNCSORT", "IEBGENER", "IDCAMS", "DFSORT"):
                 kinds = self.step_cards(s["step_id"])
                 is_sort = launcher in ("SORT", "ICETOOL", "SYNCSORT", "DFSORT") or "SORT" in pgm
@@ -1123,8 +1139,11 @@ class _Walker(_Report):
             for lf in reader_fn(progs[0], s, here + gdg, ds):
                 lf.path = list(path) + lf.path
                 leaves.append(lf)
-        for kind in self.interfaces_on(dsn):
-            leaves.append(_Leaf(list(path), f"{dsn} {kind}", "", end=END_INTERFACE.format(x=kind)))
+        for (kind, mem, ln) in self.interfaces_on(dsn):
+            if (mem, ln) in iface_at:
+                continue            # the step above already ends there
+            leaves.append(_Leaf(list(path), f"{dsn} {kind}", self.cite_dd(mem, ln, "", False) if mem and ln else "",
+                                end=END_INTERFACE.format(x=kind)))
         return leaves
 
     def dds_on_step(self, step_id: int) -> List[sqlite3.Row]:
