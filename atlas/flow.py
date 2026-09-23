@@ -1097,7 +1097,7 @@ class _Walker(_Report):
                                     self.cite_dd(s["member_name"], s["dd_line"], s["dd_name"], False),
                                     end=END_INTERFACE.format(x=kind)))
                 continue
-            if pgm.startswith("*") or launcher in ("SORT", "ICETOOL", "SYNCSORT", "IEBGENER", "IDCAMS", "DFSORT"):
+            if pgm.startswith("*") or launcher in ("SORT", "ICETOOL", "SYNCSORT", "IEBGENER", "ICEGENER", "IDCAMS", "DFSORT"):
                 kinds = self.step_cards(s["step_id"])
                 is_sort = launcher in ("SORT", "ICETOOL", "SYNCSORT", "DFSORT") or "SORT" in pgm
                 if is_sort and kinds & {"INREC", "OUTREC", "OUTFIL", "JOINKEYS"}:
@@ -1110,10 +1110,19 @@ class _Walker(_Report):
                     leaves.append(_Leaf(list(path), f"{job} {s['step_name']} SORT: control cards not indexed",
                                         self.cite_dd(s["member_name"], s["dd_line"], s["dd_name"], False), end=END_UTILITY))
                     continue
-                if not (is_sort or launcher in ("IEBGENER", "IDCAMS")):
+                if not (is_sort or launcher in ("IEBGENER", "ICEGENER", "IDCAMS")):
                     leaves.append(_Leaf(list(path), f"{job} {s['step_name']} {launcher or pgm}",
                                         self.cite_dd(s["member_name"], s["dd_line"], s["dd_name"], False), end=END_UTILITY))
                     continue
+                if launcher in ("IEBGENER", "ICEGENER"):
+                    # SYSIN DD DUMMY is the plain copy; GENERATE / RECORD FIELD= moves fields around
+                    gen = next((k for k in ("RECORD", "GENERATE") if self.conn.execute(
+                        "SELECT 1 FROM dd WHERE step_id=? AND sysin_text IS NOT NULL AND UPPER(sysin_text) LIKE ?",
+                        (s["step_id"], f"%{k}%")).fetchone()), None)
+                    if gen:
+                        leaves.append(_Leaf(list(path), f"{job} {s['step_name']} {launcher} has {gen} control statements",
+                                            self.cite_card(s["step_id"], gen), end=END_UTILITY))
+                        continue
                 other = "input" if up else "output"
                 outs = [x for x in self.dds_on_step(s["step_id"]) if x["mode"] == other and x["dsn_resolved"] != dsn]
                 if not outs:

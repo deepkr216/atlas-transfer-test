@@ -1738,6 +1738,32 @@ class FlowKnownLimits(unittest.TestCase):
         "KNOCA.cbl": H.format(p="KNOCA") + (
             "       01  WN-X                     PIC X(02).\n       PROCEDURE DIVISION.\n"
             "           MOVE 'NO' TO WN-X.\n           EXEC CICS RETURN END-EXEC.\n"),
+        # KGW writes a file that ICEGENER copies (SYSUT1 -> SYSUT2, as IEBGENER) to the file KGR reads
+        "KGW.cbl": ("       IDENTIFICATION DIVISION.\n       PROGRAM-ID. KGW.\n       ENVIRONMENT DIVISION.\n"
+                    "       INPUT-OUTPUT SECTION.\n       FILE-CONTROL.\n           SELECT OUT-F ASSIGN TO GOUT.\n"
+                    "       DATA DIVISION.\n       FILE SECTION.\n       FD  OUT-F.\n       01  OUT-REC.\n"
+                    "           05  OR-CODE              PIC X(04).\n       WORKING-STORAGE SECTION.\n"
+                    "       01  WS-GCODE                 PIC X(04).\n       PROCEDURE DIVISION.\n"
+                    "           OPEN OUTPUT OUT-F.\n           MOVE WS-GCODE TO OR-CODE.\n           WRITE OUT-REC.\n"
+                    "           CLOSE OUT-F.\n           GOBACK.\n"),
+        "KGR.cbl": ("       IDENTIFICATION DIVISION.\n       PROGRAM-ID. KGR.\n       ENVIRONMENT DIVISION.\n"
+                    "       INPUT-OUTPUT SECTION.\n       FILE-CONTROL.\n           SELECT IN-F ASSIGN TO GIN.\n"
+                    "       DATA DIVISION.\n       FILE SECTION.\n       FD  IN-F.\n       01  IN-REC.\n"
+                    "           05  IR-GCODE             PIC X(04).\n       PROCEDURE DIVISION.\n"
+                    "           OPEN INPUT IN-F.\n           READ IN-F.\n           DISPLAY IR-GCODE.\n"
+                    "           CLOSE IN-F.\n           GOBACK.\n"),
+        "KGJOB.jcl": ("//KGJOB    JOB (ACCT),'COPY'\n//W1       EXEC PGM=KGW\n"
+                      "//GOUT     DD DSN=TEST.KG.RAW,DISP=(NEW,CATLG,DELETE)\n"
+                      "//C1       EXEC PGM=ICEGENER\n//SYSPRINT DD SYSOUT=*\n//SYSIN    DD DUMMY\n"
+                      "//SYSUT1   DD DSN=TEST.KG.RAW,DISP=SHR\n"
+                      "//SYSUT2   DD DSN=TEST.KG.COPY,DISP=(NEW,CATLG,DELETE)\n"
+                      "//R1       EXEC PGM=KGR\n//GIN      DD DSN=TEST.KG.COPY,DISP=SHR\n"),
+        # IEBGENER with RECORD FIELD= re-arranges the bytes: not a plain copy
+        "KGJOB2.jcl": ("//KGJOB2   JOB (ACCT),'GEN'\n//C2       EXEC PGM=IEBGENER\n//SYSPRINT DD SYSOUT=*\n"
+                       "//SYSIN    DD *\n  GENERATE MAXFLDS=1\n  RECORD FIELD=(2,3,,1)\n/*\n"
+                       "//SYSUT1   DD DSN=TEST.KG.RAW,DISP=SHR\n"
+                       "//SYSUT2   DD DSN=TEST.KG.GEN,DISP=(NEW,CATLG,DELETE)\n"
+                       "//R2       EXEC PGM=KGR\n//GIN      DD DSN=TEST.KG.GEN,DISP=SHR\n"),
     }
 
     @classmethod
@@ -1882,6 +1908,30 @@ class FlowKnownLimits(unittest.TestCase):
         node = re.search(r"(?m)^\d+\s+CALL KMISS arg 1 <- KMISS\.LK-MISS .*\n\s+\[program partial: [^\]]*KNOCPY[^\]]*\]$", up)
         self.assertIsNotNone(node, up)
         self.assertEqual(up.count("[program partial:"), 1, up)
+
+    def test_icegener_copies_the_bytes_as_iebgener_does(self):
+        job = "KGJOB.jcl"
+        sysut1 = self.FILES[job].splitlines().index("//SYSUT1   DD DSN=TEST.KG.RAW,DISP=SHR") + 1
+        for db, tag in ((self.db, "exact"), (self.old, "reconstructed")):
+            with self.subTest(tag):
+                down = self.flow("WS-GCODE", "--program", "KGW", db=db)
+                self.assertRegex(down, rf'C1 ICEGENER copy - bytes unchanged -> TEST\.KG\.COPY\s+KGJOB:{sysut1} "//SYSUT1 DD')
+                self.assertRegex(down, r"read by KGR\.IR-GCODE bytes 1-4 \(KGJOB R1 DD GIN")
+                self.assertNotIn("KGJOB C1 ICEGENER   ", down)          # never the utility end any more
+                # control statements re-arrange the fields: a labelled stop, never a pass-through
+                self.assertRegex(down, r'KGJOB2 C2 IEBGENER has RECORD control statements\s+KGJOB2:6 "RECORD FIELD=\(2,3,,1\)"\s+'
+                                       r"\[end: utility step - bytes not modelled\]")
+                self.assertNotIn("KGJOB2 R2", down)
+                up = self.flow("IR-GCODE", "--program", "KGR", "--up", db=db)
+                self.assertRegex(up, r"C1 ICEGENER copy - bytes unchanged <- TEST\.KG\.RAW")
+                self.assertRegex(up, r"written by KGW\.OR-CODE bytes 1-4 \(KGJOB W1 DD GOUT")
+                self.assertNotIn("KGJOB C1 ICEGENER   ", up)
+                self.assertRegex(up, r"KGJOB2 C2 IEBGENER has RECORD control statements\s.*\[end: utility step - bytes not modelled\]")
+                cites = [m for t in (down, up) for m in CITE.finditer(t)]
+                answer = "\n".join(f'[[{m.group(1)} {m.group(2)}{"-" + m.group(3) if m.group(3) else ""} "{m.group(4)}"]]'
+                                   for m in cites)
+                res, _u = verify_citations.check_answer(answer, db_path=self.db)
+                self.assertEqual([(r.raw, r.status) for r in res if r.status != "PASS"], [])
 
     def test_up_ends_at_the_fixture_callees_it_cannot_follow(self):
         # the fixtures' own shapes (ROADMAP example): ERRLOG is not in the index and may set WS-ERR-CD;
