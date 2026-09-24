@@ -1148,6 +1148,115 @@ def missing_copybooks(conn: sqlite3.Connection) -> Dict[str, int]:
     return out
 
 
+def members_named(conn: sqlite3.Connection, name: str, exclude_ids: Sequence[int] = ()
+                  ) -> Tuple[List[Tuple[int, str, str, str]], List[Tuple[int, str, str, str]]]:
+    """Every member carrying a copybook's name, as (id, kind, folder, path),
+    split into the ones the build's resolver would expand (RESOLVER_KINDS)
+    and the ones it never looks at (proc, ctlcard, doc, jcl, listing ...).
+    A procedure copybook - paragraphs and statements, no level numbers, no
+    DIVISION header - has no content signature, so the FOLDER NAME decides
+    its kind: PROCS makes it a proc, CNTL a control card, a dataset-named
+    folder with no hint 'unknown'. `exclude_ids`: the copiers themselves (a
+    program copying its own name is not its own copybook)."""
+    accepted: List[Tuple[int, str, str, str]] = []
+    other: List[Tuple[int, str, str, str]] = []
+    skip = set(exclude_ids)
+    for mid, kind, folder, path in conn.execute("SELECT id, kind, library, path FROM member WHERE UPPER(name)=? "
+                                                "ORDER BY kind, library, path", (name.upper(),)):
+        if mid in skip:
+            continue
+        (accepted if kind in RESOLVER_KINDS else other).append((int(mid), kind, folder or "?", path))
+    return accepted, other
+
+
+def arrived_copybooks(conn: sqlite3.Connection) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
+    """The COPY statements the build could not resolve whose copybook's name
+    the index DOES hold now, in two lists, one entry per copybook name:
+
+      arrived  - a member of a kind the resolver expands exists (copybook,
+                 cobol, sql, unknown), so the programs were parsed BEFORE it
+                 arrived and nothing parsed them again: the build re-parses
+                 the copiers of a NEW member only when it is filed as
+                 copybook or cobol (ROADMAP re-parse item 21), so a member
+                 typed 'unknown' by its folder forces nothing. These
+                 programs are marked for the next build.
+      misfiled - the only members with that name are of a kind the resolver
+                 never looks at (proc, ctlcard, doc, jcl, listing ...): a
+                 re-parse would find nothing; the folder name decided the
+                 kind (ROADMAP re-parse item 20) and must change, or the
+                 library's kind be declared.
+
+    missing_copybooks() leaves both out - the member exists - so without
+    this scan they fell through every report silently while coverage still
+    said 'COPY X NOT FOUND'. Each entry: copybook, members [(kind, folder)],
+    programs [(member id, name, kind)], and, for `arrived`, ids to mark."""
+    by_book: Dict[str, Dict[Tuple[int, str, str], None]] = defaultdict(dict)   # copybook -> copiers (ordered set)
+    for book, mid, mname, mkind in conn.execute(
+            "SELECT UPPER(c.copybook), m.id, UPPER(m.name), m.kind FROM copy_use c JOIN member m ON m.id = c.member_id "
+            "WHERE c.resolved_member_id IS NULL AND EXISTS (SELECT 1 FROM member x WHERE UPPER(x.name) = UPPER(c.copybook) "
+            "AND x.id != c.member_id) ORDER BY 1, 3"):
+        if book and book not in expand._SYSTEM_INCLUDES:
+            by_book[book][(int(mid), str(mname), str(mkind))] = None
+    arrived: List[Dict[str, object]] = []
+    misfiled: List[Dict[str, object]] = []
+    for book in sorted(by_book):
+        copiers = list(by_book[book])
+        accepted, other = members_named(conn, book, [c[0] for c in copiers])
+        if accepted:
+            arrived.append({"copybook": book, "members": [(k, f) for _i, k, f, _p in accepted], "programs": copiers,
+                            "ids": [c[0] for c in copiers]})
+        elif other:
+            misfiled.append({"copybook": book, "members": [(k, f) for _i, k, f, _p in other], "programs": copiers, "ids": []})
+    return arrived, misfiled
+
+
+def _kinds_folders(members: Sequence[Tuple[str, str]]) -> Tuple[str, str]:
+    """('unknown', 'PROD.GC.CPYLIB') - or, for several copies, each kind and each folder once."""
+    kinds = ", ".join(sorted({k for k, _f in members}))
+    folders = ", ".join(sorted({f for _k, f in members}))
+    return kinds, folders
+
+
+MISFILED_FIX = ("the folder name decided the kind (a copybook with no level numbers has no signature): rename the folder to "
+                "end in COPYLIB, or declare the library's kind in the UI's table (the manifest kinds) and run the build")
+
+
+def arrival_report(arrived: Sequence[Dict[str, object]], misfiled: Sequence[Dict[str, object]], dry_run: bool = False,
+                   limit: int = 8) -> List[str]:
+    """The report's two sections for arrived_copybooks(): what arrived after
+    its programs were parsed (marked for the next build), and what exists
+    only under a kind the build does not expand (what to do, in words)."""
+    def progs(e: Dict[str, object]) -> str:
+        names = [n + (" (copybook)" if k == "copybook" else "") for _i, n, k in e["programs"]]   # type: ignore[union-attr]
+        return ", ".join(names[:limit]) + (f", +{len(names) - limit:,} more" if len(names) > limit else "")
+
+    lines: List[str] = []
+    if arrived:
+        lines.append("\n## Copybooks that arrived after the program was parsed\n\n"
+                     "The index holds a member with the copybook's name, but the programs below were parsed while it was "
+                     "missing and nothing parsed them again: the build re-parses the copiers of a new member only when "
+                     "it is filed as copybook or cobol (ROADMAP re-parse item 21), so one typed by its folder name - "
+                     "'unknown' in a dataset-named folder - forces nothing. "
+                     + ("They would be marked for the next build (dry run: nothing marked).\n\n" if dry_run
+                        else "They are marked for the next build: run your usual build command.\n\n")
+                     + "| copybook | kind the index filed it as | folder | programs |\n|---|---|---|---|\n")
+        for e in arrived:
+            kinds, folders = _kinds_folders(e["members"])                            # type: ignore[arg-type]
+            lines.append(f"| {e['copybook']} | {kinds} | {folders} | {progs(e)} |\n")
+    if misfiled:
+        lines.append("\n## A member with the copybook's name exists but is filed as something else\n\n"
+                     "The build expands only members filed as copybook, cobol, sql or unknown; the members below are of "
+                     "another kind, so every program that copies them stays parsed only in part - a re-parse would find "
+                     "nothing, so nothing is marked. A procedure copybook (paragraphs and statements, no level numbers, no "
+                     "DIVISION header) has no content signature, and the folder name types it: PROCS makes it a proc, CNTL a "
+                     "control card, a plain folder a document (ROADMAP re-parse item 20).\n\n"
+                     "| copybook | filed as | folder | programs | what to do |\n|---|---|---|---|---|\n")
+        for e in misfiled:
+            kinds, folders = _kinds_folders(e["members"])                            # type: ignore[arg-type]
+            lines.append(f"| {e['copybook']} | {kinds} | {folders} | {progs(e)} | {MISFILED_FIX} |\n")
+    return lines
+
+
 def needing_programs(conn: sqlite3.Connection, missing: Dict[str, int]) -> Set[str]:
     """The programs that copy a missing copybook: only their expanded text
     can hold it, so only theirs is read. A copybook that copies the missing
@@ -1468,6 +1577,33 @@ def _mark_programs(db: str, names: Sequence[str]) -> int:
         conn.close()
 
 
+def _mark_members(db: str, ids: Sequence[int]) -> int:
+    """Members by id (the programs that copy a copybook which arrived after
+    they were parsed) are parsed again on the next build. By id, not by
+    copybook name: a program in another system whose own copy resolved is
+    left alone."""
+    ids = sorted(set(int(i) for i in ids))
+    if not ids:
+        return 0
+    conn = sqlite3.connect(db)
+    try:
+        n = 0
+        for k in range(0, len(ids), 500):
+            chunk = ids[k:k + 500]
+            n += conn.execute(f"UPDATE member SET parse_status='pending', parse_error=NULL "
+                              f"WHERE id IN ({','.join('?' * len(chunk))})", tuple(chunk)).rowcount
+        conn.commit()
+        return n
+    finally:
+        conn.close()
+
+
+def _write_report(report: str, lines: Sequence[str]) -> None:
+    os.makedirs(os.path.dirname(report) or ".", exist_ok=True)
+    with open(report, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write("".join(lines))
+
+
 def held_datasets(conn: sqlite3.Connection, libs: Dict[str, str]) -> Dict[str, str]:
     """{dataset: a folder the index holds it as} - the `library` table first
     (the fetcher's marker), then every member's folder that is named after a
@@ -1630,6 +1766,10 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
             if not root:
                 raise SystemExit("the index has no estate root recorded: give --out")
             out_dir = shared_out(root)
+        # the copybooks that are NOT missing any more but whose programs still say NOT FOUND: a member with
+        # the name arrived after they were parsed (marked below), or exists only under a kind the build
+        # never expands (said, with what to do) - missing_copybooks() leaves both out
+        arrived, misfiled = arrived_copybooks(conn)
         missing = missing_copybooks(conn)
         copiers = copiers_by_kind(conn, missing)
         users = copier_names(conn, missing)
@@ -1673,6 +1813,33 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
             for d, ents in entries.items():
                 if os.path.isdir(d):
                     _save_marker(d, ents)
+    marked = 0
+    if arrived:
+        ids = sorted({i for e in arrived for i in e["ids"]})                    # type: ignore[union-attr]
+        if not dry_run:
+            marked = _mark_members(db, ids)
+        log(f"  {len(ids):,} program(s) copy a copybook that has arrived since they were parsed "
+            f"({len(arrived):,} copybook{'s' if len(arrived) != 1 else ''}): "
+            f"{'would be marked' if dry_run else 'marked'} for the next build")
+    if misfiled:
+        n_prog = len({p[0] for e in misfiled for p in e["programs"]})           # type: ignore[union-attr]
+        kinds = ", ".join(sorted({k for e in misfiled for k, _f in e["members"]}))   # type: ignore[union-attr]
+        log(f"  {len(misfiled):,} copybook name(s) exist in the index only as a member of a kind the build does not expand "
+            f"({kinds}): {n_prog:,} program(s) stay parsed only in part until the folder is renamed or the library's kind "
+            "declared - the report says what to do")
+    arrival_lines = arrival_report(arrived, misfiled, dry_run)
+
+    def early(stats: Dict[str, object]) -> Dict[str, object]:
+        """A run that ends before the listings are read still reports the arrived and misfiled copybooks."""
+        if arrival_lines and report:
+            _write_report(report, [f"# Recovered copybooks - {time.strftime('%Y-%m-%d %H:%M')}\n",
+                                   f"\n- missing in the index: {len(missing)}; expanded texts read: 0\n"] + arrival_lines)
+            log(f"every name: {report}")
+        if marked:
+            log("next: run your usual build command - the programs marked re-expand by themselves")
+        stats.update({"arrived": len(arrived), "misfiled": len(misfiled), "marked": marked})
+        return stats
+
     log(f"missing copybooks in the index: {len(missing):,}, used in {sum(missing.values()):,} places (a place = one program "
         "copying one of them)")
     if recovered:
@@ -1682,8 +1849,8 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
     if not missing and not everything:
         log("nothing to recover: every copybook the programs copy is in the index")
         if not chosen and not recovered:
-            return {"missing": 0, "sources": len(sources), "written": 0, "rejected": 0, "not_found": 0, "removed": len(removed),
-                    "kept": 0, "formats": {}, "out": out_dir, "unconfirmed": 0, "per_system": 0}
+            return early({"missing": 0, "sources": len(sources), "written": 0, "rejected": 0, "not_found": 0,
+                          "removed": len(removed), "kept": 0, "formats": {}, "out": out_dir, "unconfirmed": 0, "per_system": 0})
         check_only = True                                              # ... and to name the libraries of the recovered copies
     if not sources:
         log("expanded texts to read: 0 - the index holds no compiler listings and no --from folder was given")
@@ -1694,8 +1861,8 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
             checks, _fetch, _unnamed = _check_after(db, {}, True, to_fetch_for, True, recovered)
             log(choice_line(checks) + " - the listings would say which copy of a copybook chosen among several was right")
             checked = choice_counts(checks)
-        return {"missing": len(missing), "sources": 0, "written": 0, "rejected": 0, "not_found": len(missing), "removed": 0,
-                "kept": 0, "formats": {}, "out": out_dir, "unconfirmed": 0, "checked": checked}
+        return early({"missing": len(missing), "sources": 0, "written": 0, "rejected": 0, "not_found": len(missing),
+                      "removed": 0, "kept": 0, "formats": {}, "out": out_dir, "unconfirmed": 0, "checked": checked})
     found_all = len(sources)
     if not everything:
         # only the expanded text of a program that copies a missing copybook can hold it; a text
@@ -1717,8 +1884,8 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
             + (" (or one held only as a recovered copy)" if recovered else "")
             + (" or has a copybook chosen among several" if chosen else "") + ": are these the "
             "listings of the programs the coverage report calls partial?")
-        return {"missing": len(missing), "sources": 0, "written": 0, "rejected": 0, "not_found": len(missing), "removed": len(removed),
-                "kept": 0, "formats": {}, "out": out_dir, "unconfirmed": 0, "per_system": 0}
+        return early({"missing": len(missing), "sources": 0, "written": 0, "rejected": 0, "not_found": len(missing),
+                      "removed": len(removed), "kept": 0, "formats": {}, "out": out_dir, "unconfirmed": 0, "per_system": 0})
     wanted = set(missing) if not everything else set()
     formats: Counter = Counter()
     by_name: Dict[str, List[Region]] = defaultdict(list)
@@ -1867,6 +2034,7 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
              + f"; already there: {kept}; unconfirmed: {len(unconfirmed)}; rejected: {len(rejected)}; removed (real member arrived): {len(removed)}",
              f"\n- not in any expanded text: {len(not_found)}"
              + (f"; in an older listing whose source column could not be proven: {len(unread)}" if unread else "") + "\n"]
+    lines += arrival_lines                                              # arrived after the parse / filed as another kind
     if written:
         lines.append("\n## Written\n\n| copybook | programs copying it | folder | how |\n|---|---|---|---|\n")
         lines += [f"| {n} | {missing.get(n, 0)} | {os.path.relpath(f, root) if root else f} | {how} |\n" for n, f, how in written]
@@ -1925,9 +2093,7 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
                      "(2) is the first copied line a data item (a level number and a name), a comment, or something else?\n")
     to_fetch = sum(1 for e in fetch if not e["held"])
     if report:
-        os.makedirs(os.path.dirname(report) or ".", exist_ok=True)
-        with open(report, "w", encoding="utf-8", newline="\n") as fh:
-            fh.write("".join(lines))
+        _write_report(report, lines)
     if list_file:
         _write_fetch_list(list_file, fetch)                             # rewritten each run: never stale, never a member name
     agree =sum(1 for _n, _f, how in written if "identical in" in how or "confirmed by a second" in how)
@@ -1972,12 +2138,16 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
     if report:
         log(f"every name: {report}")
     if written and not dry_run:
-        log("next: run your usual build command - the programs that copy them re-expand by themselves")
+        log("next: run your usual build command - the programs that copy them re-expand by themselves"
+            + (" (and the programs marked above)" if marked else ""))
+    elif marked:
+        log("next: run your usual build command - the programs marked re-expand by themselves")
     return {"missing": len(missing), "sources": len(sources), "written": len(written), "rejected": len(rejected),
             "not_found": len(not_found), "removed": len(removed), "kept": kept, "formats": dict(formats),
             "out": out_dir, "unconfirmed": len(unconfirmed), "per_system": per_system,
             "checked": choice_counts(checks) if checks else None,
-            "fetch": (len(fetch), to_fetch), "unnamed": len(unnamed)}
+            "fetch": (len(fetch), to_fetch), "unnamed": len(unnamed),
+            "arrived": len(arrived), "misfiled": len(misfiled), "marked": marked}
 
 
 def trace(db: str, name: str, folders: Sequence[str] = (), log=print) -> int:
