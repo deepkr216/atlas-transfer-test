@@ -629,6 +629,122 @@ class UiSelfExplaining(unittest.TestCase):
                          "folder' to the folder")
         self.assertTrue(ui.status_after_check(True, "4. no enabled PDS in the table yet - add one", False)
                         .endswith("next: add the datasets to fetch (Add or Bulk add)"))
+        # a stop with no summary line: the exit code in plain words, never "rc"
+        self.assertEqual(ui.status_after_build(3, [], "atlas.db"),
+                         "Build stopped (exit code 3): exit code 3 - try: Build index again; members parsed so far are kept")
+        self.assertNotIn("rc ", ui.status_after_build(3, ["   "], "atlas.db"))
+
+    NO_CONF_NO_PDS = ("   run from: C:/x\n1. zowe found: C:/z/zowe.cmd\n2. zowe --version: 7.0.0\n"
+                      "3. no zowe configuration found from C:/x - run the check from the folder where your command "
+                      "works, or set 'Run zowe from folder' (sources.json -> zowe.working_dir)\n"
+                      "4. no enabled PDS in the table yet - add one, then Check again to test the host connection")
+
+    def test_no_configuration_is_not_a_pass_when_the_host_stage_was_skipped(self):
+        """With no enabled PDS the host stage is skipped and check_zowe comes
+        back OK - but stage 3 found no configuration, and that is the problem
+        to fix first: the status says so with the fix, and step 1 is not done."""
+        from atlas import ui
+        self.assertFalse(ui.check_passed(True, self.NO_CONF_NO_PDS))
+        status = ui.status_after_check(True, self.NO_CONF_NO_PDS, False)
+        self.assertEqual(status, "Zowe check failed: zowe found no configuration from C:/x - set 'Run zowe from "
+                                 "folder' to the folder where your command works")
+        # a host that answered anyway (a Zowe v1 profile) is a real pass
+        answered = self.NO_CONF_NO_PDS.rsplit("\n", 1)[0] + "\n4. host answered: PROD.X.SRC has 12 member(s) - fine"
+        self.assertTrue(ui.check_passed(True, answered))
+        self.assertTrue(ui.status_after_check(True, answered, True).startswith("Zowe OK: host answered"))
+        self.assertFalse(ui.check_passed(False, "1. 'zowe' is not on PATH for this process."))
+        # and in the window: step 1 stays "you can do this now", the status is red
+        ui, app = self._app()
+        with mock.patch("atlas.fetch.check_zowe", return_value=(True, self.NO_CONF_NO_PDS)):
+            app.check_zowe()
+            status = self._wait(app, "Zowe check failed")
+        self.assertIn("no configuration from C:/x", status)
+        self.assertIn("set 'Run zowe from folder'", status)
+        self.assertFalse(app.checked_ok)
+        self.assertEqual(app.step_state[0], "now")
+        self.assertTrue(app.strip_labels[0][0].cget("text").endswith("you can do this now"))
+        self.assertEqual(str(app.status_label.cget("foreground")), ui.BAD_FG)
+        app.update()
+        self.assertIn("RESULT: FAIL", app.log.get("1.0", "end"))
+
+    def test_a_callback_that_raises_does_not_stop_the_log(self):
+        """A callable on the queue that raises must not kill the poll loop:
+        the error goes to the log, the status goes red, and a line queued
+        after it still arrives."""
+        ui, app = self._app()
+
+        def boom():
+            raise RuntimeError("the callback broke")
+        app.q.put(boom)
+        app.q.put("a line after the broken callback")
+        for _ in range(100):
+            app.update()
+            if "a line after the broken callback" in app.log.get("1.0", "end"):
+                break
+            time.sleep(0.01)
+        text = app.log.get("1.0", "end")
+        self.assertIn("ERROR RuntimeError: the callback broke", text)
+        self.assertIn("a line after the broken callback", text)
+        self.assertLess(text.index("ERROR RuntimeError"), text.index("a line after"))
+        self.assertIn("the callback broke", app.v_status.get())
+        self.assertEqual(str(app.status_label.cget("foreground")), ui.BAD_FG)
+        self.assertIsNotNone(app._poll_job)
+        # and the loop is still alive afterwards
+        app.q.put("one more line")
+        for _ in range(100):
+            app.update()
+            if "one more line" in app.log.get("1.0", "end"):
+                break
+            time.sleep(0.01)
+        self.assertIn("one more line", app.log.get("1.0", "end"))
+
+    def test_plain_words_in_the_table_and_the_dialogs(self):
+        ui, app = self._app()
+        from tkinter import ttk
+        for key, text in (("local", "folder on this laptop"), ("auth", "production copy"), ("last", "last fetch")):
+            self.assertEqual(app.tree.heading(key)["text"], text)
+        self.assertFalse(hasattr(ui, "ZOWE_DIR_HINT"))
+        self.assertIn("e.g. the folder you cd to before typing zowe, such as C:\\Users\\you", ui.HELP["zowe_dir"])
+        dlg = ui.SourceDialog(app, modal=False)
+        dlg.withdraw()
+        self.addCleanup(dlg.destroy)
+        labels = {w.cget("text") for w in self._walk(dlg) if isinstance(w, ttk.Label)}
+        self.assertIn("File extension for members, e.g. .cbl", labels)
+        self.assertNotIn("File extension (pds)", labels)
+        with mock.patch("tkinter.messagebox.showinfo") as info:
+            app.v_filter.set("All")
+            app.fetch_system()
+        info.assert_called_once_with("Fetch system", "Pick a system in the System box first")
+
+    def test_the_log_shows_eight_lines_on_a_720_screen(self):
+        """At 1180x630 (the height the window picks on a 1280x720 laptop)
+        and at 1280x720 the log shows at least eight full lines and the
+        table four rows: the log is where Fetch and Build say how far they
+        are. The window is laid out invisible and off screen, since a
+        withdrawn window is not laid out at all."""
+        ui, app = self._app()
+        try:
+            app.attributes("-alpha", 0.0)
+        except Exception:                                             # noqa: BLE001 - no alpha here
+            pass
+        app.deiconify()
+        for i in range(40):
+            app._append_log(f"line {i}")
+        for size in ("1180x630", "1280x720"):
+            app.geometry(size + "+-3000+-3000")
+            app.update()
+            app.update()
+            if (app.winfo_width(), app.winfo_height()) != tuple(int(x) for x in size.split("x")):
+                self.skipTest(f"the window manager did not give the window {size}")
+            app.log.see("end")
+            app.update()
+            h = app.log.winfo_height()
+            full = sum(1 for i in range(1, 41)
+                       if (d := app.log.dlineinfo(f"{i}.0")) is not None and d[1] + d[3] <= h)
+            self.assertGreaterEqual(full, 8, f"{size}: {full} full log lines in {h}px")
+            self.assertEqual(int(app.tree.cget("height")), 4)
+            self.assertEqual(app.winfo_height(), int(size.split("x")[1]))
+        app.withdraw()
 
 
 if __name__ == "__main__":

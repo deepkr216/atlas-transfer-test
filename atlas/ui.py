@@ -38,7 +38,9 @@ except ImportError:                                   # pragma: no cover
 from . import fetch
 
 COLUMNS = ("dataset", "type", "kind", "system", "local", "auth", "enabled", "last")
-WIDTHS = (220, 50, 80, 90, 220, 50, 60, 260)
+# what the table says at the top of a column when the key alone is jargon
+HEADINGS = {"local": "folder on this laptop", "auth": "production copy", "last": "last fetch"}
+WIDTHS = (220, 50, 80, 90, 220, 100, 60, 260)
 HELP_FG = "#555"
 DONE_FG = "#1a7f37"
 LATER_FG = "#8a8a8a"
@@ -51,7 +53,6 @@ SIGN_IN_NOTE = ("Optional: not needed when your zowe command works without a pro
                 "Used only for the zowe commands of this session - never written to sources.json,\n"
                 "the log or a crash file. Leave the user id empty to keep the profile's.")
 NO_SESSION_PASSWORD = "no session password (not needed when your zowe command works without a prompt)"
-ZOWE_DIR_HINT = "(empty = the folder of sources.json; use the folder where your zowe command works)"
 DAEMON_OFF_LABEL = "Zowe daemon off (only if zowe hangs)"
 
 # --------------------------------------------------------------------------
@@ -71,7 +72,8 @@ STATE_WORDS = {"done": "done", "now": "you can do this now", "later": "after ste
 # One grey line under every field: what to type, and an example.
 HELP: Dict[str, str] = {
     "profile": "leave blank unless your window command uses --zosmf-profile, e.g. --zosmf-profile prod",
-    "zowe_dir": "the folder your command window is in when zowe works without asking anything "
+    "zowe_dir": "the folder your command window is in when zowe works without asking anything, "
+                "e.g. the folder you cd to before typing zowe, such as C:\\Users\\you "
                 "(blank = the folder of sources.json, this toolkit's folder)",
     "daemon": "tick only if zowe hangs when run from here",
     "sign_in": "Sign in: not needed when your zowe command works without a prompt",
@@ -248,17 +250,34 @@ def step_states(cfg: Dict, checked_ok: bool = False, db_exists: Optional[bool] =
     return [s1, s2, s3, s4, s5]
 
 
+def _no_config_line(lines: Sequence[str]) -> Optional[str]:
+    return next((ln for ln in lines if "no zowe configuration found from" in ln), None)
+
+
+def check_passed(ok: bool, msg: str) -> bool:
+    """Whether the check proved that Fetch will work. `ok` alone is not
+    enough: with no enabled PDS in the table the host stage is skipped and
+    the check comes back OK even when stage 3 found no zowe configuration -
+    that is the problem to fix first, not a pass."""
+    lines = [ln.rstrip() for ln in (msg or "").splitlines() if ln.strip()]
+    if not ok:
+        return False
+    if _no_config_line(lines) and not any(re.match(r"\s*4\.\s*host answered", ln) for ln in lines):
+        return False
+    return True
+
+
 def status_after_check(ok: bool, msg: str, has_sources: bool) -> str:
     """The check's own words, one line: what it found and the next step, or
     the failing stage and the one thing to try."""
     lines = [ln.rstrip() for ln in (msg or "").splitlines() if ln.strip()]
-    if ok:
+    if check_passed(ok, msg):
         last = re.sub(r"^\s*[1-4]\.\s*", "", lines[-1].strip()) if lines else "zowe answers"
         last = last.partition(" - ")[0]
         nxt = "Fetch (Fetch all, or select rows and Fetch selected)" if has_sources \
             else "add the datasets to fetch (Add or Bulk add)"
         return f"Zowe OK: {_clip(last, 110)} - next: {nxt}"
-    noconf = next((ln for ln in lines if "no zowe configuration found from" in ln), None)
+    noconf = _no_config_line(lines)
     if noconf:
         folder = noconf.split("found from", 1)[1].split(" - ", 1)[0].strip()
         return (f"Zowe check failed: zowe found no configuration from {folder} - set 'Run zowe from folder' "
@@ -329,8 +348,8 @@ def status_after_build(rc: Optional[int], lines: Sequence[str], db: str) -> str:
         after = text[m.end():].strip().splitlines()
         hint = after[0].strip() if after else "run Build index again; members parsed so far are kept"
         return f"Build stopped: {_clip(m.group(1), 100)} - try: {_clip(hint, 150)}"
-    last = next((ln for ln in reversed(lines) if ln.strip()), f"rc {rc}")
-    return f"Build stopped (rc {rc}): {_clip(last, 100)} - try: Build index again; members parsed so far are kept"
+    last = next((ln for ln in reversed(lines) if ln.strip()), f"exit code {rc}")
+    return f"Build stopped (exit code {rc}): {_clip(last, 100)} - try: Build index again; members parsed so far are kept"
 
 
 # --------------------------------------------------------------------------
@@ -441,7 +460,7 @@ class SourceDialog(tk.Toplevel if tk else object):
             ("kind", "Kind", ttk.Combobox(f, textvariable=self.vars["kind"], values=fetch.KINDS, state="readonly", width=14)),
             ("system", "System (CLAIMS, POLICY, ...)", ttk.Entry(f, textvariable=self.vars["system"], width=20)),
             ("local", "Local folder / file under root", ttk.Entry(f, textvariable=self.vars["local"], width=44)),
-            ("ext", "File extension (pds)", ttk.Entry(f, textvariable=self.vars["ext"], width=10)),
+            ("ext", "File extension for members, e.g. .cbl",ttk.Entry(f, textvariable=self.vars["ext"], width=10)),
             ("extra_args", "Extra zowe args", ttk.Entry(f, textvariable=self.vars["extra_args"], width=44)),
         ]
         self.help_labels: Dict[str, "ttk.Label"] = {}
@@ -510,7 +529,7 @@ class App(tk.Tk if tk else object):
         self.help_labels: Dict[str, "ttk.Label"] = {}
 
         # ---- what to do, in order ------------------------------------
-        strip = ttk.LabelFrame(self, text="What to do", padding=(8, 2, 8, 6))
+        strip = ttk.LabelFrame(self, text="What to do", padding=(8, 2, 8, 4))
         strip.pack(fill="x", padx=8, pady=(6, 0))
         bold = tkfont.nametofont("TkDefaultFont").copy()
         bold.configure(weight="bold")
@@ -594,11 +613,14 @@ class App(tk.Tk if tk else object):
                                       justify="left", anchor="w", padding=(8, 2))
         self.status_label.pack(side="bottom", fill="x")
 
+        # The table keeps four rows (it scrolls); the log below takes the
+        # rest of the height, so on a 1280x720 laptop screen it shows eight
+        # lines or more - that is where Fetch and Build say how far they are.
         mid = ttk.Frame(self, padding=(8, 0, 8, 0))
-        mid.pack(fill="both", expand=True)
-        self.tree = ttk.Treeview(mid, columns=COLUMNS, show="headings", selectmode="extended", height=6)
+        mid.pack(fill="x")
+        self.tree = ttk.Treeview(mid, columns=COLUMNS, show="headings", selectmode="extended", height=4)
         for c, w in zip(COLUMNS, WIDTHS):
-            self.tree.heading(c, text=c)
+            self.tree.heading(c, text=HEADINGS.get(c, c))
             self.tree.column(c, width=w, anchor="w")
         sb = ttk.Scrollbar(mid, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=sb.set)
@@ -608,7 +630,7 @@ class App(tk.Tk if tk else object):
 
         # Two rows so every button is on screen at 1280x720: the table's own
         # buttons, then the actions in the order of the steps.
-        btns = ttk.Frame(self, padding=(8, 4, 8, 4))
+        btns = ttk.Frame(self, padding=(8, 3, 8, 1))
         btns.pack(fill="x")
         for label, row in (("Table", (("Add", self.add_source), ("Bulk add", self.bulk_add), ("Edit", self.edit_source),
                                       ("Remove", self.remove_source), ("Enable/Disable", self.toggle_source),
@@ -621,7 +643,7 @@ class App(tk.Tk if tk else object):
                                    ("OCR images", self.ocr_images), ("Prepare documents", self.convert_legacy),
                                    ("Coverage", self.coverage)))):
             line = ttk.Frame(btns)
-            line.pack(fill="x", pady=(0, 3))
+            line.pack(fill="x", pady=(0, 2))
             ttk.Label(line, text=label, foreground=HELP_FG, width=8).pack(side="left")
             for text, cmd in row:
                 _button(line, text, cmd).pack(side="left", padx=2)
@@ -753,20 +775,30 @@ class App(tk.Tk if tk else object):
         """Drains the queue on the Tk thread: log lines go into the log, and
         a callable put by a worker thread runs here - Tk is touched from the
         main thread only, and a "done" put after the last line runs once
-        that line is on screen."""
+        that line is on screen. A callable that raises is written to the log
+        and the status line goes red; the loop goes on, so later lines still
+        arrive."""
         try:
             while True:
                 item = self.q.get_nowait()
                 if callable(item):
-                    item()
+                    try:
+                        item()
+                    except Exception as e:                # noqa: BLE001 - the window stays alive
+                        self._append_log(f"ERROR {type(e).__name__}: {e}")
+                        self._status(f"Error: {_clip(e, 140)} - the log has the details", bad=True)
                     continue
-                self.log.configure(state="normal")
-                self.log.insert("end", item.rstrip("\n") + "\n")
-                self.log.see("end")
-                self.log.configure(state="disabled")
+                self._append_log(item)
         except queue.Empty:
             pass
-        self._poll_job = self.after(150, self._poll)
+        finally:
+            self._poll_job = self.after(150, self._poll)
+
+    def _append_log(self, text: str) -> None:
+        self.log.configure(state="normal")
+        self.log.insert("end", text.rstrip("\n") + "\n")
+        self.log.see("end")
+        self.log.configure(state="disabled")
 
     def destroy(self) -> None:
         # cancel the poll timer first: a timer left behind by a closed window
@@ -829,7 +861,7 @@ class App(tk.Tk if tk else object):
             if rc == 0:
                 self._status(ok_text)
             else:
-                last = next((ln for ln in reversed(self.last_output) if ln.strip()), f"rc {rc}")
+                last = next((ln for ln in reversed(self.last_output) if ln.strip()), f"exit code {rc}")
                 self._status(f"{fail_text}: {_clip(last, 120)} - the log has the whole message", bad=True)
         self._run_bg(go, done)
 
@@ -841,11 +873,13 @@ class App(tk.Tk if tk else object):
 
         def go():
             ok, msg = fetch.check_zowe(self.cfg, log=self._log)
-            self._log("RESULT: OK - Fetch will work" if ok else "RESULT: FAIL - fix the stage above, then Check again")
-            self.checked_ok = ok
+            passed = check_passed(ok, msg)
+            self._log("RESULT: OK - Fetch will work" if passed
+                      else "RESULT: FAIL - fix the stage above, then Check again")
+            self.checked_ok = passed
 
             def show():
-                self._status(status_after_check(ok, msg, has_sources), bad=not ok)
+                self._status(status_after_check(ok, msg, has_sources), bad=not passed)
                 self._refresh_strip()
             self._on_main(show)
         self._run_bg(go)
@@ -1054,7 +1088,7 @@ class App(tk.Tk if tk else object):
     def fetch_system(self) -> None:
         sysname = self.v_filter.get()
         if sysname == "All":
-            messagebox.showinfo("Fetch system", "Pick a system in the filter first")
+            messagebox.showinfo("Fetch system", "Pick a system in the System box first")
             return
         self._fetch([self.cfg["sources"][i]["dataset"] for i in fetch.filter_sources(self.cfg, sysname)
                      if self.cfg["sources"][i].get("enabled", True)])
