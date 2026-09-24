@@ -57,11 +57,16 @@ BANNER = "1PP 5655-EC6 IBM Enterprise COBOL for z/OS  6.3.0 P231102             
 RULER = "   LineID  PL SL  ----+-*A-1-B--+----2----+----3----+----4----+----5----+----6----+----7-|--+----8 Map and Cross Reference"
 
 
-def ibm_listing(program_records, copybooks, ruler=True, flag="C", prefix_lines=0, strip=False, flag_at=None, page_lines=0):
+def ibm_listing(program_records, copybooks, ruler=True, flag="C", prefix_lines=0, strip=False, flag_at=None, page_lines=0,
+                copy_table=None):
     """What Enterprise COBOL prints: a line number per source line, a C after
     the number on every copied line, the 80-column record after that - and,
     with `page_lines`, a page break every so many lines, each new page
-    starting with the banner and the ruler again, as the real thing does."""
+    starting with the banner and the ruler again, as the real thing does.
+    `copy_table`: [(copybook, DD name, dataset)] - the copybook-source table
+    Enterprise COBOL 6 prints after the source (which library each copybook
+    was read from), under a heading, one row per copybook with a number and
+    dates after the dataset."""
     out = [BANNER.format(page=1), "0Invocation parameters:", " TRUNC(BIN),DATA(24),XREF", "0Options in effect:", "    XREF(FULL)"]
     out += [f" some translator output line {i}" for i in range(prefix_lines)]
     page = 2
@@ -102,6 +107,11 @@ def ibm_listing(program_records, copybooks, ruler=True, flag="C", prefix_lines=0
                 emit(f"   {n:06d}{f.ljust(9)}{crec.ljust(80)}")           # the flags sit in the PL/SL columns
     out.append("")
     out.append("   LineID  Message code  Message text")
+    if copy_table:
+        out.append("")
+        out.append("0Copybook  Ddname    Library dataset                                Text  Created     Last modified")
+        for k, (cb, dd, dsn) in enumerate(copy_table, 1):
+            out.append(f"  {cb:<8}  {dd:<8}  {dsn:<44}  {k:>4}  1997/01/29  2018/11/11 08:00:27")
     text = "\n".join(out) + "\n"
     return "\n".join(ln.rstrip() for ln in text.splitlines()) + "\n" if strip else text
 

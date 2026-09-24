@@ -45,6 +45,16 @@ build.
 Every recovered copybook says in its first lines where it came from; it is
 the copybook's text as one program saw it, not the library copy, and the
 report (work\recover.md) names every one.
+
+The listing also settles a second question. After the source, Enterprise
+COBOL prints one row per copybook: the member, the DD name and the LIBRARY
+DATASET the compiler read it from. Where a copybook's name exists in several
+libraries with different content the build could only choose one copy (its
+'ambiguous_copybook' row says which and how); this tool reads the listing of
+every such program too, stores the rows (listing_copy_source) and checks
+each choice: CONFIRMED, CONTRADICTED (a wrong fact - the report names every
+one with the library the listing says) or UNKNOWN. The build does not read
+the table yet (ROADMAP re-parse item 19); nothing in the fact tables changes.
 """
 
 from __future__ import annotations
@@ -803,10 +813,13 @@ UNPROVABLE = "older compiler listing, source column not provable"
 
 
 def extract(text: str, source: str, wanted: Set[str], original: Optional[Sequence[str]] = None,
-            system: Optional[str] = None) -> Tuple[str, List[Region], Dict[str, int]]:
-    """(format seen, regions, notes) for one expanded text."""
-    lines = split_lines(text)
-    how = reading(lines)
+            system: Optional[str] = None, lines: Optional[List[str]] = None,
+            how: Optional[Dict[str, object]] = None) -> Tuple[str, List[Region], Dict[str, int]]:
+    """(format seen, regions, notes) for one expanded text. `lines` and `how`
+    (split_lines / reading) can be given when the caller has them already, so
+    a 64 MB listing is not split and read twice."""
+    lines = split_lines(text) if lines is None else lines
+    how = reading(lines) if how is None else how
     records: List[str] = [ln.rstrip("\r\n") for ln in lines]
     fmt_base = "expanded source"
     carried: Dict[str, int] = {}                                       # the listing's own notes, whatever is found later
@@ -852,6 +865,249 @@ def extract(text: str, source: str, wanted: Set[str], original: Optional[Sequenc
     if not has_copy:
         return "no COPY statements", [], carried
     return (fmt_base + ", no copy marks" + ("" if original else " and the program is not in the index to line up with")), [], carried
+
+
+# --------------------------------------------------------------------------
+# the listing's copybook-source table: which library each copybook came from
+# --------------------------------------------------------------------------
+# After the source, an Enterprise COBOL listing prints one row per copybook
+# it read: the member name, the DD name it was found through (SYSLIB), the
+# LIBRARY DATASET the compiler read it from, then a number and dates. That
+# table is the compiler's own statement of which copy went into the load
+# module - where the estate holds a copybook's name in several libraries with
+# different content, the build's resolver can only GUESS (an
+# 'ambiguous_copybook' row says which copy it took and how); the listing's
+# row is the truth the guess is checked against. Rows are recognised by
+# SHAPE alone (a heading may read COPY/BASIS or name the columns, and is not
+# relied on): a member name, a DD name of 1-8 characters, a dataset name of
+# dotted qualifiers, and nothing after it but numbers, dates and times. A
+# source line is numbered and a row is not, so a first token that is a line
+# number is never a row.
+
+_ROW_NAME = r"[A-Z@#$][A-Z0-9@#$]{0,7}"                               # a member or DD name never starts with a digit
+_ROW_QUAL = r"[A-Z0-9@#$][A-Z0-9@#$\-]{0,7}"
+_COPY_ROW = re.compile(rf"^\s*(?P<name>{_ROW_NAME})\s+(?P<dd>{_ROW_NAME})\s+"
+                       rf"(?P<dsn>{_ROW_QUAL}(?:\.{_ROW_QUAL})+)(?:\((?P<mem>{_ROW_NAME})\))?"
+                       r"(?P<rest>(?:\s+\S+)*)\s*$", re.I)
+_ROW_REST = re.compile(r"^(?:\d+|\d{4}[/.\-]\d\d[/.\-]\d\d|\d\d/\d\d/\d{2,4}|\d\d[:.]\d\d[:.]\d\d)$")
+_DSN_SHAPE = re.compile(rf"^{_ROW_QUAL}(?:\.{_ROW_QUAL})+$", re.I)
+DSN_MAX = 44
+
+
+def _copy_row(ln: str) -> Optional[Tuple[str, str, str, str]]:
+    m = _COPY_ROW.match(ln)
+    if m is None:
+        return None
+    name, dd, dsn, rest = m.group("name"), m.group("dd"), m.group("dsn"), (m.group("rest") or "").split()
+    if name.isdigit() or _LISTING_LINE.match(ln) or _OLD_LINE.match(ln):
+        return None                                                    # a numbered source line, whatever follows the number
+    if len(dsn) > DSN_MAX or not all(_ROW_REST.match(t) for t in rest):
+        return None
+    return name.upper(), dd.upper(), dsn.upper(), " ".join(rest)
+
+
+def copy_sources(lines: Sequence[str]) -> List[Tuple[str, str, str, str]]:
+    """[(copybook, DD name, dataset, the numbers and dates after it)] - every
+    row of the listing's copybook-source table, in order; [] when the listing
+    has no such table (an older compiler's). A line may start with a
+    carriage-control character glued to the name (a `0` for double spacing)."""
+    out: List[Tuple[str, str, str, str]] = []
+    for ln in lines:
+        row = _copy_row(ln)
+        if row is None and ln[:1] in "01-+" and ln[1:2].strip():
+            row = _copy_row(ln[1:])
+        if row is not None:
+            out.append(row)
+    return out
+
+
+# The table the rows go to: one row per (program, copybook) the listing named,
+# replaced per program each time that program's listing is read. Its own
+# small table - no fact table changes (the build's use of it is ROADMAP
+# re-parse item 19).
+COPY_SOURCE_TABLE = ("CREATE TABLE IF NOT EXISTS listing_copy_source (program TEXT NOT NULL, copybook TEXT NOT NULL, "
+                     "ddname TEXT, dataset TEXT, listing TEXT, seen TEXT)")
+_PICK = re.compile(r"(\d+) copies of (\S+) with different content; used (.+?) \(([^()]*)\)\s*$")
+CopySource = Tuple[str, str, str, str]                                # (copybook, ddname, dataset, listing path)
+
+
+def _fkey(folder: str) -> str:
+    return os.path.normcase(os.path.normpath(os.path.abspath(folder)))
+
+
+def library_datasets(conn: sqlite3.Connection) -> Dict[str, str]:
+    """{folder (normalised): dataset} - the `library` table, which the build
+    loads from the fetcher's `.atlas-library.json` in each fetched folder."""
+    out: Dict[str, str] = {}
+    try:
+        rows = conn.execute("SELECT folder, dataset FROM library WHERE folder IS NOT NULL AND dataset IS NOT NULL").fetchall()
+    except sqlite3.OperationalError:
+        return out
+    for folder, dataset in rows:
+        out[_fkey(folder)] = str(dataset).strip().upper()
+    return out
+
+
+def dataset_of(path: str, libs: Dict[str, str]) -> Optional[str]:
+    """The library dataset a member on disk was fetched from: the `library`
+    table first (the fetcher's marker ties the folder to its dataset), else
+    the folder's own name when it is shaped like a dataset name - the fetcher
+    names each folder after its dataset (fetch.new_source: `local` is the
+    dataset, under the department's folder). None when neither says."""
+    folder = os.path.dirname(path)
+    dsn = libs.get(_fkey(folder))
+    if dsn:
+        return dsn
+    base = os.path.basename(folder).upper()
+    return base if "." in base and len(base) <= DSN_MAX and _DSN_SHAPE.match(base) else None
+
+
+def chosen_picks(conn: sqlite3.Connection) -> List[Tuple[str, str, str, str, int]]:
+    """[(program, copybook, the path the build used, how, member id)] - every
+    'ambiguous_copybook' row in the index, its note read; a note the pattern
+    does not read is skipped (it is still in the index, unchanged)."""
+    out: List[Tuple[str, str, str, str, int]] = []
+    try:
+        rows = conn.execute("SELECT m.name, m.id, u.detail FROM unresolved u JOIN member m ON m.id = u.member_id "
+                            "WHERE u.kind = 'ambiguous_copybook' ORDER BY m.name, u.id").fetchall()
+    except sqlite3.OperationalError:
+        return out
+    for name, mid, detail in rows:
+        m = _PICK.search(detail or "")
+        if m:
+            out.append((str(name).upper(), m.group(2).upper(), m.group(3), m.group(4), int(mid)))
+    return out
+
+
+def stored_copy_sources(conn: sqlite3.Connection) -> Dict[str, List[CopySource]]:
+    """{program: [(copybook, ddname, dataset, listing)]} as stored; a program
+    whose listing was read and had no table is there with an empty list."""
+    out: Dict[str, List[CopySource]] = {}
+    try:
+        rows = conn.execute("SELECT program, copybook, ddname, dataset, listing FROM listing_copy_source "
+                            "ORDER BY program, rowid").fetchall()
+    except sqlite3.OperationalError:
+        return out
+    for program, copybook, dd, dsn, listing in rows:
+        lst = out.setdefault(str(program).upper(), [])
+        if copybook:
+            lst.append((str(copybook).upper(), str(dd or ""), str(dsn or "").upper(), str(listing or "")))
+    return out
+
+
+def store_copy_sources(conn: sqlite3.Connection, per_program: Dict[str, List[CopySource]]) -> None:
+    """Replace each named program's rows. A program read with no table keeps
+    one row with an empty copybook, so the next check says 'no table' rather
+    than 'no listing read'; nothing of any other program is touched."""
+    conn.execute(COPY_SOURCE_TABLE)
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    for program, rows in per_program.items():
+        conn.execute("DELETE FROM listing_copy_source WHERE program = ?", (program,))
+        if rows:
+            conn.executemany("INSERT INTO listing_copy_source(program, copybook, ddname, dataset, listing, seen) "
+                             "VALUES(?,?,?,?,?,?)", [(program, c, d, ds, lst, now) for c, d, ds, lst in rows])
+        else:
+            conn.execute("INSERT INTO listing_copy_source(program, copybook, ddname, dataset, listing, seen) "
+                         "VALUES(?,?,?,?,?,?)", (program, "", None, None, None, now))
+    conn.commit()
+
+
+def has_copy_sources(conn: sqlite3.Connection) -> bool:
+    try:
+        return bool(conn.execute("SELECT 1 FROM listing_copy_source LIMIT 1").fetchone())
+    except sqlite3.OperationalError:
+        return False
+
+
+def _tail(path: str, n: int = 3) -> str:
+    return "/".join(path.replace("\\", "/").split("/")[-n:])
+
+
+def check_choices(conn: sqlite3.Connection, sources: Optional[Dict[str, List[CopySource]]] = None) -> List[Dict[str, object]]:
+    """One verdict per copybook choice the build made, against the program's
+    listing: CONFIRMED (the listing names the dataset the chosen member came
+    from), CONTRADICTED (it names another - a wrong fact in the index),
+    UNKNOWN (no listing read for the program, no table in it, no row for that
+    copybook, or the chosen member's dataset is not known). `sources`: the
+    rows to check against, else the stored table."""
+    libs = library_datasets(conn)
+    srcs = stored_copy_sources(conn) if sources is None else sources
+    holders: Dict[str, str] = {}                                       # dataset -> a folder the index holds for it
+    for folder, dsn in libs.items():
+        holders.setdefault(dsn, folder)
+    out: List[Dict[str, object]] = []
+    for program, copybook, used, how, mid in chosen_picks(conn):
+        used_dsn = dataset_of(used, libs)
+        rows = [r for r in srcs.get(program, []) if r[0] == copybook]
+        said = sorted({r[2] for r in rows if r[2]})
+        v: Dict[str, object] = {"program": program, "copybook": copybook, "used": used, "used_dataset": used_dsn,
+                                "how": how, "member_id": mid, "listing_datasets": said,
+                                "ddnames": sorted({r[1] for r in rows if r[1]}),
+                                "listings": sorted({r[3] for r in rows if r[3]}), "index_has": ""}
+        if program not in srcs:
+            v.update(verdict="UNKNOWN", why="no listing of the program was read")
+        elif not srcs[program]:
+            v.update(verdict="UNKNOWN", why="the program's listing has no copybook-source table")
+        elif not said:
+            v.update(verdict="UNKNOWN", why=f"the listing's table has no row for {copybook}")
+        elif used_dsn is None:
+            v.update(verdict="UNKNOWN", why="the chosen member's library dataset is not known (no `library` row for its "
+                                            "folder, and the folder is not named after a dataset)")
+        elif said == [used_dsn]:
+            v.update(verdict="CONFIRMED", why="")
+        else:
+            other = [d for d in said if d != used_dsn]
+            have = ""
+            for (path,) in conn.execute(f"SELECT path FROM member WHERE UPPER(name) = ? AND kind IN "
+                                        f"({','.join('?' * len(RESOLVER_KINDS))})", (copybook, *RESOLVER_KINDS)):
+                if dataset_of(path, libs) in other:
+                    have = f"the index holds that copy at {_tail(path)} - the build chose the other"
+                    break
+            if not have:
+                have = (f"the index holds that library ({_tail(holders[other[0]])}) but no {copybook} in it"
+                        if other[0] in holders else "not a library the index holds - fetch it")
+            v.update(verdict="CONTRADICTED", why="the listing names another library", index_has=have)
+        out.append(v)
+    return out
+
+
+def choice_counts(checks: Sequence[Dict[str, object]]) -> Tuple[int, int, int]:
+    c = Counter(str(v["verdict"]) for v in checks)
+    return c["CONFIRMED"], c["CONTRADICTED"], c["UNKNOWN"]
+
+
+def choice_line(checks: Sequence[Dict[str, object]]) -> str:
+    a, b, u = choice_counts(checks)
+    return f"copybook choices checked against the listings: {a} confirmed, {b} contradicted, {u} unknown"
+
+
+def choice_report(checks: Sequence[Dict[str, object]], root: Optional[str]) -> List[str]:
+    """The report section: every contradicted choice (each is a wrong fact in
+    the index), and the counts for the rest."""
+    a, b, u = choice_counts(checks)
+    whys = Counter(str(v["why"]) for v in checks if v["verdict"] == "UNKNOWN")
+    lines = ["\n## Copybook choices, checked against the listings\n\n"
+             "Where a copybook's name exists in several libraries with different content the build chose one copy "
+             "('ambiguous_copybook' rows: COPY..OF, then the program's own system in its declared order, then the "
+             "authoritative copy, then the same folder, then the first found). The compiler listing names the library "
+             "the compiler read each copybook from - that is the truth the choice is checked against. The build "
+             "itself does not read this table yet (ROADMAP re-parse item 19); a contradicted choice is a wrong fact "
+             "until then, and `program NAME` shows the listing's library under its notes.\n\n"
+             f"- {len(checks)} choice{'s' if len(checks) != 1 else ''} checked: {a} confirmed, {b} contradicted, {u} unknown"
+             + ("" if not whys else " (" + "; ".join(f"{n}: {w}" for w, n in sorted(whys.items(), key=lambda kv: (-kv[1], kv[0])))
+                                           + ")") + "\n"]
+    if not b:
+        lines.append("\n_no contradicted choice_\n")
+        return lines
+    lines.append("\n| program | copybook | the index used | the listing says | verdict |\n|---|---|---|---|---|\n")
+    for v in checks:
+        if v["verdict"] != "CONTRADICTED":
+            continue
+        used = f"{v['used_dataset']} ({_tail(str(v['used']))}; {v['how']})"
+        says = (", ".join(str(d) for d in v["listing_datasets"]) + (f" ({', '.join(str(d) for d in v['ddnames'])})" if v["ddnames"] else "")
+                + f" - {v['index_has']}")
+        lines.append(f"| {v['program']} | {v['copybook']} | {used} | {says} | CONTRADICTED |\n")
+    return lines
 
 
 # --------------------------------------------------------------------------
@@ -1173,6 +1429,21 @@ def _mark_programs(db: str, names: Sequence[str]) -> int:
         conn.close()
 
 
+def _check_after(db: str, per_program: Dict[str, List[CopySource]], dry_run: bool) -> List[Dict[str, object]]:
+    """Store this run's copybook-source rows (not on a dry run) and check
+    every choice against the rows now known: this run's for the programs
+    read, the stored ones for the rest."""
+    conn = sqlite3.connect(db)
+    try:
+        if per_program and not dry_run:
+            store_copy_sources(conn, per_program)
+        known = stored_copy_sources(conn)
+        known.update(per_program)
+        return check_choices(conn, known)
+    finally:
+        conn.close()
+
+
 def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry_run: bool = False,
         refresh: bool = False, everything: bool = False, log=print, report: Optional[str] = REPORT) -> Dict[str, object]:
     conn = sqlite3.connect(db)
@@ -1198,6 +1469,8 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
         sources = listing_sources(conn, folders)
         index = originals(conn)
         needing = needing_programs(conn, missing)
+        # the programs whose copybook the build CHOSE among several: their listings say which copy was right
+        chosen = {p[0] for p in chosen_picks(conn)}
         roots_out = [out_dir] + ([os.path.join(root, d, FOLDER) for d in os.listdir(root) if os.path.isdir(os.path.join(root, d))]
                                  if root and os.path.isdir(root) else [])
         real = real_copies(conn, roots_out)
@@ -1230,29 +1503,42 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
                     _save_marker(d, ents)
     log(f"missing copybooks in the index: {len(missing):,}, used in {sum(missing.values()):,} places (a place = one program "
         "copying one of them)")
+    check_only = False                                                 # nothing to recover: read listings only to check the choices
     if not missing and not everything:
         log("nothing to recover: every copybook the programs copy is in the index")
-        return {"missing": 0, "sources": len(sources), "written": 0, "rejected": 0, "not_found": 0, "removed": len(removed),
-                "kept": 0, "formats": {}, "out": out_dir, "unconfirmed": 0, "per_system": 0}
+        if not chosen:
+            return {"missing": 0, "sources": len(sources), "written": 0, "rejected": 0, "not_found": 0, "removed": len(removed),
+                    "kept": 0, "formats": {}, "out": out_dir, "unconfirmed": 0, "per_system": 0}
+        check_only = True
     if not sources:
         log("expanded texts to read: 0 - the index holds no compiler listings and no --from folder was given")
         log('next: run again as  python -m atlas.recover --db atlas.db --from "FOLDER"  with the folder that holds the '
             "programs' compiler listings or expanded source")
+        checked = None
+        if chosen:
+            checks = _check_after(db, {}, dry_run=True)
+            log(choice_line(checks) + " - the listings would say which copy of a copybook chosen among several was right")
+            checked = choice_counts(checks)
         return {"missing": len(missing), "sources": 0, "written": 0, "rejected": 0, "not_found": len(missing), "removed": 0,
-                "kept": 0, "formats": {}, "out": out_dir, "unconfirmed": 0}
+                "kept": 0, "formats": {}, "out": out_dir, "unconfirmed": 0, "checked": checked}
     found_all = len(sources)
     if not everything:
         # only the expanded text of a program that copies a missing copybook can hold it; a text
-        # whose name the index does not know at all is read too, since nothing says it cannot
+        # whose name the index does not know at all is read too, since nothing says it cannot; and
+        # the listing of a program whose copybook was chosen among several says which copy was right
         sources = [(p, s) for p, s in sources
                    if os.path.splitext(os.path.basename(p))[0].upper() in needing
+                   or os.path.splitext(os.path.basename(p))[0].upper() in chosen
                    or os.path.splitext(os.path.basename(p))[0].upper() not in index]
     log(f"expanded texts to read: {len(sources):,} of {found_all:,} found "
         f"({'compiler listings the index holds' if not folders else 'listings + the folders given'})"
-        + ("" if everything else f" - only the {len(needing):,} programs that copy a missing copybook, and texts the "
-                                  "index cannot place"))
+        + ("" if everything else f" - only the {len(needing):,} programs that copy a missing copybook"
+                                  + (f", the {len(chosen):,} with a copybook chosen among several (to check the choice "
+                                     "against the listing)" if chosen else "")
+                                  + ", and texts the index cannot place"))
     if not sources:
-        log("none of the expanded texts belongs to a program that copies a missing copybook: are these the "
+        log("none of the expanded texts belongs to a program that copies a missing copybook"
+            + (" or has a copybook chosen among several" if chosen else "") + ": are these the "
             "listings of the programs the coverage report calls partial?")
         return {"missing": len(missing), "sources": 0, "written": 0, "rejected": 0, "not_found": len(missing), "removed": len(removed),
                 "kept": 0, "formats": {}, "out": out_dir, "unconfirmed": 0, "per_system": 0}
@@ -1266,6 +1552,7 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
     lined_up = 0
     look_untied: List[Tuple[str, int, int, str, list, str]] = []        # (listing, untied line, program line before, its shape, lines before, why)
     columns: Counter = Counter()                                         # where the source starts, per listing
+    copy_src: Dict[str, List[CopySource]] = {}                           # program -> the listing's copybook-source rows
     t0 = last = time.time()
     for k, (path, system) in enumerate(sources, 1):
         if time.time() - last >= 10:
@@ -1287,7 +1574,14 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
                 original = split_lines(reader.load(orig_path)[0])
             except OSError:
                 original = None
-        fmt, regions, stats = extract(text, path, wanted or set(), original, system)
+        lines_ = split_lines(text)
+        how = reading(lines_)
+        fmt, regions, stats = extract(text, path, wanted or set(), original, system, lines=lines_, how=how)
+        if how["kind"] in ("current", "older"):
+            # a listing: its copybook-source table says which library each copybook came from (no table: an empty list,
+            # stored as such, so the check says 'no table' rather than 'no listing read')
+            copy_src.setdefault(stem.upper(), []).extend((c, d, ds, path) for c, d, ds, _n in copy_sources(lines_))
+        del lines_
         formats[fmt] += 1
         unattached += stats.get("flagged lines with no COPY before them", 0)
         if stats.get("source column"):
@@ -1380,6 +1674,8 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
         for d, ents in entries.items():
             if ents or os.path.isdir(d):
                 _save_marker(d, ents)
+    # the listings' copybook-source rows, stored per program read, and every choice the build made checked against them
+    checks = _check_after(db, copy_src, dry_run) if (copy_src or chosen) else []
     seen_names = set(by_name) | have_now
     unread = sorted(n for n in missing if n not in seen_names and n in unprovable)   # in a listing, column unproven
     not_found = sorted(n for n in missing if n not in seen_names and n not in unprovable)
@@ -1428,6 +1724,8 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
         for n in stale:
             where = next((os.path.join(d, n + ".cpy") for d, ents in entries.items() if n in ents), "?")
             lines.append(f"| {n} | {os.path.relpath(where, root) if root and where != '?' else where} |\n")
+    if checks:
+        lines += choice_report(checks, root)
     if look_untied or rejected:
         lines.append("\n## Please look\n\nOpen the listing named below in VS Code and go to the line (Ctrl+G). "
                      "Answer in words and numbers only - nothing from the file needs to be copied.\n")
@@ -1451,7 +1749,9 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
     agree = sum(1 for _n, _f, how in written if "identical in" in how or "confirmed by a second" in how)
     differ = sum(1 for _n, _f, how in written if "different texts" in how)
     per_system = sum(1 for _n, _f, how in written if "differs between systems" in how)
-    if not written and kept:
+    if check_only:
+        pass                                                           # nothing was missing: said above, once
+    elif not written and kept:
         log(f"nothing new to write: {kept:,} of {len(missing):,} missing copybooks were recovered on an earlier run"
             + (f"; {len(not_found):,} in no expanded text" if not_found else ""))
         log("next: run your usual build command if you have not since - the programs that copy them re-expand by themselves")
@@ -1464,6 +1764,10 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
             + (f", {len(unread):,} in older listings whose source column could not be proven (see the report)" if unread else "")
             + (f"; {lined_up:,} text(s) read by lining up with the program" if lined_up else "")
             + (f"; {kept:,} already recovered earlier" if kept else ""))
+    if checks:
+        n_contra = choice_counts(checks)[1]
+        log(choice_line(checks) + (" - every contradicted choice is a wrong fact in the index: the report names each "
+                                   "one with the library the listing says" if n_contra else ""))
     if nested_only:
         log(f"  {len(nested_only):,} of the {len(not_found):,} not found are copied from INSIDE another copybook: their lines sit "
             "inside that copybook's block in the listings, which this tool does not cut apart yet - the report's table names the "
@@ -1480,7 +1784,8 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
         log("next: run your usual build command - the programs that copy them re-expand by themselves")
     return {"missing": len(missing), "sources": len(sources), "written": len(written), "rejected": len(rejected),
             "not_found": len(not_found), "removed": len(removed), "kept": kept, "formats": dict(formats),
-            "out": out_dir, "unconfirmed": len(unconfirmed), "per_system": per_system}
+            "out": out_dir, "unconfirmed": len(unconfirmed), "per_system": per_system,
+            "checked": choice_counts(checks) if checks else None}
 
 
 def trace(db: str, name: str, folders: Sequence[str] = (), log=print) -> int:

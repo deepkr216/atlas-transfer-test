@@ -530,6 +530,7 @@ def cmd_program(conn: sqlite3.Connection, name: str) -> str:
             out.append("- codes/literals set here: " + ", ".join(f"'{l['literal']}'->{l['field']}" for l in lits) + "\n")
 
         out.append(unresolved_for(conn, [p["member_id"]]))
+        out.append(_listing_says(conn, p["member_id"]))
     out.append(_docs_section(conn, name.upper()))
     return "".join(out)
 
@@ -1209,6 +1210,7 @@ def cmd_copybook(conn: sqlite3.Connection, name: str) -> str:
         for c in copies:
             r = conn.execute("SELECT MAX(offset+length) AS len, COUNT(*) AS n FROM field WHERE member_id=?", (c["id"],)).fetchone()
             out.append(f"  - `{c['path']}`: {r['len']} bytes, {r['n']} fields" + ("  [authoritative]" if c["authoritative"] else "") + "\n")
+    out.append(_listing_sources_of(conn, name))
     progs = conn.execute("""SELECT DISTINCT m.name AS member_name, p.program_id, p.id AS pid, c.replacing, c.line,
                                    c.resolved_member_id, rm.path AS rpath, rm.system AS rsys, rm.norm_sha AS rsha
                             FROM copy_use c JOIN member m ON m.id=c.member_id JOIN program p ON p.member_id=m.id
@@ -1515,6 +1517,63 @@ def _partial_members(conn: sqlite3.Connection, limit: int = COVERAGE_ROWS) -> st
 _PICK_RE = re.compile(r"(\d+) copies of (\S+) with different content; used (.+?) \(([^()]*)\)\s*$")
 
 
+# The compiler listing's own statement of which library each copybook came
+# from: atlas.recover reads the listing's copybook-source table into
+# listing_copy_source and checks every 'ambiguous_copybook' choice against it
+# (the resolver's guess versus the compiler's fact). Absent until recover has
+# run over an index with listings; nothing here depends on it being there.
+
+def _choices_checked(conn: sqlite3.Connection) -> str:
+    """One sentence for coverage: how the choices stand against the listings."""
+    from . import recover
+    if not recover.has_copy_sources(conn):
+        return ""
+    a, b, u = recover.choice_counts(recover.check_choices(conn))
+    return (f"\n{a} of these choices {'is' if a == 1 else 'are'} confirmed by the program's listing, {b} contradicted "
+            f"(see work/recover.md), {u} unknown - the listing names the library the compiler read the copybook from.\n")
+
+
+def _listing_says(conn: sqlite3.Connection, member_id: int) -> str:
+    """`program`: what the program's listing says each copybook came from,
+    and, for a copybook chosen among several, whether that agrees with the
+    copy the build used."""
+    from . import recover
+    if not recover.has_copy_sources(conn):
+        return ""
+    row = conn.execute("SELECT name FROM member WHERE id=?", (member_id,)).fetchone()
+    if not row:
+        return ""
+    rows = conn.execute("SELECT DISTINCT copybook, ddname, dataset FROM listing_copy_source WHERE program=? AND copybook<>'' "
+                        "ORDER BY copybook, dataset", (row[0].upper(),)).fetchall()
+    if not rows:
+        return ""
+    verdicts = {v["copybook"]: v for v in recover.check_choices(conn) if v["member_id"] == member_id}
+    out = ["\n### Listing says\n"]
+    for r in rows:
+        line = f"- listing says: {r['copybook']} came from {r['dataset']} ({r['ddname'] or 'no DD name'})"
+        v = verdicts.get(r["copybook"])
+        if v is not None and v["verdict"] == "CONTRADICTED":
+            line += f" - CONTRADICTS the copy the build used ({v['used_dataset']}; {v['index_has']}) - see work/recover.md"
+        elif v is not None and v["verdict"] == "CONFIRMED":
+            line += " - confirms the copy the build used"
+        out.append(line + "\n")
+    return "".join(out)
+
+
+def _listing_sources_of(conn: sqlite3.Connection, copybook: str) -> str:
+    """`copybook`: the datasets the programs' listings say this copybook came from, per program count."""
+    from . import recover
+    if not recover.has_copy_sources(conn):
+        return ""
+    rows = conn.execute("SELECT dataset, COUNT(DISTINCT program) AS n FROM listing_copy_source WHERE copybook=? "
+                        "GROUP BY dataset ORDER BY n DESC, dataset", (copybook.upper(),)).fetchall()
+    if not rows:
+        return ""
+    return ("\nThe programs' compiler listings say this copybook came from: "
+            + ", ".join(f"{r['dataset']} ({r['n']} program{'s' if r['n'] != 1 else ''})" for r in rows)
+            + " - the library the compiler read, per listing; `program NAME` shows each one.\n")
+
+
 def _chosen_members(conn: sqlite3.Connection, limit: int = COVERAGE_ROWS) -> str:
     """Members the index marks `partial` only because a copybook was chosen
     among several same-named ones with different content: every COPY
@@ -1565,6 +1624,7 @@ def _chosen_members(conn: sqlite3.Connection, limit: int = COVERAGE_ROWS) -> str
     if len(rows) > limit:
         out.append(f"_... {len(rows) - limit} more; every one of them: `coverage --all`; `program NAME` shows each "
                    "member's choice under Unresolved in scope_\n")
+    out.append(_choices_checked(conn))
     out.append(f"\n> {'This member is' if len(rows) == 1 else f'These {len(rows)} members are'} NOT parsed only in "
                "part: every COPY expanded, and their facts are "
                "complete for the copy named. The index marks them `partial` only because the build repeats the "
