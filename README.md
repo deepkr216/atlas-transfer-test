@@ -312,8 +312,10 @@ falls back to the bare PROC only when no indexed job expands it.
   (X(01)) - stored by this program; PGMB WS-DEP-SEX via copybook DEPREC2
   (X(01)) - layout differs from PGMA's; PGMC: no field at that offset`) -
   matched by byte range, never by name; a FILLER, a longer or shorter item
-  or a run of items is said as such. `dbd NAME` counts the programs that
-  store and read each segment.
+  or a run of items is said as such. An area whose copybook is missing from
+  the index is "layout incomplete - bytes unknown", never a 0-byte area, and
+  an I/O area with no 01 in the program is said as undeclared. `dbd NAME`
+  counts the programs that store and read each segment.
 - `layout COPYBOOK|01 [--program PGM]` — the byte layout (offset, length,
   PIC, usage, OCCURS/ODO/REDEFINES, 88 values, record length) from the
   parser's numbers; with `--program` the 01 as that program sees it after

@@ -13,11 +13,21 @@ I/O area, whatever that program calls it.
   programs storing and reading each segment; `--dbd` keeps one DBD when two
   use the segment name. On an index built before the value-flow tables the
   copybook's own rows answer, with the caveat said.
+
+  The edges a second DBD (CLMDBD) covers: an 01 holding a COPY of a copybook
+  the index lacks is "layout incomplete", never a 0-byte area; an I/O area
+  name with no 01 in the program is said as undeclared (the rebuild sentence
+  only when the pfield table truly is absent); a call with no I/O area names
+  the call; on the old index the program's own rows are cited at the
+  member's lines (field.line is the EXPANDED line) and an 01 that follows a
+  COPY is paired with ITS copybook, both bounds mapped to one coordinate
+  system first.
 """
 
 import contextlib
 import io
 import os
+import re
 import shutil
 import sqlite3
 import sys
@@ -103,7 +113,54 @@ FILES = {
         "       LINKAGE SECTION.\n       01  OTH-PCB PIC X(40).\n"
         "       PROCEDURE DIVISION USING OTH-PCB.\n"
         "           CALL 'CBLTDLI' USING WS-REPL OTH-PCB OTH-AREA.\n           GOBACK.\n"),
+    # ---- a second database for the edge cases (the DEPSEG lines above stay exact) ----
+    "CLMDBD.dbd": ("         DBD   NAME=CLMDBD,ACCESS=HDAM\n"
+                   "         SEGM  NAME=CLMSEG,PARENT=0,BYTES=50\n"
+                   "         FIELD NAME=(CLMNO,SEQ,U),BYTES=8,START=1\n"
+                   "         FIELD NAME=CLMNAME,BYTES=30,START=9\n"
+                   "         FIELD NAME=CLMSEX,BYTES=1,START=45\n"
+                   "         DBDGEN\n         FINISH\n         END\n"),
+    # the I/O area's 01 holds a COPY of a copybook that is NOT in the index
+    "PGMX.cbl": H.format(p="PGMX") + (
+        "       01  WS-GU            PIC X(4) VALUE 'GU  '.\n"
+        "       01  WS-X-AREA.\n"
+        "           COPY MISSING.\n"
+        "       LINKAGE SECTION.\n       01  CLM-PCB PIC X(40).\n"
+        "       PROCEDURE DIVISION USING CLM-PCB.\n"
+        "           CALL 'CBLTDLI' USING WS-GU CLM-PCB WS-X-AREA.\n           GOBACK.\n"),
+    # an I/O area name with no 01 in the program (line 10), and a call with no I/O area at all (line 11)
+    "PGMU.cbl": H.format(p="PGMU") + (
+        "       01  WS-GU            PIC X(4) VALUE 'GU  '.\n"
+        "       LINKAGE SECTION.\n       01  CLM-PCB PIC X(40).\n"
+        "       PROCEDURE DIVISION USING CLM-PCB.\n"
+        "           CALL 'CBLTDLI' USING WS-GU CLM-PCB WS-UNKNOWN-AREA.\n"
+        "           CALL 'CBLTDLI' USING WS-GU CLM-PCB.\n           GOBACK.\n"),
+    # 01 Q-IN / COPY A / 01 Q-OUT / COPY B / 01 Q-OWN with its own items: Q-OUT must get B, and
+    # Q-OWN's items (member lines 12-13; expanded lines 23-24 after the two copybooks) cite the member's lines
+    "PGMQ.cbl": H.format(p="PGMQ") + (
+        "       01  WS-GU            PIC X(4) VALUE 'GU  '.\n"
+        "       01  Q-IN.\n"
+        "           COPY DEPREC3.\n"
+        "       01  Q-OUT.\n"
+        "           COPY DEPREC2.\n"
+        "       01  Q-OWN.\n"
+        "           05  QO-KEY           PIC X(08).\n"
+        "           05  QO-REST          PIC X(42).\n"
+        "       LINKAGE SECTION.\n       01  CLM-PCB PIC X(40).\n"
+        "       PROCEDURE DIVISION USING CLM-PCB.\n"
+        "           CALL 'CBLTDLI' USING WS-GU CLM-PCB Q-IN.\n"
+        "           CALL 'CBLTDLI' USING WS-GU CLM-PCB Q-OUT.\n"
+        "           CALL 'CBLTDLI' USING WS-GU CLM-PCB Q-OWN.\n           GOBACK.\n"),
 }
+for _p in ("PGMX", "PGMU", "PGMQ"):
+    FILES[_p + ".psb"] = ("         PCB   TYPE=DB,DBDNAME=CLMDBD,PROCOPT=G,KEYLEN=8\n"
+                          "         SENSEG NAME=CLMSEG,PARENT=0\n"
+                          f"         PSBGEN LANG=COBOL,PSBNAME={_p}\n         END\n")
+
+OLD = "this index was built before the value-flow tables: rebuild it for this program's own offsets"
+UNDECLARED = ("PGMU (WS-UNKNOWN-AREA): WS-UNKNOWN-AREA is not declared in PGMU (no 01 of that name; "
+              "a LINKAGE item or a copybook missing from the index?)")
+INCOMPLETE = "PGMX: layout incomplete (copybook MISSING missing) - bytes unknown"
 
 GENDER = ("- GENDER (bytes 45-45): PGMA DEP-GENDER via copybook DEPSEG (X(01)) `DEPSEG:4` - stored by this program; "
           "PGMB WS-DEP-SEX via copybook DEPREC2 (X(01)) `DEPREC2:5` - layout differs from PGMA's; "
@@ -136,11 +193,29 @@ class SegmentOffsets(unittest.TestCase):
             build._main([src, "--db", cls.db, "--rebuild", "--quiet"])
         cls.conn = query.connect(cls.db)
         cls.text = query.cmd_segment(cls.conn, "DEPSEG", "DEPDBD")
+        cls.clm = query.cmd_segment(cls.conn, "CLMSEG")
+        # the same estate as an index built before the value-flow tables: no pfield table
+        cls.old_db = os.path.join(cls.td, "old.db")
+        shutil.copyfile(cls.db, cls.old_db)
+        c = sqlite3.connect(cls.old_db)
+        c.executescript("DROP TABLE pfield;")
+        c.close()
+        conn = query.connect(cls.old_db)
+        try:
+            cls.old_text = query.cmd_segment(conn, "DEPSEG")
+            cls.old_clm = query.cmd_segment(conn, "CLMSEG")
+        finally:
+            conn.close()
 
     @classmethod
     def tearDownClass(cls):
         cls.conn.close()
         shutil.rmtree(cls.td, ignore_errors=True)
+
+    def _gate(self, answer: str, db: str) -> None:
+        """Every [[MEMBER line "token"]] in `answer` passes verify_citations on `db`."""
+        res, _u = verify_citations.check_answer(answer, db_path=db)
+        self.assertEqual([r.status for r in res], ["PASS"] * len(res), [(r.status, r.detail) for r in res])
 
     # ---- the lines ----------------------------------------------------------
 
@@ -200,22 +275,77 @@ class SegmentOffsets(unittest.TestCase):
     # ---- an index built before the value-flow tables ------------------------------
 
     def test_old_index_answers_from_the_copybooks_own_rows_and_says_so(self):
-        old = os.path.join(self.td, "old.db")
-        shutil.copyfile(self.db, old)
-        c = sqlite3.connect(old)
-        c.executescript("DROP TABLE pfield;")
-        c.close()
-        conn = query.connect(old)
-        try:
-            text = query.cmd_segment(conn, "DEPSEG")
-        finally:
-            conn.close()
+        text = self.old_text
         self.assertIn(GENDER, text)
         self.assertIn(BIRTHDT, text)
         self.assertIn(OKEY, text)
-        self.assertIn("| PGMA | DEP-IO-AREA | copybook DEPSEG (this index was built before the value-flow tables: "
-                      "rebuild it for this program's own offsets) | 50 | ISRT | stores | PGMA:13 |", text)
+        self.assertIn(f"| PGMA | DEP-IO-AREA | copybook DEPSEG ({OLD}) | 50 | ISRT | stores | PGMA:13 |", text)
         self.assertIn("| PGMO | OTH-AREA | in the program (this index was built before", text)
+
+    def test_old_index_cites_the_members_lines_not_the_expanded_ones(self):
+        # Q-OWN's items are the program's own rows; field.line is the EXPANDED line (23-24, after the
+        # two copybooks) and must be mapped back to the member's lines (12-13) or the cite fails the gate
+        self.assertIn("PGMQ (Q-OWN) QO-KEY in the program (X(08)) `PGMQ:12`", self.old_clm)
+        self.assertIn("QO-REST in the program (X(42), bytes 9-50: longer than the DBD field) `PGMQ:13`", self.old_clm)
+        self.assertNotIn("`PGMQ:23`", self.old_clm)
+        self.assertNotIn("`PGMQ:24`", self.old_clm)
+        self._gate('[[PGMQ 12 "QO-KEY"]] [[PGMQ 13 "QO-REST"]]', self.old_db)
+        # and every cite the old-index report prints is a real layout line: cited with the text written
+        # on that line, it passes the gate (an expanded line number would reach another line, or none)
+        cites = sorted(set(re.findall(r"`([A-Z0-9/]+):(\d+)`", self.old_clm)))
+        self.assertTrue(cites)
+        conn = query.connect(self.old_db)
+        try:
+            lines = {(m, ln): query.source_line(conn, m, int(ln)) for m, ln in cites}
+        finally:
+            conn.close()
+        self.assertEqual(lines[("PGMQ", "12")], "05  QO-KEY           PIC X(08).")
+        self._gate(" ".join(f'[[{m} {ln} "{lines[(m, ln)]}"]]' for m, ln in cites), self.old_db)
+
+    def test_old_index_pairs_an_01_after_a_copy_with_its_own_copybook(self):
+        # 01 Q-IN / COPY DEPREC3 / 01 Q-OUT / COPY DEPREC2: the 01's bounds are expanded lines, copy_use
+        # counts member lines - compared raw, Q-IN got both COPYs and Q-OUT none
+        self.assertIn(f"| PGMQ | Q-IN | copybook DEPREC3 ({OLD}) | 44 | GU | reads | PGMQ:17 |", self.old_clm)
+        self.assertIn(f"| PGMQ | Q-OUT | copybook DEPREC2 ({OLD}) | 50 | GU | reads | PGMQ:18 |", self.old_clm)
+        self.assertIn("PGMQ (Q-OUT) WS-DEP-SEX via copybook DEPREC2 (X(01)) `DEPREC2:5`", self.old_clm)
+        self.assertIn("PGMQ (Q-IN) D3-NO via copybook DEPREC3 (X(08)) `DEPREC3:1`", self.old_clm)
+        self.assertNotIn("COPY statements inside the 01", self.old_clm)
+        self.assertNotIn("no items in this index", self.old_clm)
+        # the same pairing on the current index, and 'layout differs' names the area it differs from
+        self.assertIn("| PGMQ | Q-OUT | copybook DEPREC2 | 50 | GU | reads | PGMQ:18 |", self.clm)
+        self.assertIn("`DEPREC2:1` - layout differs from PGMQ (Q-IN)'s", self.clm)
+
+    # ---- a copybook missing from the index, an undeclared area, a call with no area ------------
+
+    def test_missing_copybook_is_an_incomplete_layout_not_a_0_byte_area(self):
+        for text in (self.clm, self.old_clm):
+            self.assertIn("| PGMX | WS-X-AREA | layout incomplete: copybook MISSING not in the index", text)
+            self.assertEqual(text.count(INCOMPLETE), 3, text)      # one per DBD field line
+            self.assertNotIn("PGMX: no field at that offset", text)
+            self.assertNotIn("area shorter: 0 bytes", text)
+            self.assertNotIn("| PGMX | WS-X-AREA | in the program", text)
+        self.assertIn("| PGMX | WS-X-AREA | layout incomplete: copybook MISSING not in the index | ? | GU | reads | PGMX:12 |",
+                      self.clm)
+        self.assertIn(f"| PGMX | WS-X-AREA | layout incomplete: copybook MISSING not in the index ({OLD}) | ? |",
+                      self.old_clm)
+
+    def test_undeclared_io_area_is_said_as_undeclared_not_as_an_old_index(self):
+        self.assertEqual(self.clm.count(UNDECLARED), 3, self.clm)
+        self.assertIn("| PGMU | WS-UNKNOWN-AREA | not declared in PGMU | ? | GU | reads | PGMU:10 |", self.clm)
+        self.assertNotIn("value-flow tables", self.clm)         # the pfield table exists: no rebuild sentence
+        self.assertNotIn("not indexed as a layout", self.clm)
+        # on the old index the same sentence, and the rebuild sentence because the table truly is absent
+        self.assertEqual(self.old_clm.count(UNDECLARED), 3, self.old_clm)
+        self.assertIn(f"| PGMU | WS-UNKNOWN-AREA | not declared in PGMU ({OLD}) | ? | GU | reads | PGMU:10 |",
+                      self.old_clm)
+
+    def test_a_call_with_no_io_area_names_the_call(self):
+        for text in (self.clm, self.old_clm):
+            self.assertEqual(text.count("PGMU (call at PGMU:11): no I/O area on the call"), 3, text)
+            self.assertNotIn("PGMU ():", text)
+            self.assertNotIn("I/O area ?", text)
+            self.assertIn("| PGMU | (none) | no I/O area on the call | ? | GU | reads | PGMU:11 |", text)
+        self._gate('[[PGMU 11 "CBLTDLI"]] [[PGMU 10 "WS-UNKNOWN-AREA"]] [[PGMX 12 "WS-X-AREA"]]', self.db)
 
 
 if __name__ == "__main__":

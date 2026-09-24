@@ -39,7 +39,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import re
 
-from . import cobol, reader, screens
+from . import cobol, expand, reader, screens
 from . import flow   # the `flow` engine; it imports this module back, both at run time only
 
 
@@ -2753,7 +2753,9 @@ class _AreaItem:
         return self.length * self.occurs
 
     def cite(self) -> str:
-        return f"`{self.src_name}:{self.src_line}`" if self.src_name and self.src_line else ""
+        if self.src_name and self.src_line:
+            return f"`{self.src_name}:{self.src_line}`"
+        return "(line not in the index's line map)"   # said, never dropped in silence
 
     def shape(self) -> str:                       # X(01) / S9(7)V99 COMP-3 / group
         if self.is_group:
@@ -2761,67 +2763,157 @@ class _AreaItem:
         return (self.pic or "?") + (f" {self.usage}" if self.usage and self.usage != "DISPLAY" else "")
 
 
+def _next_root_exp(conn: sqlite3.Connection, pid: int, member_id: int, root_exp: int, has_pfield: bool) -> int:
+    """The expanded line where a program's 01 ends: the next 01/77 of the
+    program's own (pfield roots, or `field` roots on an older index) or the
+    first paragraph, whichever comes first; a far line when nothing follows."""
+    bounds = []
+    if has_pfield:
+        bounds.append(conn.execute("SELECT MIN(exp_line) FROM pfield WHERE program_id=? AND parent_id IS NULL "
+                                   "AND exp_line>?", (pid, root_exp)).fetchone()[0])
+    else:
+        bounds.append(conn.execute("SELECT MIN(line) FROM field WHERE member_id=? AND parent_id IS NULL AND line>?",
+                                   (member_id, root_exp)).fetchone()[0])
+    try:
+        bounds.append(conn.execute("SELECT MIN(start_line) FROM paragraph WHERE program_id=?", (pid,)).fetchone()[0])
+    except sqlite3.OperationalError:              # an index without the paragraph table: the roots bound it
+        pass
+    live = [b for b in bounds if b is not None and b > root_exp]
+    return min(live) if live else 10 ** 9
+
+
+def _copies_inside_01(conn: sqlite3.Connection, pid: int, member_id: int, root_exp: int, nxt_exp: int
+                      ) -> Tuple[List[sqlite3.Row], List[str]]:
+    """The COPY statements written inside a program's 01 (from its line to
+    the next 01's), in ONE coordinate system. The 01's bounds come from
+    `pfield` / `field`, whose lines are EXPANDED; `copy_use` counts the
+    member's own lines. Both bounds are mapped back through the line map
+    before they meet copy_use, so an 01 that follows a COPY is paired with
+    ITS copybook and not the previous one's. A resolved copybook is kept
+    only when its expanded run sits inside the 01 (a COPY nested in a
+    copybook is recorded in that copybook's lines, not the program's).
+    (the COPY rows in the index, the copybook names missing from it)."""
+    m1, l1, d1, _v = origin(conn, pid, root_exp)
+    if not m1 or d1 or l1 is None:
+        return [], []                             # the 01 itself came from a copybook: nothing to pair
+    l2 = 10 ** 9
+    if nxt_exp < 10 ** 9:
+        m2, ln2, d2, _v2 = origin(conn, pid, nxt_exp)
+        if m2 == m1 and not d2 and ln2 is not None:
+            l2 = ln2
+        else:                                     # the next entry is inside a copybook: the program's first line after it
+            r = conn.execute("SELECT MIN(src_start) FROM expand_run WHERE program_id=? AND depth=0 AND src_member=? "
+                             "AND exp_start>?", (pid, member_id, nxt_exp)).fetchone()[0]
+            l2 = r if r is not None else 10 ** 9
+    rows = conn.execute("""SELECT copybook, resolved_member_id, replacing, line FROM copy_use
+                           WHERE member_id=? AND line>? AND line<? ORDER BY line""", (member_id, l1, l2)).fetchall()
+    kept, missing = [], []
+    for c in rows:
+        if c["resolved_member_id"]:
+            run = conn.execute("SELECT 1 FROM expand_run WHERE program_id=? AND depth=1 AND src_member=? "
+                               "AND exp_start>? AND exp_start<? LIMIT 1",
+                               (pid, c["resolved_member_id"], root_exp, nxt_exp)).fetchone()
+            if run:
+                kept.append(c)
+        elif c["copybook"].upper() not in expand._SYSTEM_INCLUDES:   # SQLCA / SQLDA: the compiler supplies them
+            missing.append(c["copybook"].upper())
+    return kept, missing
+
+
+def _incomplete(missing: List[str], caveat: str) -> Tuple[None, str, str, str]:
+    names = ", ".join(sorted(set(missing)))
+    return (None, f"layout incomplete: copybook {names} not in the index", caveat,
+            f"layout incomplete (copybook {names} missing) - bytes unknown")
+
+
 def _io_area_items(conn: sqlite3.Connection, pid: int, member_id: int, area: str
-                   ) -> Tuple[Optional[List[_AreaItem]], str, str]:
+                   ) -> Tuple[Optional[List[_AreaItem]], str, str, str]:
     """The items of a program's I/O area (the 01 a DL/I call names), at the
     program's offsets: the program's pfield rows first (they carry the
     copybook line to cite and the program's own offsets); on an index built
     before pfield existed, the program's `field` rows, else the rows of the
     one copybook COPYed inside that 01 (the copybook's own offsets - right
-    when nothing precedes the COPY, which is the usual shape).
-    (items or None, where the layout came from, a caveat or '')."""
+    when nothing precedes the COPY, which is the usual shape). An 01 holding
+    a COPY of a copybook the index lacks is an incomplete layout, said as
+    such - never a 0-byte area.
+    (items or None, where the layout came from, a caveat or '', and when
+    there are no items the plain-English reason a DBD field line prints)."""
     n = area.upper()
+    prog = conn.execute("SELECT program_id FROM program WHERE id=?", (pid,)).fetchone()[0]
+    has_pfield = True
     try:
         root = conn.execute("SELECT * FROM pfield WHERE program_id=? AND parent_id IS NULL AND UPPER(name)=? "
                             "ORDER BY id LIMIT 1", (pid, n)).fetchone()
     except sqlite3.OperationalError:
-        root = None                               # an index built before the value-flow tables
-    if root is not None and not root["pruned"]:
-        rows = conn.execute("""SELECT p.*, m.name AS src_name FROM pfield p LEFT JOIN member m ON m.id=p.src_member
-                               WHERE p.root_id=? ORDER BY p.offset, p.id""", (root["root_id"],)).fetchall()
-        items = [_AreaItem(r, r["src_name"], r["src_line"], bool(r["src_member"] and r["src_member"] != member_id))
-                 for r in rows]
-        books = sorted({i.src_name for i in items if i.from_copy and i.src_name})
-        return items, ("copybook " + ", ".join(books)) if books else "in the program", ""
+        root, has_pfield = None, False            # an index built before the value-flow tables
+    undeclared = (f"{n} is not declared in {prog} (no 01 of that name; a LINKAGE item or a copybook "
+                  f"missing from the index?)")
+    if has_pfield:
+        if root is None:
+            sub = conn.execute("""SELECT p.level, r.name AS root_name FROM pfield p JOIN pfield r ON r.id=p.root_id
+                                  WHERE p.program_id=? AND UPPER(p.name)=? AND p.parent_id IS NOT NULL
+                                  ORDER BY p.id LIMIT 1""", (pid, n)).fetchone()
+            if sub:
+                why = (f"{n} is a level {sub['level']} item under 01 {sub['root_name']} in {prog}, not an 01; "
+                       f"this report places DBD fields in 01-level areas only")
+                return None, f"not an 01 (level {sub['level']} under {sub['root_name']})", "", why
+            return None, f"not declared in {prog}", "", undeclared
+        if not root["pruned"]:
+            nxt_exp = _next_root_exp(conn, pid, member_id, root["exp_line"], True)
+            _kept, missing = _copies_inside_01(conn, pid, member_id, root["exp_line"], nxt_exp)
+            if missing:
+                return _incomplete(missing, "")
+            rows = conn.execute("""SELECT p.*, m.name AS src_name FROM pfield p LEFT JOIN member m ON m.id=p.src_member
+                                   WHERE p.root_id=? ORDER BY p.offset, p.id""", (root["root_id"],)).fetchall()
+            items = [_AreaItem(r, r["src_name"], r["src_line"], bool(r["src_member"] and r["src_member"] != member_id))
+                     for r in rows]
+            books = sorted({i.src_name for i in items if i.from_copy and i.src_name})
+            return items, ("copybook " + ", ".join(books)) if books else "in the program", "", ""
+        caveat = ("the index stored this 01 without its items: the rows below are the copybook's or the "
+                  "program's own, not at this program's offsets")
+    else:
+        caveat = "this index was built before the value-flow tables: rebuild it for this program's own offsets"
 
     def subtree(roots: List[sqlite3.Row], src: str, from_copy: bool) -> List[_AreaItem]:
         items, todo = [], list(roots)
         while todo:
             cur = todo.pop(0)
-            items.append(_AreaItem(cur, src, cur["line"], from_copy))
+            if from_copy:                         # a copybook's rows count its own lines: cite as they are
+                items.append(_AreaItem(cur, src, cur["line"], True))
+            else:                                 # the program's rows count EXPANDED lines: map back to the member's
+                tag, ln, _d, _v = origin(conn, pid, cur["line"])
+                items.append(_AreaItem(cur, tag, ln if tag else None, False))
             todo.extend(conn.execute("SELECT * FROM field WHERE parent_id=? ORDER BY id", (cur["id"],)).fetchall())
         items.sort(key=lambda i: (i.offset, i.id))
         return items
 
-    old = "this index was built before the value-flow tables: rebuild it for this program's own offsets"
     root = conn.execute("SELECT * FROM field WHERE member_id=? AND parent_id IS NULL AND UPPER(name)=? ORDER BY id LIMIT 1",
                         (member_id, n)).fetchone()
     if root is None:
-        return None, "not indexed as a layout", old
+        return None, f"not declared in {prog}", caveat, undeclared
+    nxt_exp = _next_root_exp(conn, pid, member_id, root["line"] or 0, False)
+    copies, missing = _copies_inside_01(conn, pid, member_id, root["line"] or 0, nxt_exp)
+    if missing:
+        return _incomplete(missing, caveat)
     mem = conn.execute("SELECT name FROM member WHERE id=?", (member_id,)).fetchone()[0]
     if not root["is_group"] or conn.execute("SELECT 1 FROM field WHERE parent_id=? LIMIT 1", (root["id"],)).fetchone():
-        return subtree([root], mem, False), "in the program", old
+        return subtree([root], mem, False), "in the program", caveat, ""
     lib = _osvs_library_root(conn, member_id, root)
     if lib:
         _p, cb_mid, cb_root = lib
         cbm = conn.execute("SELECT name FROM member WHERE id=?", (cb_mid,)).fetchone()[0]
-        return subtree([cb_root], cbm, True), f"copybook {cbm}", old
-    # `01 X.` followed by `COPY Y.`: the COPY statements between this 01 and the next one
-    nxt = conn.execute("SELECT MIN(line) FROM field WHERE member_id=? AND parent_id IS NULL AND line>?",
-                       (member_id, root["line"] or 0)).fetchone()[0]
-    copies = conn.execute("""SELECT c.copybook, c.resolved_member_id, c.replacing FROM copy_use c
-                             WHERE c.member_id=? AND c.line>? AND c.line<? ORDER BY c.line""",
-                          (member_id, root["line"] or 0, nxt if nxt is not None else 10 ** 9)).fetchall()
-    if len(copies) == 1 and copies[0]["resolved_member_id"] and not copies[0]["replacing"]:
+        return subtree([cb_root], cbm, True), f"copybook {cbm}", caveat, ""
+    # `01 X.` followed by `COPY Y.`: the one copybook inside the 01 answers with its own rows
+    if len(copies) == 1 and not copies[0]["replacing"]:
         cb_mid = copies[0]["resolved_member_id"]
         cbm = conn.execute("SELECT name FROM member WHERE id=?", (cb_mid,)).fetchone()[0]
         tops = conn.execute("SELECT * FROM field WHERE member_id=? AND parent_id IS NULL ORDER BY id", (cb_mid,)).fetchall()
         if tops:
-            return subtree(tops, cbm, True), f"copybook {cbm}", old
+            return subtree(tops, cbm, True), f"copybook {cbm}", caveat, ""
     why = (f"{len(copies)} COPY statements inside the 01" if len(copies) > 1 else
            "COPY with REPLACING inside the 01" if copies and copies[0]["replacing"] else
-           "the copybook inside the 01 is not in the index" if copies else "the 01 has no items in this index")
-    return None, "not indexed as a layout", f"{why}; {old}"
+           "the copybook inside the 01 has no items in the index" if copies else "the 01 has no items in this index")
+    return None, "not indexed as a layout", f"{why}; {caveat}", f"I/O area {n} not indexed as a layout ({why})"
 
 
 def _under_redefines(items: List[_AreaItem], it: _AreaItem) -> bool:
@@ -2896,9 +2988,10 @@ def _segment_offsets(conn: sqlite3.Connection, seg: sqlite3.Row,
         key = (c["program_id"], area)
         a = areas.get(key)
         if a is None:
-            items, src, caveat = (_io_area_items(conn, c["pid"], c["member_id"], area) if area
-                                  else (None, "no I/O area on the call", ""))
-            a = areas[key] = {"pid": c["pid"], "items": items, "src": src, "caveat": caveat, "funcs": set(), "first": c}
+            items, src, caveat, why = (_io_area_items(conn, c["pid"], c["member_id"], area) if area
+                                       else (None, "no I/O area on the call", "", "no I/O area on the call"))
+            a = areas[key] = {"pid": c["pid"], "items": items, "src": src, "caveat": caveat, "why": why,
+                              "funcs": set(), "first": c}
         a["funcs"].add(c["func"] or "?")
     if not areas:
         out.append("_no program's DL/I call reaches this segment through an indexed PSB_\n")
@@ -2931,10 +3024,13 @@ def _segment_offsets(conn: sqlite3.Connection, seg: sqlite3.Row,
         first_key: Optional[tuple] = None
         first_pg: Optional[str] = None
         for (pg, area), a in sorted(areas.items()):
-            label = pg + (f" ({area})" if per_prog[pg] > 1 else "")
+            if not area:                          # a call with no I/O area: say which call
+                label = f"{pg} (call at {cite(conn, a['pid'], a['first']['line'])})"
+            else:
+                label = pg + (f" ({area})" if per_prog[pg] > 1 else "")
             stores = any(fn in _DLI_STORE for fn in a["funcs"])
             if a["items"] is None:
-                parts.append(f"{label}: I/O area {area or '?'} {a['src']}")
+                parts.append(f"{label}: {a['why']}")
                 continue
             text, key = _describe_hit(a["items"], lo, hi, a["src"])
             notes = []
@@ -2942,7 +3038,7 @@ def _segment_offsets(conn: sqlite3.Connection, seg: sqlite3.Row,
                 notes.append("stored by this program")
             if key is not None:
                 if first_key is None:
-                    first_key, first_pg = key, pg
+                    first_key, first_pg = key, label
                 elif key != first_key:
                     notes.append(f"layout differs from {first_pg}'s")
             parts.append(label + text + (" - " + ", ".join(notes) if notes else ""))
