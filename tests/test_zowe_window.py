@@ -24,6 +24,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -405,6 +406,229 @@ class UiRoundTrip(unittest.TestCase):
         finally:
             app.destroy()
         self.assertEqual(fetch.load_config(cfgp)["zowe"]["daemon"], "window")
+
+
+class UiSelfExplaining(unittest.TestCase):
+    """His words: "the UI should be self explanatory". A senior developer
+    alone on a locked laptop must read what to do from the window itself:
+    a strip with the five steps in order and which one is possible now, a
+    grey help line with an example under every field, a hover tip on every
+    button, a status line that says what happened and the next step, and a
+    Help button. Skipped where tkinter is absent or no display opens."""
+
+    def setUp(self):
+        fetch.set_session_credentials(None, None)
+        self.td = tempfile.mkdtemp()
+
+    def tearDown(self):
+        fetch.set_session_credentials(None, None)
+
+    def _app(self):
+        try:
+            import tkinter  # noqa: F401
+        except ImportError:
+            self.skipTest("tkinter not available")
+        from atlas import ui
+        cfgp = os.path.join(self.td, "sources.json")
+        fetch.save_config(_cfg(self.td), cfgp)
+        try:
+            app = ui.App(cfgp)
+        except Exception as e:                                        # noqa: BLE001 - no display on this CI
+            self.skipTest(f"no Tk display here: {e}")
+        app.withdraw()
+        self.addCleanup(app.destroy)
+        return ui, app
+
+    @classmethod
+    def _walk(cls, w):
+        yield w
+        for c in w.winfo_children():
+            yield from cls._walk(c)
+
+    def _windows(self, ui, app):
+        """The main window and its three dialogs, all kept off screen."""
+        wins = [ui.SourceDialog(app, modal=False), app.sign_in(), app.bulk_add()]
+        for w in wins:
+            w.withdraw()
+            self.addCleanup(w.destroy)
+        return [app, *wins]
+
+    def _wait(self, app, marker: str) -> str:
+        for _ in range(600):
+            app.update()
+            if marker in app.v_status.get() and not app.busy:
+                return app.v_status.get()
+            time.sleep(0.01)
+        self.fail(f"status never said {marker!r}: {app.v_status.get()!r}")
+
+    def test_help_line_under_every_field(self):
+        ui, app = self._app()
+        from tkinter import ttk
+        for win in self._windows(ui, app):
+            fields = [w for w in self._walk(win) if isinstance(w, (ttk.Entry, ttk.Combobox, ttk.Checkbutton))]
+            self.assertTrue(fields, win.title())
+            for w in fields:
+                lab = getattr(w, "_atlas_help", None)
+                self.assertIsNotNone(lab, f"no help line under a field of '{win.title()}'")
+                self.assertTrue(lab.cget("text").strip(), win.title())
+                self.assertGreater(int(lab.cget("wraplength")), 0, "a help line must wrap, never overflow")
+                self.assertEqual(str(lab.cget("foreground")), ui.HELP_FG)
+        self.assertEqual(set(app.help_labels), {"profile", "zowe_dir", "daemon", "sign_in", "root", "db", "extra", "filter"})
+        # the words he asked for, each with an example
+        for key, must in {"dataset": "e.g. PROD.CLAIMS.SRC", "local": "e.g. CLAIMS\\SRC gives estate\\CLAIMS\\SRC",
+                          "zowe_dir": "the folder your command window is in when zowe works without asking anything",
+                          "profile": "leave blank unless your window command uses --zosmf-profile",
+                          "extra_args": "rarely needed; what you add to your own command, e.g. --encoding 1047",
+                          "daemon": "tick only if zowe hangs when run from here",
+                          "sign_in": "not needed when your zowe command works without a prompt"}.items():
+            self.assertIn(must, ui.HELP[key], key)
+
+    def test_strip_lists_the_five_steps_in_order(self):
+        ui, app = self._app()
+        self.assertEqual(len(ui.STEPS), 5)
+        self.assertEqual(len(app.strip_labels), 5)
+        names = ("Check Zowe", "Add the datasets to fetch", "Fetch", "Build", "Ask")
+        buttons = ("Check Zowe", "Add, Bulk add", "Fetch selected / Fetch system / Fetch all", "Build index", "atlas.query")
+        for i, ((head, body), name, button) in enumerate(zip(app.strip_labels, names, buttons), 1):
+            self.assertTrue(head.cget("text").startswith(f"{i}  {name} - "), head.cget("text"))
+            self.assertIn(button, body.cget("text"))
+            self.assertGreater(int(body.cget("wraplength")), 0)
+        # one row in the table, nothing fetched, no estate folder, no index:
+        # step 2 is done, 1 and 3 are possible, 4 and 5 come later - and the
+        # strip says so in words
+        self.assertEqual(app.step_state, ["now", "done", "now", "later", "later"])
+        heads = [h.cget("text") for h, _b in app.strip_labels]
+        self.assertTrue(heads[0].endswith("you can do this now"), heads[0])
+        self.assertTrue(heads[1].endswith("done"), heads[1])
+        self.assertTrue(heads[3].endswith("after step 3"), heads[3])
+        self.assertTrue(heads[4].endswith("after step 4"), heads[4])
+        # the Help button and its page
+        helps = [b for b in self._walk(app) if b.winfo_class() == "TButton" and b.cget("text") == "Help"]
+        self.assertEqual(len(helps), 1)
+        win = app.show_help()
+        win.withdraw()
+        self.addCleanup(win.destroy)
+        for must in ("1  Check Zowe", "2  Add the datasets", "3  Fetch", "4  Build", "5  Ask", "zowe.working_dir",
+                     "zowe.daemon", "local_root", "extra_roots", "sources", "atlas.db", "work\\", "out\\",
+                     "manifest.json", "atlas-problems.txt"):
+            self.assertIn(must, ui.HELP_TEXT, must)
+
+    def test_step_states_follow_what_the_window_knows(self):
+        from atlas import ui
+        cfg = _cfg(self.td)
+        self.assertEqual(ui.step_states(cfg, False, db_exists=False), ["now", "done", "now", "later", "later"])
+        self.assertEqual(ui.step_states(dict(cfg, sources=[]), False, db_exists=False),
+                         ["now", "now", "later", "later", "later"])
+        cfg["sources"][0].update(last_fetched="2000-01-01T00:00:00", last_result="ok 3 file(s) in x")
+        self.assertEqual(ui.step_states(cfg, True, db_exists=False), ["done", "done", "done", "now", "later"])
+        # an estate folder alone makes Build possible
+        os.makedirs(os.path.join(cfg["local_root"], "CLAIMS"))
+        self.assertEqual(ui.step_states(dict(cfg, sources=[]), False, db_exists=False)[3], "now")
+        # an index newer than the last fetch: Build done, Ask possible; a
+        # fetch newer than the index: Build again
+        db = os.path.join(self.td, "atlas.db")
+        with open(db, "w", encoding="utf-8"):
+            pass
+        cfg["db"] = db
+        self.assertEqual(ui.step_states(cfg, True), ["done", "done", "done", "done", "now"])
+        cfg["sources"][0]["last_fetched"] = "2099-01-01T00:00:00"
+        self.assertEqual(ui.step_states(cfg, True), ["done", "done", "done", "now", "now"])
+        cfg["sources"][0]["last_result"] = "FAILED rc 1"
+        self.assertEqual(ui.step_states(cfg, True)[2], "now")
+
+    def test_every_button_has_a_tooltip(self):
+        ui, app = self._app()
+        seen = 0
+        for win in self._windows(ui, app):
+            for b in self._walk(win):
+                if b.winfo_class() != "TButton":
+                    continue
+                tip = ui.Tooltip.of(b)
+                self.assertIsNotNone(tip, f"no tip on button '{b.cget('text')}' of '{win.title()}'")
+                self.assertTrue(tip.text.strip(), b.cget("text"))
+                self.assertIn("<Enter>", b.bind())
+                self.assertIn("<Leave>", b.bind())
+                seen += 1
+        self.assertGreaterEqual(seen, 24)
+        # the two Browse buttons say different things
+        tips = {ui.Tooltip.of(b).text for b in self._walk(app) if b.winfo_class() == "TButton" and b.cget("text") == "Browse"}
+        self.assertEqual(len(tips), 2)
+
+    def test_status_says_what_happened_and_the_next_step(self):
+        ui, app = self._app()
+        ok = [fetch.FetchResult("PROD.X.SRC", True, 3, 0.1, "3 file(s) in x")] * 3
+        with mock.patch("atlas.fetch.fetch_all", return_value=ok):
+            app.fetch_all()
+            status = self._wait(app, "next:")
+        self.assertEqual(status, "Fetched 3 of 3 datasets - next: Build index")
+        bad = [fetch.FetchResult("PROD.X.SRC", False, 0, 0.1,
+                                 "rc 1: Error: no password | second line - set 'Run zowe from folder' to the folder "
+                                 "where your command works")]
+        with mock.patch("atlas.fetch.fetch_all", return_value=bad):
+            app.fetch_all()
+            status = self._wait(app, "failed")
+        self.assertEqual(status, "Fetched 0 of 1; PROD.X.SRC failed: rc 1: Error: no password - try: set 'Run zowe "
+                                 "from folder' to the folder where your command works")
+        # a fake build: the summary the build prints, read back into one line
+        lines = ["12:00:00  parsing done: 121,000 member(s) in 2:10:00",
+                 "", "== members by kind / parse status ==",
+                 "  cobol      ok        80850", "  cobol      partial     150", "  copybook   ok        40000",
+                 "", "== this run: new 121000  changed 0  unchanged 0  pruned 0 ==",
+                 "== problems in this run: none ==", "db: atlas.db   root: C:/estate   7800.0s"]
+
+        def fake_stream(self_, cmd):
+            self.assertIn("atlas.build", cmd)
+            self_.last_output = list(lines)
+            return 0
+        with mock.patch.object(ui.App, "_stream", fake_stream):
+            app.build(False)
+            status = self._wait(app, "Build done")
+        self.assertTrue(status.startswith("Build done: 121,000 members, 150 parsed only in part - next: ask"), status)
+        self.assertIn("python -m atlas.query --db atlas.db pack NAME", status)
+        # the check: its own words, the folder, the one thing to try
+        no_conf = ("   run from: C:/x\n1. zowe found: C:/z/zowe.cmd\n2. zowe --version: 7.0.0\n"
+                   "3. no zowe configuration found from C:/x - run the check from the folder where your command "
+                   "works, or set 'Run zowe from folder' (sources.json -> zowe.working_dir)\n"
+                   "4. the host did NOT answer `zowe zos-files list all-members PROD.X.SRC` (rc 1): no password\n"
+                   "   -> the folder hint")
+        with mock.patch("atlas.fetch.check_zowe", return_value=(False, no_conf)):
+            app.check_zowe()
+            status = self._wait(app, "Zowe check failed")
+        self.assertEqual(status, "Zowe check failed: zowe found no configuration from C:/x - set 'Run zowe from "
+                                 "folder' to the folder where your command works")
+        self.assertEqual(app.step_state[0], "now")
+        with mock.patch("atlas.fetch.check_zowe", return_value=(True, "1. zowe found: z\n4. host answered: PROD.X.SRC "
+                                                                     "has 12 member(s) - connection, profile and "
+                                                                     "password are fine; Fetch will work")):
+            app.check_zowe()
+            status = self._wait(app, "Zowe OK")
+        self.assertEqual(status, "Zowe OK: host answered: PROD.X.SRC has 12 member(s) - next: Fetch (Fetch all, or "
+                                 "select rows and Fetch selected)")
+        self.assertEqual(app.step_state[0], "done")
+        self.assertTrue(app.strip_labels[0][0].cget("text").endswith("done"))
+
+    def test_status_lines_without_a_window(self):
+        from atlas import ui
+        self.assertEqual(ui.status_after_fetch([]), "Nothing fetched: no enabled dataset matched - enable a row or add "
+                                                    "one, then Fetch again")
+        r = fetch.FetchResult("A", False, 2900, 9.0, "INCOMPLETE 2900/4100 members (1200 missing)")
+        self.assertEqual(ui.status_after_fetch([r]), "Fetched 0 of 1; A failed: INCOMPLETE 2900/4100 members (1200 "
+                                                     "missing) - try: Fetch it again; the log lists the missing members")
+        self.assertEqual(ui.status_after_build(130, [], "atlas.db"),
+                         "Build stopped - Build index again continues from where it stopped; parsed members are kept")
+        crash = ["12:00  BUILD STOPPED BY AN ERROR: OSError: disk full",
+                 "  The index cannot be written (disk full): free space on the drive holding C:/atlas.db", "trace"]
+        self.assertEqual(ui.status_after_build(2, crash, "atlas.db"),
+                         "Build stopped: OSError: disk full - try: The index cannot be written (disk full): free space "
+                         "on the drive holding C:/atlas.db")
+        self.assertTrue(ui.status_after_build(0, ["nothing to parse"], "x.db").startswith("Build finished - next: ask"))
+        # a failing stage without an arrow hint: the text after " - " is the thing to try
+        msg = "1. zowe found: z\n2. the working folder does not exist: C:/nope - set 'Run zowe from folder' to the folder"
+        self.assertEqual(ui.status_after_check(False, msg, True),
+                         "Zowe check failed: the working folder does not exist: C:/nope - try: set 'Run zowe from "
+                         "folder' to the folder")
+        self.assertTrue(ui.status_after_check(True, "4. no enabled PDS in the table yet - add one", False)
+                        .endswith("next: add the datasets to fetch (Add or Bulk add)"))
 
 
 if __name__ == "__main__":
