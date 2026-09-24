@@ -350,6 +350,167 @@ class CopybookExpansion(unittest.TestCase):
         self.assertTrue(any("recursive" in w for w in res.warnings))
 
 
+class PrefixBeforeCopy(unittest.TestCase):
+    """His line "A-100-BEGIN SECTION.  COPY PROCBOOK." - a complete statement of
+    the program's own, then COPY on the same line. The whole line became a
+    comment, so the section vanished: PERFORM A-100-BEGIN pointed at nothing and
+    the copybook's paragraphs fell into the section before it (LESSONS 178).
+    The compiler keeps the text before COPY and replaces only the COPY statement."""
+
+    PROG = ("       IDENTIFICATION DIVISION.\n       PROGRAM-ID. SECPGM.\n"
+            "       PROCEDURE DIVISION.\n"
+            "       MAIN SECTION.\n"
+            "           PERFORM A-100-BEGIN.\n"
+            "           GOBACK.\n"
+            "       A-100-BEGIN SECTION.  COPY PROCBOOK.\n"
+            "       Z-900-END SECTION.\n"
+            "           EXIT.\n")
+    BOOK = ("       A-110-DO.\n"
+            "           MOVE 1 TO WS-X.\n"
+            "       A-199-EXIT.\n"
+            "           EXIT.\n")
+    FRAG = ("           05  AAAA-KEY          PIC X(10).\n"
+            "           05  AAAA-STAT         PIC X(02).\n")
+
+    def _lines(self, text):
+        lines, _ = reader.read_cobol_lines(text, fixed=True)
+        return lines
+
+    def _expand(self, prog, lib, name="PROCBOOK"):
+        cb = self._lines(lib)
+        return expand.expand(self._lines(prog), 1, lambda n, l: (2, cb, None) if n == name else None)
+
+    def _code(self, res):
+        return [(ln.indicator, ln.code.strip()) for ln in res.lines if ln.indicator != " " or ln.code.strip()]
+
+    def _origin_of(self, res, text):
+        no = next(ln.no for ln in res.lines if text in ln.code)
+        return no, res.origin(no)[:2]
+
+    def test_section_header_then_copy(self):
+        res = self._expand(self.PROG, self.BOOK)
+        code = self._code(res)
+        k = code.index((" ", "A-100-BEGIN SECTION."))
+        self.assertEqual(code[k + 1], (" ", "A-110-DO."), "no comment echo is invented: the copybook follows")
+        self.assertNotIn("*", [c[0] for c in code], "nothing became a comment")
+        no, org = self._origin_of(res, "A-100-BEGIN SECTION")
+        self.assertEqual((no, org), (7, (1, 7)), "the section stays on its own line number")
+        self.assertFalse(res.lines[no - 1].is_comment)
+        self.assertEqual(self._origin_of(res, "A-110-DO")[1], (2, 1))
+        self.assertEqual(self._origin_of(res, "Z-900-END")[1], (1, 8), "line accounting unchanged")
+        self.assertEqual(res.copies[0][:2], ("PROCBOOK", None))
+        self.assertEqual(res.copies[0][3:], (7, 2))
+        self.assertFalse(res.warnings)
+        f = cobol.parse_program(expand.expanded_text(res))
+        secs = {p.name: p for p in f.paragraphs if p.kind == "section"}
+        self.assertIn("A-100-BEGIN", secs)
+        self.assertEqual({p.name: p.section for p in f.paragraphs if p.kind == "paragraph"},
+                         {"A-110-DO": "A-100-BEGIN", "A-199-EXIT": "A-100-BEGIN"},
+                         "the copybook's paragraphs are inside the section")
+        self.assertEqual(secs["MAIN"].end_line, 6, "MAIN ends where the section begins")
+        self.assertIn(("MAIN", "A-100-BEGIN", None, 5, "perform"), f.performs)
+        self.assertIn("A-100-BEGIN", {p.name for p in f.paragraphs}, "PERFORM of the section resolves")
+
+    def test_paragraph_name_then_copy(self):
+        prog = ("       PROCEDURE DIVISION.\n"
+                "           PERFORM A-200-INIT.\n"
+                "       A-200-INIT.  COPY PROCBOOK.\n"
+                "       A-300-NEXT.\n           GOBACK.\n")
+        res = self._expand(prog, "           MOVE 1 TO WS-X.\n           MOVE 2 TO WS-Y.\n")
+        self.assertEqual(self._code(res)[2:4], [(" ", "A-200-INIT."), (" ", "MOVE 1 TO WS-X.")])
+        self.assertEqual(self._origin_of(res, "A-300-NEXT")[1], (1, 4))
+        f = cobol.parse_program(expand.expanded_text(res))
+        para = {p.name: (p.start_line, p.end_line) for p in f.paragraphs}
+        self.assertEqual(para["A-200-INIT"][0], 3)
+        self.assertEqual(para["A-300-NEXT"][0], self._origin_of(res, "A-300-NEXT")[0])
+        self.assertEqual(para["A-200-INIT"][1], para["A-300-NEXT"][0] - 1,
+                         "the copied statements belong to the paragraph")
+        self.assertIn(("WS-X", "write"), {(n, m) for (n, m, _s, _l) in f.field_refs})
+
+    def test_statement_then_copy(self):
+        prog = ("       PROCEDURE DIVISION.\n"
+                "           MOVE A TO B.  COPY PROCBOOK.\n"
+                "           GOBACK.\n")
+        res = self._expand(prog, "           MOVE 1 TO WS-X.\n")
+        self.assertEqual(self._code(res)[1:3], [(" ", "MOVE A TO B."), (" ", "MOVE 1 TO WS-X.")])
+        self.assertEqual(self._origin_of(res, "GOBACK")[1], (1, 3))
+        f = cobol.parse_program(expand.expanded_text(res))
+        self.assertIn(("A", "B"), {(r.src_name, r.dst_name) for r in f.flows if r.kind == "move"},
+                      "the MOVE before the COPY is still a statement")
+
+    def test_closed_01_then_copy_hangs_the_items_under_it(self):
+        # "01 X.  COPY Y.": a period after the name - a normal COPY after a complete
+        # entry, not the OS/VS rename. The 01 stays, the copybook's items hang under it.
+        from atlas import copybook
+        prog = "       01  WS-REC.  COPY ABCDE.\n       01  WS-AFTER PIC X.\n"
+        res = self._expand(prog, self.FRAG, "ABCDE")
+        self.assertEqual(self._code(res)[:2], [(" ", "01  WS-REC."), (" ", "05  AAAA-KEY          PIC X(10).")])
+        self.assertEqual((res.aliases, res.renamed), ([], []))
+        self.assertEqual(self._origin_of(res, "WS-REC")[1], (1, 1))
+        self.assertEqual(self._origin_of(res, "WS-AFTER")[1], (1, 2))
+        roots, _w = copybook.parse_data_division(reader.join_cobol_continuations(res.lines))
+        tree = {f.name: f for f in copybook.flatten(roots)}
+        self.assertEqual(tree["AAAA-KEY"].parent.name, "WS-REC")
+        self.assertEqual(tree["WS-REC"].length, 12)
+
+    def test_the_osvs_form_and_a_copy_starting_its_line_are_unchanged(self):
+        full = "       01  LIB-REC.\n" + self.FRAG
+        res = self._expand("       01  ABCD-SEG   COPY  'ABCDE'.\n", full, "ABCDE")
+        self.assertEqual(self._code(res)[:2], [("*", "01  ABCD-SEG   COPY  'ABCDE'."), (" ", "01  ABCD-SEG.")])
+        self.assertEqual(res.aliases, [("ABCDE", "LIB-REC", "ABCD-SEG", 1)])
+        res = self._expand("       01  WS-REC.\n           COPY ABCDE.\n", self.FRAG, "ABCDE")
+        self.assertEqual(self._code(res)[:3], [(" ", "01  WS-REC."), ("*", "COPY ABCDE."),
+                                               (" ", "05  AAAA-KEY          PIC X(10).")])
+
+    def test_replacing_continued_on_the_next_line_after_a_prefix(self):
+        # the period after SECTION is not the COPY statement's end: the REPLACING
+        # on the next line belongs to it, and that line is the comment echo
+        prog = ("       A-100-BEGIN SECTION.  COPY PROCBOOK REPLACING ==:X:== BY ==WS==\n"
+                "                                          ==:Y:== BY ==LK==.\n"
+                "       Z-900-END SECTION.\n")
+        res = self._expand(prog, "       A-110-DO.\n           MOVE :X:-A TO :Y:-B.\n")
+        self.assertEqual(self._code(res), [(" ", "A-100-BEGIN SECTION."), ("*", "==:Y:== BY ==LK==."),
+                                           (" ", "A-110-DO."), (" ", "MOVE WS-A TO LK-B."),
+                                           (" ", "Z-900-END SECTION.")])
+        self.assertEqual((res.origin(1)[:2], res.origin(2)[:2]), ((1, 1), (1, 2)))
+        self.assertEqual(self._origin_of(res, "MOVE WS-A")[1], (2, 2))
+        self.assertEqual(self._origin_of(res, "Z-900-END")[1], (1, 3), "line accounting unchanged")
+        self.assertEqual(res.copies[0][2].rstrip(". ").split(), ["==:X:==", "BY", "==WS==", "==:Y:==", "BY", "==LK=="],
+                         "both pairs reach the copy_use row")
+        self.assertFalse(res.warnings)
+
+    def test_the_builds_paragraph_rows_follow(self):
+        import contextlib
+        import shutil
+        import sqlite3
+        from atlas import build
+        td = tempfile.mkdtemp()
+        try:
+            src = os.path.join(td, "estate")
+            os.makedirs(src)
+            with open(os.path.join(src, "SECPGM.cbl"), "w", encoding="utf-8") as fh:
+                fh.write(self.PROG)
+            with open(os.path.join(src, "PROCBOOK.cpy"), "w", encoding="utf-8") as fh:
+                fh.write(self.BOOK)
+            db = os.path.join(td, "t.db")
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                build._main([src, "--db", db, "--rebuild", "--quiet"])
+            conn = sqlite3.connect(db)
+            try:
+                rows = conn.execute(
+                    "SELECT p.kind, p.name, p.section, p.start_line FROM paragraph p JOIN program pr ON pr.id=p.program_id "
+                    "JOIN member m ON m.id=pr.member_id WHERE m.name='SECPGM' ORDER BY p.ordinal").fetchall()
+                self.assertIn(("section", "A-100-BEGIN", "A-100-BEGIN", 7), rows)
+                self.assertIn(("paragraph", "A-110-DO", "A-100-BEGIN", 8), rows)
+                self.assertIn(("paragraph", "A-199-EXIT", "A-100-BEGIN", 10), rows)
+                self.assertEqual(conn.execute("SELECT from_para, to_para FROM perform_edge WHERE kind='perform'").fetchall(),
+                                 [("MAIN", "A-100-BEGIN")])
+            finally:
+                conn.close()
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
+
+
 class OsvsLevelCopy(unittest.TestCase):
     """OS/VS "01 X COPY Y." (also 77, FD, SD): the compiler puts X in place of
     the library's own 01 name. The whole line used to become a comment, so X

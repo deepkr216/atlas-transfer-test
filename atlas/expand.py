@@ -284,12 +284,20 @@ def expand(lines: Sequence[Line], member_id: int, resolver: Resolver,
         # a level 01/77 or FD/SD and one name - on this line, or alone on the
         # last code line before it ("01 X" / "COPY Y.")
         osvs = None                      # (kind, program's name, index in out of a live "01 X" line)
+        # Anything else before COPY on its line is a complete statement of the
+        # program's own - "A-100-BEGIN SECTION.  COPY PROCBOOK.", a paragraph
+        # name, "MOVE A TO B.", "01 X." - and the compiler keeps it: only the
+        # COPY statement is replaced. It stays live on its own line number, the
+        # COPY part blanked, so the line map is unchanged (LESSONS 178).
+        prefix: Optional[str] = None
         if m and not msql and m.group(1).upper() == "COPY":
             before = code[:m.start(1)]
             if before.strip():
                 h = _OSVS_HEAD.search(before)
                 if h:
                     osvs = (_entry_kind(h.group(1)), h.group(2), None, before[:h.end(2)])
+                else:
+                    prefix = before.rstrip()
             elif last_live is not None:
                 h = _OSVS_HEAD.search(out[last_live].code)
                 if h:
@@ -297,9 +305,12 @@ def expand(lines: Sequence[Line], member_id: int, resolver: Resolver,
         last_live = None
 
         # ---- gather the whole COPY statement (may span lines) --------------
+        # from the COPY keyword: a period in the text before it ("SECTION.")
+        # is not the statement's end
         j = i
         stmt = code.strip()
         if m and m.group(1).upper() == "COPY":
+            stmt = code[m.start(1):].strip()
             while find_terminator(stmt, 0, at_line_end=True) < 0 and j + 1 < n:
                 j += 1
                 nxt = lines[j]
@@ -321,8 +332,14 @@ def expand(lines: Sequence[Line], member_id: int, resolver: Resolver,
                 name, lib, rep_text = m.group(3).upper(), None, None
 
         # The COPY statement itself stays in the output as a comment line so
-        # that line accounting for the including member is preserved.
-        for k in range(i, j + 1):
+        # that line accounting for the including member is preserved. With a
+        # live prefix the first line is the prefix (no extra line is invented);
+        # the statement's continuation lines, if any, are the comment echo.
+        first = i
+        if prefix is not None:
+            emit(ln, prefix, member_id, ln.no, depth)
+            first = i + 1
+        for k in range(first, j + 1):
             emit(lines[k], lines[k].code, member_id, lines[k].no, depth, indicator="*")
 
         if name in _SYSTEM_INCLUDES and msql:
