@@ -227,6 +227,10 @@ class CheckReportsTheConfiguration(unittest.TestCase):
                          ["/home/me/.zowe/zowe.config.json"])
         self.assertEqual(fetch.parse_config_locations(""), [])
         self.assertEqual(fetch.parse_config_locations("profiles:\n  base:\n    host: x\n"), [])
+        # a user folder with a space in it, and a bulleted list: the whole path, nothing before it
+        self.assertEqual(fetch.parse_config_locations("Configuration files:\n - C:\\Users\\John Smith\\.zowe\\zowe.config.json\n"
+                                                      " - C:\\My Work\\proj\\zowe.config.user.json\n"),
+                         ["C:\\Users\\John Smith\\.zowe\\zowe.config.json", "C:\\My Work\\proj\\zowe.config.user.json"])
 
     def test_check_names_the_configuration_files_and_where_it_looked(self):
         cfg = _cfg(self.td)

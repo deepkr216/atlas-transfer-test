@@ -272,7 +272,8 @@ def config_locations_cmd(cfg: Dict) -> List[str]:
     return [_exe(cfg), "config", "list", "--locations", "--root"]
 
 
-_CONFIG_PATH_RE = re.compile(r"(?:[A-Za-z]:)?[^\s\"'<>|:]*?zowe\.config(?:\.user)?\.json", re.IGNORECASE)
+# a path may hold spaces (C:\Users\John Smith\.zowe\...): only quotes, brackets, a colon and a line end bound it
+_CONFIG_PATH_RE = re.compile(r"(?:[A-Za-z]:)?[^\"'<>|:\r\n]*?zowe\.config(?:\.user)?\.json", re.IGNORECASE)
 
 
 def parse_config_locations(stdout: str) -> List[str]:
@@ -281,7 +282,7 @@ def parse_config_locations(stdout: str) -> List[str]:
     paths only, never a value, in the order zowe listed them."""
     seen: List[str] = []
     for m in _CONFIG_PATH_RE.finditer(stdout or ""):
-        p = m.group(0)
+        p = m.group(0).strip().lstrip("-").strip()                     # a list bullet before the path is not the path
         if p not in seen:
             seen.append(p)
     return seen
