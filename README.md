@@ -449,7 +449,13 @@ copybook the build chose among several same-named ones (the listing's
 copybook-source table names the library the compiler read each copybook
 from) and checks each choice: confirmed, contradicted - a wrong fact, named
 in `work\recover.md` with the library the listing says - or unknown; `coverage`,
-`program` and `copybook` repeat what the listings say.
+`program` and `copybook` repeat what the listings say. The same listing rows
+give the fetch list: `work\recover.md` tables every library dataset the
+listings name (the copybooks missing from the index that came from it first,
+whether the index already holds it, how many programs), and
+`work\fetch-list.txt` holds the not-fetched ones one per line - datasets
+only - to paste into the UI's Bulk add or give to zowe; once fetched and
+built, those copybooks resolve and the recovered copies go.
 
 **Pictures are read, not just counted.** `OCR images` (UI) or
 `python -m atlas.ocr --db atlas.db --out out/images` pulls every image out of
