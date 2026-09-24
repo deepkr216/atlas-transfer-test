@@ -141,8 +141,8 @@ class FetchReconcile(unittest.TestCase):
 
             class FakeRunner:
                 def run(self, cmd):
-                    if "--directory" in cmd:
-                        d = cmd[cmd.index("--directory") + 1]
+                    if "-d" in cmd:
+                        d = cmd[cmd.index("-d") + 1]
                         os.makedirs(d, exist_ok=True)
                         for m in ("clmpost", "clmupdt", "clmold"):
                             with open(os.path.join(d, m + ".cbl"), "w") as fh:

@@ -32,6 +32,16 @@ from . import fetch
 COLUMNS = ("dataset", "type", "kind", "system", "local", "auth", "enabled", "last")
 WIDTHS = (220, 50, 80, 90, 220, 50, 60, 260)
 
+# The toolkit runs the same command the developer's window does, from the
+# same folder, and asks for nothing the window does not (LESSONS 179): the
+# session password exists for shops whose profile stores none.
+SIGN_IN_NOTE = ("Optional: not needed when your zowe command works without a prompt.\n"
+                "Used only for the zowe commands of this session - never written to sources.json,\n"
+                "the log or a crash file. Leave the user id empty to keep the profile's.")
+NO_SESSION_PASSWORD = "no session password (not needed when your zowe command works without a prompt)"
+ZOWE_DIR_HINT = "(empty = the folder of sources.json; use the folder where your zowe command works)"
+DAEMON_OFF_LABEL = "Zowe daemon off (only if zowe hangs)"
+
 
 class SourceDialog(tk.Toplevel if tk else object):
     """Add / edit one source row."""
@@ -118,32 +128,43 @@ class App(tk.Tk if tk else object):
         self.v_profile = tk.StringVar(value=self.cfg["zowe"].get("profile", ""))
         self.v_root = tk.StringVar(value=self.cfg["local_root"])
         self.v_db = tk.StringVar(value=self.cfg.get("db", "atlas.db"))
+        # Zowe runs from the folder the developer's own window runs it in
+        # (where it finds its zowe.config.json), with the daemon as that
+        # window has it - so a command that works there works here unchanged.
+        self.v_zowe_dir = tk.StringVar(value=self.cfg["zowe"].get("working_dir") or "")
+        self.v_daemon_off = tk.BooleanVar(value=fetch.daemon_off(self.cfg))
         ttk.Label(top, text="Zowe profile").grid(row=0, column=0, sticky="w")
-        ttk.Entry(top, textvariable=self.v_profile, width=18).grid(row=0, column=1, padx=(4, 16))
-        ttk.Label(top, text="Local root").grid(row=0, column=2, sticky="w")
-        ttk.Entry(top, textvariable=self.v_root, width=48).grid(row=0, column=3, padx=4)
-        ttk.Button(top, text="Browse", command=self._browse_root).grid(row=0, column=4, padx=(0, 16))
-        ttk.Label(top, text="Database").grid(row=0, column=5, sticky="w")
-        ttk.Entry(top, textvariable=self.v_db, width=22).grid(row=0, column=6, padx=4)
+        ttk.Entry(top, textvariable=self.v_profile, width=18).grid(row=0, column=1, padx=(4, 16), sticky="w")
+        ttk.Label(top, text="Run zowe from folder").grid(row=0, column=2, sticky="w")
+        ttk.Entry(top, textvariable=self.v_zowe_dir, width=48).grid(row=0, column=3, padx=4)
+        ttk.Button(top, text="Browse", command=self._browse_zowe_dir).grid(row=0, column=4, padx=(0, 16))
+        ttk.Checkbutton(top, text=DAEMON_OFF_LABEL, variable=self.v_daemon_off).grid(
+            row=0, column=5, columnspan=2, sticky="w")
         ttk.Button(top, text="Check Zowe", command=self.check_zowe).grid(row=0, column=7, padx=(16, 0))
         ttk.Button(top, text="Sign in...", command=self.sign_in).grid(row=0, column=8, padx=(4, 0))
+        ttk.Label(top, text=ZOWE_DIR_HINT, foreground="#555").grid(row=1, column=2, columnspan=6, sticky="w")
+        ttk.Label(top, text="Local root").grid(row=2, column=0, sticky="w", pady=(6, 0))
+        ttk.Entry(top, textvariable=self.v_root, width=70).grid(row=2, column=1, columnspan=3, sticky="w", padx=(4, 4), pady=(6, 0))
+        ttk.Button(top, text="Browse", command=self._browse_root).grid(row=2, column=4, padx=(0, 16), pady=(6, 0), sticky="w")
+        ttk.Label(top, text="Database").grid(row=2, column=5, sticky="w", pady=(6, 0))
+        ttk.Entry(top, textvariable=self.v_db, width=22).grid(row=2, column=6, padx=4, pady=(6, 0), sticky="w")
         # One estate, many departments: filter the table to one system, fetch
         # or inspect that system alone, keep the rest untouched.
-        ttk.Label(top, text="System").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(top, text="System").grid(row=3, column=0, sticky="w", pady=(6, 0))
         self.v_filter = tk.StringVar(value="All")
         self.cb_filter = ttk.Combobox(top, textvariable=self.v_filter, state="readonly", width=16, values=("All",))
-        self.cb_filter.grid(row=1, column=1, padx=(4, 16), pady=(6, 0), sticky="w")
+        self.cb_filter.grid(row=3, column=1, padx=(4, 16), pady=(6, 0), sticky="w")
         self.cb_filter.bind("<<ComboboxSelected>>", lambda e: self.refresh())
         # Documents are not mainframe datasets: they already sit in a folder on
         # this laptop. Name those folders here and the build indexes them too.
-        ttk.Label(top, text="Document folders").grid(row=2, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(top, text="Document folders").grid(row=4, column=0, sticky="w", pady=(6, 0))
         self.v_extra = tk.StringVar(value=";".join(self.cfg.get("extra_roots") or []))
-        ttk.Entry(top, textvariable=self.v_extra, width=70).grid(row=2, column=1, columnspan=3, sticky="w", padx=(4, 4), pady=(6, 0))
-        ttk.Button(top, text="Add folder", command=self._add_extra_root).grid(row=2, column=4, pady=(6, 0), sticky="w")
+        ttk.Entry(top, textvariable=self.v_extra, width=70).grid(row=4, column=1, columnspan=3, sticky="w", padx=(4, 4), pady=(6, 0))
+        ttk.Button(top, text="Add folder", command=self._add_extra_root).grid(row=4, column=4, pady=(6, 0), sticky="w")
         ttk.Label(top, text="(semicolon-separated; indexed as documentation, images read by OCR)",
-                  foreground="#555").grid(row=2, column=5, columnspan=3, sticky="w", pady=(6, 0))
+                  foreground="#555").grid(row=4, column=5, columnspan=3, sticky="w", pady=(6, 0))
         self.v_status = tk.StringVar(value=f"config: {self.config_path}")
-        ttk.Label(top, textvariable=self.v_status, foreground="#555").grid(row=1, column=2, columnspan=6, sticky="w", pady=(6, 0))
+        ttk.Label(top, textvariable=self.v_status, foreground="#555").grid(row=3, column=2, columnspan=6, sticky="w", pady=(6, 0))
 
         mid = ttk.Frame(self, padding=(8, 0, 8, 0))
         mid.pack(fill="both", expand=True)
@@ -201,6 +222,8 @@ class App(tk.Tk if tk else object):
 
     def _sync_cfg(self) -> None:
         self.cfg["zowe"]["profile"] = self.v_profile.get().strip()
+        self.cfg["zowe"]["working_dir"] = self.v_zowe_dir.get().strip()
+        self.cfg["zowe"]["daemon"] = "off" if self.v_daemon_off.get() else "window"
         self.cfg["local_root"] = self.v_root.get().strip() or self.cfg["local_root"]
         self.cfg["db"] = self.v_db.get().strip() or "atlas.db"
         self.cfg["extra_roots"] = [p.strip() for p in self.v_extra.get().split(";") if p.strip()]
@@ -258,6 +281,12 @@ class App(tk.Tk if tk else object):
         if d:
             self.v_root.set(d)
 
+    def _browse_zowe_dir(self) -> None:
+        d = filedialog.askdirectory(title="Folder where your zowe command works",
+                                    initialdir=self.v_zowe_dir.get().strip() or fetch.zowe_cwd(self.cfg))
+        if d:
+            self.v_zowe_dir.set(d)
+
     # ---- logging / background ------------------------------------------
 
     def _log(self, text: str) -> None:
@@ -314,9 +343,11 @@ class App(tk.Tk if tk else object):
         self._run_bg(go)
 
     def sign_in(self) -> None:
-        """The mainframe password for THIS SESSION: zowe reads it from its own
-        environment variable in the fetch subprocess. Nothing is saved to
-        sources.json, the log or a crash file; closing the window forgets it."""
+        """OPTIONAL - the mainframe password for THIS SESSION, for shops whose
+        profile stores none; a zowe command that works in a window without a
+        prompt needs nothing here. zowe reads it from its own environment
+        variable in the fetch subprocess. Nothing is saved to sources.json,
+        the log or a crash file; closing the window forgets it."""
         win = tk.Toplevel(self)
         win.title("Sign in - this session only")
         win.transient(self)
@@ -331,21 +362,20 @@ class App(tk.Tk if tk else object):
         ttk.Label(f, text="Password").grid(row=1, column=0, sticky="w")
         e_pw = ttk.Entry(f, textvariable=v_pw, width=24, show="*")
         e_pw.grid(row=1, column=1, padx=6, pady=2)
-        ttk.Label(f, text="Used only for the zowe commands of this session - never written to sources.json,\n"
-                          "the log or a crash file. Leave the user id empty to keep the profile's.",
-                  foreground="#555", justify="left").grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 8))
+        ttk.Label(f, text=SIGN_IN_NOTE, foreground="#555", justify="left").grid(
+            row=2, column=0, columnspan=2, sticky="w", pady=(6, 8))
 
         def use() -> None:
             fetch.set_session_credentials(v_user.get().strip() or None, v_pw.get() or None)
             v_pw.set("")
             self.v_status.set("signed in for this session" + (f" as {v_user.get().strip()}" if v_user.get().strip() else "")
-                              if fetch.has_session_credentials() else "no session password")
+                              if fetch.has_session_credentials() else NO_SESSION_PASSWORD)
             self._log("session password " + ("set (not stored)" if fetch.has_session_credentials() else "cleared"))
             win.destroy()
 
         def forget() -> None:
             fetch.set_session_credentials(None, None)
-            self.v_status.set("no session password")
+            self.v_status.set(NO_SESSION_PASSWORD)
             win.destroy()
 
         b = ttk.Frame(f)
@@ -357,9 +387,12 @@ class App(tk.Tk if tk else object):
         win.bind("<Return>", lambda e: use())
 
     def plan(self) -> None:
+        """The exact command lines and the folder they run from - compare
+        them word for word with the command typed in a window."""
         self._sync_cfg()
+        self._log(fetch.run_from_line(self.cfg))
         for s in self.cfg["sources"]:
-            self._log(" ".join(fetch.download_cmd(self.cfg, s)) + ("" if s.get("enabled", True) else "   (disabled)"))
+            self._log(fetch.redact_cmd(fetch.download_cmd(self.cfg, s)) + ("" if s.get("enabled", True) else "   (disabled)"))
         self._log(" ".join(fetch.build_cmd(self.cfg, self._manifest_path())))
 
     def _fetch(self, only: Optional[List[str]]) -> None:

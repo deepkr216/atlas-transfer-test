@@ -182,13 +182,13 @@ class FetchLayer(unittest.TestCase):
         pds = fetch.download_cmd(cfg, cfg["sources"][0])
         self.assertEqual(pds[:4], ["zowe", "zos-files", "download", "all-members"])
         self.assertIn("PROD.CLAIMS.SRC", pds)
-        self.assertIn("--directory", pds)
+        self.assertIn("-d", pds)
         self.assertIn(fetch.local_path(cfg, cfg["sources"][0]), pds)
         self.assertTrue(fetch.local_path(cfg, cfg["sources"][0]).endswith(os.path.join("CLAIMS", "PROD.CLAIMS.SRC")))
         # exactly what a developer types by hand: no flag the shop's Zowe may not know (LESSONS 127)
         self.assertNotIn("--extension", pds)
         self.assertNotIn("--max-concurrent-requests", pds)
-        self.assertEqual(pds[pds.index("--directory") + 1], fetch.local_path(cfg, cfg["sources"][0]))
+        self.assertEqual(pds[pds.index("-d") + 1], fetch.local_path(cfg, cfg["sources"][0]))
         cfg["zowe"]["extra_args"] = ["--max-concurrent-requests", "4"]        # a shop that wants more says so
         cfg["sources"][0]["extra_args"] = ["--extension", "cbl"]
         opt = fetch.download_cmd(cfg, cfg["sources"][0])
@@ -224,8 +224,8 @@ class FetchLayer(unittest.TestCase):
             def run(self, cmd):
                 seen.append(cmd)
                 # simulate zowe writing one member into the target directory
-                if "--directory" in cmd:
-                    d = cmd[cmd.index("--directory") + 1]
+                if "-d" in cmd:
+                    d = cmd[cmd.index("-d") + 1]
                     os.makedirs(d, exist_ok=True)
                     with open(os.path.join(d, "clmpost.cbl"), "w") as fh:
                         fh.write("       IDENTIFICATION DIVISION.\n")

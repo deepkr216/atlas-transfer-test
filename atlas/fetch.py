@@ -18,6 +18,15 @@ Zowe is invoked as a subprocess; nothing here talks to the mainframe itself.
 Every command is logged exactly as run, so a shop-specific flag (a different
 profile type, an encoding, `--preserve-original-letter-case`) is a config
 edit, not a code change: put it in `extra_args`.
+
+The subprocess runs the command exactly as the developer's own window does
+(LESSONS 179): `zowe zos-files download all-members "DSN" -d folder`, from
+the folder the window would run it in (`zowe.working_dir`, empty = the
+folder that holds sources.json - Zowe looks for its project zowe.config.json
+from the current folder upward), with the Zowe daemon left as the
+environment has it (`zowe.daemon`: "window", or "off" for ZOWE_USE_DAEMON=no
+when zowe hangs). A command that works in the window works unchanged here
+and is asked for nothing the window does not ask for.
 """
 
 from __future__ import annotations
@@ -41,7 +50,9 @@ EXT_FOR_KIND = {"cobol": "cbl", "copybook": "cpy", "jcl": "jcl", "proc": "prc", 
                 "other": "txt"}
 
 DEFAULT_CONFIG: Dict = {
-    "zowe": {"executable": "zowe", "profile": "", "encoding": "", "timeout_seconds": 3600, "extra_args": []},
+    "zowe": {"executable": "zowe", "profile": "", "encoding": "", "timeout_seconds": 3600, "extra_args": [],
+             "working_dir": "",       # folder zowe runs from; "" = the folder that holds sources.json
+             "daemon": "window"},     # "window" = ZOWE_USE_DAEMON as the environment has it; "off" = no
     "local_root": "C:/estate",
     "extra_roots": [],       # folders indexed as well - the documentation folder, listings, exports
     "db": "atlas.db",
@@ -53,7 +64,12 @@ DEFAULT_CONFIG: Dict = {
 # config
 # --------------------------------------------------------------------------
 
+CONFIG_DIR_KEY = "_config_dir"      # where sources.json lives: in memory only, never written back
+
+
 def load_config(path: str) -> Dict:
+    """sources.json with every missing key at its default, so a file written
+    before a key existed (no `working_dir`, no `daemon`) still loads."""
     cfg = json.loads(json.dumps(DEFAULT_CONFIG))
     if os.path.exists(path):
         with open(path, "r", encoding="utf-8") as fh:
@@ -65,14 +81,45 @@ def load_config(path: str) -> Dict:
         cfg["extra_roots"] = [p for p in (user.get("extra_roots") or []) if str(p).strip()]
         cfg["sources"] = [dict(new_source(s.get("dataset", ""), s.get("kind", "other")), **s)
                           for s in user.get("sources", [])]
+    cfg[CONFIG_DIR_KEY] = os.path.dirname(os.path.abspath(path))
     return cfg
 
 
 def save_config(cfg: Dict, path: str) -> None:
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(cfg, fh, indent=2)
+        json.dump({k: v for k, v in cfg.items() if k != CONFIG_DIR_KEY}, fh, indent=2)
     os.replace(tmp, path)
+
+
+def zowe_cwd(cfg: Dict) -> str:
+    """The folder every zowe subprocess runs from. Zowe looks for a project
+    zowe.config.json from the CURRENT folder upward, so run from the wrong
+    folder it finds no profile and asks for host / user / password - the
+    window the developer types in never has that problem because it sits in
+    the right folder. `zowe.working_dir` names that folder; empty means the
+    folder that holds sources.json."""
+    wd = str((cfg.get("zowe") or {}).get("working_dir") or "").strip()
+    if not wd:
+        wd = cfg.get(CONFIG_DIR_KEY) or os.getcwd()
+    return os.path.abspath(os.path.expanduser(wd))
+
+
+def daemon_off(cfg: Optional[Dict]) -> bool:
+    """`zowe.daemon`: "window" (default) leaves ZOWE_USE_DAEMON exactly as
+    the environment has it - the developer's own window runs that way;
+    "off" sets ZOWE_USE_DAEMON=no for the subprocess (only if zowe hangs)."""
+    if not cfg:
+        return False
+    return str((cfg.get("zowe") or {}).get("daemon") or "window").strip().lower() in ("off", "no", "false")
+
+
+def run_from_line(cfg: Dict) -> str:
+    """One line for the plan and the log: the folder the commands run from
+    and the daemon setting, so the run can be compared with the window."""
+    return (f"run from: {zowe_cwd(cfg)}"
+            + ("   [ZOWE_USE_DAEMON=no - 'Zowe daemon off' is set]" if daemon_off(cfg)
+               else "   [zowe daemon as your window has it]"))
 
 
 def new_source(dataset: str, kind: str = "cobol", **kw) -> Dict:
@@ -218,6 +265,28 @@ def version_cmd(cfg: Dict) -> List[str]:
     return [_exe(cfg), "--version"]
 
 
+def config_locations_cmd(cfg: Dict) -> List[str]:
+    """`zowe config list --locations --root`: the configuration files zowe
+    finds from the working folder, root property names only - no profile
+    values, so nothing secret can reach a log."""
+    return [_exe(cfg), "config", "list", "--locations", "--root"]
+
+
+_CONFIG_PATH_RE = re.compile(r"(?:[A-Za-z]:)?[^\s\"'<>|:]*?zowe\.config(?:\.user)?\.json", re.IGNORECASE)
+
+
+def parse_config_locations(stdout: str) -> List[str]:
+    """The zowe.config.json / zowe.config.user.json paths named in the
+    output of `zowe config list --locations` (with or without --root) -
+    paths only, never a value, in the order zowe listed them."""
+    seen: List[str] = []
+    for m in _CONFIG_PATH_RE.finditer(stdout or ""):
+        p = m.group(0)
+        if p not in seen:
+            seen.append(p)
+    return seen
+
+
 def list_members_cmd(cfg: Dict, dataset: str) -> List[str]:
     return [_exe(cfg), "zos-files", "list", "all-members", dataset, "--response-format-json"] + _flags(cfg)
 
@@ -227,12 +296,14 @@ def download_cmd(cfg: Dict, src: Dict) -> List[str]:
     if src.get("type", "pds") == "seq":
         return ([_exe(cfg), "zos-files", "download", "data-set", src["dataset"], "--file", dest]
                 + _flags(cfg, src))
-    # Exactly the command a developer types by hand:
-    #     zowe zos-files download all-members "DSN" --directory <folder>
+    # Exactly the command a developer types by hand, word for word:
+    #     zowe zos-files download all-members "DSN" -d <folder>
     # Nothing else by default: a Zowe CLI that does not know a flag rejects
-    # the whole command and downloads nothing (LESSONS 127). A shop that wants
-    # --extension or --max-concurrent-requests puts them in extra_args.
-    return ([_exe(cfg), "zos-files", "download", "all-members", src["dataset"], "--directory", dest]
+    # the whole command and downloads nothing (LESSONS 127); no profile flag
+    # unless one is configured, no --user / --password unless a session
+    # password was given (LESSONS 179). A shop that wants --extension or
+    # --max-concurrent-requests puts them in extra_args.
+    return ([_exe(cfg), "zos-files", "download", "all-members", src["dataset"], "-d", dest]
             + _flags(cfg, src))
 
 
@@ -294,10 +365,12 @@ def redact_cmd(cmd: List[str]) -> str:
 
 
 # --------------------------------------------------------------------------
-# credentials for THIS RUN ONLY. When the Zowe profile stores no password,
-# `zowe` asks for it on the terminal - and a background run cannot answer, so
-# Fetch all creates the folders and downloads nothing (LESSONS 128). Zowe
-# also reads ZOWE_OPT_USER / ZOWE_OPT_PASSWORD from the environment: the UI's
+# credentials for THIS RUN ONLY - OPTIONAL. A zowe command that works in a
+# window without a prompt needs nothing here (LESSONS 179: run from the same
+# folder, the same way). For a shop whose profile stores no password, `zowe`
+# asks for it on the terminal - and a background run cannot answer, so Fetch
+# all creates the folders and downloads nothing (LESSONS 128). Zowe also
+# reads ZOWE_OPT_USER / ZOWE_OPT_PASSWORD from the environment: the UI's
 # Sign in and the CLI's --ask-password put them there for the subprocess and
 # nowhere else - not in sources.json, not in the log, not in a crash file.
 # --------------------------------------------------------------------------
@@ -316,56 +389,85 @@ def has_session_credentials() -> bool:
     return "ZOWE_OPT_PASSWORD" in _SESSION
 
 
-def session_env() -> Dict[str, str]:
-    """The zowe subprocess environment: the session credentials, and the
-    Zowe daemon switched OFF. Zowe CLI v2/v3 normally hands the command to a
-    background daemon process; from a process with no console that hand-off
-    can wait forever, and the daemon does not see this process's
-    environment. ZOWE_USE_DAEMON=no runs the plain CLI instead - slower to
-    start, but it answers."""
+def session_env(cfg: Optional[Dict] = None) -> Dict[str, str]:
+    """The zowe subprocess environment: this process's environment as it is
+    - ZOWE_USE_DAEMON included, exactly as the developer's window has it -
+    plus the session credentials. Only `zowe.daemon: "off"` sets
+    ZOWE_USE_DAEMON=no: Zowe CLI v2/v3 normally hands the command to a
+    background daemon process, and from a process with no console that
+    hand-off has been seen to wait forever; the plain CLI is slower to start
+    but answers. Off is the exception, never the default, because the plain
+    CLI must then find the team configuration itself (LESSONS 179)."""
     env = dict(os.environ)
-    env["ZOWE_USE_DAEMON"] = "no"
+    if daemon_off(cfg):
+        env["ZOWE_USE_DAEMON"] = "no"
     env.update(_SESSION)
     return env
 
 
-HANG_SECONDS = 120     # a host command that prints nothing for this long is waiting for a password
+HANG_SECONDS = 120     # a host command that prints nothing for this long is waiting for something it cannot ask
 
 
-def password_hint(rc: int, out: str, err: str) -> str:
-    """What to tell the user when zowe failed - or hung - because it wanted
-    a password. rc 124 (timed out) with no output is the hang: zowe put up
-    its password prompt and, run in the background, waits forever."""
+def _folder_hint(cfg: Optional[Dict]) -> str:
+    """The first thing to try when zowe asked for host / user / password: it
+    did not find the configuration the window uses, and that is a matter of
+    the folder it ran from and the daemon setting, not of typing a password."""
+    where = f" (this run was from {zowe_cwd(cfg)})" if cfg else ""
+    return ("run the toolkit from the folder where your zowe command works, or set the working folder "
+            "('Run zowe from folder' in the UI / sources.json -> zowe.working_dir)" + where
+            + ", and leave the daemon as your window has it ('Zowe daemon off' unchecked / zowe.daemon \"window\")")
+
+
+def password_hint(rc: int, out: str, err: str, cfg: Optional[Dict] = None) -> str:
+    """What to tell the user when zowe failed - or hung - because it asked
+    for something the window never asks for: the host name, the user, the
+    password. rc 124 (timed out) with no output is the hang: zowe put up a
+    prompt and, run in the background, waits forever. The FIRST suggestion
+    is always the folder and the daemon - a window command that works
+    without a prompt proves the configuration exists and holds what zowe
+    needs; the toolkit only has to run from the same place the same way.
+    The session password comes last, for shops whose profile stores none."""
     text = f"{out}\n{err}"
+    folder = _folder_hint(cfg)
     if rc != 0 and re.search(r"host\s*name|hostname|Enter the host", text, re.IGNORECASE):
-        return ("zowe asked for the HOST NAME: the plain CLI (daemon off) does not see the profile your window "
-                "uses. Put the connection into sources.json -> zowe.extra_args, e.g. "
-                "[\"--host\", \"HOST\", \"--port\", \"PORT\", \"--reject-unauthorized\", \"false\"] "
-                "(`zowe config list --locations` shows them) - never the password")
+        return ("zowe asked for the HOST NAME: it did not find the configuration your window uses. First, "
+                + folder + ". Only if the window needs them too, put the connection into sources.json -> "
+                "zowe.extra_args, e.g. [\"--host\", \"HOST\", \"--port\", \"PORT\", \"--reject-unauthorized\", "
+                "\"false\"] (`zowe config list --locations` shows them) - never the password")
     if rc == 124 and not (out or "").strip():
         if has_session_credentials():
             return ("zowe printed nothing and did not come back although a session password was given: it is "
-                    "waiting for something else it cannot ask for - usually the HOST NAME, when the plain CLI "
-                    "(daemon off) does not see your profile. Put --host / --port (and --reject-unauthorized "
-                    "false if your certificate needs it) into sources.json -> zowe.extra_args; "
-                    "`zowe config list --locations` shows the values")
-        return ("zowe printed nothing and did not come back: it is waiting for the mainframe password it asked "
-                "you for when you ran it by hand. Give it for this run - Sign in (UI) or --ask-password (CLI) - "
-                "or store it once with `zowe config secure` (Windows Credential Manager)")
+                    "waiting for something else it cannot ask for - usually the HOST NAME, because it did not "
+                    "find the configuration your window uses. First, " + folder + ". Only then --host / --port "
+                    "(and --reject-unauthorized false if your certificate needs it) in sources.json -> "
+                    "zowe.extra_args; `zowe config list --locations` shows the values")
+        return ("zowe printed nothing and did not come back: it is waiting for something it cannot ask for in "
+                "the background - the host name when it did not find your configuration, or the mainframe "
+                "password when the profile stores none. First, " + folder + ". If your window asks for the "
+                "password too, store it once with `zowe config secure` (Windows Credential Manager), or give "
+                "it for this run last of all: Sign in (UI) or --ask-password (CLI)")
     if rc != 0 and re.search(r"password", text, re.IGNORECASE):
-        return ("zowe wanted a password and a background run cannot type one: store it in the "
-                "profile once (`zowe config secure`, kept in Windows Credential Manager) or use "
-                "Sign in (UI) / --ask-password (CLI) for this session")
+        return ("zowe wanted a password and a background run cannot type one. First, " + folder
+                + " - a window command that works without a prompt needs no password here either. If your "
+                "window asks for the password too, store it once in the profile (`zowe config secure`, kept in "
+                "Windows Credential Manager), or give it for this session last of all: Sign in (UI) / "
+                "--ask-password (CLI)")
     return ""
 
 
 class Runner:
-    """subprocess wrapper; tests substitute a fake with the same run() shape."""
+    """subprocess wrapper; tests substitute a fake with the same run() shape.
+    Every zowe subprocess runs from `zowe_cwd(cfg)` with `session_env(cfg)`
+    - the folder and the daemon setting of the developer's own window."""
 
-    def __init__(self, timeout: int = 3600):
+    def __init__(self, timeout: int = 3600, cfg: Optional[Dict] = None):
         self.timeout = timeout
+        self.cfg = cfg
+        self.cwd: Optional[str] = zowe_cwd(cfg) if cfg else None
 
     def run(self, cmd: List[str]) -> Tuple[int, str, str]:
+        if self.cwd and not os.path.isdir(self.cwd):
+            return 2, "", f"the zowe working folder does not exist: {self.cwd}"
         try:
             # Zowe prints UTF-8; the Windows console codepage would otherwise
             # abort the whole fetch on the first unmappable byte. stdin is
@@ -373,7 +475,7 @@ class Runner:
             # waiting for the timeout; the session credentials ride in env.
             p = subprocess.run(cmd, capture_output=True, text=True, timeout=self.timeout,
                                encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL,
-                               env=session_env())
+                               env=session_env(self.cfg), cwd=self.cwd)
             return p.returncode, p.stdout or "", p.stderr or ""
         except FileNotFoundError:
             return 127, "", f"not found: {cmd[0]}"
@@ -393,12 +495,13 @@ class FetchResult:
 
 def check_zowe(cfg: Dict, runner: Optional[Runner] = None,
                log: Optional[Callable[[str], None]] = None) -> Tuple[bool, str]:
-    """Three stages, each reported AS IT HAPPENS through `log` (zowe is a
+    """Four stages, each reported AS IT HAPPENS through `log` (zowe is a
     Node program: 10-20 s of silence before its first answer is normal):
-    is zowe found (and which file), does it run, and - with the first
-    enabled dataset - does the host answer a member list through this
-    profile. The stage that fails is the problem; the message says what to
-    do about it. Returns (ok, the same lines joined)."""
+    is zowe found (and which file), does it run, which configuration files
+    it finds from the working folder (paths only - no values, no secrets),
+    and - with the first enabled dataset - does the host answer a member
+    list. The stage that fails is the problem; the message says what to do
+    about it. Returns (ok, the same lines joined)."""
     lines: List[str] = []
 
     def say(line: str) -> None:
@@ -406,6 +509,8 @@ def check_zowe(cfg: Dict, runner: Optional[Runner] = None,
         if log:
             log(line)
 
+    folder = zowe_cwd(cfg)
+    say("   " + run_from_line(cfg))
     exe = zowe_exe(cfg)
     if exe is None:
         say(f"1. '{cfg['zowe'].get('executable') or 'zowe'}' is not on PATH for this process. "
@@ -413,8 +518,12 @@ def check_zowe(cfg: Dict, runner: Optional[Runner] = None,
             "that same window, or set zowe.executable in sources.json to the full path (`where zowe` shows it).")
         return False, "\n".join(lines)
     say(f"1. zowe found: {exe}")
+    if not os.path.isdir(folder):
+        say(f"2. the working folder does not exist: {folder} - set 'Run zowe from folder' to the folder where "
+            "your zowe command works (or leave it empty for the folder of sources.json)")
+        return False, "\n".join(lines)
     say("   running `zowe --version` (Node starts slowly - up to 20 s of silence is normal) ...")
-    runner = runner or Runner(180)
+    runner = runner or Runner(180, cfg)
     rc, out, err = runner.run(version_cmd(cfg))
     if rc != 0:
         say(f"2. zowe --version failed (rc {rc}): {(err or out).strip()[:300]}"
@@ -423,26 +532,44 @@ def check_zowe(cfg: Dict, runner: Optional[Runner] = None,
         return False, "\n".join(lines)
     say(f"2. zowe --version: {out.strip().splitlines()[0] if out.strip() else '?'}"
         + (f", profile {cfg['zowe']['profile']}" if cfg["zowe"].get("profile") else "")
-        + (", session password set" if has_session_credentials() else ", no session password"))
+        + (", session password set" if has_session_credentials() else
+           ", no session password (not needed when your zowe command works without a prompt)"))
+    # Which configuration zowe sees from that folder. Only the file paths are
+    # logged: the values (host, user) stay out of the log, the password is in
+    # the secure store and never printed by this command anyway.
+    say(f"   > {' '.join(config_locations_cmd(cfg))}")
+    rc, out, err = runner.run(config_locations_cmd(cfg))
+    paths = parse_config_locations(out) if rc == 0 else []
+    if rc != 0:
+        say(f"3. `zowe config list --locations` failed (rc {rc}): {(err or out).strip().splitlines()[0][:200] if (err or out).strip() else '(no output)'}"
+            "\n   -> a Zowe v1 without team configuration answers this way; the check goes on with the profile as is")
+    elif paths:
+        say(f"3. zowe configuration found from {folder}:")
+        for p in paths:
+            say(f"     {p}")
+    else:
+        say(f"3. no zowe configuration found from {folder} - run the check from the folder where your command "
+            "works, or set 'Run zowe from folder' (sources.json -> zowe.working_dir)")
     first = next((x for x in cfg.get("sources", []) if x.get("enabled", True) and x.get("type", "pds") != "seq"), None)
     if first is None:
-        say("3. no enabled PDS in the table yet - add one, then Check again to test the host connection")
+        say("4. no enabled PDS in the table yet - add one, then Check again to test the host connection")
         return True, "\n".join(lines)
     say(f"   asking the host for the member list of {first['dataset']} (this is the first command that logs on; "
-        f"if nothing comes back within {HANG_SECONDS} s, zowe is waiting for a password) ...")
-    say(f"   > {redact_cmd(list_members_cmd(cfg, first['dataset']))}   [ZOWE_USE_DAEMON=no]")
-    lister = runner if runner is not None and not isinstance(runner, Runner) else Runner(HANG_SECONDS)
+        f"if nothing comes back within {HANG_SECONDS} s, zowe is waiting for something it cannot ask for here) ...")
+    say(f"   > {redact_cmd(list_members_cmd(cfg, first['dataset']))}"
+        + ("   [ZOWE_USE_DAEMON=no]" if daemon_off(cfg) else ""))
+    lister = runner if runner is not None and not isinstance(runner, Runner) else Runner(HANG_SECONDS, cfg)
     rc, out, err = lister.run(list_members_cmd(cfg, first["dataset"]))
     if rc != 0:
         tail = " | ".join((err or out).strip().splitlines()[-3:])[:400] or "(no output at all)"
-        hint = password_hint(rc, out, err)
-        say(f"3. the host did NOT answer `zowe zos-files list all-members {first['dataset']}` (rc {rc}): {tail}"
+        hint = password_hint(rc, out, err, cfg)
+        say(f"4. the host did NOT answer `zowe zos-files list all-members {first['dataset']}` (rc {rc}): {tail}"
             + (f"\n   -> {hint}" if hint else
                "\n   -> the same command with your profile: run it by hand in your window and compare - "
                "a different profile, a certificate flag or a typo in the dataset name shows here"))
         return False, "\n".join(lines)
     members = parse_member_list(out)
-    say(f"3. host answered: {first['dataset']} has {len(members)} member(s) - connection, profile and "
+    say(f"4. host answered: {first['dataset']} has {len(members)} member(s) - connection, profile and "
         "password are fine; Fetch will work")
     return True, "\n".join(lines)
 
@@ -457,12 +584,13 @@ def _count_files(path: str) -> int:
 
 def fetch_source(cfg: Dict, src: Dict, runner: Optional[Runner] = None,
                  log: Callable[[str], None] = print) -> FetchResult:
-    runner = runner or Runner(int(cfg["zowe"].get("timeout_seconds") or 3600))
+    runner = runner or Runner(int(cfg["zowe"].get("timeout_seconds") or 3600), cfg)
     cmd = download_cmd(cfg, src)
     safe = redact_list(cmd)                       # never the password, wherever the result ends up
     dest = local_path(cfg, src)
     is_pds = src.get("type", "pds") != "seq"
     os.makedirs(dest if is_pds else os.path.dirname(dest) or ".", exist_ok=True)
+    log(f"  {run_from_line(cfg)}")
     log(f"> {redact_cmd(cmd)}")
     t0 = time.time()
     if zowe_exe(cfg) is None:
@@ -475,7 +603,7 @@ def fetch_source(cfg: Dict, src: Dict, runner: Optional[Runner] = None,
             res = FetchResult(src["dataset"], True, n, secs, f"{n} file(s) in {dest}", safe)
         else:
             tail = (err or out).strip().splitlines()[-3:]
-            hint = password_hint(rc, out, err)
+            hint = password_hint(rc, out, err, cfg)
             res = FetchResult(src["dataset"], False, n, secs,
                               f"rc {rc}: " + " | ".join(tail)[:300] + (f" - {hint}" if hint else ""), safe)
         if is_pds:
@@ -507,7 +635,7 @@ def reconcile_library(cfg: Dict, src: Dict, dest: str, rc: int, runner: Runner,
     retired program does not stay alive in the index. Returns the record,
     or None when the member list could not be obtained (then nothing is
     moved and the folder is trusted as it is)."""
-    lister = runner if not isinstance(runner, Runner) else Runner(max(HANG_SECONDS, 300))
+    lister = runner if not isinstance(runner, Runner) else Runner(max(HANG_SECONDS, 300), cfg)
     rc_l, out, err = lister.run(list_members_cmd(cfg, src["dataset"]))
     if rc_l != 0:
         log(f"  (member list unavailable, rc {rc_l}: folder taken as is)")
@@ -630,7 +758,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--build", action="store_true", help="rebuild atlas.db after fetching")
     ap.add_argument("--rebuild", action="store_true", help="with --build: start the db from empty")
     ap.add_argument("--ask-password", action="store_true",
-                    help="ask for the mainframe password once, for this run only - never stored anywhere")
+                    help="optional - not needed when your zowe command works without a prompt: ask for the "
+                         "mainframe password once, for this run only, never stored anywhere")
     ap.add_argument("--user", help="mainframe user id for this run (with --ask-password)")
     a = ap.parse_args(argv)
 
@@ -656,6 +785,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("RESULT: OK - Fetch will work" if ok else "RESULT: FAIL - fix the stage above, then --check again", flush=True)
         return 0 if ok else 1
     if a.plan:
+        # the exact command lines and the folder they run from, so the plan
+        # can be compared word for word with the command typed in a window
+        print(run_from_line(cfg))
         for src in cfg["sources"]:
             flag = "" if src.get("enabled", True) else "  (disabled)"
             print(redact_cmd(download_cmd(cfg, src)) + flag)

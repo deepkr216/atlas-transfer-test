@@ -41,9 +41,10 @@ class SessionCredentials(unittest.TestCase):
         fetch.set_session_credentials(None, None)
         self.assertNotIn("ZOWE_OPT_PASSWORD", fetch.session_env())
 
-    def test_credentials_travel_as_options_too_and_the_daemon_is_off(self):
+    def test_credentials_travel_as_options_too_and_the_daemon_is_the_windows(self):
         """Explicit --user/--password reach every Zowe version and mode; the
-        log never shows the value; the daemon is bypassed for our subprocess."""
+        log never shows the value; the daemon stays as the window has it
+        (LESSONS 179) unless sources.json says "off"."""
         fetch.set_session_credentials("DEEPAK", SECRET)
         cfg = fetch.load_config(os.path.join(tempfile.mkdtemp(), "nope.json"))
         with mock.patch("atlas.fetch.zowe_exe", return_value="zowe"):
@@ -54,11 +55,14 @@ class SessionCredentials(unittest.TestCase):
             self.assertEqual(c[c.index("--password") + 1], SECRET)
             self.assertNotIn(SECRET, fetch.redact_cmd(c))
             self.assertIn("--password <redacted>", fetch.redact_cmd(c))
-        self.assertEqual(fetch.session_env()["ZOWE_USE_DAEMON"], "no")
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("ZOWE_USE_DAEMON", None)
+            self.assertNotIn("ZOWE_USE_DAEMON", fetch.session_env(cfg))
+            cfg["zowe"]["daemon"] = "off"
+            self.assertEqual(fetch.session_env(cfg)["ZOWE_USE_DAEMON"], "no")
         fetch.set_session_credentials(None, None)
         with mock.patch("atlas.fetch.zowe_exe", return_value="zowe"):
             self.assertNotIn("--password", fetch.list_members_cmd(cfg, "PROD.X.SRC"))
-        self.assertEqual(fetch.session_env()["ZOWE_USE_DAEMON"], "no")
 
     def test_runner_passes_the_env_and_closes_stdin(self):
         fetch.set_session_credentials("DEEPAK", SECRET)
@@ -86,6 +90,8 @@ class SessionCredentials(unittest.TestCase):
         self.assertIn("zowe wanted a password", res.message)
         self.assertIn("zowe config secure", res.message)
         self.assertIn("--ask-password", res.message)
+        # the folder comes first, the session password last (LESSONS 179)
+        self.assertLess(res.message.index("folder where your zowe command works"), res.message.index("--ask-password"))
         joined = "\n".join(lines) + res.message + " ".join(res.command) + (src.get("last_result") or "")
         self.assertNotIn(SECRET, joined)
         self.assertEqual(fetch.password_hint(0, "password ok", ""), "")   # only on failure
@@ -123,25 +129,30 @@ class StagedCheck(unittest.TestCase):
         def run(self, cmd):
             if "--version" in cmd:
                 return 0, "7.18.0\n", ""
+            if "config" in cmd:
+                return 0, "C:\\work\\zowe.config.json:\n - profiles\n - defaults\n", ""
             if "list" in cmd:
                 return self.list_rc, ('{"success":true,"data":{"apiResponse":{"items":[{"member":"A"},{"member":"B"}]}}}'
                                       if self.list_rc == 0 else ""), self.list_err
             return 1, "", "unexpected"
 
-    def test_all_three_stages_pass(self):
+    def test_all_four_stages_pass(self):
         with mock.patch("atlas.fetch.zowe_exe", return_value=r"C:\\npm\\zowe.cmd"):
             ok, msg = fetch.check_zowe(self._cfg(), runner=self.Fake())
         self.assertTrue(ok, msg)
         self.assertIn("1. zowe found: C:\\\\npm\\\\zowe.cmd", msg)
         self.assertIn("2. zowe --version: 7.18.0", msg)
-        self.assertIn("3. host answered: PROD.X.SRC has 2 member(s)", msg)
+        self.assertIn("3. zowe configuration found from", msg)
+        self.assertIn("C:\\work\\zowe.config.json", msg)
+        self.assertIn("4. host answered: PROD.X.SRC has 2 member(s)", msg)
 
     def test_host_refuses_with_password_prompt(self):
         with mock.patch("atlas.fetch.zowe_exe", return_value="zowe"):
             ok, msg = fetch.check_zowe(self._cfg(), runner=self.Fake(1, "Enter password: \nCommand Error: password required"))
         self.assertFalse(ok)
-        self.assertIn("3. the host did NOT answer", msg)
+        self.assertIn("4. the host did NOT answer", msg)
         self.assertIn("zowe wanted a password", msg)
+        self.assertIn("folder where your zowe command works", msg)
 
     def test_host_command_hangs_on_the_password_prompt(self):
         """The real symptom: stages 1-2 pass, the first command that logs on
@@ -157,15 +168,21 @@ class StagedCheck(unittest.TestCase):
             ok, msg = fetch.check_zowe(self._cfg(), runner=Hanging())
         self.assertFalse(ok)
         self.assertIn("did NOT answer", msg)
-        self.assertIn("waiting for the mainframe password", msg)
+        self.assertIn("waiting for something it cannot ask for", msg)
         self.assertIn("--ask-password", msg)
         self.assertIn("zowe config secure", msg)
-        # with a session password the same silence is the HOST prompt (the plain CLI
-        # not seeing the profile) - the confirmed case on the work laptop
+        # the folder and the daemon come first, the session password last (LESSONS 179)
+        self.assertLess(msg.index("folder where your zowe command works"), msg.index("zowe config secure"))
+        self.assertLess(msg.index("zowe config secure"), msg.index("--ask-password"))
+        self.assertIn("leave the daemon as your window has it", msg)
+        # with a session password the same silence is the HOST prompt (zowe
+        # not seeing the configuration) - the confirmed case on the work laptop
         fetch.set_session_credentials("DEEPAK", "pw")
         try:
             self.assertIn("HOST NAME", fetch.password_hint(124, "", "timed out"))
             self.assertIn("extra_args", fetch.password_hint(124, "", "timed out"))
+            self.assertLess(fetch.password_hint(124, "", "timed out").index("folder where your zowe command works"),
+                            fetch.password_hint(124, "", "timed out").index("extra_args"))
         finally:
             fetch.set_session_credentials(None, None)
         # and when zowe manages to print the prompt, it is named directly
