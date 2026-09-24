@@ -56,11 +56,16 @@ each choice: CONFIRMED, CONTRADICTED (a wrong fact - the report names every
 one with the library the listing says) or UNKNOWN. The build does not read
 the table yet (ROADMAP re-parse item 19); nothing in the fact tables changes.
 
-The same rows are the FETCH LIST: per library dataset the listings name,
-which copybooks came from it (the missing ones, the ones chosen among
-several, the rest), how many programs' listings name it, and whether the
-index already holds it (the `library` table, or a folder named after the
-dataset). The report tables it, datasets with missing copybooks first, and
+The same rows are the FETCH LIST: per library dataset named by the listings
+this tool reads (those of the programs that copy a missing copybook, one the
+index holds only as a recovered copy, or one chosen among several - not
+every listing in the estate), which copybooks came from it (the ones to
+fetch for, the ones chosen among several, the rest), how many programs'
+listings name it, and whether the index already holds it (the `library`
+table, or a folder named after the dataset). A copybook the build has read
+as a recovered copy is no longer missing, but its library stays on the list,
+the copybook shown as a recovered copy, until the real member arrives. The
+report tables it, datasets with copybooks to fetch for first, and
 work\fetch-list.txt holds the not-fetched ones one per line - datasets only,
 never a member name - to paste into the UI's Bulk add or give to zowe. Once
 a library is fetched and the build has run, its copybooks resolve and the
@@ -1212,6 +1217,28 @@ def real_copies(conn: sqlite3.Connection, roots: Sequence[str]) -> Set[str]:
     return names
 
 
+def recovered_only(conn: sqlite3.Connection, roots: Sequence[str], real: Set[str]) -> Dict[str, int]:
+    """{copybook: programs copying it} for the copybooks the index holds ONLY
+    as recovered copies: a member inside a recovered folder and no real
+    member anywhere. Once the build has read a recovered copy the copybook is
+    no longer missing - every COPY of it resolves - but the library the
+    listing named is still the one to fetch: the real member replaces the
+    copy. So these stay on the fetch list, and their programs' listings are
+    still read for the table that names the library."""
+    rec = [os.path.normcase(os.path.abspath(r)) + os.sep for r in roots]
+    names: Set[str] = set()
+    for name, path in conn.execute(f"SELECT name, path FROM member WHERE kind IN ({','.join('?' * len(RESOLVER_KINDS))})",
+                                   RESOLVER_KINDS):
+        p = os.path.normcase(os.path.abspath(path))
+        if name.upper() not in real and (any(p.startswith(r) for r in rec) or FOLDER.lower() in p.lower()):
+            names.add(name.upper())
+    if not names:
+        return {}
+    q = ",".join("?" * len(names))
+    return {str(n): int(k) for n, k in conn.execute(f"SELECT UPPER(copybook), COUNT(DISTINCT member_id) FROM copy_use "
+                                                     f"WHERE UPPER(copybook) IN ({q}) GROUP BY 1", tuple(sorted(names)))}
+
+
 def estate_root(conn: sqlite3.Connection) -> Optional[str]:
     row = conn.execute("SELECT root FROM build_run WHERE root IS NOT NULL ORDER BY id DESC LIMIT 1").fetchone()
     return row[0] if row else None
@@ -1464,15 +1491,19 @@ def held_datasets(conn: sqlite3.Connection, libs: Dict[str, str]) -> Dict[str, s
 
 
 def fetch_list(conn: sqlite3.Connection, sources: Dict[str, List[CopySource]], missing: Dict[str, int],
-               checks: Sequence[Dict[str, object]]) -> Tuple[List[Dict[str, object]], List[str]]:
-    """The libraries the listings name, one entry per dataset, and the missing
-    copybooks no listing's table names. Each entry: dataset, held (a folder
-    the index holds it as, or None), programs (whose listings name it), and
-    the copybooks that came from it in three lists - missing (the index lacks
-    them: the ones to fetch for), chosen (the build chose among several and
-    this listing says this dataset), other. Datasets with missing copybooks
-    first, then the most programs first: the order to fetch in."""
+               checks: Sequence[Dict[str, object]], recovered: Sequence[str] = ()) -> Tuple[List[Dict[str, object]], List[str]]:
+    """The libraries the listings name, one entry per dataset, and the
+    copybooks to fetch for that no listing's table names. `missing` holds
+    every copybook to fetch for: the ones the index lacks and (`recovered`)
+    the ones it holds only as a recovered copy. Each entry: dataset, held (a
+    folder the index holds it as, or None), programs (whose listings name
+    it), and the copybooks that came from it in four lists - missing (the
+    index lacks them), recovered (held only as a recovered copy: still to
+    fetch for), chosen (the build chose among several and this listing says
+    this dataset), other. Datasets with copybooks to fetch for first, then
+    the most programs first: the order to fetch in."""
     holders = held_datasets(conn, library_datasets(conn))
+    rec = {n.upper() for n in recovered}
     chosen_at: Dict[str, Set[str]] = defaultdict(set)                  # dataset -> copybooks chosen among several
     for v in checks:
         for d in v["listing_datasets"]:                                 # type: ignore[union-attr]
@@ -1484,20 +1515,32 @@ def fetch_list(conn: sqlite3.Connection, sources: Dict[str, List[CopySource]], m
             if not dsn or not cb:
                 continue
             named.add(cb)
-            e = per.setdefault(dsn, {"dataset": dsn, "programs": set(), "missing": set(), "chosen": set(), "other": set()})
+            e = per.setdefault(dsn, {"dataset": dsn, "programs": set(), "missing": set(), "recovered": set(),
+                                     "chosen": set(), "other": set()})
             e["programs"].add(program)                                  # type: ignore[union-attr]
-            bucket = "missing" if cb in missing else "chosen" if cb in chosen_at.get(dsn, ()) else "other"
+            bucket = ("recovered" if cb in rec else "missing") if cb in missing else \
+                     "chosen" if cb in chosen_at.get(dsn, ()) else "other"
             e[bucket].add(cb)                                           # type: ignore[union-attr]
     out: List[Dict[str, object]] = []
     for dsn, e in per.items():
         e["held"] = holders.get(dsn)
         e["programs"] = len(e["programs"])                              # type: ignore[arg-type]
-        for k in ("missing", "chosen", "other"):
+        for k in ("missing", "recovered", "chosen", "other"):
             e[k] = sorted(e[k])                                         # type: ignore[arg-type]
         out.append(e)
-    out.sort(key=lambda e: (0 if e["missing"] else 1, -int(e["programs"]), str(e["dataset"])))  # type: ignore[arg-type]
+    out.sort(key=lambda e: (0 if (e["missing"] or e["recovered"]) else 1, -int(e["programs"]), str(e["dataset"])))  # type: ignore[arg-type]
     unnamed = sorted(n for n in missing if n not in named)
     return out, unnamed
+
+
+def _to_fetch_for(e: Dict[str, object]) -> str:
+    """The table cell: the copybooks the index lacks, then the ones it holds
+    only as recovered copies, said once for the lot."""
+    missing, rec = list(e["missing"]), list(e["recovered"])           # type: ignore[arg-type]
+    if not rec:
+        return _names(missing)
+    said = f"recovered cop{'ies' if len(rec) != 1 else 'y'}: {_names(rec)}"
+    return f"{_names(missing)}; {said}" if missing else said
 
 
 def _names(names: Sequence[str], limit: int = FETCH_NAMES) -> str:
@@ -1508,27 +1551,30 @@ def _names(names: Sequence[str], limit: int = FETCH_NAMES) -> str:
 
 def fetch_report(fetch: Sequence[Dict[str, object]], unnamed: Sequence[str], root: Optional[str], list_file: str) -> List[str]:
     """The report section: the table of libraries the listings name, the
-    sentence on how to fetch one, and the missing copybooks no table names."""
+    sentence on how to fetch one, and the copybooks to fetch for that no
+    table names."""
     lines = ["\n## Libraries the listings name (fetch list)\n\n"
              "After the source, a compiler listing names the library dataset each copybook was read from. A dataset "
-             "that holds a missing copybook and is not fetched yet is the one to fetch: its members, once in the "
-             "estate, make the recovered copies unnecessary.\n\n"]
+             "that holds a copybook to fetch for - one the index lacks, or holds only as a recovered copy (the build "
+             "has read the copy this tool wrote, so the copybook is no longer missing, but the real member is still on "
+             "the host) - and is not fetched yet is the one to fetch: its members, once in the estate, make the "
+             "recovered copies unnecessary.\n\n"]
     if fetch:
-        lines.append("| dataset | held? | copybooks missing from the index | copybooks the build chose among several | programs |\n"
-                     "|---|---|---|---|---|\n")
+        lines.append("| dataset | held? | copybooks to fetch for (missing, or held only as a recovered copy) | "
+                     "copybooks the build chose among several | programs |\n|---|---|---|---|---|\n")
         for e in fetch:
             held = f"held as {_tail(str(e['held']), 2)}" if e["held"] else "not fetched"
-            lines.append(f"| {e['dataset']} | {held} | {_names(e['missing'])} | {_names(e['chosen'])} | {e['programs']} |\n")  # type: ignore[arg-type]
+            lines.append(f"| {e['dataset']} | {held} | {_to_fetch_for(e)} | {_names(e['chosen'])} | {e['programs']} |\n")  # type: ignore[arg-type]
         to_fetch = [e for e in fetch if not e["held"]]
         lines.append("\nFetch a dataset with the UI's Bulk add (paste the dataset names) or your zowe command; then run the "
                      "build; the missing copybooks it holds resolve, and the recovered copies of them are removed on the next "
                      f"recover run. `{list_file}` holds the {len(to_fetch)} not-fetched dataset{'s' if len(to_fetch) != 1 else ''}, "
-                     "one per line, the ones with missing copybooks first, datasets only - paste it into Bulk add.\n")
+                     "one per line, the ones with copybooks to fetch for first, datasets only - paste it into Bulk add.\n")
     else:
         lines.append("_no listing read has a copybook-source table (an older compiler's listing prints none), so no library "
                      "is named_\n")
     n = len(unnamed)
-    lines.append(f"\n- {n} missing copybook{'s are' if n != 1 else ' is'} named by no listing's table"
+    lines.append(f"\n- {n} copybook{'s' if n != 1 else ''} to fetch for {'are' if n != 1 else 'is'} named by no listing's table"
                  + (": " + _names(unnamed) if unnamed else "") + "\n")
     return lines
 
@@ -1545,12 +1591,13 @@ def _write_fetch_list(path: str, fetch: Sequence[Dict[str, object]]) -> int:
 
 
 def _check_after(db: str, per_program: Dict[str, List[CopySource]], dry_run: bool, missing: Dict[str, int],
-                 chosen: bool) -> Tuple[List[Dict[str, object]], List[Dict[str, object]], List[str]]:
+                 chosen: bool, recovered: Sequence[str] = ()) -> Tuple[List[Dict[str, object]], List[Dict[str, object]], List[str]]:
     """Store this run's copybook-source rows (not on a dry run); check every
     choice against the rows now known (this run's for the programs read, the
     stored ones for the rest) when there is a choice to check; and build the
-    fetch list from the same rows. Returns (checks, fetch list, the missing
-    copybooks no table names)."""
+    fetch list from the same rows. `missing` is every copybook to fetch for,
+    `recovered` the ones among them the index holds only as recovered copies.
+    Returns (checks, fetch list, the copybooks to fetch for no table names)."""
     conn = sqlite3.connect(db)
     try:
         if per_program and not dry_run:
@@ -1558,7 +1605,7 @@ def _check_after(db: str, per_program: Dict[str, List[CopySource]], dry_run: boo
         known = stored_copy_sources(conn)
         known.update(per_program)
         checks = check_choices(conn, known) if (per_program or chosen) else []
-        fetch, unnamed = fetch_list(conn, known, missing, checks)
+        fetch, unnamed = fetch_list(conn, known, missing, checks, recovered)
         return checks, fetch, unnamed
     finally:
         conn.close()
@@ -1588,12 +1635,17 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
         users = copier_names(conn, missing)
         sources = listing_sources(conn, folders)
         index = originals(conn)
-        needing = needing_programs(conn, missing)
         # the programs whose copybook the build CHOSE among several: their listings say which copy was right
         chosen = {p[0] for p in chosen_picks(conn)}
         roots_out = [out_dir] + ([os.path.join(root, d, FOLDER) for d in os.listdir(root) if os.path.isdir(os.path.join(root, d))]
                                  if root and os.path.isdir(root) else [])
         real = real_copies(conn, roots_out)
+        # held only as a recovered copy: no longer missing to the build, still to fetch for - the listings of the
+        # programs copying them are read too, so the fetch list keeps naming their libraries after the build has run
+        recovered = recovered_only(conn, roots_out, real)
+        to_fetch_for = dict(missing)
+        to_fetch_for.update(recovered)
+        needing = needing_programs(conn, to_fetch_for)
     finally:
         conn.close()
     # the recovered folders first: what is there, and what the estate now holds for real
@@ -1623,20 +1675,23 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
                     _save_marker(d, ents)
     log(f"missing copybooks in the index: {len(missing):,}, used in {sum(missing.values()):,} places (a place = one program "
         "copying one of them)")
+    if recovered:
+        log(f"  held only as recovered copies: {len(recovered):,} - the build has read them, so they are not missing any more; "
+            "their libraries stay on the fetch list until the real members arrive")
     check_only = False                                                 # nothing to recover: read listings only to check the choices
     if not missing and not everything:
         log("nothing to recover: every copybook the programs copy is in the index")
-        if not chosen:
+        if not chosen and not recovered:
             return {"missing": 0, "sources": len(sources), "written": 0, "rejected": 0, "not_found": 0, "removed": len(removed),
                     "kept": 0, "formats": {}, "out": out_dir, "unconfirmed": 0, "per_system": 0}
-        check_only = True
+        check_only = True                                              # ... and to name the libraries of the recovered copies
     if not sources:
         log("expanded texts to read: 0 - the index holds no compiler listings and no --from folder was given")
         log('next: run again as  python -m atlas.recover --db atlas.db --from "FOLDER"  with the folder that holds the '
             "programs' compiler listings or expanded source")
         checked = None
         if chosen:
-            checks, _fetch, _unnamed = _check_after(db, {}, True, missing, True)
+            checks, _fetch, _unnamed = _check_after(db, {}, True, to_fetch_for, True, recovered)
             log(choice_line(checks) + " - the listings would say which copy of a copybook chosen among several was right")
             checked = choice_counts(checks)
         return {"missing": len(missing), "sources": 0, "written": 0, "rejected": 0, "not_found": len(missing), "removed": 0,
@@ -1653,11 +1708,13 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
     log(f"expanded texts to read: {len(sources):,} of {found_all:,} found "
         f"({'compiler listings the index holds' if not folders else 'listings + the folders given'})"
         + ("" if everything else f" - only the {len(needing):,} programs that copy a missing copybook"
+                                  + (" (or one held only as a recovered copy)" if recovered else "")
                                   + (f", the {len(chosen):,} with a copybook chosen among several (to check the choice "
                                      "against the listing)" if chosen else "")
                                   + ", and texts the index cannot place"))
     if not sources:
         log("none of the expanded texts belongs to a program that copies a missing copybook"
+            + (" (or one held only as a recovered copy)" if recovered else "")
             + (" or has a copybook chosen among several" if chosen else "") + ": are these the "
             "listings of the programs the coverage report calls partial?")
         return {"missing": len(missing), "sources": 0, "written": 0, "rejected": 0, "not_found": len(missing), "removed": len(removed),
@@ -1796,7 +1853,7 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
                 _save_marker(d, ents)
     # the listings' copybook-source rows, stored per program read, and every choice the build made checked against them
     # ... and, from the same rows, the libraries the listings name: the fetch list
-    checks, fetch, unnamed = _check_after(db, copy_src, dry_run, missing, bool(chosen))
+    checks, fetch, unnamed = _check_after(db, copy_src, dry_run, to_fetch_for, bool(chosen), recovered)
     list_file = os.path.join(os.path.dirname(report) or ".", FETCH_LIST) if report else None
     seen_names = set(by_name) | have_now
     unread = sorted(n for n in missing if n not in seen_names and n in unprovable)   # in a listing, column unproven
@@ -1831,7 +1888,7 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
             inside = ", ".join(f"{o} ({k} listing{'s' if k != 1 else ''})" for o, k in nested_in[n].most_common(3)) if nested_in.get(n) else "-"
             lines.append(f"| {n} | {p} program{'s' if p != 1 else ''}, {b} copybook{'s' if b != 1 else ''} | "
                          f"{users.get(n, '?')} | {inside} |\n")
-    if fetch or missing:
+    if fetch or to_fetch_for:
         lines += fetch_report(fetch, unnamed, root, list_file.replace("\\", "/") if list_file else FETCH_LIST)
     if unread:
         lines.append("\n## In an older listing whose source column could not be proven\n\nThe copybook IS in the listing, but "
@@ -1899,8 +1956,9 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
         log(f"libraries the listings name: {len(fetch):,} datasets, {to_fetch:,} not fetched yet - the report's fetch list "
             "names them" + (f"; {list_file} holds the {to_fetch:,} to fetch, one dataset per line, for the UI's Bulk add"
                             if list_file and to_fetch else ""))
-    if unnamed and (fetch or not_found):
-        log(f"  {len(unnamed):,} missing copybook{'s are' if len(unnamed) != 1 else ' is'} named by no listing's table")
+    if unnamed and (fetch or not_found or recovered):
+        log(f"  {len(unnamed):,} copybook{'s' if len(unnamed) != 1 else ''} to fetch for {'are' if len(unnamed) != 1 else 'is'} "
+            "named by no listing's table")
     if nested_only:
         log(f"  {len(nested_only):,} of the {len(not_found):,} not found are copied from INSIDE another copybook: their lines sit "
             "inside that copybook's block in the listings, which this tool does not cut apart yet - the report's table names the "

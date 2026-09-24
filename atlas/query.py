@@ -1210,7 +1210,8 @@ def cmd_copybook(conn: sqlite3.Connection, name: str) -> str:
         for c in copies:
             r = conn.execute("SELECT MAX(offset+length) AS len, COUNT(*) AS n FROM field WHERE member_id=?", (c["id"],)).fetchone()
             out.append(f"  - `{c['path']}`: {r['len']} bytes, {r['n']} fields" + ("  [authoritative]" if c["authoritative"] else "") + "\n")
-    out.append(_listing_sources_of(conn, name))
+    from . import recover
+    out.append(_listing_sources_of(conn, name, recovered=all(recover.FOLDER.lower() in (c["path"] or "").lower() for c in copies)))
     progs = conn.execute("""SELECT DISTINCT m.name AS member_name, p.program_id, p.id AS pid, c.replacing, c.line,
                                    c.resolved_member_id, rm.path AS rpath, rm.system AS rsys, rm.norm_sha AS rsha
                             FROM copy_use c JOIN member m ON m.id=c.member_id JOIN program p ON p.member_id=m.id
@@ -1560,11 +1561,12 @@ def _listing_says(conn: sqlite3.Connection, member_id: int) -> str:
     return "".join(out)
 
 
-def _listing_sources_of(conn: sqlite3.Connection, copybook: str, missing: bool = False) -> str:
+def _listing_sources_of(conn: sqlite3.Connection, copybook: str, missing: bool = False, recovered: bool = False) -> str:
     """`copybook`: the datasets the programs' listings say this copybook came
-    from, per program count. For a copybook the index lacks (`missing`), the
-    library named is the one to fetch - the same rows atlas.recover puts in
-    its fetch list (work/fetch-list.txt)."""
+    from, per program count. For a copybook the index lacks (`missing`) or
+    holds only as a copy atlas.recover wrote (`recovered`), the library named
+    is the one to fetch - the same rows atlas.recover puts in its fetch list
+    (work/fetch-list.txt)."""
     from . import recover
     if not recover.has_copy_sources(conn):
         return ""
@@ -1574,9 +1576,14 @@ def _listing_sources_of(conn: sqlite3.Connection, copybook: str, missing: bool =
     if not rows:
         return ""
     said = ", ".join(f"{r['dataset']} ({r['n']} program{'s' if r['n'] != 1 else ''})" for r in rows)
+    how = ("the UI's Bulk add takes the dataset name; `python -m atlas.recover` writes every such dataset to "
+           "work/fetch-list.txt")
     if missing:
-        return (f"\nNot in the index, but the listings say it came from: {said} - fetch that library (the UI's Bulk add "
-                "takes the dataset name; `python -m atlas.recover` writes every such dataset to work/fetch-list.txt).\n")
+        return f"\nNot in the index, but the listings say it came from: {said} - fetch that library ({how}).\n"
+    if recovered:
+        return (f"\nThe index holds this copybook only as a recovered copy (rebuilt from a listing by atlas.recover, not "
+                f"the library's member), and the listings say it came from: {said} - fetch that library ({how}); the "
+                "recovered copy goes on the next recover run once the real member is in the estate.\n")
     return (f"\nThe programs' compiler listings say this copybook came from: {said}"
             " - the library the compiler read, per listing; `program NAME` shows each one.\n")
 

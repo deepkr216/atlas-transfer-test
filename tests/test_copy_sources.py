@@ -348,6 +348,38 @@ def listing2(name, copybooks, texts, table):
     return ibm_listing(program(name, *copybooks).splitlines(), texts, copy_table=table)
 
 
+def fetch_estate(root):
+    """The estate of FetchListFromTheListings (its docstring says who copies
+    what and which library each listing names), written under `root`."""
+    texts = {"DUPREC": DUPREC_CLAIMS, "MISSING1": MISSING1, "PLAIN": PLAIN}
+    files = {
+        "CLAIMS/PROD.CLAIMS.SRC/MISSPGM.cbl": program("MISSPGM", "MISSING1", "DUPREC"),
+        "CLAIMS/PROD.CLAIMS.SRC/OTHER1.cbl": program("OTHER1", "DUPREC", "PLAIN"),
+        "CLAIMS/PROD.CLAIMS.SRC/OTHER2.cbl": program("OTHER2", "DUPREC"),
+        "CLAIMS/PROD.CLAIMS.SRC/NOTBL.cbl": program("NOTBL", "NOTNAMED"),
+        "CLAIMS/PROD.CLAIMS.COPYLIB/DUPREC.cpy": DUPREC_CLAIMS[0] + "\n",
+        "CLAIMS/PROD.CLAIMS.COPYLIB/PLAIN.cpy": PLAIN[0] + "\n",
+        "POLICY/POLCOPY2/DUPREC.cpy": DUPREC_POLICY[0] + "\n",
+        "POLICY/POLCOPY2/.atlas-library.json": json.dumps({"dataset": "PROD.POLICY.COPYLIB2", "folder": "x", "rc": 0,
+                                                          "expected": 1, "present": 1, "complete": True,
+                                                          "missing": [], "stale": []}),
+        "CLAIMS/PROD.CLAIMS.LISTING/MISSPGM.lst": listing2("MISSPGM", ["MISSING1", "DUPREC"], texts,
+                                                           [("MISSING1", "SYSLIB", "PROD.NEW.COPYLIB"),
+                                                            ("DUPREC", "SYSLIB", "PROD.POLICY.COPYLIB2")]),
+        "CLAIMS/PROD.CLAIMS.LISTING/OTHER1.lst": listing2("OTHER1", ["DUPREC", "PLAIN"], texts,
+                                                          [("DUPREC", "SYSLIB", "PROD.CLAIMS.COPYLIB"),
+                                                           ("PLAIN", "SYSLIB", "PROD.OTHER.COPYLIB")]),
+        "CLAIMS/PROD.CLAIMS.LISTING/OTHER2.lst": listing2("OTHER2", ["DUPREC"], texts,
+                                                          [("DUPREC", "SYSLIB", "PROD.CLAIMS.COPYLIB")]),
+        "CLAIMS/PROD.CLAIMS.LISTING/NOTBL.lst": listing2("NOTBL", ["NOTNAMED"], texts, None),
+    }
+    for rel, text in files.items():
+        p = os.path.join(root, *rel.split("/"))
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w", encoding="utf-8") as fh:
+            fh.write(text)
+
+
 class FetchListFromTheListings(unittest.TestCase):
     """The listings name the library each copybook came from: the run turns
     those rows into a fetch list - the datasets to pull members from, the
@@ -368,33 +400,7 @@ class FetchListFromTheListings(unittest.TestCase):
     def setUpClass(cls):
         cls.td = tempfile.mkdtemp()
         cls.root = os.path.join(cls.td, "estate")
-        texts = {"DUPREC": DUPREC_CLAIMS, "MISSING1": MISSING1, "PLAIN": PLAIN}
-        files = {
-            "CLAIMS/PROD.CLAIMS.SRC/MISSPGM.cbl": program("MISSPGM", "MISSING1", "DUPREC"),
-            "CLAIMS/PROD.CLAIMS.SRC/OTHER1.cbl": program("OTHER1", "DUPREC", "PLAIN"),
-            "CLAIMS/PROD.CLAIMS.SRC/OTHER2.cbl": program("OTHER2", "DUPREC"),
-            "CLAIMS/PROD.CLAIMS.SRC/NOTBL.cbl": program("NOTBL", "NOTNAMED"),
-            "CLAIMS/PROD.CLAIMS.COPYLIB/DUPREC.cpy": DUPREC_CLAIMS[0] + "\n",
-            "CLAIMS/PROD.CLAIMS.COPYLIB/PLAIN.cpy": PLAIN[0] + "\n",
-            "POLICY/POLCOPY2/DUPREC.cpy": DUPREC_POLICY[0] + "\n",
-            "POLICY/POLCOPY2/.atlas-library.json": json.dumps({"dataset": "PROD.POLICY.COPYLIB2", "folder": "x", "rc": 0,
-                                                              "expected": 1, "present": 1, "complete": True,
-                                                              "missing": [], "stale": []}),
-            "CLAIMS/PROD.CLAIMS.LISTING/MISSPGM.lst": listing2("MISSPGM", ["MISSING1", "DUPREC"], texts,
-                                                               [("MISSING1", "SYSLIB", "PROD.NEW.COPYLIB"),
-                                                                ("DUPREC", "SYSLIB", "PROD.POLICY.COPYLIB2")]),
-            "CLAIMS/PROD.CLAIMS.LISTING/OTHER1.lst": listing2("OTHER1", ["DUPREC", "PLAIN"], texts,
-                                                              [("DUPREC", "SYSLIB", "PROD.CLAIMS.COPYLIB"),
-                                                               ("PLAIN", "SYSLIB", "PROD.OTHER.COPYLIB")]),
-            "CLAIMS/PROD.CLAIMS.LISTING/OTHER2.lst": listing2("OTHER2", ["DUPREC"], texts,
-                                                              [("DUPREC", "SYSLIB", "PROD.CLAIMS.COPYLIB")]),
-            "CLAIMS/PROD.CLAIMS.LISTING/NOTBL.lst": listing2("NOTBL", ["NOTNAMED"], texts, None),
-        }
-        for rel, text in files.items():
-            p = os.path.join(cls.root, *rel.split("/"))
-            os.makedirs(os.path.dirname(p), exist_ok=True)
-            with open(p, "w", encoding="utf-8") as fh:
-                fh.write(text)
+        fetch_estate(cls.root)
         cls.db = os.path.join(cls.td, "t.db")
         cls.report = os.path.join(cls.td, "work", "recover.md")
         cls.list_file = os.path.join(cls.td, "work", "fetch-list.txt")
@@ -424,7 +430,8 @@ class FetchListFromTheListings(unittest.TestCase):
         self.assertEqual((stats["written"], stats["fetch"], stats["unnamed"]), (1, (4, 2), 1), text)
         self.assertIn("libraries the listings name: 4 datasets, 2 not fetched yet - the report's fetch list names them", text)
         self.assertIn("fetch-list.txt holds the 2 to fetch, one dataset per line, for the UI's Bulk add", text)
-        self.assertIn("1 missing copybook is named by no listing's table", text)
+        self.assertIn("1 copybook to fetch for is named by no listing's table", text)
+        self.assertNotIn("held only as recovered copies", text)                # nothing recovered yet
         rep = self.report_text()
         # placed right after the not-found section, before the choices
         self.assertLess(rep.index("## Not in any expanded text"), rep.index("## Libraries the listings name (fetch list)"))
@@ -437,11 +444,13 @@ class FetchListFromTheListings(unittest.TestCase):
             "| PROD.OTHER.COPYLIB | not fetched | - | - | 1 |",
             "| PROD.POLICY.COPYLIB2 | held as POLICY/POLCOPY2 | - | DUPREC | 1 |",
         ])
-        self.assertIn("| dataset | held? | copybooks missing from the index | copybooks the build chose among several | programs |", sec)
+        self.assertIn("| dataset | held? | copybooks to fetch for (missing, or held only as a recovered copy) | "
+                      "copybooks the build chose among several | programs |", sec)
         self.assertIn("Fetch a dataset with the UI's Bulk add (paste the dataset names) or your zowe command; then run the build; "
                       "the missing copybooks it holds resolve, and the recovered copies of them are removed on the next recover run.", sec)
         self.assertIn("fetch-list.txt` holds the 2 not-fetched datasets, one per line", sec)
-        self.assertIn("- 1 missing copybook is named by no listing's table: NOTNAMED", sec)
+        self.assertIn("- 1 copybook to fetch for is named by no listing's table: NOTNAMED", sec)
+        self.assertNotIn("recovered cop", "\n".join(rows))                # no copybook is held as a copy yet
         # the file: not-fetched datasets only, the one with a missing copybook first, nothing else in it
         self.assertEqual(self.list_lines(), ["PROD.NEW.COPYLIB", "PROD.OTHER.COPYLIB"])
         for ln in self.list_lines():
@@ -485,6 +494,125 @@ class FetchListFromTheListings(unittest.TestCase):
         stats, text = self.run_it(dry_run=True)
         self.assertEqual(stats["fetch"], (4, 2))
         self.assertEqual(self.list_lines(), ["PROD.NEW.COPYLIB", "PROD.OTHER.COPYLIB"])
+
+
+class FetchListAfterTheBuild(unittest.TestCase):
+    """The same estate after recover wrote MISSING1 and the build read the
+    copy: MISSING1 is no longer missing to the build (every COPY of it
+    resolves to the recovered copy), but the real member is still on the
+    host, so PROD.NEW.COPYLIB must stay first in the table and in
+    fetch-list.txt, MISSING1 shown as a recovered copy - after an incremental
+    build (the stored listing rows survive) and after --rebuild (a fresh
+    index: MISSPGM's listing must be read again for its table)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.td = tempfile.mkdtemp()
+        cls.root = os.path.join(cls.td, "estate")
+        fetch_estate(cls.root)
+        cls.db = os.path.join(cls.td, "t.db")
+        cls.report = os.path.join(cls.td, "work", "recover.md")
+        cls.list_file = os.path.join(cls.td, "work", "fetch-list.txt")
+        cls.build("--rebuild")
+        stats, _text = cls.run_it()                                    # writes MISSING1 under RECOVERED-COPYBOOKS
+        assert stats["written"] == 1, stats
+        cls.build()                                                    # incremental: the build reads the copy
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.td, ignore_errors=True)
+
+    @classmethod
+    def build(cls, *flags):
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = build._main([cls.root, "--db", cls.db, "--quiet", *flags])
+        assert rc == 0
+
+    @classmethod
+    def run_it(cls, **kw):
+        said = []
+        stats = recover.run(cls.db, log=said.append, report=cls.report, **kw)
+        return stats, "\n".join(said)
+
+    def section(self):
+        with open(self.report, encoding="utf-8") as fh:
+            rep = fh.read()
+        return rep.split("## Libraries the listings name (fetch list)")[1].split("\n## ")[0]
+
+    def list_lines(self):
+        with open(self.list_file, encoding="utf-8") as fh:
+            return fh.read().splitlines()
+
+    def rows(self):
+        return [ln for ln in self.section().splitlines() if ln.startswith("| PROD.")]
+
+    EXPECTED = [
+        "| PROD.NEW.COPYLIB | not fetched | recovered copy: MISSING1 | - | 1 |",          # still first: its member is on the host
+        "| PROD.CLAIMS.COPYLIB | held as CLAIMS/PROD.CLAIMS.COPYLIB | - | DUPREC | 2 |",
+        "| PROD.OTHER.COPYLIB | not fetched | - | - | 1 |",
+        "| PROD.POLICY.COPYLIB2 | held as POLICY/POLCOPY2 | - | DUPREC | 1 |",
+    ]
+
+    def check(self, stats, text):
+        self.assertEqual((stats["missing"], stats["written"], stats["fetch"], stats["unnamed"]), (1, 0, (4, 2), 1), text)
+        self.assertIn("held only as recovered copies: 1 - the build has read them, so they are not missing any more; "
+                      "their libraries stay on the fetch list until the real members arrive", text)
+        self.assertIn("libraries the listings name: 4 datasets, 2 not fetched yet", text)
+        self.assertIn("1 copybook to fetch for is named by no listing's table", text)      # NOTNAMED, still missing
+        self.assertEqual(self.rows(), self.EXPECTED)
+        self.assertIn("- 1 copybook to fetch for is named by no listing's table: NOTNAMED", self.section())
+        self.assertEqual(self.list_lines(), ["PROD.NEW.COPYLIB", "PROD.OTHER.COPYLIB"])
+
+    def test_1_after_an_incremental_build_the_library_is_still_the_one_to_fetch(self):
+        conn = sqlite3.connect(self.db)
+        try:                                                           # the premise: the build resolved MISSING1 to the copy
+            self.assertEqual(recover.missing_copybooks(conn), {"NOTNAMED": 1})
+        finally:
+            conn.close()
+        stats, text = self.run_it()
+        self.check(stats, text)
+
+    def test_2_after_a_rebuild_the_listing_is_read_again_for_its_table(self):
+        self.build("--rebuild")                                        # a fresh index: no stored listing rows
+        conn = sqlite3.connect(self.db)
+        try:
+            self.assertFalse(recover.has_copy_sources(conn))
+        finally:
+            conn.close()
+        stats, text = self.run_it()
+        self.check(stats, text)
+        self.assertIn("only the 2 programs that copy a missing copybook (or one held only as a recovered copy)", text)
+
+    def test_3_copybook_says_held_only_as_a_recovered_copy_and_names_the_library(self):
+        self.run_it()
+        conn = query.connect(self.db)
+        try:
+            out = query.cmd_copybook(conn, "MISSING1")
+            self.assertNotIn("NOT FOUND", out)
+            self.assertIn("The index holds this copybook only as a recovered copy", out)
+            self.assertIn("the listings say it came from: PROD.NEW.COPYLIB (1 program) - fetch that library", out)
+            self.assertIn("work/fetch-list.txt", out)
+            out = query.cmd_copybook(conn, "DUPREC")                            # a real member: the plain sentence
+            self.assertNotIn("recovered copy", out)
+            self.assertIn("The programs' compiler listings say this copybook came from:", out)
+        finally:
+            conn.close()
+
+    def test_4_nothing_missing_at_all_still_reads_the_listings_for_the_fetch_list(self):
+        # NOTNAMED arrives for real: nothing is missing any more, yet MISSING1 is held only as a copy
+        p = os.path.join(self.root, "CLAIMS", "PROD.CLAIMS.COPYLIB", "NOTNAMED.cpy")
+        with open(p, "w", encoding="utf-8") as fh:
+            fh.write("           05  NOTNAMED-F    PIC X(2).\n")
+        try:
+            self.build("--rebuild")
+            stats, text = self.run_it()
+            self.assertEqual((stats["missing"], stats["written"], stats["fetch"], stats["unnamed"]), (0, 0, (4, 2), 0), text)
+            self.assertIn("nothing to recover: every copybook the programs copy is in the index", text)
+            self.assertEqual(self.rows(), self.EXPECTED)
+            self.assertEqual(self.list_lines(), ["PROD.NEW.COPYLIB", "PROD.OTHER.COPYLIB"])
+            self.assertNotIn("recovered: 0 of 0", text)
+        finally:
+            os.remove(p)
 
 
 if __name__ == "__main__":
