@@ -314,6 +314,7 @@ def cmd_program(conn: sqlite3.Connection, name: str) -> str:
         if other:
             out = [f"# {n}\n\n**Not a program**: indexed as a `{other[0]['kind']}` member (`{other[0]['path']}`). "
                    f"What the estate knows about it:\n"]
+            out.append(_copied_as_copybook(conn, n))
         else:
             out = [f"# Program {n}\n\n**Source not indexed** (no member with this PROGRAM-ID or name). "
                    f"What the estate knows about it:\n"]
@@ -1198,6 +1199,38 @@ def cmd_dataset(conn: sqlite3.Connection, dsn: str) -> str:
     return "".join(out)
 
 
+def _copied_as_copybook(conn: sqlite3.Connection, name: str) -> str:
+    """`program NAME` on a name that is not a program: when programs COPY it,
+    say what it is to them - a copybook atlas.recover re-filed (its layout
+    rows still absent), or a member filed as another kind by a line of its
+    text (no folder change helps: recover re-files it) or by its folder
+    name (rename it), with the programs that say NOT FOUND for it."""
+    from . import recover
+    accepted, other = recover.members_named(conn, name)
+    if accepted:
+        refiled = recover.refiled_members(conn)
+        notes = [refiled[i] for i, _k, _f, _p in accepted if i in refiled]
+        if notes:
+            return f"\n> {_cap(recover.REFILED_NOTE)}: {notes[0]}.\n"
+        return ""
+    if not other:
+        return ""
+    unresolved = [r[0] for r in conn.execute(
+        "SELECT DISTINCT UPPER(m.name) FROM copy_use c JOIN member m ON m.id=c.member_id "
+        "WHERE UPPER(c.copybook)=? AND m.kind='cobol' AND c.resolved_member_id IS NULL ORDER BY 1", (name.upper(),))]
+    if not unresolved:
+        return ""
+    readings = recover.member_readings(other)
+    parts = []
+    for r in readings:
+        fix = recover.MISFILED_FIX if r["by"] != "content" else recover.content_fix(r)
+        parts.append(f"in {r['folder']} it is {recover.filed_phrase(r)} - {fix}")
+    who = ", ".join(unresolved[:8]) + (f", +{len(unresolved) - 8} more" if len(unresolved) > 8 else "")
+    return (f"\n> {len(unresolved)} program{'s' if len(unresolved) != 1 else ''} cop{'y' if len(unresolved) != 1 else 'ies'} it "
+            f"as a copybook and say{'' if len(unresolved) != 1 else 's'} `COPY {name.upper()} NOT FOUND` ({who}): "
+            + "; ".join(dict.fromkeys(parts)) + ".\n")
+
+
 def _exists_as_other_kind(conn: sqlite3.Connection, name: str) -> str:
     """`copybook` found no copybook / cobol / unknown member: a member of
     another kind may still carry the name - filed as a proc, a control card
@@ -1207,13 +1240,36 @@ def _exists_as_other_kind(conn: sqlite3.Connection, name: str) -> str:
     accepted, other = recover.members_named(conn, name)
     if not accepted and not other:
         return ""
-    members = accepted or other
-    where = "; ".join(f"filed as {k} (folder {f})" for _i, k, f, _p in members[:4]) + (" ..." if len(members) > 4 else "")
     if accepted:                                                        # sql: the resolver expands it, this report does not read it
+        where = "; ".join(f"filed as {k} (folder {f})" for _i, k, f, _p in accepted[:4]) + (" ..." if len(accepted) > 4 else "")
         return (f" as a copybook - a member with this name exists, {where}: a kind the build expands, but not one this "
                 "report reads; `program NAME` shows each COPY of it.")
+    # the folder name decided the kind (rename it), or a line of the text did (no folder change helps: atlas.recover
+    # re-files it, or says why it cannot) - said per member
+    readings = recover.member_readings(other[:4])
+    wheres = []
+    for r in readings:
+        if r["by"] != "content":
+            wheres.append(f"filed as {r['kind']} (folder {r['folder']})")
+        else:
+            wheres.append(f"filed as {r['kind']} by its content (folder {r['folder']}; {r['seen']})")
+    where = "; ".join(wheres) + (" ..." if len(other) > 4 else "")
+    fixes = []
+    if any(r["by"] != "content" for r in readings):
+        fixes.append(_sentence(recover.MISFILED_FIX))
+    for fix in dict.fromkeys(recover.content_fix(r) for r in readings if r["by"] == "content"):
+        fixes.append(f"For the copy filed by its content, {fix}." if fixes else _sentence(fix))
     return (f" as a copybook - a member with this name exists, {where}: not a kind the build expands, so every program "
-            f"that copies it is parsed only in part. {recover.MISFILED_FIX[0].upper() + recover.MISFILED_FIX[1:]}.")
+            f"that copies it is parsed only in part. " + " ".join(fixes))
+
+
+def _cap(s: str) -> str:
+    return s[:1].upper() + s[1:]
+
+
+def _sentence(s: str) -> str:
+    """'the folder name decided ...' -> 'The folder name decided ....'"""
+    return _cap(s) + "."
 
 
 def cmd_copybook(conn: sqlite3.Connection, name: str) -> str:
@@ -1229,8 +1285,14 @@ def cmd_copybook(conn: sqlite3.Connection, name: str) -> str:
             r = conn.execute("SELECT MAX(offset+length) AS len, COUNT(*) AS n FROM field WHERE member_id=?", (c["id"],)).fetchone()
             out.append(f"  - `{c['path']}`: {r['len']} bytes, {r['n']} fields" + ("  [authoritative]" if c["authoritative"] else "") + "\n")
     from . import recover
+    # a member atlas.recover re-filed as a copybook (the classifier had typed it asm / listing / mfs by a line of
+    # its text): indexed, expanded into its programs, its own layout rows absent until the next full re-parse
+    refiled = [c for c in copies if (c["parse_error"] or "").startswith(recover.REFILED_MARK)]
+    if refiled and len(refiled) == len(copies):
+        out.append(f"\n**{_cap(recover.REFILED_NOTE)}**: {refiled[0]['parse_error']}.\n")
     out.append(_listing_sources_of(conn, name, recovered=all(recover.FOLDER.lower() in (c["path"] or "").lower() for c in copies)))
-    progs = conn.execute("""SELECT DISTINCT m.name AS member_name, m.id AS mid, p.program_id, p.id AS pid, c.replacing, c.line,
+    progs = conn.execute("""SELECT DISTINCT m.name AS member_name, m.id AS mid, m.parse_status AS mstatus, p.program_id,
+                                   p.id AS pid, c.replacing, c.line,
                                    c.resolved_member_id, rm.path AS rpath, rm.system AS rsys, rm.norm_sha AS rsha
                             FROM copy_use c JOIN member m ON m.id=c.member_id JOIN program p ON p.member_id=m.id
                             LEFT JOIN member rm ON rm.id=c.resolved_member_id
@@ -1273,7 +1335,17 @@ def cmd_copybook(conn: sqlite3.Connection, name: str) -> str:
     if skips:
         out.append("\n> " + "; ".join(f"{skipped_cell(w)}: {', '.join(ps)}" for w, ps in skips.items()) + ".\n")
     stale = {p["program_id"] for p in progs if p["resolved_member_id"] is None and not skip_why(p)}   # programs, not COPY sites
-    if stale:
+    if stale and refiled and len(refiled) == len(copies):
+        # re-filed by atlas.recover: the programs were parsed while it was filed as the other kind, and the same run
+        # marked them - unless something un-marked them since
+        pending = all(p["mstatus"] == "pending" for p in progs if p["program_id"] in stale)
+        before = recover.refiled_kind_before(refiled[0]["parse_error"])
+        out.append(f"\n> {len(stale)} of the programs above still say{'s' if len(stale) == 1 else ''} `COPY {name.upper()} NOT "
+                   f"FOUND` (under 'Unresolved in scope' below): parsed while this member was filed as `{before}` by a line of "
+                   "its text; atlas.recover re-filed it"
+                   + (" and marked them - run your usual build command" if pending
+                      else "; `python -m atlas.recover --db atlas.db` marks them, then run your usual build") + ".\n")
+    elif stale:
         # the member is here and a program still says NOT FOUND: it was parsed before the member arrived, and a
         # member the build files 'unknown' (or sql) forces no re-parse by itself - say why, and the whole fix
         kinds = ", ".join(sorted({c["kind"] for c in copies}))
@@ -1571,9 +1643,31 @@ def _partial_members(conn: sqlite3.Connection, limit: int = COVERAGE_ROWS) -> st
                            + ("; a member filed `unknown` also needs its folder renamed to end in COPYLIB (or the library's "
                               "kind declared in the UI) so its own lines are indexed" if unknown else ""))
         if misfiled:
-            clauses.append(f"{len(misfiled)} exist{'s' if len(misfiled) == 1 else ''} only as a member of a kind the build "
-                           "does not expand (the folder name decided it): rename the folder to end in COPYLIB or declare the "
-                           "library's kind in the UI, then build")
+            # the folder name decided the kind (rename it), or a line of the text did - a START- name reads as
+            # Assembler before the level numbers and the folder are looked at: no folder change helps, atlas.recover
+            # re-files it (ROADMAP re-parse item 22)
+            recover.read_misfiled(misfiled)
+            by_folder = [e for e in misfiled if recover.folder_decided(e)]
+            by_content = [e for e in misfiled if not recover.folder_decided(e)]
+            if by_folder:
+                clauses.append(f"{len(by_folder)} exist{'s' if len(by_folder) == 1 else ''} only as a member of a kind the build "
+                               "does not expand (the folder name decided it): rename the folder to end in COPYLIB or declare the "
+                               "library's kind in the UI, then build")
+            if by_content:
+                kinds = ", ".join(sorted({k for e in by_content for k, _f in e["members"]}))   # type: ignore[union-attr]
+                can = sum(1 for e in by_content if any(r["refile"] for r in e["readings"]))    # type: ignore[union-attr]
+                n = len(by_content)
+                if can == n:
+                    fix = (f"`python -m atlas.recover --db atlas.db` re-files {'it' if n == 1 else 'them'} as a copybook in the "
+                           "index, then build")
+                elif can:
+                    fix = (f"`python -m atlas.recover --db atlas.db` re-files {can} of them as a copybook in the index, then "
+                           "build; the 'Copybooks not found' table says why not for the rest")
+                else:
+                    fix = f"atlas.recover cannot re-file {'it' if n == 1 else 'them'}; the 'Copybooks not found' table says why"
+                clauses.append(f"{n} exist{'s' if n == 1 else ''} only as a member the classifier typed by a line of its text "
+                               f"({kinds} - a START- name, a MODULE MAP comment, a first word MSG; {recover.REFILED_ITEM}): no "
+                               f"folder change helps - {fix}")
         if clauses:
             out.append("\n> " + "; ".join(clauses) + ". The 'Copybooks not found' table below says which.\n")
     return "".join(out)
@@ -1666,18 +1760,48 @@ def same_named_note(conn: sqlite3.Connection, copybook: str, exclude_ids: Sequen
     copiers themselves. 'Run recover, then the build' is not the whole fix
     for a member typed 'unknown': the build has no parser for it, so its
     own lines are not in the index (`paragraph` shows them empty, nothing
-    can cite them) until the same folder fix is applied - the note says so."""
+    can cite them) until the same folder fix is applied - the note says so.
+    A member of another kind may also have been typed by a LINE OF ITS TEXT
+    (a START- name reads as Assembler, a MODULE MAP comment as a listing, a
+    first word MSG as MFS - before the level numbers and the folder are
+    looked at, ROADMAP re-parse item 22): the folder fix does nothing for
+    it, atlas.recover re-files it as a copybook in the index, and the note
+    says that instead; once re-filed, the note says the programs are marked
+    for the build (or, after a build, nothing: the COPY resolves)."""
     from . import recover
     accepted, other = recover.members_named(conn, copybook, exclude_ids)
     if accepted:
+        refiled = recover.refiled_members(conn)
+        if all(i in refiled for i, _k, _f, _p in accepted):
+            # a member atlas.recover re-filed as a copybook (the classifier had typed it by a line of its text):
+            # not arrived - the programs it marked re-expand on the next build
+            where = ", ".join(sorted({f"{f} (copybook, re-filed by atlas.recover)" for _i, _k, f, _p in accepted}))
+            ids = [int(i) for i in exclude_ids]
+            pending = bool(ids) and all(
+                r[0] == "pending" for r in conn.execute(f"SELECT parse_status FROM member WHERE id IN ({','.join('?' * len(ids))})",
+                                                        ids))
+            return f"{where} - " + ("the programs copying it are marked: run your usual build command" if pending
+                                    else "parsed before it was re-filed: run recover, then the build")
         where = ", ".join(sorted({f"{f} ({k})" for _i, k, f, _p in accepted}))
         return (f"{where} - parsed before it arrived: run recover, then the build"
                 + (f"; and {recover.UNKNOWN_FIX}" if any(k == "unknown" for _i, k, _f, _p in accepted) else ""))
     if other:
-        # each folder with its own kind: 'PROD.CLM.PROCS, downloads, filed as doc, proc' would not say which is which
-        where = "; ".join(dict.fromkeys(f"{f}, filed as {k}" for _i, k, f, _p in other))
-        return (f"{where} - not a kind the build expands: rename the folder to end in COPYLIB "
-                "or declare its kind in the UI, then build")
+        # the folder name decided the kind for some members, a line of the text for others (a START- name reads
+        # as Assembler: no folder change helps, atlas.recover re-files it) - each with its own instruction
+        readings = recover.member_readings(other)
+        parts = []
+        by_folder = [r for r in readings if r["by"] != "content"]
+        by_content = [r for r in readings if r["by"] == "content"]
+        if by_folder:
+            # each folder with its own kind: 'PROD.CLM.PROCS, downloads, filed as doc, proc' would not say which is which
+            where = "; ".join(dict.fromkeys(f"{r['folder']}, filed as {r['kind']}" for r in by_folder))
+            parts.append(f"{where} - not a kind the build expands: rename the folder to end in COPYLIB "
+                         "or declare its kind in the UI, then build")
+        if by_content:
+            where = "; ".join(dict.fromkeys(f"{r['folder']}, {recover.filed_phrase(r)}" for r in by_content))
+            fixes = "; ".join(dict.fromkeys(recover.content_fix(r) for r in by_content))
+            parts.append(f"{where} - not a kind the build expands, and {fixes}")
+        return "; ".join(parts)
     return ""
 
 
@@ -1851,6 +1975,17 @@ def cmd_coverage(conn: sqlite3.Connection, everything: bool = False) -> str:
         out.append(f"- of the {n_part} members marked `partial`, **{n_true} {'is' if n_true == 1 else 'are'} parsed only "
                    f"in part** and **{n_chosen} {'is' if n_chosen == 1 else 'are'} complete with a copybook chosen among "
                    "several** (the two tables below).\n")
+    from . import recover
+    n_refiled = len(recover.refiled_members(conn))
+    if n_refiled:
+        # a copybook marked `skipped` because atlas.recover re-filed it is not a gap: the programs copying it expand
+        # it; only its own layout rows wait for the re-parse
+        one = n_refiled == 1
+        out.append(f"- {n_refiled} copybook{'' if one else 's'} marked `skipped` {'was' if one else 'were'} re-filed by "
+                   f"atlas.recover (the classifier had read {'it' if one else 'them'} as another kind by a line of "
+                   f"{'its' if one else 'their'} text - {recover.REFILED_ITEM}): not a gap in the parse - the programs copying "
+                   f"such a member expand it; its own layout rows arrive with the next full re-parse. `copybook NAME` says so "
+                   "on each.\n")
     out.append(_partial_members(conn, limit))
     out.append(_chosen_members(conn, limit))
     out.append(_failed_members(conn, limit))
@@ -1901,7 +2036,11 @@ def cmd_coverage(conn: sqlite3.Connection, everything: bool = False) -> str:
                    "expands, because the folder name decided its kind (a copybook with no level numbers has no signature): "
                    "rename the folder to end in COPYLIB, or declare the library's kind in the UI's table (the manifest "
                    "kinds), and build. A member filed `unknown` is expanded but has no parser of its own, so its own lines "
-                   "are not indexed or citable until that same folder fix is applied.\n")
+                   "are not indexed or citable until that same folder fix is applied. Where the cell says `by its content`, "
+                   "a line of the member's own text tripped a weak signature (a START- name reads as Assembler, a comment "
+                   "naming MODULE MAP as a listing, a first word MSG as MFS) before its level numbers and its folder were "
+                   "looked at: no folder change helps - `python -m atlas.recover --db atlas.db` re-files it as a copybook in "
+                   f"the index ({recover.REFILED_ITEM}), then build; the cell says why when it cannot.\n")
     out.append("\n### Unresolved by kind - what the index could NOT work out, and what closes each one\n")
     rows = conn.execute("""SELECT CASE WHEN kind = 'expand' AND instr(COALESCE(detail, ''), ?) > 0
                                        THEN 'expand (copybook chosen among several)' ELSE kind END AS k, COUNT(*)

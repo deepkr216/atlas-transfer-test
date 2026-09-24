@@ -46,6 +46,15 @@ Every recovered copybook says in its first lines where it came from; it is
 the copybook's text as one program saw it, not the library copy, and the
 report (work\recover.md) names every one.
 
+A copybook the index HOLDS under another kind is not recovered but re-filed:
+a member the classifier typed asm, listing or mfs by a line of its text (a
+field or paragraph named START-..., a comment naming MODULE MAP, a line
+whose first word is MSG - weak signatures checked before the level numbers
+and the folder name; ROADMAP re-parse item 22) becomes a copybook in the
+index, its programs are marked, and the next build expands it; the report
+says which member the folder name decided instead (rename the folder) and
+which it could not re-file, and why.
+
 The listing also settles a second question. After the source, Enterprise
 COBOL prints one row per copybook: the member, the DD name and the LIBRARY
 DATASET the compiler read it from. Where a copybook's name exists in several
@@ -1221,7 +1230,12 @@ def arrived_copybooks(conn: sqlite3.Connection) -> Tuple[List[Dict[str, object]]
                  never looks at (proc, ctlcard, doc, jcl, listing ...): a
                  re-parse would find nothing; the folder name decided the
                  kind (ROADMAP re-parse item 20) and must change, or the
-                 library's kind be declared.
+                 library's kind be declared - or a LINE OF THE TEXT decided
+                 it (asm / listing / mfs by a weak signature: ROADMAP item
+                 22), which no folder change touches: read_misfiled() tells
+                 the two apart per member and refile_misfiled() re-files the
+                 second sort in the index. Each entry carries `found`, the
+                 member rows, for that.
 
     missing_copybooks() leaves the arrived case out (a member of a resolver
     kind carries the name), so without this scan it fell through every
@@ -1260,7 +1274,8 @@ def arrived_copybooks(conn: sqlite3.Connection) -> Tuple[List[Dict[str, object]]
             arrived.append({"copybook": book, "members": [(k, f) for _i, k, f, _p in accepted], "programs": copiers,
                             "ids": [c[0] for c in copiers]})
         elif other:
-            misfiled.append({"copybook": book, "members": [(k, f) for _i, k, f, _p in other], "programs": copiers, "ids": []})
+            misfiled.append({"copybook": book, "members": [(k, f) for _i, k, f, _p in other], "programs": copiers, "ids": [],
+                             "found": other})                       # the full rows, for read_misfiled()
     return arrived, misfiled
 
 
@@ -1285,16 +1300,333 @@ MISFILED_NEXT = ("next: rename the folder(s) the report names to end in COPYLIB 
                  "table), then run your usual build command")
 
 
+# --------------------------------------------------------------------------
+# how the classifier read a misfiled member - by a line of its text, or by
+# its folder - and the stand-in for ROADMAP re-parse item 22
+# --------------------------------------------------------------------------
+#
+# classify.classify() checks the content signatures before the level numbers
+# and before the folder hint, and three of them are weak: _SIG_ASM fires on
+# any line whose first or second word BEGINS with START, CSECT or DSECT
+# (`05 START-DATE PIC X(8).`, `PERFORM START-PARA.`), _SIG_LISTING on a
+# comment saying MODULE MAP or CROSS REFERENCE TABLE, _SIG_MFS on a line
+# whose first word is MSG / FMT / DEV / DFLD / MFLD. A copybook in a folder
+# ending in COPYLIB is then filed asm / listing / mfs, the resolver never
+# looks at it, and every program copying it says COPY X NOT FOUND - and the
+# folder fix the misfiled report gave (rename the folder, declare the kind)
+# changes nothing: the content decided, and the declared kind in sources.json
+# only replaces 'unknown' (build.py _inventory_one). The classifier is a fact
+# module, so the fix waits for the re-parse batch; meanwhile refile_misfiled()
+# sets such a member's kind to copybook in the index. That is enough for the
+# programs: the build keeps the stored kind of an unchanged member whose
+# outcome is settled ('skipped' is), and the expander reads the copybook's
+# text from disk through the resolver's member list. The member's own field
+# rows stay absent until the re-parse files it as a copybook itself.
+
+REFILED_MARK = "re-filed as copybook by atlas.recover"      # parse_error prefix of a member refile_misfiled() re-filed
+WEAK_KINDS = ("asm", "listing", "mfs")                        # the three kinds a COBOL line trips by a weak signature
+HEAD_BYTES = 64 * 1024                                        # read to say how the classifier read a member
+REFILED_ITEM = "ROADMAP re-parse item 22"
+
+# the shape a REAL member of each weak kind has and a COBOL copybook never has (the tighter signatures of
+# ROADMAP item 22): an Assembler label in column 1 before CSECT / DSECT, START alone or with a numeric
+# operand, DFHEIENT, a DS / DC with a type; a listing's banner or its numbered source lines; an MFS
+# macro with a label in column 1, TYPE= / POS= / LTH= operands, MSGEND / FMTEND
+_ASM_SHAPE = re.compile(r"^[A-Z@#$][A-Z0-9@#$]{0,7}[ \t]+(?:CSECT|DSECT)\b"
+                        r"|^(?:[A-Z@#$][A-Z0-9@#$]{0,7})?[ \t]+START(?:[ \t]+\d+)?[ \t]*$"
+                        r"|^(?:[A-Z@#$][A-Z0-9@#$]{0,7})?[ \t]+DFHEIENT\b"
+                        r"|^(?:[A-Z@#$][A-Z0-9@#$]{0,7})?[ \t]+D[SC][ \t]+\d*[ABCDEFHPXZ]L?\d*(?:'|[ \t]|$)", re.I | re.M)
+_MFS_SHAPE = re.compile(r"^[A-Z@#$][A-Z0-9@#$]{0,7}[ \t]+(?:MSG|FMT|DEV|DFLD|MFLD)\b"
+                        r"|[ \t](?:MSG|DEV)[ \t]+TYPE=|[ \t]DFLD[ \t]+(?:POS|LTH)=|^[ \t]+(?:MSGEND|FMTEND)\b", re.I | re.M)
+_JCL_LINE = re.compile(r"^//", re.M)
+_WORD_AT = re.compile(r"[A-Z0-9@#$\-_]+", re.I)
+# the strong signatures, by kind, for the word that fired (a member of these kinds is not a copybook)
+_STRONG_SIGS = {"jcl": (classify._SIG_JOB, classify._SIG_EXEC), "proc": (classify._SIG_PROC,),
+                "imsgen": (classify._SIG_IMSGEN,), "csd": (classify._SIG_CSD,),
+                "dbd": (classify._SIG_DBD, classify._SIG_SEGM), "psb": (classify._SIG_PSB,), "bms": (classify._SIG_BMS,),
+                "rexx": (classify._SIG_REXX,), "sql": (classify._SIG_SQL_DDL,), "cobol": (classify._SIG_COBOL, classify._SIG_PROGRAM_ID)}
+_WEAK_WORDS = {"asm": "Assembler - a first or second word beginning with START, CSECT or DSECT",
+               "listing": "a compiler listing - a comment naming MODULE MAP or CROSS REFERENCE TABLE",
+               "mfs": "an MFS statement - a line whose first word is MSG, FMT, DEV, DFLD or MFLD"}
+CONTENT_FIX = ("no folder change helps (the content decided): run `python -m atlas.recover --db atlas.db`, which re-files "
+               "it as a copybook in the index, then the build")
+CONTENT_FIX_DRY = ("no folder change helps (the content decided): a run without --dry-run re-files it as a copybook in the "
+                   "index and marks the programs")
+REFILED_NOTE = "indexed as a copybook (re-filed by atlas.recover; its own layout rows arrive with the next full re-parse)"
+
+
+def _signature_hit(kind: str, head: str) -> Tuple[int, str]:
+    """(line, word) of the content signature that filed `head` as `kind`:
+    the word that begins with START / CSECT / DSECT, the MODULE MAP comment,
+    the MSG - so the report can quote the line the classifier read."""
+    m = None
+    if kind == "asm":
+        m = classify._SIG_ASM.search(head)
+    elif kind == "listing":
+        m = classify._SIG_LISTING.search(head)
+    elif kind == "mfs":
+        m = classify._SIG_MFS.search(head)
+    else:
+        m = next((x for rx in _STRONG_SIGS.get(kind, ()) for x in [rx.search(head)] if x), None)
+    if not m:
+        return 0, ""
+    line = head.count("\n", 0, m.start()) + 1
+    if kind in ("asm", "mfs"):
+        w = _WORD_AT.match(head, m.start(1))
+        word = w.group(0) if w else m.group(1)
+    else:
+        word = m.group(0).strip()[:40]
+    return line, word
+
+
+def how_classified(path: str, stored_kind: Optional[str] = None) -> Dict[str, object]:
+    """How the build's classifier came to file a member: classify.classify()
+    run again over the member's first 8 KB, decoded as the build decodes it,
+    and its REASON read. `by` is 'content' (a signature fired: the line and
+    the word are quoted in `seen`), 'folder' (the library folder name),
+    'extension', 'changed' (the file now reads as another kind than the
+    index holds: build first) or 'unreadable'. `text` is what was read (up
+    to HEAD_BYTES), for the checks refile_verdict() makes."""
+    out: Dict[str, object] = {"kind": stored_kind, "reason": "", "by": "unreadable", "line": 0, "word": "", "text": "",
+                              "seen": "the file could not be read from disk to say what decided its kind - is the estate "
+                                      "where the build saw it?"}
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read(HEAD_BYTES)
+    except OSError:
+        return out
+    text, _enc = reader.decode_bytes(data)
+    head = text[:8192]                                              # as the build hands it to the classifier
+    kind, reason = classify.classify(path, head)
+    # the shape checks are line-anchored: a member downloaded with CR LF must not slip past a `$`
+    out.update(kind=kind, reason=reason, text=text.replace("\r\n", "\n").replace("\r", "\n"))
+    ext = os.path.splitext(path)[1].lower()
+    if stored_kind == "empty":
+        # the build files a code member with no code lines (comments and blanks only) as empty, after classifying
+        out.update(kind="empty", by="content",
+                   seen=f"the classifier read it as {kind} ({reason}) and the build filed it empty: no code lines, nothing "
+                        "a program could copy")
+    elif stored_kind and kind != stored_kind:
+        out.update(kind=stored_kind, by="changed",
+                   seen=f"the file now reads as {kind} ({reason}) and the index holds {stored_kind} from an earlier read: "
+                        "run the build first")
+    elif reason.startswith("library folder"):
+        parent = os.path.basename(os.path.dirname(path))
+        tail = next((m.group(0) for rx, _k in classify.DIR_HINTS for m in [rx.search(parent)] if m), parent)
+        out.update(by="folder", seen=f"the folder name ends in {tail.upper()}")
+    elif reason.startswith("binary extension"):
+        out.update(by="extension", seen=f"the extension {ext} is a binary document's")
+    elif reason.startswith(("extension", "unrecognised member", "no signature")):
+        out.update(by="extension", seen=f"the extension {ext or '(none)'} in a folder with no library hint")
+    elif kind == "listing" and not classify._SIG_LISTING.search(head):
+        out.update(by="extension", seen=f"the extension {ext} reads as a compiler listing")
+    else:
+        line, word = _signature_hit(kind, head)
+        if kind in _WEAK_WORDS:
+            seen = (f"line {line} `{word}` reads as {_WEAK_WORDS[kind]}, checked before the level numbers and the folder "
+                    f"name; {REFILED_ITEM}")
+        else:
+            seen = f"line {line} `{word}`: {reason}" if word else reason
+        out.update(by="content", line=line, word=word, seen=seen)
+    return out
+
+
+def refile_verdict(r: Dict[str, object], folder: str) -> Tuple[bool, str]:
+    """(can be re-filed as a copybook, why not). Only a member the classifier
+    typed asm / listing / mfs BY ITS CONTENT that (a) sits in a folder
+    classify.DIR_HINTS maps to copybook or (b) carries COBOL level numbers,
+    (c) has no JCL line and no IDENTIFICATION DIVISION / PROGRAM-ID, and (d)
+    has none of the shapes a real member of that kind has. The strong
+    signatures (JOB card, PROC, DBD, PSB, BMS, CSD, stage-1) are never
+    overridden: such a member is not a copybook. A copy of the member in
+    another folder or under another name reads the same, so nothing but the
+    re-parse batch helps a member this refuses."""
+    if r["by"] != "content":
+        return False, ""
+    kind = str(r["kind"])
+    text = str(r["text"])
+    if kind == "empty":
+        return False, "it has no code lines (comments and blanks only): nothing a program could copy"
+    if kind not in WEAK_KINDS:
+        return False, (f"its text carries a {kind} signature ({r['reason']}): not a COBOL copybook - the copybook the "
+                       "programs copy is another member, still to fetch")
+    hint = next((k for rx, k in classify.DIR_HINTS if rx.search(folder or "")), None)
+    if hint != "copybook" and not classify._SIG_DATA_LEVEL.search(text):
+        return False, ("neither its folder (the name does not end in COPYLIB) nor its text (no level numbers) says it is a "
+                       "copybook - a folder ending in COPYLIB would let this tool re-file it; the classifier itself reads "
+                       f"it as {kind} until {REFILED_ITEM}")
+    if _JCL_LINE.search(text):
+        return False, f"it holds a JCL line (//) - if it is the copybook after all, wait for {REFILED_ITEM}"
+    if classify._SIG_COBOL.search(text) or classify._SIG_PROGRAM_ID.search(text):
+        return False, "it holds an IDENTIFICATION DIVISION or PROGRAM-ID: a program, not a copybook"
+    shape = ""
+    if kind == "asm" and _ASM_SHAPE.search(text):
+        shape = ("an Assembler member (a label in column 1 before CSECT or DSECT, START alone or with a numeric operand, "
+                 "DFHEIENT, or DS / DC with a type)")
+    elif kind == "listing" and (_LISTING_HEAD.search(text) or sum(1 for ln in text.splitlines() if _LISTING_SHAPE.match(ln)) >= 3):
+        shape = "a compiler listing (the banner, or numbered source lines)"
+    elif kind == "mfs" and _MFS_SHAPE.search(text):
+        shape = "MFS source (a labelled MSG / FMT / DEV / DFLD / MFLD, or TYPE= / POS= / LTH= operands)"
+    if shape:
+        return False, (f"it has the shape of {shape} - the copybook the programs copy is then another member, still to "
+                       f"fetch; if this member IS the COBOL copybook, wait for {REFILED_ITEM}")
+    return True, ""
+
+
+def member_readings(found: Sequence[Tuple[int, str, str, str]]) -> List[Dict[str, object]]:
+    """Per member (id, kind, folder, path) as members_named() lists them: how
+    the classifier decided (how_classified) and whether refile_misfiled()
+    may re-file it (refile_verdict). Reads each member's file once."""
+    readings: List[Dict[str, object]] = []
+    for mid, kind, folder, path in found:
+        r = how_classified(path, kind)
+        r.update(id=int(mid), folder=folder, path=path)
+        ok, why_not = refile_verdict(r, folder)
+        r.update(refile=ok, why_not=why_not)
+        readings.append(r)
+    return readings
+
+
+def read_misfiled(entries: Sequence[Dict[str, object]]) -> None:
+    """Give every misfiled entry of arrived_copybooks() its `readings`
+    (member_readings over its `found` rows), once."""
+    for e in entries:
+        if "readings" not in e:
+            e["readings"] = member_readings(e.get("found", []))                # type: ignore[arg-type]
+
+
+def filed_phrase(r: Dict[str, object]) -> str:
+    """'filed as asm by its content (line 3 `START-DATE` reads as ...)' /
+    'filed as proc by its folder (the folder name ends in PROCS)' / 'filed
+    as doc by its extension (...)' - one member, the way it was decided."""
+    by = str(r["by"])
+    if by in ("content", "folder", "extension"):
+        return f"filed as {r['kind']} by its {by} ({r['seen']})"
+    return f"filed as {r['kind']} ({r['seen']})"
+
+
+def content_fix(r: Dict[str, object], dry_run: bool = False) -> str:
+    """What to do for a member typed by its content: this tool re-files it
+    (or would, on a dry run), or says why it cannot."""
+    if r.get("refile"):
+        return CONTENT_FIX_DRY if dry_run else CONTENT_FIX
+    return f"no folder change helps (the content decided); not re-filed: {r['why_not']}"
+
+
+def folder_decided(e: Dict[str, object]) -> bool:
+    """A misfiled entry with at least one member the folder name, the
+    extension, or nothing readable decided: the rename / declare sentence
+    applies to it."""
+    return any(r["by"] != "content" for r in e.get("readings", []))              # type: ignore[union-attr]
+
+
+def refiled_members(conn: sqlite3.Connection) -> Dict[int, str]:
+    """{member id: parse_error} for every member this tool re-filed as a
+    copybook (kind copybook, parse_status skipped, the marker in
+    parse_error): not misfiled any more, its own layout rows still absent."""
+    return {int(mid): str(err) for mid, err in conn.execute("SELECT id, parse_error FROM member WHERE parse_error LIKE ?",
+                                                             (REFILED_MARK + "%",))}
+
+
+_REFILED_KIND = re.compile(r"the classifier filed it as (\w+) by its content")
+
+
+def refiled_kind_before(parse_error: Optional[str]) -> str:
+    """'asm' from a re-filed member's parse_error."""
+    m = _REFILED_KIND.search(parse_error or "")
+    return m.group(1) if m else "?"
+
+
+def _refile_member(conn: sqlite3.Connection, r: Dict[str, object], today: str) -> None:
+    """The member row becomes a copybook the build keeps as it is (settled:
+    'skipped'), hashed as the build hashes a copybook; the rows its parse as
+    the other kind wrote (an MFS member's 'no macros recognised' note, a
+    screen) are void for a copybook and go."""
+    from . import build as _build                                   # local: build imports nothing from here
+    mid = int(r["id"])                                              # type: ignore[arg-type]
+    text, data, enc = reader.load(str(r["path"]))
+    norm, nlines, fixed = _build.norm_hash("copybook", text, data, enc)
+    conn.execute("DELETE FROM unresolved WHERE member_id=?", (mid,))
+    for (sid,) in conn.execute("SELECT id FROM screen WHERE member_id=?", (mid,)).fetchall():
+        conn.execute("DELETE FROM screen_field WHERE screen_id=?", (sid,))
+    conn.execute("DELETE FROM screen WHERE member_id=?", (mid,))
+    conn.execute("DELETE FROM literal_ref WHERE member_id=? AND program_id IS NULL", (mid,))
+    conn.execute("UPDATE member SET kind='copybook', parse_status='skipped', parse_error=?, norm_sha=?, lines=?, "
+                 "fixed_format=? WHERE id=?",
+                 (f"{REFILED_MARK} on {today}: the classifier filed it as {r['kind']} by its content ({REFILED_ITEM}); "
+                  "the programs copying it were marked", norm, nlines, fixed, mid))
+
+
+def refile_misfiled(conn: sqlite3.Connection, misfiled: Sequence[Dict[str, object]], dry_run: bool = False
+                    ) -> Tuple[List[Dict[str, object]], List[Dict[str, object]], int]:
+    """The stand-in for ROADMAP re-parse item 22: every misfiled member
+    refile_verdict() accepts becomes a copybook in the index and the
+    programs copying it are marked pending (by name: none of them resolved
+    it, so none is left alone wrongly). Returns (entries re-filed - or, on a
+    dry run, that would be - entries still misfiled, programs marked). On a
+    dry run nothing changes and every entry stays misfiled."""
+    read_misfiled(misfiled)
+    refiled: List[Dict[str, object]] = []
+    remaining: List[Dict[str, object]] = []
+    marked = 0
+    today = time.strftime("%Y-%m-%d")
+    for e in misfiled:
+        todo = [r for r in e["readings"] if r["refile"]]                         # type: ignore[union-attr]
+        if not todo:
+            remaining.append(e)
+            continue
+        if dry_run:
+            refiled.append(e)
+            remaining.append(e)
+            continue
+        done = 0
+        for r in todo:
+            try:
+                _refile_member(conn, r, today)
+                done += 1
+            except OSError as exc:                                  # gone since it was read: left misfiled, said why
+                r.update(refile=False, why_not=f"the file could not be read to re-file it ({exc})")
+        if not done:
+            remaining.append(e)
+            continue
+        refiled.append(e)
+        marked += _mark_programs_in(conn, [str(e["copybook"])])
+    if refiled and not dry_run:
+        conn.commit()
+    return refiled, remaining, marked
+
+
 def _unknown_among(entries: Sequence[Dict[str, object]]) -> int:
     """How many of the arrived copybooks have a member the index filed 'unknown'."""
     return sum(1 for e in entries if any(k == "unknown" for k, _f in e["members"]))    # type: ignore[union-attr]
 
 
+def misfiled_cells(e: Dict[str, object], dry_run: bool = False) -> Tuple[str, str]:
+    """('what to do', 'why that kind') for a misfiled entry: the rename /
+    declare sentence for the members the folder name decided, the re-file
+    (or why not) for the ones a line of their text decided - both when the
+    copybook's name has members of both sorts."""
+    readings = list(e.get("readings", []))                                         # type: ignore[arg-type]
+    if not readings:
+        return MISFILED_FIX, ""
+    why = "; ".join(dict.fromkeys(filed_phrase(r) for r in readings))
+    todo: List[str] = []
+    if any(r["by"] != "content" for r in readings):
+        todo.append(MISFILED_FIX)
+    by_content = [r for r in readings if r["by"] == "content"]
+    if by_content:
+        fixes = list(dict.fromkeys(content_fix(r, dry_run) for r in by_content))
+        todo.append(("the copy filed by its content: " if todo else "") + "; ".join(fixes))
+    return "; ".join(todo), why
+
+
 def arrival_report(arrived: Sequence[Dict[str, object]], misfiled: Sequence[Dict[str, object]], dry_run: bool = False,
-                   limit: int = 8) -> List[str]:
-    """The report's two sections for arrived_copybooks(): what arrived after
-    its programs were parsed (marked for the next build), and what exists
-    only under a kind the build does not expand (what to do, in words)."""
+                   limit: int = 8, refiled: Sequence[Dict[str, object]] = ()) -> List[str]:
+    """The report's sections for arrived_copybooks(): what arrived after its
+    programs were parsed (marked for the next build), what exists only under
+    a kind the build does not expand (what to do, in words - the folder fix,
+    or that no folder fix helps), and what this run re-filed as a copybook
+    (refile_misfiled)."""
     def progs(e: Dict[str, object]) -> str:
         names = [n + (" (copybook)" if k == "copybook" else "") for _i, n, k in e["programs"]]   # type: ignore[union-attr]
         return ", ".join(names[:limit]) + (f", +{len(names) - limit:,} more" if len(names) > limit else "")
@@ -1316,16 +1648,46 @@ def arrival_report(arrived: Sequence[Dict[str, object]], misfiled: Sequence[Dict
             kinds, folders = _kinds_folders(e["members"])                            # type: ignore[arg-type]
             lines.append(f"| {e['copybook']} | {kinds} | {folders} | {progs(e)} |\n")
     if misfiled:
+        read_misfiled(misfiled)
         lines.append("\n## A member with the copybook's name exists but is filed as something else\n\n"
                      "The build expands only members filed as copybook, cobol, sql or unknown; the members below are of "
                      "another kind, so every program that copies them stays parsed only in part - a re-parse would find "
                      "nothing, so nothing is marked. A procedure copybook (paragraphs and statements, no level numbers, no "
                      "DIVISION header) has no content signature, and the folder name types it: PROCS makes it a proc, CNTL a "
-                     "control card, a plain folder a document (ROADMAP re-parse item 20).\n\n"
-                     "| copybook | filed as | folder | programs | what to do |\n|---|---|---|---|---|\n")
+                     "control card, a plain folder a document (ROADMAP re-parse item 20). A member whose text trips a weak "
+                     "content signature - a field or paragraph named START-..., a comment naming MODULE MAP, a line whose "
+                     "first word is MSG - is typed by that line before its level numbers and its folder are looked at "
+                     f"({REFILED_ITEM}): no folder change helps, and a copy of it elsewhere or under another name reads the "
+                     "same; this tool re-files such a member as a copybook in the index when its text is COBOL (the section "
+                     "'Re-filed as copybook'), and says why when it cannot. The last column says which decided.\n\n"
+                     "| copybook | filed as | folder | programs | what to do | why that kind |\n|---|---|---|---|---|---|\n")
         for e in misfiled:
             kinds, folders = _kinds_folders(e["members"])                            # type: ignore[arg-type]
-            lines.append(f"| {e['copybook']} | {kinds} | {folders} | {progs(e)} | {MISFILED_FIX} |\n")
+            todo, why = misfiled_cells(e, dry_run)
+            lines.append(f"| {e['copybook']} | {kinds} | {folders} | {progs(e)} | {todo} | {why} |\n")
+    if refiled:
+        lines.append("\n## Re-filed as copybook\n\n"
+                     "The classifier reads a member's first 8 KB for content signatures before its level numbers and before "
+                     "its folder name, and three of them are weak: a first or second word beginning with START, CSECT or "
+                     "DSECT reads as Assembler, a comment naming MODULE MAP or CROSS REFERENCE TABLE as a compiler listing, "
+                     f"a line whose first word is MSG, FMT, DEV, DFLD or MFLD as an MFS statement ({REFILED_ITEM}). The "
+                     "members below are COBOL by their folder (COPYLIB) or their level numbers, carry no JCL line and no "
+                     "IDENTIFICATION DIVISION, and have none of those kinds' shapes, so "
+                     + ("a run without --dry-run sets their kind to copybook in the index and marks the programs that copy "
+                        "them (dry run: nothing changed). " if dry_run else
+                        "this run set their kind to copybook in the index and marked the programs that copy them: run your "
+                        "usual build command - it expands them (the build keeps the stored kind of an unchanged member, and "
+                        "the expander reads the copybook's text from disk). ")
+                     + "Their own layout rows - fields, offsets - stay absent until the next full re-parse files them as "
+                     "copybooks itself; a --rebuild before that files them as before, and this tool re-files them again.\n\n"
+                     "| copybook | had been filed as | why (the signature that fired, in words) | folder | programs |\n"
+                     "|---|---|---|---|---|\n")
+        for e in refiled:
+            done = [r for r in e["readings"] if r["refile"]]                         # type: ignore[union-attr]
+            kinds = ", ".join(dict.fromkeys(str(r["kind"]) for r in done))
+            why = "; ".join(dict.fromkeys(str(r["seen"]) for r in done))
+            folders = ", ".join(dict.fromkeys(str(r["folder"]) for r in done))
+            lines.append(f"| {e['copybook']} | {kinds} | {why} | {folders} | {progs(e)} |\n")
     return lines
 
 
@@ -1644,14 +2006,20 @@ def _mark_programs(db: str, names: Sequence[str]) -> int:
         return 0
     conn = sqlite3.connect(db)
     try:
-        n = 0
-        for name in names:
-            n += conn.execute("UPDATE member SET parse_status='pending', parse_error=NULL WHERE kind='cobol' AND id IN "
-                              "(SELECT member_id FROM copy_use WHERE UPPER(copybook)=?)", (name.upper(),)).rowcount
+        n = _mark_programs_in(conn, names)
         conn.commit()
         return n
     finally:
         conn.close()
+
+
+def _mark_programs_in(conn: sqlite3.Connection, names: Sequence[str]) -> int:
+    """_mark_programs on an open connection (the caller commits)."""
+    n = 0
+    for name in names:
+        n += conn.execute("UPDATE member SET parse_status='pending', parse_error=NULL WHERE kind='cobol' AND id IN "
+                          "(SELECT member_id FROM copy_use WHERE UPPER(copybook)=?)", (name.upper(),)).rowcount
+    return n
 
 
 def _mark_members(db: str, ids: Sequence[int]) -> int:
@@ -1851,6 +2219,10 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
         # what to do) - counted as missing, and rejected by the listing path, without a word that the
         # member was on disk
         arrived, misfiled = arrived_copybooks(conn)
+        # a misfiled member a LINE OF ITS TEXT typed asm / listing / mfs (a START- name, a MODULE MAP comment, a
+        # first word MSG) is re-filed as a copybook here, not on a dry run - no folder fix helps it (ROADMAP
+        # re-parse item 22); the missing count is taken after, so a re-filed name is not sent to the listings
+        refiled, misfiled, marked_refiled = refile_misfiled(conn, misfiled, dry_run)
         missing = missing_copybooks(conn)
         copiers = copiers_by_kind(conn, missing)
         users = copier_names(conn, missing)
@@ -1914,15 +2286,37 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
         if _unknown_among(arrived):
             log(f"  {_unknown_among(arrived):,} of them filed 'unknown' (a folder with no COPY hint): the build expands it but "
                 f"has no parser for it, so its own lines are not indexed - {UNKNOWN_FIX}")
-    if misfiled:
-        n_prog = len({p[0] for e in misfiled for p in e["programs"]})           # type: ignore[union-attr]
-        kinds = ", ".join(sorted({k for e in misfiled for k, _f in e["members"]}))   # type: ignore[union-attr]
-        log(f"  {len(misfiled):,} copybook name(s) exist in the index only as a member of a kind the build does not expand "
+    if refiled:
+        n_prog = len({p[0] for e in refiled for p in e["programs"]})            # type: ignore[union-attr]
+        kinds = "/".join(sorted({str(r["kind"]) for e in refiled for r in e["readings"] if r["refile"]}))   # type: ignore[union-attr]
+        if dry_run:
+            log(f"  {len(refiled):,} misfiled copybook(s) would be re-filed as copybook in the index (the classifier had read "
+                f"them as {kinds} by a line of their text): {n_prog:,} program(s) would be marked for the next build (dry run: "
+                "nothing changed)")
+        else:
+            log(f"  {len(refiled):,} misfiled copybook(s) re-filed as copybook in the index (the classifier had read them as "
+                f"{kinds} by a line of their text): {marked_refiled:,} program(s) marked for the next build")
+    # still misfiled: the folder name decided (the rename / declare sentence), or a line of the text decided
+    # and this run could not re-file it (the report says why); on a dry run the would-be re-filed stay here too
+    folder_fix = [e for e in misfiled if folder_decided(e)]
+    content_left = [e for e in misfiled if not folder_decided(e) and not any(e is x for x in refiled)]
+    if folder_fix:
+        n_prog = len({p[0] for e in folder_fix for p in e["programs"]})         # type: ignore[union-attr]
+        kinds = ", ".join(sorted({k for e in folder_fix for k, _f in e["members"]}))   # type: ignore[union-attr]
+        log(f"  {len(folder_fix):,} copybook name(s) exist in the index only as a member of a kind the build does not expand "
             f"({kinds}): {n_prog:,} program(s) stay parsed only in part until the folder is renamed to end in COPYLIB or "
             "the library's kind declared in the UI's table - the report names each")
-    arrival_lines = removed_lines + arrival_report(arrived, misfiled, dry_run)
-    # every missing name is one a member of another kind carries: the folder fix comes before any listing
-    only_misfiled = bool(missing) and set(missing) <= {str(e["copybook"]) for e in misfiled}
+    if content_left:
+        n_prog = len({p[0] for e in content_left for p in e["programs"]})       # type: ignore[union-attr]
+        kinds = ", ".join(sorted({k for e in content_left for k, _f in e["members"]}))   # type: ignore[union-attr]
+        log(f"  {len(content_left):,} copybook name(s) exist in the index only as a member the classifier typed by a line of "
+            f"its text ({kinds}) and this run could not re-file: {n_prog:,} program(s) stay parsed only in part - no folder "
+            f"change helps; the report says why for each ({REFILED_ITEM})")
+    arrival_lines = removed_lines + arrival_report(arrived, misfiled, dry_run, refiled=refiled)
+    # every missing name is one a member of another kind carries and a rename (or a run without --dry-run)
+    # settles: that comes before any listing - a member this run could not re-file is left to the listings
+    settle_first = {str(e["copybook"]) for e in folder_fix} | {str(e["copybook"]) for e in refiled}
+    only_misfiled = bool(missing) and set(missing) <= settle_first
 
     def early(stats: Dict[str, object], nothing: str) -> Dict[str, object]:
         """A run that ends before the listings are read still reports the
@@ -1940,18 +2334,23 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
             elif os.path.exists(report):
                 _write_report(report, head + [f"\nNothing to report on this run: {nothing}.\n"])
                 log(f"{report} - nothing to report on this run (the earlier run's report is replaced)")
-        if marked or marked_removed:
+        if marked or marked_removed or marked_refiled:
             log("next: run your usual build command - the programs marked re-expand by themselves")
-        if misfiled:
+        if folder_fix:
             log(MISFILED_NEXT)
-        stats.update({"arrived": len(arrived), "misfiled": len(misfiled), "marked": marked + marked_removed})
+        stats.update({"arrived": len(arrived), "misfiled": len(misfiled), "refiled": 0 if dry_run else len(refiled),
+                      "marked": marked + marked_removed + marked_refiled})
         return stats
 
     log(f"missing copybooks in the index: {len(missing):,}, used in {sum(missing.values()):,} places (a place = one program "
         "copying one of them)")
     if only_misfiled:
-        log("  every one of them is the name of a member filed as a kind the build does not expand (above): the folder fix "
-            "comes first - the listings only if a program still says NOT FOUND after the build")
+        if any(n in {str(e["copybook"]) for e in folder_fix} for n in missing):
+            log("  every one of them is the name of a member filed as a kind the build does not expand (above): the folder fix "
+                "comes first - the listings only if a program still says NOT FOUND after the build")
+        else:
+            log("  every one of them is the name of a member this run would re-file as a copybook (above): run without "
+                "--dry-run first - the listings only if a program still says NOT FOUND after the build")
     if recovered:
         log(f"  held only as recovered copies: {len(recovered):,} - the build has read them, so they are not missing any more; "
             "their libraries stay on the fetch list until the real members arrive")
@@ -2254,17 +2653,18 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
         log(f"every name: {report}")
     if written and not dry_run:
         log("next: run your usual build command - the programs that copy them re-expand by themselves"
-            + (" (and the programs marked above)" if marked or marked_removed else ""))
-    elif marked or marked_removed:
+            + (" (and the programs marked above)" if marked or marked_removed or marked_refiled else ""))
+    elif marked or marked_removed or marked_refiled:
         log("next: run your usual build command - the programs marked re-expand by themselves")
-    if misfiled:
+    if folder_fix:
         log(MISFILED_NEXT)
     return {"missing": len(missing), "sources": len(sources), "written": len(written), "rejected": len(rejected),
             "not_found": len(not_found), "removed": len(removed), "kept": kept, "formats": dict(formats),
             "out": out_dir, "unconfirmed": len(unconfirmed), "per_system": per_system,
             "checked": choice_counts(checks) if checks else None,
             "fetch": (len(fetch), to_fetch), "unnamed": len(unnamed),
-            "arrived": len(arrived), "misfiled": len(misfiled), "marked": marked + marked_removed}
+            "arrived": len(arrived), "misfiled": len(misfiled), "refiled": 0 if dry_run else len(refiled),
+            "marked": marked + marked_removed + marked_refiled}
 
 
 def trace(db: str, name: str, folders: Sequence[str] = (), log=print) -> int:
