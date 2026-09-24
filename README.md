@@ -453,7 +453,18 @@ folder to end in COPYLIB, or declare the library's kind in the UI's table,
 and build (`coverage`, `program` and `copybook` say the same beside each
 such NOT FOUND). A member typed `unknown` is expanded into its programs
 but has no parser of its own, so its own lines are not indexed or citable
-until that same folder fix is applied - the notes say so beside it. `--from
+until that same folder fix is applied - the notes say so beside it. A member the
+classifier typed `asm`, `listing` or `mfs` by a LINE OF ITS TEXT - a field
+or paragraph named START-..., a comment naming MODULE MAP, a line whose
+first word is MSG: weak signatures checked before the level numbers and
+the folder name (ROADMAP re-parse item 22) - gets no folder advice, because
+none helps: the same run re-files it as a copybook in the index when its
+text is COBOL (never a real Assembler, listing or MFS member, a JCL line or
+a program), marks the programs copying it, and the next build expands it;
+its own field rows wait for the next full re-parse, the report's 'Re-filed
+as copybook' section names each, and `coverage`, `program` and `copybook`
+say 'filed as asm by its content' with the recover instruction instead of
+the rename. `--from
 FOLDER` adds expanded programs the index does not hold; `--dry-run` says
 what would be written. The same run reads the listing of every program whose
 copybook the build chose among several same-named ones (the listing's

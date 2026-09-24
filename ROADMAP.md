@@ -255,6 +255,31 @@ shipped alone and cost one such night; these still wait for the next one:
    alone a COPY the expander SKIPPED (a copybook copying itself; nesting deeper than 12): that
    program row is NULL too, but the member was found and the program parsed after it - the
    program's own 'expand' note tells the two apart (recover.skipped_copies, LESSONS 185).
+22. **classify.py: the level-number signature and a COBOL-statement signature are checked BEFORE the
+   Assembler, listing and MFS signatures, and `_SIG_ASM` requires the Assembler shape.** His copybook
+   in a `.COPYLIB` folder was filed `asm`: `_SIG_ASM` (`^(?:[ \t]*\w+)?[ \t]+(CSECT|DSECT|START|DFHEIENT)\b`)
+   fires on any line whose first or second word BEGINS with START - `05 START-DATE PIC X(8).`,
+   `PERFORM START-PARA.`, `MOVE START-DATE TO WS-DATE` - and runs before `_SIG_DATA_LEVEL` and before the
+   folder hint; `_SIG_LISTING` fires on a comment saying MODULE MAP or CROSS REFERENCE TABLE, `_SIG_MFS`
+   on a line whose first word is MSG / FMT / DEV / DFLD / MFLD. The resolver never looks at asm / listing /
+   mfs, so every program copying such a member says COPY X NOT FOUND while the file is in the estate, and
+   the folder fix of item 20 changes nothing - the content decided (LESSONS 186); data copybooks with a
+   START-DATE field are common in insurance code. At the re-parse: (a) the level-number signature and a
+   COBOL-statement signature (PERFORM / MOVE / IF / EVALUATE / EXEC / GOBACK / paragraph names in area A,
+   no DIVISION header) are checked before the Assembler, listing and MFS signatures; (b) `_SIG_ASM`
+   requires the Assembler shape - a label in column 1 followed by CSECT / DSECT, or START with a numeric
+   operand or alone - so START-DATE, START-PARA, a comment naming MODULE MAP and a line starting with MSG
+   no longer type a copybook as something else; (c) the declared kind in sources.json (the manifest
+   kinds) wins over a weak content signature, not only over 'unknown' (`_inventory_one` applies it to
+   'unknown' alone today, so 'declare the library's kind' never helped a member a signature had typed).
+   Until then `atlas.recover` re-files such a member as a copybook in the index (`kind='copybook'`,
+   `parse_status='skipped'`, the reason in `parse_error`; `refile_misfiled()`) and marks its programs:
+   the build keeps the stored kind of an unchanged, settled member and the expander reads the copybook's
+   text from disk, so the next incremental build makes the programs whole; the member's own field rows
+   stay absent, a `--rebuild` files it as before and recover re-files it again; a real Assembler, listing
+   or MFS member with a copybook's name is never re-filed (its shape is checked) and the report says so.
+   This item makes the stand-in unnecessary: once the classifier files these as copybooks the re-parse
+   gives them their own rows and `refile_misfiled()` finds nothing to do.
 
 ### flow: known limits (open after review)
 
