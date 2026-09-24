@@ -450,10 +450,14 @@ copybook-source table names the library the compiler read each copybook
 from) and checks each choice: confirmed, contradicted - a wrong fact, named
 in `work\recover.md` with the library the listing says - or unknown; `coverage`,
 `program` and `copybook` repeat what the listings say. The same listing rows
-give the fetch list: `work\recover.md` tables every library dataset the
-listings name (the copybooks missing from the index that came from it first,
-whether the index already holds it, how many programs), and
-`work\fetch-list.txt` holds the not-fetched ones one per line - datasets
+give the fetch list: `work\recover.md` tables the library datasets named by
+the listings the run reads - those of the programs that copy a missing
+copybook, one the index holds only as a recovered copy, or one chosen among
+several; not every listing in the estate - with the copybooks to fetch for
+that came from each first, whether the index already holds it, and how many
+programs. A copybook the build has read as a recovered copy is no longer
+missing, but its library stays on the list until the real member arrives.
+`work\fetch-list.txt` holds the not-fetched datasets one per line - datasets
 only - to paste into the UI's Bulk add or give to zowe; once fetched and
 built, those copybooks resolve and the recovered copies go.
 
