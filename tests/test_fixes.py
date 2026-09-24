@@ -453,6 +453,21 @@ class PrefixBeforeCopy(unittest.TestCase):
         self.assertEqual(tree["AAAA-KEY"].parent.name, "WS-REC")
         self.assertEqual(tree["WS-REC"].length, 12)
 
+    def test_an_unfinished_entry_before_copy_is_not_kept_live(self):
+        # "05 WS-X COPY Y." - a level the OS/VS form does not take, and no period: kept live, "05 WS-X" would join
+        # the copybook's first item into one wrong entry (WS-X 10 bytes long, AAAA-KEY gone). The line stays a
+        # comment as before: WS-X is missing, which is honest, and the copybook's items keep their lengths
+        from atlas import copybook
+        prog = "       01  WS-TOP.\n           05  WS-X   COPY ABCDE.\n           05  WS-AFTER PIC X.\n"
+        res = self._expand(prog, self.FRAG, "ABCDE")
+        self.assertEqual(self._code(res)[:3], [(" ", "01  WS-TOP."), ("*", "05  WS-X   COPY ABCDE."),
+                                               (" ", "05  AAAA-KEY          PIC X(10).")])
+        roots, _w = copybook.parse_data_division(reader.join_cobol_continuations(res.lines))
+        tree = {f.name: f for f in copybook.flatten(roots)}
+        self.assertNotIn("WS-X", tree)
+        self.assertEqual((tree["AAAA-KEY"].length, tree["AAAA-STAT"].length, tree["WS-TOP"].length), (10, 2, 13))
+        self.assertEqual(self._origin_of(res, "WS-AFTER")[1], (1, 3), "line accounting unchanged")
+
     def test_the_osvs_form_and_a_copy_starting_its_line_are_unchanged(self):
         full = "       01  LIB-REC.\n" + self.FRAG
         res = self._expand("       01  ABCD-SEG   COPY  'ABCDE'.\n", full, "ABCDE")

@@ -296,8 +296,11 @@ def expand(lines: Sequence[Line], member_id: int, resolver: Resolver,
                 h = _OSVS_HEAD.search(before)
                 if h:
                     osvs = (_entry_kind(h.group(1)), h.group(2), None, before[:h.end(2)])
-                else:
+                elif _mask_literals(before).rstrip().endswith("."):
                     prefix = before.rstrip()
+                # else: an unfinished entry before COPY ("05 WS-X COPY Y." at a level the OS/VS form
+                # does not take) - kept live it would join the copybook's first line into one wrong
+                # entry; the line stays a comment as before, a missing fact rather than a wrong one
             elif last_live is not None:
                 h = _OSVS_HEAD.search(out[last_live].code)
                 if h:
