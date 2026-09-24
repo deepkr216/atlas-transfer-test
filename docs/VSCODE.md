@@ -72,8 +72,10 @@ answer is checked mechanically before you rely on it.
 | What a recorded session showed and said | Atlas: read recordings (once per new recording), then the build; then Atlas: document sections about a term | `/atlas-answer` (quote it as a recording, not as fact) |
 | The gate said FAIL | Atlas: verify | `/atlas-fix` |
 
-`Atlas: coverage` before trusting anything; `Atlas: UI` for fetch and build;
-`Atlas: selfcheck` after every `git pull`.
+`Atlas: coverage` before trusting anything; `Atlas: UI` for fetch and build
+(run it from the folder where your zowe command works, or set the working
+folder; the toolkit runs the same command your window does and asks for
+nothing your window does not); `Atlas: selfcheck` after every `git pull`.
 
 ## Ask mode or agent mode
 

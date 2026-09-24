@@ -53,7 +53,7 @@ python -m atlas.fetch --config sources.json --init     # starter config, then ed
 ```
 
 ```bash
-python -m atlas.fetch --config sources.json --check    # is zowe on PATH, does --version work
+python -m atlas.fetch --config sources.json --check    # zowe on PATH, --version, which config it finds, host answers
 ```
 
 ```bash
@@ -70,16 +70,35 @@ shows every command exactly as run. Shop-specific Zowe flags (a profile, an
 encoding, `--preserve-original-letter-case`) go in `extra_args` — a config
 edit, not a code change. See `sources.example.json`.
 
+The fetch runs exactly what you would type in a window - `zowe zos-files
+download all-members "DSN" -d folder`, nothing added unless `sources.json`
+says so. Run it from the folder where your zowe command works, or set the
+working folder; the toolkit runs the same command your window does and asks
+for nothing your window does not. Zowe looks for its `zowe.config.json`
+from the current folder upward, so **Run zowe from folder** in the UI
+(`zowe.working_dir`; empty = the folder of `sources.json`) is where every
+`zowe` subprocess starts, and the daemon is left exactly as your window has
+it (`zowe.daemon: "window"`; tick **Zowe daemon off** only if zowe hangs).
+**Plan** and the log print the command and the folder so you can compare
+word for word; **Check Zowe** lists the configuration files zowe finds from
+that folder (paths only, never a value) or says in words that it found none.
+
 Re-indexing is **incremental**: unchanged members keep their facts, a changed
 copybook forces every program that expands it to be re-parsed, and members
 that disappeared are pruned. A full estate re-run after a small change takes
 seconds, not minutes.
 
-### The mainframe password
+### When zowe asks for a host, a user or a password
 
-Run by hand, `zowe` asks for your password when the profile does not store
-it. Run by the toolkit it cannot ask, so a fetch would create the folders and
-download nothing - the log then says so and what to do. Two ways to give it:
+If your zowe command works in a window without a prompt, the toolkit needs
+no password either: it did not find the configuration your window uses.
+First, run the toolkit from the folder where your zowe command works, or
+set **Run zowe from folder**, and leave **Zowe daemon off** unticked; Check
+Zowe shows which configuration files it sees from that folder. The session
+password is optional and comes last - for a shop whose profile stores none,
+where `zowe` asks for the password in the window too. Run by the toolkit it
+cannot ask, so a fetch would create the folders and download nothing - the
+log then says so and what to do. Two ways to give it:
 
 - once, in the profile: `zowe config secure` (Zowe v2/v3; the password goes
   into Windows Credential Manager, never into a file), or

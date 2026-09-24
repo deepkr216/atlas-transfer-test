@@ -1,11 +1,13 @@
 {
-  "_comment": "Where the automation looks. One row per mainframe dataset; `system` is the department, and each department gets its own folder under local_root (CLAIMS/PROD.CLAIMS.SRC). The ORDER of a department's copybook rows is the SYSLIB order its programs compile against - first match wins when a copybook name exists in several. Fetch SOURCE libraries only: PSBLIB / DBDLIB / ACBLIB / LOADLIB are compiled output. In the UI: Bulk add pastes a department's dataset list and infers kinds; the System filter, Fetch system and Move up/down work per department. CLI: python -m atlas.fetch --config sources.json --check / --plan / --all --build",
+  "_comment": "Where the automation looks. One row per mainframe dataset; `system` is the department, and each department gets its own folder under local_root (CLAIMS/PROD.CLAIMS.SRC). The ORDER of a department's copybook rows is the SYSLIB order its programs compile against - first match wins when a copybook name exists in several. Fetch SOURCE libraries only: PSBLIB / DBDLIB / ACBLIB / LOADLIB are compiled output. In the UI: Bulk add pastes a department's dataset list and infers kinds; the System filter, Fetch system and Move up/down work per department. CLI: python -m atlas.fetch --config sources.json --check / --plan / --all --build. Zowe: the fetch runs exactly `zowe zos-files download all-members \"DSN\" -d folder`. Run it from the folder where your zowe command works, or set the working folder; the toolkit runs the same command your window does and asks for nothing your window does not. `working_dir` = that folder (empty = the folder of this file; Zowe looks for zowe.config.json from there upward); `daemon` = \"window\" (ZOWE_USE_DAEMON left as your window has it) or \"off\" (ZOWE_USE_DAEMON=no, only if zowe hangs).",
   "zowe": {
     "executable": "zowe",
     "profile": "",
     "encoding": "",
     "timeout_seconds": 3600,
-    "extra_args": []
+    "extra_args": [],
+    "working_dir": "",
+    "daemon": "window"
   },
   "local_root": "C:/estate",
   "db": "atlas.db",
