@@ -1035,13 +1035,14 @@ class TheDocsSayIt(unittest.TestCase):
         with open(os.path.join(root, "README.md"), encoding="utf-8") as fh:
             self.assertIn("the rename. A build that re-parses every member - `--rebuild`, the\nmanifest changed (every library "
                           "added or re-kinded in the UI's table\nrewrites it), a parser module changed - files such a member "
-                          "as before\nand un-links its programs: run recover after such a build and it\nre-files them.",
+                          "as before\nand parses its programs again without it, so they read partial with\nCOPY NOT FOUND: "
+                          "run recover after such a build and it re-files them.",
                           fh.read())
         with open(os.path.join(root, "docs", "FieldManual.html"), encoding="utf-8") as fh:
             self.assertIn("instead of the rename. A build that re-parses every member — <code>--rebuild</code>, the manifest "
                           "changed (every library added or re-kinded in the UI's table rewrites it), a parser module changed "
-                          "— files such a member as before and un-links its programs: run recover after such a build and it "
-                          "re-files them. Such a member", fh.read())
+                          "— files such a member as before and parses its programs again without it, so they read partial "
+                          "with COPY NOT FOUND: run recover after such a build and it re-files them. Such a member", fh.read())
 
 
 class TheVerdict(unittest.TestCase):

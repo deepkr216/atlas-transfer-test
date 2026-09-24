@@ -1429,8 +1429,8 @@ REFILED_NOTE = "indexed as a copybook (re-filed by atlas.recover; its own layout
 # stored kind (build.py: `not force_all`): --rebuild is one way to lose it, and a build that re-parses every member
 # for its own reasons is another - the manifest changed (the UI rewrites manifest.json from the sources table on
 # every build, so every library he adds or re-kinds in its table changes it - his routine of LESSONS 183) or a
-# parser module changed. Such a build files the member as before and un-links its programs; nothing but a run of
-# this tool re-files it (LESSONS 188).
+# parser module changed. Such a build files the member as before and parses its programs again without it (they
+# read partial, COPY NOT FOUND); nothing but a run of this tool re-files it (LESSONS 188).
 REPARSE_UNDOES = ("So does any build that re-parses every member - the manifest changed (a library added or re-kinded in "
                   "the UI's table rewrites it) or a parser module changed: run this tool after such a build and it "
                   "re-files them again.")

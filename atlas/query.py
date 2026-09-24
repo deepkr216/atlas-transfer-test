@@ -255,6 +255,20 @@ UNLINKED_WHY = ("the member it had expanded went out of the index since - its te
 UNLINKED_FIX = "run `python -m atlas.recover --db atlas.db`, then the build"
 
 
+def unlinked_why(programs: int, books: int) -> str:
+    """UNLINKED_WHY in the number of the sentence it sits in: one program and
+    one copybook keep the pinned wording."""
+    if programs == 1 and books == 1:
+        return UNLINKED_WHY
+    member = "the member it had expanded" if books == 1 else "the members they had expanded" if programs != 1 \
+        else "the members it had expanded"
+    text = "its text changed" if books == 1 else "their text changed"
+    file = "the file went" if books == 1 else "the files went"
+    program = "the program" if programs == 1 else "the programs"
+    return (f"{member} went out of the index since - {text} on disk and the classifier filed the new text as another "
+            f"kind, or {file} - and nothing parsed {program} again")
+
+
 def unlinked_ok_note(conn: sqlite3.Connection, member_id: int, status: Optional[str]) -> str:
     """`program`'s clause after 'parse: ok' when a COPY row of the program is
     unresolved although the parse was whole: its fields are those of the
@@ -268,7 +282,7 @@ def unlinked_ok_note(conn: sqlite3.Connection, member_id: int, status: Optional[
     books = entry[1]
     n = len(books)
     return (f", but {n} COPY row{'s' if n != 1 else ''} {'is' if n == 1 else 'are'} unresolved ({', '.join(books)}): "
-            f"{UNLINKED_WHY}, so its fields are those of the earlier read of "
+            f"{unlinked_why(1, n)}, so its fields are those of the earlier read of "
             f"{'that copybook' if n == 1 else 'those copybooks'}; {UNLINKED_FIX} (the Copybooks table below says what "
             "happened to each)")
 
@@ -285,8 +299,9 @@ def unlinked_ok_clause(stale: Dict[int, Tuple[str, List[str]]]) -> str:
     return (f"\n> Not counted above: {n} program{'s' if n != 1 else ''} marked `ok` {'has' if n == 1 else 'have'} a COPY row "
             f"no member resolves any more ({', '.join(names[:8])}{f', +{n - 8:,} more' if n > 8 else ''}; "
             f"copybook{'s' if len(books) != 1 else ''} {', '.join(books[:8])}{f', +{len(books) - 8:,} more' if len(books) > 8 else ''}): "
-            f"{UNLINKED_WHY}, so its fields are those of the earlier read. `program NAME` says so beside `parse: ok`; "
-            f"{UNLINKED_FIX} - the 'Copybooks not found' table names each copybook with what to do.\n")
+            f"{unlinked_why(n, len(books))}, so {'its fields are' if n == 1 else 'their fields are'} those of the earlier "
+            f"read. `program NAME` says so beside `parse: ok`; {UNLINKED_FIX} - the 'Copybooks not found' table names "
+            "each copybook with what to do.\n")
 
 
 def unresolved_for(conn: sqlite3.Connection, member_ids: Sequence[int], limit: int = 40) -> str:
