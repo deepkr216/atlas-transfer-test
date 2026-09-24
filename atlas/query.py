@@ -2628,8 +2628,11 @@ def cmd_dbd(conn: sqlite3.Connection, name: str) -> str:
         for s in segs:
             flds = conn.execute("SELECT name, start, bytes, is_seq FROM ims_field WHERE segment_id=? ORDER BY start", (s["id"],)).fetchall()
             srows.append((s["name"], s["parent"] or "(root)", s["bytes"], s["seq_field"] or "",
-                          ", ".join(f"{f['name']}@{f['start']}/{f['bytes']}" + ("*" if f["is_seq"] else "") for f in flds)[:120]))
-        out.append(table(["segment", "parent", "bytes", "seq field", "fields (name@start/len, *=SEQ)"], srows))
+                          ", ".join(f"{f['name']}@{f['start']}/{f['bytes']}" + ("*" if f["is_seq"] else "") for f in flds)[:120],
+                          _segment_traffic(conn, s["name"], d["name"])))
+        out.append(table(["segment", "parent", "bytes", "seq field", "fields (name@start/len, *=SEQ)", "programs"], srows))
+        out.append("- `segment NAME --dbd " + d["name"] + "` puts each DBD field at its bytes in every program's "
+                   "I/O area, whatever that program calls it\n")
         xd = conn.execute("SELECT name, segment, srch FROM ims_xdfld WHERE dbd_id=?", (d["id"],)).fetchall()
         if xd:
             out.append("- secondary index search fields (XDFLD): " + "; ".join(
@@ -2672,45 +2675,327 @@ def cmd_dbd(conn: sqlite3.Connection, name: str) -> str:
     return "".join(out)
 
 
-def cmd_segment(conn: sqlite3.Connection, name: str) -> str:
+_DLI_STORE = ("ISRT", "REPL")
+_DLI_READ = ("GU", "GN", "GHU", "GHN", "GNP", "GHNP")
+
+
+def _segment_pcbs(conn: sqlite3.Connection, seg: str, dbds: List[str]) -> List[sqlite3.Row]:
+    """The PCBs (of the named DBDs) sensitive to a segment."""
+    if not dbds:
+        return []
+    q = ",".join("?" * len(dbds))
+    return conn.execute(f"""SELECT ps.name AS psb, pc.ordinal, pc.dbd_name, pc.procopt, pc.sensegs
+                            FROM ims_pcb pc JOIN ims_psb ps ON ps.id=pc.psb_id
+                            WHERE UPPER(pc.dbd_name) IN ({q}) AND pc.sensegs LIKE ?
+                            ORDER BY ps.name, pc.ordinal""", (*dbds, f'%"{seg}"%')).fetchall()
+
+
+def _segment_calls(conn: sqlite3.Connection, seg: str, dbds: List[str],
+                   pcbs: Optional[List[sqlite3.Row]] = None) -> List[Tuple[sqlite3.Row, str]]:
+    """The DL/I calls that can touch a segment: on a PCB sensitive to it, or
+    EXEC DLI SEGMENT(X) naming it (that names the segment even when the PCB
+    position could not be resolved through a PSB). Each with how it was tied."""
+    if not dbds:
+        return []
+    if pcbs is None:
+        pcbs = _segment_pcbs(conn, seg, dbds)
+    keys = {(p["psb"].upper(), p["ordinal"]) for p in pcbs}
+    q = ",".join("?" * len(dbds))
+    calls = conn.execute(f"""SELECT p.program_id, p.id AS pid, p.member_id, d.func, d.procopt, d.psb_name,
+                                    d.pcb_ordinal, d.ssa_args, d.io_area, d.line, d.dbd_name
+                             FROM dli_call d JOIN program p ON p.id=d.program_id
+                             WHERE UPPER(d.dbd_name) IN ({q}) OR d.ssa_args LIKE ? ORDER BY p.program_id, d.line""",
+                         (*dbds, f'%"{seg}"%')).fetchall()
+    out = []
+    for c in calls:
+        via_pcb = (c["psb_name"] or "").upper(), c["pcb_ordinal"]
+        named = seg in [x.upper() for x in _jl(c["ssa_args"])]
+        if named:
+            out.append((c, "SEGMENT() names it"))
+        elif via_pcb in keys:
+            out.append((c, "PCB sensitive to it"))
+    return out
+
+
+def _count_phrase(n: int, verb: str, plural_verb: str) -> str:
+    return f"{n} program{'s' if n != 1 else ''} {plural_verb if n != 1 else verb} it"
+
+
+def _segment_traffic(conn: sqlite3.Connection, seg: str, dbd: str) -> str:
+    """'2 programs store it, 1 reads it' for one segment of one DBD."""
+    calls = _segment_calls(conn, seg.upper(), [dbd.upper()])
+    store = {c["program_id"] for c, _h in calls if (c["func"] or "") in _DLI_STORE}
+    read = {c["program_id"] for c, _h in calls if (c["func"] or "") in _DLI_READ}
+    dele = {c["program_id"] for c, _h in calls if (c["func"] or "") == "DLET"}
+    if not (store or read or dele):
+        return "no program touches it"
+    parts = [_count_phrase(len(store), "stores", "store"), _count_phrase(len(read), "reads", "read")]
+    if dele:
+        parts.append(_count_phrase(len(dele), "deletes", "delete"))
+    return ", ".join(parts)
+
+
+class _AreaItem:
+    """One data item of a program's I/O area at THIS program's offsets, with
+    the line to cite (the copybook's own line when it came from a COPY)."""
+    __slots__ = ("id", "parent_id", "name", "level", "pic", "usage", "offset", "length", "occurs",
+                 "is_group", "redefines", "src_name", "src_line", "from_copy")
+
+    def __init__(self, r: sqlite3.Row, src_name: Optional[str], src_line: Optional[int], from_copy: bool):
+        self.id, self.parent_id, self.name, self.level = r["id"], r["parent_id"], r["name"], r["level"]
+        self.pic, self.usage, self.offset, self.length = r["pic"], r["usage"], r["offset"] or 0, r["length"] or 0
+        self.occurs = r["occurs_max"] or 1
+        self.is_group, self.redefines = bool(r["is_group"]), r["redefines"]
+        self.src_name, self.src_line, self.from_copy = src_name, src_line, from_copy
+
+    @property
+    def extent(self) -> int:                      # bytes covered, every occurrence
+        return self.length * self.occurs
+
+    def cite(self) -> str:
+        return f"`{self.src_name}:{self.src_line}`" if self.src_name and self.src_line else ""
+
+    def shape(self) -> str:                       # X(01) / S9(7)V99 COMP-3 / group
+        if self.is_group:
+            return "group"
+        return (self.pic or "?") + (f" {self.usage}" if self.usage and self.usage != "DISPLAY" else "")
+
+
+def _io_area_items(conn: sqlite3.Connection, pid: int, member_id: int, area: str
+                   ) -> Tuple[Optional[List[_AreaItem]], str, str]:
+    """The items of a program's I/O area (the 01 a DL/I call names), at the
+    program's offsets: the program's pfield rows first (they carry the
+    copybook line to cite and the program's own offsets); on an index built
+    before pfield existed, the program's `field` rows, else the rows of the
+    one copybook COPYed inside that 01 (the copybook's own offsets - right
+    when nothing precedes the COPY, which is the usual shape).
+    (items or None, where the layout came from, a caveat or '')."""
+    n = area.upper()
+    try:
+        root = conn.execute("SELECT * FROM pfield WHERE program_id=? AND parent_id IS NULL AND UPPER(name)=? "
+                            "ORDER BY id LIMIT 1", (pid, n)).fetchone()
+    except sqlite3.OperationalError:
+        root = None                               # an index built before the value-flow tables
+    if root is not None and not root["pruned"]:
+        rows = conn.execute("""SELECT p.*, m.name AS src_name FROM pfield p LEFT JOIN member m ON m.id=p.src_member
+                               WHERE p.root_id=? ORDER BY p.offset, p.id""", (root["root_id"],)).fetchall()
+        items = [_AreaItem(r, r["src_name"], r["src_line"], bool(r["src_member"] and r["src_member"] != member_id))
+                 for r in rows]
+        books = sorted({i.src_name for i in items if i.from_copy and i.src_name})
+        return items, ("copybook " + ", ".join(books)) if books else "in the program", ""
+
+    def subtree(roots: List[sqlite3.Row], src: str, from_copy: bool) -> List[_AreaItem]:
+        items, todo = [], list(roots)
+        while todo:
+            cur = todo.pop(0)
+            items.append(_AreaItem(cur, src, cur["line"], from_copy))
+            todo.extend(conn.execute("SELECT * FROM field WHERE parent_id=? ORDER BY id", (cur["id"],)).fetchall())
+        items.sort(key=lambda i: (i.offset, i.id))
+        return items
+
+    old = "this index was built before the value-flow tables: rebuild it for this program's own offsets"
+    root = conn.execute("SELECT * FROM field WHERE member_id=? AND parent_id IS NULL AND UPPER(name)=? ORDER BY id LIMIT 1",
+                        (member_id, n)).fetchone()
+    if root is None:
+        return None, "not indexed as a layout", old
+    mem = conn.execute("SELECT name FROM member WHERE id=?", (member_id,)).fetchone()[0]
+    if not root["is_group"] or conn.execute("SELECT 1 FROM field WHERE parent_id=? LIMIT 1", (root["id"],)).fetchone():
+        return subtree([root], mem, False), "in the program", old
+    lib = _osvs_library_root(conn, member_id, root)
+    if lib:
+        _p, cb_mid, cb_root = lib
+        cbm = conn.execute("SELECT name FROM member WHERE id=?", (cb_mid,)).fetchone()[0]
+        return subtree([cb_root], cbm, True), f"copybook {cbm}", old
+    # `01 X.` followed by `COPY Y.`: the COPY statements between this 01 and the next one
+    nxt = conn.execute("SELECT MIN(line) FROM field WHERE member_id=? AND parent_id IS NULL AND line>?",
+                       (member_id, root["line"] or 0)).fetchone()[0]
+    copies = conn.execute("""SELECT c.copybook, c.resolved_member_id, c.replacing FROM copy_use c
+                             WHERE c.member_id=? AND c.line>? AND c.line<? ORDER BY c.line""",
+                          (member_id, root["line"] or 0, nxt if nxt is not None else 10 ** 9)).fetchall()
+    if len(copies) == 1 and copies[0]["resolved_member_id"] and not copies[0]["replacing"]:
+        cb_mid = copies[0]["resolved_member_id"]
+        cbm = conn.execute("SELECT name FROM member WHERE id=?", (cb_mid,)).fetchone()[0]
+        tops = conn.execute("SELECT * FROM field WHERE member_id=? AND parent_id IS NULL ORDER BY id", (cb_mid,)).fetchall()
+        if tops:
+            return subtree(tops, cbm, True), f"copybook {cbm}", old
+    why = (f"{len(copies)} COPY statements inside the 01" if len(copies) > 1 else
+           "COPY with REPLACING inside the 01" if copies and copies[0]["replacing"] else
+           "the copybook inside the 01 is not in the index" if copies else "the 01 has no items in this index")
+    return None, "not indexed as a layout", f"{why}; {old}"
+
+
+def _under_redefines(items: List[_AreaItem], it: _AreaItem) -> bool:
+    by_id = {i.id: i for i in items}
+    cur: Optional[_AreaItem] = it
+    while cur is not None:
+        if cur.redefines:
+            return True
+        cur = by_id.get(cur.parent_id) if cur.parent_id is not None else None
+    return False
+
+
+def _at_offset(items: List[_AreaItem], lo: int, hi: int) -> Tuple[List[_AreaItem], List[_AreaItem]]:
+    """The elementary items covering 0-based bytes lo..hi: (the plain ones,
+    the ones under a REDEFINES - the same bytes under another name)."""
+    hits = [i for i in items if not i.is_group and i.offset <= hi and i.offset + i.extent - 1 >= lo]
+    plain = [i for i in hits if not _under_redefines(items, i)]
+    other = [i for i in hits if _under_redefines(items, i)]
+    return plain, other
+
+
+def _describe_hit(items: List[_AreaItem], lo: int, hi: int, src: str) -> Tuple[str, Optional[tuple]]:
+    """One program's answer for one DBD field: the text after the program
+    name, and a key (layout source, names, bytes, PIC) that says whether two
+    programs see the same layout at these bytes. Never the nearest name: a
+    miss is said as a miss, a FILLER as a FILLER, a longer or shorter item
+    or a run of items as such."""
+    plain, other = _at_offset(items, lo, hi)
+    where = f"via {src}" if src.startswith("copybook") else "in the program"
+    if not plain and not other:
+        area_len = max((i.offset + i.extent for i in items), default=0)
+        return f": no field at that offset (area shorter: {area_len} bytes)", None
+    hits = plain or other
+    note = ""
+    if plain and other:
+        note = " - also " + ", ".join(f"{o.name} ({o.shape()}, REDEFINES {o.redefines or 'a parent'})" for o in other)
+    elif not plain:
+        note = " - under a REDEFINES"
+    cites = " ".join(sorted({h.cite() for h in hits if h.cite()}))
+    key = (src, tuple(h.name for h in hits), tuple((h.offset, h.length, h.pic) for h in hits))
+    if len(hits) == 1:
+        h = hits[0]
+        first, last = h.offset + 1, h.offset + h.extent
+        if h.name == "FILLER":                    # a difference in itself: no 'layout differs' on top
+            return f": FILLER at that offset {where} ({h.shape()}, bytes {first}-{last}) {cites}{note}".rstrip(), None
+        size = ""
+        if (h.offset, h.extent) != (lo, hi - lo + 1):
+            size = (f", bytes {first}-{last}: " + ("longer than" if h.extent > hi - lo + 1 else "shorter than")
+                    + " the DBD field" + (f", OCCURS {h.occurs}" if h.occurs > 1 else ""))
+        return f" {h.name} {where} ({h.shape()}{size}) {cites}{note}".rstrip(), key
+    names = f"{hits[0].name}..{hits[-1].name}"
+    shapes = f"{hits[0].shape()}..{hits[-1].shape()}"
+    fillers = " (FILLER inside)" if any(h.name == "FILLER" for h in hits) else ""
+    return f" spans {names} {where} ({shapes}){fillers} {cites}{note}".rstrip(), key
+
+
+def _segment_offsets(conn: sqlite3.Connection, seg: sqlite3.Row,
+                     calls: List[Tuple[sqlite3.Row, str]]) -> str:
+    """For each DBD FIELD of a segment, the item at its bytes in every
+    program's I/O area - whatever that program calls it. A field NAME is not
+    the handle across programs (each copybook names the byte its own way);
+    the byte range inside the I/O area is."""
+    flds = conn.execute("SELECT name, start, bytes, is_seq, line FROM ims_field WHERE segment_id=? ORDER BY start, id",
+                        (seg["id"],)).fetchall()
+    dbd_mem = conn.execute("SELECT m.name FROM ims_dbd d JOIN member m ON m.id=d.member_id WHERE d.id=?",
+                           (seg["dbd_id"],)).fetchone()[0]
+    out = [f"\n### DBD {seg['dbd']} segment {seg['name']}: each DBD field at its bytes in every program's I/O area\n"]
+    # one row per (program, I/O area): the area's layout and whether the program stores the segment
+    areas: Dict[Tuple[str, str], dict] = {}
+    for c, how in calls:
+        area = (c["io_area"] or "").upper()
+        key = (c["program_id"], area)
+        a = areas.get(key)
+        if a is None:
+            items, src, caveat = (_io_area_items(conn, c["pid"], c["member_id"], area) if area
+                                  else (None, "no I/O area on the call", ""))
+            a = areas[key] = {"pid": c["pid"], "items": items, "src": src, "caveat": caveat, "funcs": set(), "first": c}
+        a["funcs"].add(c["func"] or "?")
+    if not areas:
+        out.append("_no program's DL/I call reaches this segment through an indexed PSB_\n")
+        return "".join(out)
+    rows = []
+    for (pg, area), a in sorted(areas.items()):
+        items = a["items"]
+        size = max((i.offset + i.extent for i in items), default=0) if items else None
+        stores = any(f in _DLI_STORE for f in a["funcs"])
+        rows.append((pg, area or "(none)", a["src"] + (f" ({a['caveat']})" if a["caveat"] else ""),
+                     size if size is not None else "?", ", ".join(sorted(a["funcs"])), "stores" if stores else "reads",
+                     cite(conn, a["pid"], a["first"]["line"])))
+    out.append(table(["program", "I/O area", "layout from", "bytes", "functions", "stores/reads", "first call"], rows))
+    if seg["bytes"]:
+        out.append(f"- the DBD says the segment is {seg['bytes']} bytes; an area of another size holds a "
+                   f"sibling segment, a prefix, or a partial layout\n")
+    if not flds:
+        out.append("_the DBD declares no FIELD for this segment (a DBD names only its SEQ and search fields); "
+                   "the I/O areas above hold the whole segment - `layout` shows each one_\n")
+        return "".join(out)
+    per_prog: Dict[str, int] = defaultdict(int)
+    for (pg, _a) in areas:
+        per_prog[pg] += 1
+    for f in flds:
+        if f["start"] is None or f["bytes"] is None:
+            out.append(f"- {f['name']}: START / BYTES not given in the DBD `{dbd_mem}:{f['line']}`\n")
+            continue
+        lo, hi = f["start"] - 1, f["start"] - 1 + f["bytes"] - 1
+        parts = []
+        first_key: Optional[tuple] = None
+        first_pg: Optional[str] = None
+        for (pg, area), a in sorted(areas.items()):
+            label = pg + (f" ({area})" if per_prog[pg] > 1 else "")
+            stores = any(fn in _DLI_STORE for fn in a["funcs"])
+            if a["items"] is None:
+                parts.append(f"{label}: I/O area {area or '?'} {a['src']}")
+                continue
+            text, key = _describe_hit(a["items"], lo, hi, a["src"])
+            notes = []
+            if stores:
+                notes.append("stored by this program")
+            if key is not None:
+                if first_key is None:
+                    first_key, first_pg = key, pg
+                elif key != first_key:
+                    notes.append(f"layout differs from {first_pg}'s")
+            parts.append(label + text + (" - " + ", ".join(notes) if notes else ""))
+        seq = " (SEQ)" if f["is_seq"] else ""
+        out.append(f"- {f['name']}{seq} (bytes {f['start']}-{f['start'] + f['bytes'] - 1}): " + "; ".join(parts) + "\n")
+    out.append("> Bytes are 1-based as the DBD counts them; the match is by byte range inside the I/O area, never "
+               "by name. Cite a copybook line as `[[COPYBOOK line \"05  FIELD-NAME\"]]`. 'stored by this program' = "
+               "it ISRTs or REPLs on this PCB: those programs are the writers of the value.\n")
+    return "".join(out)
+
+
+def cmd_segment(conn: sqlite3.Connection, name: str, dbd: Optional[str] = None) -> str:
     """Who touches an IMS segment: the DBDs holding it, the PCBs sensitive to
-    it, and the programs using those PCBs (with function and PROCOPT)."""
+    it, the programs using those PCBs (with function and PROCOPT), and each
+    DBD field at its bytes in every program's I/O area - the way to find where
+    'the gender field' is populated when every program names the byte
+    differently. `dbd` keeps one DBD when several use the segment name."""
     n = name.upper()
     segs = conn.execute("""SELECT s.*, d.name AS dbd FROM ims_segment s JOIN ims_dbd d ON d.id=s.dbd_id
-                           WHERE UPPER(s.name)=?""", (n,)).fetchall()
-    out = [f"# IMS segment {n}\n"]
+                           WHERE UPPER(s.name)=? ORDER BY d.name, s.id""", (n,)).fetchall()
+    out = [f"# IMS segment {n}" + (f" in DBD {dbd.upper()}" if dbd else "") + "\n"]
+    if dbd:
+        segs = [s for s in segs if s["dbd"].upper() == dbd.upper()]
     if not segs:
-        return out[0] + "\n**NOT FOUND** in any indexed DBD.\n"
+        return out[0] + "\n**NOT FOUND** in any indexed DBD" + (f" named {dbd.upper()}" if dbd else "") + ".\n"
     out.append(table(["DBD", "parent", "bytes", "seq field"],
                      [(s["dbd"], s["parent"] or "(root)", s["bytes"], s["seq_field"] or "") for s in segs]))
     dbds = sorted({s["dbd"].upper() for s in segs})
-    q = ",".join("?" * len(dbds))
-    pcbs = conn.execute(f"""SELECT ps.name AS psb, pc.ordinal, pc.dbd_name, pc.procopt, pc.sensegs
-                            FROM ims_pcb pc JOIN ims_psb ps ON ps.id=pc.psb_id
-                            WHERE UPPER(pc.dbd_name) IN ({q}) AND pc.sensegs LIKE ?""", (*dbds, f'%"{n}"%')).fetchall()
+    if len(dbds) > 1:
+        out.append(f"- {len(dbds)} DBDs hold a segment of this name; `segment {n} --dbd NAME` keeps one\n")
+    pcbs = _segment_pcbs(conn, n, dbds)
     if pcbs:
         out.append("\n### PCBs sensitive to it\n")
         out.append(table(["PSB", "PCB #", "DBD", "PROCOPT"],
                          [(p["psb"], p["ordinal"], p["dbd_name"], p["procopt"] or "") for p in pcbs]))
-    keys = {(p["psb"].upper(), p["ordinal"]) for p in pcbs}
-    # EXEC DLI SEGMENT(X) names the segment even when the PCB position could
-    # not be resolved through a PSB.
-    calls = conn.execute(f"""SELECT p.program_id, p.id AS pid, d.func, d.procopt, d.psb_name, d.pcb_ordinal, d.ssa_args, d.line
-                             FROM dli_call d JOIN program p ON p.id=d.program_id
-                             WHERE UPPER(d.dbd_name) IN ({q}) OR d.ssa_args LIKE ? ORDER BY p.program_id, d.line""",
-                         (*dbds, f'%"{n}"%')).fetchall()
-    rows = []
-    for c in calls:
-        via_pcb = (c["psb_name"] or "").upper(), c["pcb_ordinal"]
-        named = n in [x.upper() for x in _jl(c["ssa_args"])]
-        if via_pcb in keys or named:
-            rows.append((c["program_id"], c["func"] or "?", c["procopt"] or "", c["psb_name"] or "",
-                         "SEGMENT() names it" if named else "PCB sensitive to it", cite(conn, c["pid"], c["line"])))
+    calls = _segment_calls(conn, n, dbds, pcbs)
+    rows = [(c["program_id"], c["func"] or "?", c["procopt"] or "", c["psb_name"] or "", c["io_area"] or "", how,
+             cite(conn, c["pid"], c["line"])) for c, how in calls]
     if rows:
         out.append("\n### Programs (DL/I calls on a PCB sensitive to this segment)\n")
-        out.append(table(["program", "func", "PROCOPT", "PSB", "how", "cite"], rows))
+        out.append(table(["program", "func", "PROCOPT", "PSB", "I/O area", "how", "cite"], rows))
         out.append("> CBLTDLI calls name the segment inside the SSA data, not in the call: a call on a "
                    "multi-segment PCB may touch a sibling segment instead. EXEC DLI SEGMENT() is exact.\n")
+    for s in segs:
+        if len(segs) > 1:
+            # each DBD's own callers: a call is tied to a DBD through its PCB
+            pcb_keys = {(p["psb"].upper(), p["ordinal"]) for p in pcbs if p["dbd_name"].upper() == s["dbd"].upper()}
+            seg_calls = [(c, how) for c, how in calls
+                         if ((c["psb_name"] or "").upper(), c["pcb_ordinal"]) in pcb_keys
+                         or (how == "SEGMENT() names it" and (c["dbd_name"] or "").upper() in ("", s["dbd"].upper()))]
+        else:
+            seg_calls = calls
+        out.append(_segment_offsets(conn, s, seg_calls))
     return "".join(out)
 
 
@@ -4163,8 +4448,12 @@ def _main(argv: Optional[List[str]] = None) -> int:
                                   "writes UTF-16)")
     sub = ap.add_subparsers(dest="cmd", required=True)
     for c in ("program", "job", "dataset", "copybook", "values", "screen", "transaction", "column",
-              "table", "dbd", "segment"):
+              "table", "dbd"):
         sub.add_parser(c).add_argument("name")
+    s = sub.add_parser("segment", help="who touches an IMS segment, and each DBD field at its bytes in every "
+                                       "program's I/O area (whatever that program calls it)")
+    s.add_argument("name")
+    s.add_argument("--dbd", help="only this DBD's segment when several DBDs use the segment name")
     s = sub.add_parser("field")
     s.add_argument("name")
     s.add_argument("--all", action="store_true", help="every reference site (default: one cite per program/statement)")
@@ -4330,7 +4619,7 @@ def _run(a: argparse.Namespace) -> int:
         elif a.cmd == "dbd":
             print(cmd_dbd(conn, a.name))
         elif a.cmd == "segment":
-            print(cmd_segment(conn, a.name))
+            print(cmd_segment(conn, a.name, a.dbd))
         elif a.cmd == "layout":
             print(cmd_layout(conn, a.name, a.program))
         elif a.cmd == "docs":
