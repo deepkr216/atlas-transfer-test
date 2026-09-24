@@ -712,10 +712,12 @@ class _Walker(_Report):
 
     def partial_note(self, pid: int) -> Optional[str]:
         p = self.prog(pid)
-        if not p or p["parse_status"] != "partial":
+        # a copybook chosen among several is not a partial parse (Q.partial_kind)
+        if not p or not Q.is_truly_partial(self.conn, p["member_id"]):
             return None
         rows = self.conn.execute("""SELECT detail FROM unresolved WHERE member_id=? AND kind IN ('expand','missing_copybook')
-                                    ORDER BY id LIMIT 4""", (p["member_id"],)).fetchall()
+                                    AND instr(COALESCE(detail, ''), ?) = 0 ORDER BY id LIMIT 4""",
+                                 (p["member_id"], Q.AMBIGUOUS_PICK)).fetchall()
         det = "; ".join(r["detail"].split(" - ")[0].replace("]", ")") for r in rows) or "facts incomplete"
         return f"[program partial: {det}]"
 

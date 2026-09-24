@@ -199,14 +199,64 @@ def table(headers: Sequence[str], rows: Iterable[Sequence]) -> str:
     return "\n".join(out) + "\n"
 
 
+# The resolver's own wording when several members share a copybook's name
+# with different content and one was chosen (build.make_resolver): the
+# 'ambiguous_copybook' row carries it, expand.py repeats it as a COPY warning
+# ("L12: COPY X: 2 copies of X with different content; used PATH (how)") and
+# build.py stores that warning as an 'expand' note - which marks the program
+# `partial` although every COPY expanded. The build-side fix waits for the
+# next re-parse (ROADMAP "Next re-parse batch" 18, LESSONS 181); until then
+# every query-side reader of parse_status='partial' tells the two apart
+# through partial_kind(), never by the status column alone.
+AMBIGUOUS_PICK = " with different content; used "
+PARSE_CHOSEN = "complete (copybook chosen among several - see notes)"
+# SQL: member alias `m` is marked partial only by the resolver's pick - every
+# 'expand' note is that note (one bound parameter: AMBIGUOUS_PICK)
+_CHOSEN_PRED = """EXISTS (SELECT 1 FROM unresolved u WHERE u.member_id = m.id AND u.kind = 'expand')
+    AND NOT EXISTS (SELECT 1 FROM unresolved u WHERE u.member_id = m.id AND u.kind = 'expand'
+                    AND instr(COALESCE(u.detail, ''), ?) = 0)"""
+
+
+def partial_kind(conn: sqlite3.Connection, member_id: int) -> Optional[str]:
+    """None: the member is not marked partial. 'chosen': marked partial only
+    because a copybook was chosen among several same-named ones (every
+    'expand' note is the resolver's pick) - the program expanded COMPLETELY
+    with the copy the 'ambiguous_copybook' row names. 'partial': parsed only
+    in part (a copybook NOT FOUND, a COPY skipped as recursive or too deeply
+    nested, a scan with no text, an unrecognised map)."""
+    row = conn.execute("SELECT parse_status FROM member WHERE id=?", (member_id,)).fetchone()
+    if not row or row[0] != "partial":
+        return None
+    n_exp, n_true = conn.execute("""SELECT COUNT(*), COALESCE(SUM(instr(COALESCE(detail, ''), ?) = 0), 0)
+                                    FROM unresolved WHERE member_id=? AND kind='expand'""",
+                                 (AMBIGUOUS_PICK, member_id)).fetchone()
+    return "chosen" if n_exp and not n_true else "partial"
+
+
+def is_truly_partial(conn: sqlite3.Connection, member_id: int) -> bool:
+    """The member's facts are incomplete (not merely a copybook chosen among several)."""
+    return partial_kind(conn, member_id) == "partial"
+
+
+def parse_label(conn: sqlite3.Connection, member_id: int, status: Optional[str]) -> str:
+    """The parse status as a header line states it: `ok`, `partial`, or the
+    chosen-among-several wording for a member marked partial only by that."""
+    return PARSE_CHOSEN if partial_kind(conn, member_id) == "chosen" else (status or "?")
+
+
 def unresolved_for(conn: sqlite3.Connection, member_ids: Sequence[int], limit: int = 40) -> str:
     if not member_ids:
         return ""
     q = ",".join("?" * len(member_ids))
+    # the 'expand' copy of the resolver's pick says what the member's own
+    # 'ambiguous_copybook' row says: shown once, as the choice it is
+    not_pick = "NOT (u.kind = 'expand' AND instr(COALESCE(u.detail, ''), ?) > 0)"
     rows = conn.execute(f"""
         SELECT m.name, u.kind, u.detail, u.line FROM unresolved u JOIN member m ON m.id = u.member_id
-        WHERE u.member_id IN ({q}) ORDER BY u.kind, m.name LIMIT ?""", (*member_ids, limit)).fetchall()
-    total = conn.execute(f"SELECT COUNT(*) FROM unresolved WHERE member_id IN ({q})", member_ids).fetchone()[0]
+        WHERE u.member_id IN ({q}) AND {not_pick} ORDER BY u.kind, m.name LIMIT ?""",
+                        (*member_ids, AMBIGUOUS_PICK, limit)).fetchall()
+    total = conn.execute(f"SELECT COUNT(*) FROM unresolved u WHERE u.member_id IN ({q}) AND {not_pick}",
+                         (*member_ids, AMBIGUOUS_PICK)).fetchone()[0]
     if not total:
         return "\n### Unresolved in scope\n_none - but see `coverage` for estate-wide blind spots_\n"
     out = [f"\n### Unresolved in scope ({total}) - the answer is incomplete to this extent\n"]
@@ -297,7 +347,8 @@ def cmd_program(conn: sqlite3.Connection, name: str) -> str:
         out.append(f"\n## {p['member_name']}  `{p['path']}`"
                    + ("  **[authoritative]**" if p["authoritative"] else "") + "\n")
         out.append(f"- PROGRAM-ID `{p['program_id']}` - {p['src_lines']} source lines, "
-                   f"{p['exp_lines']} after COPY expansion - parse: {p['parse_status']}\n")
+                   f"{p['exp_lines']} after COPY expansion - parse: "
+                   f"{parse_label(conn, p['member_id'], p['parse_status'])}\n")
         out.append(f"- system: {p['system'] or 'not declared (add it to sources.json / manifest systems)'}\n")
         flags = [k for k in ("sql", "cics", "dli", "mq") if p[f"uses_{k}"]]
         out.append(f"- uses: {', '.join(flags) if flags else 'files only'}\n")
@@ -1321,8 +1372,13 @@ def index_header(conn: sqlite3.Connection) -> str:
 # What each blind spot in `unresolved` means, and what closes it. The parsers
 # record the kind; a reader should not have to guess what the word implies.
 UNRESOLVED_MEANING = {
-    "expand": ("a COPY statement whose copybook is not in the index",
+    "expand": ("a COPY statement whose copybook is not in the index (or skipped: recursive, nested too deep)",
                "fetch that copybook library and build again - until then the program's fields are incomplete"),
+    "expand (copybook chosen among several)": (
+        "the resolver's own choice repeated as a COPY warning: the program expanded completely with the copy its "
+        "'ambiguous_copybook' row names - not a missing copybook",
+        "nothing to fetch; the next re-parse stops the repeat (ROADMAP item 18) - check the manifest's system / "
+        "copybook order if the copy named is the wrong one"),
     "ambiguous_copybook": ("two copies of one copybook with different content; one was chosen",
                            "declare the department's copybook order (manifest `copylib_order`) or remove the stale copy"),
     "include_member": ("a JCL `INCLUDE MEMBER=` whose member is not in the index",
@@ -1416,15 +1472,19 @@ def _partial_members(conn: sqlite3.Connection, limit: int = COVERAGE_ROWS) -> st
     a COBOL member is `partial` mostly because a copybook it copies was not
     found, and then the fields of that copybook are missing from the index.
     The reason shown is the one that MADE it partial (a missing copybook, an
-    unrecognised map), not the first note the parser happened to write."""
-    rows = conn.execute("""
+    unrecognised map), not the first note the parser happened to write - and
+    never the resolver's chosen-among-several note, which does not make a
+    member partial (see _chosen_members: those members are not in this table)."""
+    rows = conn.execute(f"""
         SELECT m.kind, m.name, m.library, m.parse_error,
                (SELECT u.kind || ': ' || SUBSTR(COALESCE(u.detail, ''), 1, 90) FROM unresolved u
                 WHERE u.member_id = m.id
-                ORDER BY CASE WHEN u.kind IN ('expand', 'screen') THEN 0 ELSE 1 END, u.id LIMIT 1) AS why,
+                ORDER BY CASE WHEN u.kind = 'expand' AND instr(COALESCE(u.detail, ''), ?) = 0 THEN 0
+                              WHEN u.kind IN ('expand', 'screen') THEN 1 ELSE 2 END, u.id LIMIT 1) AS why,
                (SELECT COUNT(*) FROM doc_image i WHERE i.member_id = m.id AND i.ocr_text IS NOT NULL
                 AND i.ocr_text <> '') AS ocr_read
-        FROM member m WHERE m.parse_status = 'partial' ORDER BY m.kind, m.name""").fetchall()
+        FROM member m WHERE m.parse_status = 'partial' AND NOT ({_CHOSEN_PRED})
+        ORDER BY m.kind, m.name""", (AMBIGUOUS_PICK, AMBIGUOUS_PICK)).fetchall()
     if not rows:
         return "\n### Members parsed only in part\n_none_\n"
     by_kind: Dict[str, List[sqlite3.Row]] = defaultdict(list)
@@ -1449,6 +1509,69 @@ def _partial_members(conn: sqlite3.Connection, limit: int = COVERAGE_ROWS) -> st
                "programs, `python -m atlas.recover --db atlas.db` rebuilds the missing copybooks from them. A "
                "document is partial when no text could be extracted (a scan - run `OCR images`). A screen member "
                "is partial when no map or format macro was recognised.\n")
+    return "".join(out)
+
+
+_PICK_RE = re.compile(r"(\d+) copies of (\S+) with different content; used (.+?) \(([^()]*)\)\s*$")
+
+
+def _chosen_members(conn: sqlite3.Connection, limit: int = COVERAGE_ROWS) -> str:
+    """Members the index marks `partial` only because a copybook was chosen
+    among several same-named ones with different content: every COPY
+    expanded, so they are complete for the copy the resolver named. Their
+    own table, so that `coverage` does not count them with the members whose
+    copybook is missing (his 701 'partial' with ~60 copybooks missing)."""
+    rows = conn.execute(f"""
+        SELECT m.kind, m.name, m.library,
+               (SELECT COUNT(*) FROM unresolved u WHERE u.member_id = m.id AND u.kind = 'ambiguous_copybook') AS picks,
+               (SELECT GROUP_CONCAT(u.detail, CHAR(10)) FROM unresolved u
+                WHERE u.member_id = m.id AND u.kind = 'ambiguous_copybook') AS notes
+        FROM member m WHERE m.parse_status = 'partial' AND {_CHOSEN_PRED}
+        ORDER BY m.kind, m.name""", (AMBIGUOUS_PICK,)).fetchall()
+    if not rows:
+        return ""
+    by_kind: Dict[str, List[sqlite3.Row]] = defaultdict(list)
+    for r in rows:
+        by_kind[r["kind"]].append(r)
+
+    def pick_names(members: List[sqlite3.Row]) -> Dict[str, int]:
+        """copybook name -> members that took a chosen copy of it"""
+        counts: Dict[str, int] = defaultdict(int)
+        for r in members:
+            for m in (_PICK_RE.search(n) for n in (r["notes"] or "").split("\n")):
+                if m:
+                    counts[m.group(2)] += 1
+        return counts
+
+    def top_names(members: List[sqlite3.Row]) -> str:
+        best = sorted(pick_names(members).items(), key=lambda kv: (-kv[1], kv[0]))[:3]
+        return ", ".join(f"{k} ({v})" for k, v in best) or "(note not readable)"
+
+    def used(r: sqlite3.Row) -> str:
+        m = _PICK_RE.search((r["notes"] or "").split("\n")[0])
+        if m:
+            tail = "/".join(m.group(3).replace("\\", "/").split("/")[-3:])     # SYSTEM/LIBRARY/member
+            first = f"{m.group(2)}: {m.group(1)} copies, used {tail} ({m.group(4)})"
+        else:
+            first = (r["notes"] or "")[:110]
+        return first[:110] + (f" - and {r['picks'] - 1} more copybook(s)" if r["picks"] > 1 else "")
+
+    out = [f"\n### Complete, with a copybook chosen among several: {len(rows)} member{'s' if len(rows) != 1 else ''} - "
+           "the build picked by system and library order; the 'ambiguous_copybook' rows name the copy used\n"]
+    out.append(table(["kind", "members", "most often chosen"],
+                     [(k, len(v), top_names(v)) for k, v in sorted(by_kind.items(), key=lambda kv: -len(kv[1]))]))
+    out.append("\n" + table(["kind", "member", "library", "copy used"],
+                            [(r["kind"], r["name"], r["library"], used(r)) for r in rows[:limit]]))
+    if len(rows) > limit:
+        out.append(f"_... {len(rows) - limit} more; every one of them: `coverage --all`; `program NAME` shows each "
+                   "member's choice under Unresolved in scope_\n")
+    out.append(f"\n> {'This member is' if len(rows) == 1 else f'These {len(rows)} members are'} NOT parsed only in "
+               "part: every COPY expanded, and their facts are "
+               "complete for the copy named. The index marks them `partial` only because the build repeats the "
+               "resolver's choice as a COPY warning (fixed at the next re-parse - ROADMAP item 18). The choice "
+               "follows `COPY ... OF`, then the member's own system in its declared copybook order, then the "
+               f"manifest's authoritative copy; {len(pick_names(rows))} copybook name(s) are involved - `ambiguous` lists "
+               "them per department, and a choice is wrong only where the manifest's system or copybook order is.\n")
     return "".join(out)
 
 
@@ -1528,9 +1651,20 @@ def cmd_coverage(conn: sqlite3.Connection, everything: bool = False) -> str:
                "by name only - `search` does not see their text), or the "
                "member sits in a source library but is not a program (no PROGRAM-ID and no DIVISION header - a "
                "procedure copybook or a card deck filed there); the member itself says which. **partial**: a parser "
-               "ran but could not complete the picture - the next table says which members and why. **failed**: not "
+               "ran but could not complete the picture - the next table says which members and why - or, for a "
+               "COBOL member, a copybook was chosen among several same-named ones: complete, its own table. "
+               "**failed**: not "
                "indexed at all - the table after it names every one, including those given up on before a restart.\n")
+    n_part = conn.execute("SELECT COUNT(*) FROM member WHERE parse_status = 'partial'").fetchone()[0]
+    n_chosen = conn.execute(f"SELECT COUNT(*) FROM member m WHERE m.parse_status = 'partial' AND {_CHOSEN_PRED}",
+                            (AMBIGUOUS_PICK,)).fetchone()[0]
+    if n_chosen:
+        n_true = n_part - n_chosen
+        out.append(f"- of the {n_part} members marked `partial`, **{n_true} {'is' if n_true == 1 else 'are'} parsed only "
+                   f"in part** and **{n_chosen} {'is' if n_chosen == 1 else 'are'} complete with a copybook chosen among "
+                   "several** (the two tables below).\n")
     out.append(_partial_members(conn, limit))
+    out.append(_chosen_members(conn, limit))
     out.append(_failed_members(conn, limit))
     out.append(_recovered_shadowing(conn))
     out.append("\n### Call resolution\n")
@@ -1541,7 +1675,9 @@ def cmd_coverage(conn: sqlite3.Connection, everything: bool = False) -> str:
         "SELECT copybook, COUNT(*) FROM copy_use WHERE resolved_member_id IS NULL AND copybook NOT IN ('SQLCA','SQLDA') "
         "GROUP BY 1 ORDER BY 2 DESC LIMIT 40").fetchall()))
     out.append("\n### Unresolved by kind - what the index could NOT work out, and what closes each one\n")
-    rows = conn.execute("SELECT kind, COUNT(*) FROM unresolved GROUP BY 1 ORDER BY 2 DESC").fetchall()
+    rows = conn.execute("""SELECT CASE WHEN kind = 'expand' AND instr(COALESCE(detail, ''), ?) > 0
+                                       THEN 'expand (copybook chosen among several)' ELSE kind END AS k, COUNT(*)
+                           FROM unresolved GROUP BY 1 ORDER BY 2 DESC""", (AMBIGUOUS_PICK,)).fetchall()
     out.append(table(["kind", "count", "what it means", "what closes it"],
                      [(k, n, *UNRESOLVED_MEANING.get(k, ("(see the members below)", "send this kind's name for a fix")))
                       for k, n in rows]))
@@ -4164,7 +4300,8 @@ def cmd_walk(conn: sqlite3.Connection, name: str, start: Optional[str] = None, b
                          "WHERE program_id=? ORDER BY start_line, kind='paragraph'", (pid,)).fetchall()
     if not paras:
         return (f"# Walk {pname}\n\nThe PROCEDURE DIVISION has no paragraphs or sections in the index (parse status: "
-                f"{p['parse_status']}). Read it with `cite {mname} <first>-<last>`; `program {pname}` lists its facts.\n")
+                f"{parse_label(conn, mid, p['parse_status'])}). Read it with `cite {mname} <first>-<last>`; "
+                f"`program {pname}` lists its facts.\n")
     by_name: Dict[str, List[sqlite3.Row]] = defaultdict(list)   # a name can live in several sections
     for r in paras:
         by_name[r["name"].upper()].append(r)
