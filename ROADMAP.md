@@ -256,6 +256,13 @@ change-impact work. Three families are open: following a VALUE across renames (i
 it), ORDER IN TIME (which write is live at the CALL, which job ran before this one), and OVERLAP judgement
 (REDEFINES, group moves, truncation). Pick from that table; do not add to it from guesswork.
 
+docs/RECOMMENDATIONS-2026-09-24.md answers "what else would a senior mainframe developer want": thirteen
+ranked items (impact table with the change class decided by rule, restart, batch closure, rule-based review,
+regression scope, PSB/SSA/MFS, unit of work, abend offset from the listings, argument contracts in bytes,
+reaching definitions, dataset layout contract, DB2 bind facts, change tags), each with the moment it serves,
+what exists today, the cost class and the host input it needs; the already-built commands he may not use;
+and what stays out of reach. Items there enter this roadmap only when scheduled.
+
 ## What stays out of reach, by design
 
 - Anything decided at **run time**: dynamic SQL, dispatch tables held in DB2
