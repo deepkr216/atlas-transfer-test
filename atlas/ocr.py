@@ -636,7 +636,33 @@ def run(conn: sqlite3.Connection, out_dir: str, do_ocr: bool = True, member: Opt
         stats["ocr_text"] += 1
     conn.commit()
     log(f"OCR: {stats['ocr_text']} with text, {stats['ocr_empty']} empty, {stats['ocr_failed']} failed")
+    stats["now_readable"] = mark_read_documents(conn, log)
     return stats
+
+
+def mark_read_documents(conn: sqlite3.Connection, log=print) -> int:
+    """A document that was partial for 'no extractable text' and now holds
+    OCR sections is readable: its status becomes ok, its note says how. The
+    OCR run used to leave the status alone, so coverage kept counting a scan
+    it had read as 'parsed only in part' - the same 92 documents before and
+    after the run (LESSONS 180). Runs over every document, so an index whose
+    pictures were read before this rule flips on the next run too."""
+    rows = conn.execute(
+        """SELECT m.id, m.parse_error,
+                  (SELECT COUNT(*) FROM doc_section s WHERE s.member_id = m.id AND s.ordinal > ?) AS read
+           FROM member m WHERE m.kind = 'doc' AND m.parse_status = 'partial'
+             AND m.parse_error LIKE '%no extractable text%'""", (OCR_ORDINAL_BASE,)).fetchall()
+    flipped = 0
+    for mid, note, read in rows:
+        if not read:
+            continue
+        conn.execute("UPDATE member SET parse_status = 'ok', parse_error = ? WHERE id = ?",
+                     ((note or "") + f"; text read by OCR ({read} picture{'s' if read != 1 else ''}, sections {OCR_ORDINAL_BASE + 1}+)", mid))
+        flipped += 1
+    conn.commit()
+    if flipped:
+        log(f"OCR: {flipped} document(s) that had no extractable text are readable now - coverage counts them as parsed")
+    return flipped
 
 
 def main(argv: Optional[List[str]] = None) -> int:

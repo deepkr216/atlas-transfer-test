@@ -382,6 +382,76 @@ class BrokenPictures(unittest.TestCase):
             conn.close()
 
 
+class ReadScansCountAsParsed(unittest.TestCase):
+    """At work (2026-09-24): the OCR run read the scanned documents, and the
+    coverage report still said 'doc 92, no extractable text' - the run stored
+    the text as sections but never changed the document's status."""
+
+    def setUp(self):
+        self.td = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.td, ignore_errors=True)
+
+    @staticmethod
+    def blank_pdf() -> bytes:
+        """A one-page PDF that draws nothing: no text to extract - a scan's shape."""
+        content = b"q Q"
+        objs = [b"<< /Type /Catalog /Pages 2 0 R >>", b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>",
+                b"<< /Length " + str(len(content)).encode() + b" >>\nstream\n" + content + b"\nendstream"]
+        out = bytearray(b"%PDF-1.4\n")
+        offsets = []
+        for i, body in enumerate(objs, 1):
+            offsets.append(len(out))
+            out += f"{i} 0 obj\n".encode() + body + b"\nendobj\n"
+        xref = len(out)
+        out += f"xref\n0 {len(objs) + 1}\n0000000000 65535 f \n".encode()
+        for off in offsets:
+            out += f"{off:010d} 00000 n \n".encode()
+        out += f"trailer\n<< /Size {len(objs) + 1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode()
+        return bytes(out)
+
+    def test_a_scan_ocr_has_read_is_no_longer_parsed_only_in_part(self):
+        docs_dir = os.path.join(self.td, "docs")
+        os.makedirs(docs_dir)
+        with open(os.path.join(docs_dir, "SCANONLY.pdf"), "wb") as fh:
+            fh.write(self.blank_pdf())
+        estate = os.path.join(self.td, "estate", "SRC")
+        os.makedirs(estate)
+        shutil.copy(os.path.join(HERE, "fixtures", "SAMPPGM.cbl"), estate)
+        db = os.path.join(self.td, "t.db")
+        with contextlib.redirect_stdout(io.StringIO()):
+            build._main([os.path.join(self.td, "estate"), "--db", db, "--rebuild", "--quiet", "--also", docs_dir])
+        conn = query.connect(db)
+        try:
+            mid, status, note = conn.execute("SELECT id, parse_status, parse_error FROM member WHERE name='SCANONLY'").fetchone()
+            self.assertEqual(status, "partial")
+            self.assertIn("no extractable text", note)
+            self.assertIn("| doc |", query.cmd_coverage(conn).split("### Members parsed only in part")[1].split("###")[0],
+                          "listed as partial before OCR")
+            # nothing read yet: the pass changes nothing
+            self.assertEqual(ocr.mark_read_documents(conn, log=lambda s: None), 0)
+            # an OCR run that read its page (the engine is Windows-only; here its result is written as the run writes it)
+            conn.execute("INSERT INTO doc_image(member_id, name, ocr_text) VALUES(?, 'page-0001', 'CLAIM INTAKE PROCEDURE STEP 1')", (mid,))
+            conn.execute("INSERT INTO doc_section(member_id, heading, text, ordinal) VALUES(?, 'page 1', 'CLAIM INTAKE PROCEDURE STEP 1', ?)",
+                         (mid, ocr.OCR_ORDINAL_BASE + 1))
+            conn.commit()
+            said = []
+            self.assertEqual(ocr.mark_read_documents(conn, log=said.append), 1)
+            self.assertTrue(any("1 document(s) that had no extractable text are readable now" in s for s in said), said)
+            status, note = conn.execute("SELECT parse_status, parse_error FROM member WHERE name='SCANONLY'").fetchone()
+            self.assertEqual(status, "ok")
+            self.assertIn("text read by OCR (1 picture, sections 1001+)", note)
+            self.assertIn("no extractable text", note, "the original note is kept")
+            cov = query.cmd_coverage(conn)
+            part = cov.split("### Members parsed only in part")[1].split("###")[0] if "### Members parsed only in part" in cov else ""
+            self.assertNotIn("| doc |", part, "no document counted as partial any more")
+            self.assertEqual(ocr.mark_read_documents(conn, log=lambda s: None), 0, "flipped once, not twice")
+        finally:
+            conn.close()
+
+
 class PagesTheEngineRefused(unittest.TestCase):
     """At work: 'page-0001.png: Exception calling "Wait" ... One or more errors
     occurred' - the wrapper hid the reason, a big page lost its small print,
