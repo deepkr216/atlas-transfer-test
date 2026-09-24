@@ -1,6 +1,7 @@
 r"""
 A copybook that ARRIVED after the program was parsed, and one FILED AS
-SOMETHING ELSE (LESSONS 183).
+SOMETHING ELSE (LESSONS 183); a copybook copied from inside another
+copybook is NOT one that arrived (LESSONS 184).
 
 His line `A-100-BEGIN SECTION.  COPY PROCBOOK.` copies a PROCEDURE copybook:
 paragraph names and statements, no level numbers, no DIVISION header - no
@@ -12,13 +13,24 @@ on disk. Two mechanisms, both build-side (ROADMAP re-parse items 20, 21):
   * in a dataset-named folder with no COPY hint the member is 'unknown' - a
     kind the resolver accepts - but the build re-parses the copiers of a NEW
     member only when it is filed as copybook or cobol, so nothing parsed the
-    program again (case A: recover marks it now);
+    program again (case A: recover marks it now; and an 'unknown' member has
+    no handler, so its own lines are not indexed until the folder is renamed
+    - the note says so);
   * in a PROCS / CNTL / plain folder the member is a proc / ctlcard / doc -
     kinds the resolver never looks at - so no re-parse would find it (case
     B: recover names it with the fix, coverage / program / copybook say so).
 
 A data copybook (level numbers) has a signature, is a copybook wherever it
 sits, and the existing forcing handles it (case C: the control).
+
+LESSONS 184: a copybook member's own COPY rows are recorded with no
+resolved_member_id (the build parses a copybook for copies only, never
+resolves them), so they are NULL for ever - reading them as 'unresolved'
+made every copybook that copies another copybook 'arrived', marked the
+COPYBOOK pending, and the next build re-inserted it under a new id and
+nulled the links of every program copying it. Only a PROGRAM's row says
+whether a COPY was found, and a program carries its own row for every
+nested COPY, so marking programs alone is enough (cases D and E).
 """
 
 import contextlib
@@ -42,15 +54,23 @@ HEAD = ("       IDENTIFICATION DIVISION.\n       PROGRAM-ID. {name}.\n"
         "       PROCEDURE DIVISION.\n       MAIN SECTION.\n           PERFORM A-100-BEGIN.\n"
         "           GOBACK.\n")
 TAIL = "       Z-900-END SECTION.\n           EXIT.\n"
-SECTION_COPY = "       A-100-BEGIN SECTION.  COPY PROCBOOK.\n"
+SECTION_COPY = "       A-100-BEGIN SECTION.  COPY {book}.\n"
 # a procedure copybook: paragraphs and statements, no level numbers, no DIVISION - no content signature
 PROCBOOK = ("       A-110-DO.\n           MOVE 1 TO WS-X.\n       A-199-EXIT.\n           EXIT.\n")
 # a data copybook: level numbers ARE a signature, whatever the folder is called
 DATABOOK = ("           05  DB-FIELD-A          PIC X(5).\n           05  DB-FIELD-B          PIC 9(3).\n")
+# a procedure copybook that copies another one (LESSONS 184)
+OUTBOOK = ("       A-110-DO.\n           MOVE 1 TO WS-X.\n           COPY INBOOK.\n       A-199-EXIT.\n           EXIT.\n")
+INBOOK = ("       A-150-SUB.\n           MOVE 2 TO WS-Y.\n")
+
+ARRIVED = "parsed before it arrived: run recover, then the build"
+UNKNOWN_FIX = ("; and rename the folder to end in COPYLIB (or declare the library's kind in the UI's table) so the "
+               "copybook's own lines are indexed and citable")
+MISFILED = "not a kind the build expands: rename the folder to end in COPYLIB or declare its kind in the UI, then build"
 
 
-def program(name="SECPGM", data=""):
-    return HEAD.format(name=name, data=data) + SECTION_COPY + TAIL
+def program(name="SECPGM", data="", book="PROCBOOK"):
+    return HEAD.format(name=name, data=data) + SECTION_COPY.format(book=book) + TAIL
 
 
 class _Estate(unittest.TestCase):
@@ -61,8 +81,11 @@ class _Estate(unittest.TestCase):
         self.root = os.path.join(self.td, "estate")
         self.db = os.path.join(self.td, "t.db")
         self.report = os.path.join(self.td, "work", "recover.md")
-        self.write("GC/PROD.GC.SRC/SECPGM.cbl", program())
+        self.first_files()
         self.build(["--rebuild"])
+
+    def first_files(self):
+        self.write("GC/PROD.GC.SRC/SECPGM.cbl", program())
 
     def tearDown(self):
         shutil.rmtree(self.td, ignore_errors=True)
@@ -96,26 +119,26 @@ class _Estate(unittest.TestCase):
         finally:
             conn.close()
 
-    def status(self, name="SECPGM"):
-        return self.q("SELECT parse_status FROM member WHERE UPPER(name)=? AND kind='cobol'", name)[0][0]
+    def status(self, name="SECPGM", kind="cobol"):
+        return self.q("SELECT parse_status FROM member WHERE UPPER(name)=? AND kind=?", name, kind)[0][0]
 
     def book(self, name="PROCBOOK"):
         return self.q("SELECT kind, library FROM member WHERE UPPER(name)=?", name)
 
-    def copy_use(self, name="PROCBOOK"):
+    def copy_use(self, name="PROCBOOK", copier="SECPGM"):
         return self.q("SELECT c.resolved_member_id FROM copy_use c JOIN member m ON m.id=c.member_id "
-                      "WHERE UPPER(m.name)='SECPGM' AND UPPER(c.copybook)=?", name)
+                      "WHERE UPPER(m.name)=? AND UPPER(c.copybook)=?", copier, name)
 
-    def paragraphs(self):
+    def paragraphs(self, name="SECPGM"):
         return self.q("SELECT p.name, p.kind, p.section FROM paragraph p JOIN program g ON g.id=p.program_id "
-                      "JOIN member m ON m.id=g.member_id WHERE UPPER(m.name)='SECPGM' ORDER BY p.start_line")
+                      "JOIN member m ON m.id=g.member_id WHERE UPPER(m.name)=? ORDER BY p.start_line", name)
 
-    def outputs(self):
+    def outputs(self, name="SECPGM", book="PROCBOOK"):
         conn = query.connect(self.db)
         try:
             cov = query.cmd_coverage(conn)
             return (cov, cov.split("### Copybooks not found")[1].split("\n###")[0],
-                    query.cmd_program(conn, "SECPGM"), query.cmd_copybook(conn, "PROCBOOK"))
+                    query.cmd_program(conn, name), query.cmd_copybook(conn, book))
         finally:
             conn.close()
 
@@ -147,12 +170,19 @@ class ArrivedAfterTheParse(_Estate):
         self.assertEqual(self.book(), [("unknown", "PROD.GC.CPYLIB")])
         self.assertEqual(self.status(), "partial")
         self.assertEqual(self.copy_use(), [(None,)])
-        cov, nf, prog, _book = self.outputs()
-        self.assertIn("| PROCBOOK | 1 | yes: PROD.GC.CPYLIB (unknown) - parsed before it arrived: run recover, then the build |", nf)
+        cov, nf, prog, book = self.outputs()
+        # the note says the whole fix: recover + build, AND the folder rename - an 'unknown' member has no
+        # handler, so its own lines are not in the index until it is filed as a copybook (LESSONS 184)
+        self.assertIn(f"| PROCBOOK | 1 | yes: PROD.GC.CPYLIB (unknown) - {ARRIVED}{UNKNOWN_FIX} |", nf)
         self.assertIn("A copybook marked `yes` is not missing", cov)
         self.assertIn("1 of the copybooks reported NOT FOUND has a member with that name in the index now", cov)
-        self.assertIn("| PROCBOOK | **NOT FOUND** - a member with this name exists: PROD.GC.CPYLIB (unknown) - parsed before "
-                      "it arrived: run recover, then the build |", prog)
+        self.assertNotIn("0 exist", cov, "a zero-count clause with an instruction attached")
+        self.assertIn(f"| PROCBOOK | **NOT FOUND** - a member with this name exists: PROD.GC.CPYLIB (unknown) - {ARRIVED}"
+                      f"{UNKNOWN_FIX} |", prog)
+        # `copybook PROCBOOK` finds the member and says why the program still says NOT FOUND
+        self.assertIn("1 of the programs above still say", book)
+        self.assertIn("parsed before this member arrived and nothing parsed them again", book)
+        self.assertIn("`python -m atlas.recover --db atlas.db` marks them, then run your usual build" + UNKNOWN_FIX, book)
         # a dry run reports and marks nothing
         stats, said = self.recover(dry_run=True)
         self.assertEqual((stats["arrived"], stats["misfiled"], stats["marked"]), (1, 0, 0), said)
@@ -166,6 +196,8 @@ class ArrivedAfterTheParse(_Estate):
         self.assertEqual((stats["arrived"], stats["misfiled"], stats["marked"]), (1, 0, 1), said)
         self.assertIn("1 program(s) copy a copybook that has arrived since they were parsed (1 copybook): marked for the "
                       "next build", said)
+        self.assertIn("1 of them filed 'unknown' (a folder with no COPY hint): the build expands it but has no parser for "
+                      "it, so its own lines are not indexed - rename the folder to end in COPYLIB", said)
         self.assertIn("next: run your usual build command", said)
         self.assertIn(f"every name: {self.report}", said)
         self.assertEqual(self.status(), "pending")
@@ -173,6 +205,7 @@ class ArrivedAfterTheParse(_Estate):
         self.assertIn("## Copybooks that arrived after the program was parsed", rep)
         self.assertIn("| copybook | kind the index filed it as | folder | programs |", rep)
         self.assertIn("| PROCBOOK | unknown | PROD.GC.CPYLIB | SECPGM |", rep)
+        self.assertIn("so its own lines are not indexed", rep)
         self.assertNotIn("filed as something else", rep)
         # the next build, without --rebuild, parses the program again: whole, the section holding the book's paragraphs
         self.build()
@@ -183,14 +216,24 @@ class ArrivedAfterTheParse(_Estate):
         self.assertIn(("A-100-BEGIN", "section", "A-100-BEGIN"), paras)
         self.assertIn(("A-110-DO", "paragraph", "A-100-BEGIN"), paras)
         self.assertIn(("A-199-EXIT", "paragraph", "A-100-BEGIN"), paras)
-        cov, nf, prog, _book = self.outputs()
+        cov, nf, prog, book = self.outputs()
         self.assertIn("_none_", nf)
         self.assertNotIn("NOT FOUND", prog)
+        self.assertNotIn("still say", book)
         self.assertIn("### Members parsed only in part\n_none_", cov)
-        # nothing left for the step to say
+        # the copybook's own lines are still outside the index (no handler for 'unknown'): the reason for the clause
+        self.assertEqual(self.status("PROCBOOK", "unknown"), "skipped")
+        self.assertEqual(self.q("SELECT COUNT(*) FROM src_fts f JOIN member m ON m.id=f.member_id WHERE m.name='PROCBOOK'"),
+                         [(0,)])
+        # nothing left for the step to say - and the earlier run's report does not stay in place saying 'marked'
         stats, said = self.recover()
         self.assertEqual((stats["arrived"], stats["misfiled"], stats["marked"]), (0, 0, 0), said)
         self.assertNotIn("has arrived since", said)
+        rep = self.report_text()
+        self.assertIn("Nothing to report on this run", rep)
+        self.assertNotIn("arrived after the program was parsed", rep)
+        self.assertNotIn("marked for the next build", rep)
+        self.assertIn(f"{self.report} - nothing to report on this run (the earlier run's report is replaced)", said)
 
     def test_a_program_whose_own_copy_resolved_is_left_alone(self):
         # OTHERPGM arrives together with the book and resolves it at its first parse; SECPGM, parsed
@@ -222,8 +265,7 @@ class ArrivedAfterTheParse(_Estate):
             self.assertEqual((arrived[0]["copybook"], arrived[0]["members"]), ("PROCBOOK", [("unknown", "PROD.GC.CPYLIB")]))
             self.assertEqual([(n, k) for _i, n, k in arrived[0]["programs"]], [("SECPGM", "cobol")])
             self.assertEqual(recover.missing_copybooks(conn), {}, "not missing: the member exists - that is why it fell through")
-            self.assertEqual(query.same_named_note(conn, "PROCBOOK"),
-                             "PROD.GC.CPYLIB (unknown) - parsed before it arrived: run recover, then the build")
+            self.assertEqual(query.same_named_note(conn, "PROCBOOK"), f"PROD.GC.CPYLIB (unknown) - {ARRIVED}{UNKNOWN_FIX}")
             self.assertEqual(query.same_named_note(conn, "NOPE"), "")
         finally:
             conn.close()
@@ -241,9 +283,13 @@ class FiledAsAnotherKind(_Estate):
         self.assertEqual(self.status(), "partial")
         stats, said = self.recover()
         self.assertEqual((stats["arrived"], stats["misfiled"], stats["marked"]), (0, 1, 0), said)
+        # the console line carries the fix itself, and the run's own 'next:' line says it too - not only
+        # the line that sends him to the compiler listings
         self.assertIn("1 copybook name(s) exist in the index only as a member of a kind the build does not expand (proc): "
-                      "1 program(s) stay parsed only in part until the folder is renamed or the library's kind declared - "
-                      "the report says what to do", said)
+                      "1 program(s) stay parsed only in part until the folder is renamed to end in COPYLIB or the library's "
+                      "kind declared in the UI's table - the report names each", said)
+        self.assertIn("next: rename the folder(s) the report names to end in COPYLIB (or declare the library's kind in the "
+                      "UI's table), then run your usual build command", said)
         self.assertNotIn("has arrived since", said)
         self.assertNotIn("next: run your usual build command", said)
         self.assertEqual(self.status(), "partial", "a re-parse would find nothing: not marked")
@@ -262,12 +308,12 @@ class FiledAsAnotherKind(_Estate):
         self.write("SHARED/PROD.GC.PROCS/PROCBOOK.txt", PROCBOOK)
         self.build()
         cov, nf, prog, book = self.outputs()
-        self.assertIn("| PROCBOOK | 1 | yes: PROD.GC.PROCS, filed as proc - not a kind the build expands: rename the folder "
-                      "to end in COPYLIB or declare its kind in the UI, then build |", nf)
+        self.assertIn(f"| PROCBOOK | 1 | yes: PROD.GC.PROCS, filed as proc - {MISFILED} |", nf)
         self.assertIn("A copybook marked `yes` is not missing", cov)
         self.assertIn("1 exists only as a member of a kind the build does not expand", cov)
-        self.assertIn("| PROCBOOK | **NOT FOUND** - a member with this name exists: PROD.GC.PROCS, filed as proc - not a kind "
-                      "the build expands: rename the folder to end in COPYLIB or declare its kind in the UI, then build |", prog)
+        self.assertNotIn("0 of the copybooks", cov, "a zero-count clause with an instruction attached")
+        self.assertIn(f"| PROCBOOK | **NOT FOUND** - a member with this name exists: PROD.GC.PROCS, filed as proc - {MISFILED} |",
+                      prog)
         self.assertIn("**NOT FOUND** as a copybook - a member with this name exists, filed as proc (folder PROD.GC.PROCS): "
                       "not a kind the build expands, so every program that copies it is parsed only in part. The folder name "
                       "decided the kind (a copybook with no level numbers has no signature): rename the folder to end in "
@@ -280,6 +326,21 @@ class FiledAsAnotherKind(_Estate):
         cov, nf, prog, book = self.outputs()
         self.assertIn("_none_", nf)
         self.assertNotIn("NOT FOUND", prog + book)
+
+    def test_two_misfiled_copies_keep_each_folder_paired_with_its_kind(self):
+        # the same .txt in a PROCS folder (proc) and in a plain folder (doc): every report says which folder is which
+        self.write("SHARED/PROD.GC.PROCS/PROCBOOK.txt", PROCBOOK)
+        self.write("SHARED/downloads/PROCBOOK.txt", PROCBOOK)
+        self.build()
+        self.assertEqual(sorted(self.book()), [("doc", "downloads"), ("proc", "PROD.GC.PROCS")])
+        cov, nf, prog, book = self.outputs()
+        self.assertIn(f"| PROCBOOK | 1 | yes: downloads, filed as doc; PROD.GC.PROCS, filed as proc - {MISFILED} |", nf)
+        self.assertIn(f"a member with this name exists: downloads, filed as doc; PROD.GC.PROCS, filed as proc - {MISFILED} |", prog)
+        self.assertIn("filed as doc (folder downloads); filed as proc (folder PROD.GC.PROCS)", book)
+        stats, said = self.recover()
+        self.assertEqual((stats["arrived"], stats["misfiled"], stats["marked"]), (0, 1, 0), said)
+        self.assertIn("(doc, proc)", said)
+        self.assertIn("| PROCBOOK | doc, proc | downloads, PROD.GC.PROCS | SECPGM |", self.report_text())
 
 
 class DataCopybookIsTheControl(_Estate):
@@ -313,6 +374,93 @@ class DataCopybookIsTheControl(_Estate):
         self.assertNotIn("DATABOOK", nf)
         self.assertNotIn("A copybook marked `yes`", cov)
         self.assertNotIn("has a member with that name in the index now", cov)
+
+
+class NestedCopybookIsNotArrived(_Estate):
+    """Case D (LESSONS 184): NESTPGM copies OUTBOOK, which copies INBOOK, both
+    present in a COPYLIB folder from the first build - nothing is wrong. The
+    copybook's own COPY INBOOK row is recorded with no resolved_member_id
+    (the build never resolves a copybook's copies), and reading it as
+    'unresolved' called INBOOK 'arrived', marked OUTBOOK pending, and the next
+    build re-inserted OUTBOOK under a new id and nulled the program's link."""
+
+    def first_files(self):
+        self.write("GC/PROD.GC.SRC/NESTPGM.cbl", program("NESTPGM", book="OUTBOOK"))
+        self.write("GC/PROD.GC.COPYLIB/OUTBOOK.cpy", OUTBOOK)
+        self.write("GC/PROD.GC.COPYLIB/INBOOK.cpy", INBOOK)
+
+    def ids(self):
+        return self.q("SELECT name, id, parse_status FROM member WHERE name IN ('NESTPGM','OUTBOOK','INBOOK') ORDER BY name")
+
+    def test_nothing_is_reported_marked_or_broken(self):
+        self.assertEqual(self.status("NESTPGM"), "ok")
+        # the program carries its own row for the nested COPY, resolved; the copybook's own row is NULL by construction
+        self.assertIsNotNone(self.copy_use("OUTBOOK", "NESTPGM")[0][0])
+        self.assertIsNotNone(self.copy_use("INBOOK", "NESTPGM")[0][0])
+        self.assertEqual(self.copy_use("INBOOK", "OUTBOOK"), [(None,)])
+        before = self.ids()
+        cov, nf, prog, book = self.outputs("NESTPGM", "INBOOK")
+        self.assertIn("_none_", nf, "a copybook every program found is not 'not found'")
+        self.assertNotIn("INBOOK", nf)
+        self.assertNotIn("yes:", nf)
+        self.assertNotIn("NOT FOUND", prog + book)
+        self.assertIn("### Members parsed only in part\n_none_", cov)
+        conn = query.connect(self.db)
+        try:
+            self.assertEqual(recover.arrived_copybooks(conn), ([], []))
+        finally:
+            conn.close()
+        # recover, build, recover, build: nothing is ever reported, marked or re-inserted - it settles at once
+        for _round in range(2):
+            stats, said = self.recover()
+            self.assertEqual((stats["arrived"], stats["misfiled"], stats["marked"]), (0, 0, 0), said)
+            self.assertNotIn("has arrived since", said)
+            self.assertNotIn("next: run your usual build command", said)
+            self.assertEqual(self.ids(), before, "no member marked pending")
+            self.assertFalse(os.path.exists(self.report) and "arrived after" in self.report_text())
+            self.build()
+            self.assertEqual(self.ids(), before, "no member re-inserted under a new id")
+            self.assertIsNotNone(self.copy_use("OUTBOOK", "NESTPGM")[0][0], "the program's link to OUTBOOK kept")
+            self.assertIsNotNone(self.copy_use("INBOOK", "NESTPGM")[0][0])
+            cov, nf, prog, _book = self.outputs("NESTPGM", "INBOOK")
+            self.assertIn("_none_", nf)
+            self.assertNotIn("NOT FOUND", prog)
+
+
+class NestedCopybookArrivesLater(_Estate):
+    """Case E: OUTBOOK is present, INBOOK absent: the program is partial and
+    carries its own unresolved row for INBOOK. INBOOK then arrives as
+    'unknown': recover marks the PROGRAM only - never the copybook - and the
+    next build makes the program whole."""
+
+    def first_files(self):
+        self.write("GC/PROD.GC.SRC/NESTPGM.cbl", program("NESTPGM", book="OUTBOOK"))
+        self.write("GC/PROD.GC.COPYLIB/OUTBOOK.cpy", OUTBOOK)
+
+    def test_the_program_is_marked_and_the_copybook_is_left_alone(self):
+        self.assertEqual(self.status("NESTPGM"), "partial")
+        self.assertEqual(self.copy_use("INBOOK", "NESTPGM"), [(None,)])
+        self.assertEqual(self.copy_use("INBOOK", "OUTBOOK"), [(None,)])
+        cov, nf, _prog, _book = self.outputs("NESTPGM", "INBOOK")
+        self.assertIn("| INBOOK | 1 | - |", nf, "one use: the program's - the copybook's own row is not a use")
+        self.write("SHARED/PROD.GC.CPYLIB/INBOOK.txt", INBOOK)
+        self.build()
+        self.assertEqual(self.book("INBOOK"), [("unknown", "PROD.GC.CPYLIB")])
+        self.assertEqual(self.status("NESTPGM"), "partial")
+        outbook_id = self.q("SELECT id FROM member WHERE name='OUTBOOK'")
+        stats, said = self.recover()
+        self.assertEqual((stats["arrived"], stats["misfiled"], stats["marked"]), (1, 0, 1), said)
+        self.assertIn("1 program(s) copy a copybook that has arrived", said)
+        self.assertIn("| INBOOK | unknown | PROD.GC.CPYLIB | NESTPGM |", self.report_text())
+        self.assertNotIn("OUTBOOK (copybook)", self.report_text())
+        self.assertEqual((self.status("NESTPGM"), self.status("OUTBOOK", "copybook")), ("pending", "ok"))
+        self.build()
+        self.assertEqual(self.status("NESTPGM"), "ok")
+        self.assertIsNotNone(self.copy_use("INBOOK", "NESTPGM")[0][0])
+        self.assertEqual(self.q("SELECT id FROM member WHERE name='OUTBOOK'"), outbook_id, "the copybook was not touched")
+        self.assertIn(("A-150-SUB", "paragraph", "A-100-BEGIN"), [(p[0], p[1], p[2]) for p in self.paragraphs("NESTPGM")])
+        stats, said = self.recover()
+        self.assertEqual((stats["arrived"], stats["misfiled"], stats["marked"]), (0, 0, 0), said)
 
 
 if __name__ == "__main__":

@@ -451,7 +451,9 @@ build never expands - a procedure copybook, paragraphs and statements with
 no level numbers, in a PROCS or CNTL folder - with what to do: rename the
 folder to end in COPYLIB, or declare the library's kind in the UI's table,
 and build (`coverage`, `program` and `copybook` say the same beside each
-such NOT FOUND). `--from
+such NOT FOUND). A member typed `unknown` is expanded into its programs
+but has no parser of its own, so its own lines are not indexed or citable
+until that same folder fix is applied - the notes say so beside it. `--from
 FOLDER` adds expanded programs the index does not hold; `--dry-run` says
 what would be written. The same run reads the listing of every program whose
 copybook the build chose among several same-named ones (the listing's

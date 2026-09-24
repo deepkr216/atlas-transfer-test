@@ -1253,6 +1253,16 @@ def cmd_copybook(conn: sqlite3.Connection, name: str) -> str:
     out.append(table(["program", "member", "REPLACING", "cite"],
                      [(p["program_id"], p["member_name"], (p["replacing"] or "")[:40], f"{p['member_name']}:{p['line']}")
                       for p in progs]))
+    stale = [p for p in progs if p["resolved_member_id"] is None]
+    if stale:
+        # the member is here and a program still says NOT FOUND: it was parsed before the member arrived, and a
+        # member the build files 'unknown' (or sql) forces no re-parse by itself - say why, and the whole fix
+        kinds = ", ".join(sorted({c["kind"] for c in copies}))
+        out.append(f"\n> {len(stale)} of the programs above still say{'s' if len(stale) == 1 else ''} `COPY {name.upper()} NOT "
+                   "FOUND` (under 'Unresolved in scope' below): parsed before this member arrived and nothing parsed them "
+                   f"again - a member filed `{kinds}` forces no re-parse by itself. `python -m atlas.recover --db atlas.db` "
+                   "marks them, then run your usual build"
+                   + (f"; and {recover.UNKNOWN_FIX}" if any(c["kind"] == "unknown" for c in copies) else "") + ".\n")
     pnames = [p["program_id"].upper() for p in progs]
     if pnames:
         q = ",".join("?" * len(pnames))
@@ -1533,13 +1543,20 @@ def _partial_members(conn: sqlite3.Connection, limit: int = COVERAGE_ROWS) -> st
     if any(r["kind"] in ("cobol", "copybook") for r in rows):
         from . import recover
         arrived, misfiled = recover.arrived_copybooks(conn)
-        if arrived or misfiled:
-            out.append(f"\n> {len(arrived)} of the copybooks reported NOT FOUND {'has' if len(arrived) == 1 else 'have'} a member "
-                       "with that name in the index now - the programs were parsed before it arrived and nothing parsed "
-                       f"them again: `python -m atlas.recover --db atlas.db` marks them, then build; {len(misfiled)} "
-                       f"exist{'s' if len(misfiled) == 1 else ''} only as a member of a kind the build does not expand (the "
-                       "folder name decided it): rename the folder to end in COPYLIB or declare the library's kind in the "
-                       "UI, then build. The 'Copybooks not found' table below says which.\n")
+        clauses = []                                                    # only the clause whose count is not zero
+        if arrived:
+            unknown = any(k == "unknown" for e in arrived for k, _f in e["members"])   # type: ignore[union-attr]
+            clauses.append(f"{len(arrived)} of the copybooks reported NOT FOUND {'has' if len(arrived) == 1 else 'have'} a "
+                           "member with that name in the index now - the programs were parsed before it arrived and nothing "
+                           "parsed them again: `python -m atlas.recover --db atlas.db` marks them, then build"
+                           + ("; a member filed `unknown` also needs its folder renamed to end in COPYLIB (or the library's "
+                              "kind declared in the UI) so its own lines are indexed" if unknown else ""))
+        if misfiled:
+            clauses.append(f"{len(misfiled)} exist{'s' if len(misfiled) == 1 else ''} only as a member of a kind the build "
+                           "does not expand (the folder name decided it): rename the folder to end in COPYLIB or declare the "
+                           "library's kind in the UI, then build")
+        if clauses:
+            out.append("\n> " + "; ".join(clauses) + ". The 'Copybooks not found' table below says which.\n")
     return "".join(out)
 
 
@@ -1627,16 +1644,20 @@ def same_named_note(conn: sqlite3.Connection, copybook: str, exclude_ids: Sequen
     never expands (proc, ctlcard, doc ...), because a procedure copybook has
     no content signature and the folder name decided its kind - the folder
     must be renamed or the library's kind declared. `exclude_ids`: the
-    copiers themselves."""
+    copiers themselves. 'Run recover, then the build' is not the whole fix
+    for a member typed 'unknown': the build has no parser for it, so its
+    own lines are not in the index (`paragraph` shows them empty, nothing
+    can cite them) until the same folder fix is applied - the note says so."""
     from . import recover
     accepted, other = recover.members_named(conn, copybook, exclude_ids)
     if accepted:
         where = ", ".join(sorted({f"{f} ({k})" for _i, k, f, _p in accepted}))
-        return f"{where} - parsed before it arrived: run recover, then the build"
+        return (f"{where} - parsed before it arrived: run recover, then the build"
+                + (f"; and {recover.UNKNOWN_FIX}" if any(k == "unknown" for _i, k, _f, _p in accepted) else ""))
     if other:
-        folders = ", ".join(sorted({f for _i, _k, f, _p in other}))
-        kinds = ", ".join(sorted({k for _i, k, _f, _p in other}))
-        return (f"{folders}, filed as {kinds} - not a kind the build expands: rename the folder to end in COPYLIB "
+        # each folder with its own kind: 'PROD.CLM.PROCS, downloads, filed as doc, proc' would not say which is which
+        where = "; ".join(dict.fromkeys(f"{f}, filed as {k}" for _i, k, f, _p in other))
+        return (f"{where} - not a kind the build expands: rename the folder to end in COPYLIB "
                 "or declare its kind in the UI, then build")
     return ""
 
@@ -1805,12 +1826,18 @@ def cmd_coverage(conn: sqlite3.Connection, everything: bool = False) -> str:
     out.append(table(["kind", "resolution", "count"], conn.execute(
         "SELECT kind, resolution, COUNT(*) FROM call_edge GROUP BY 1,2").fetchall()))
     out.append("\n### Copybooks not found\n")
+    # a PROGRAM's row only: the build records a copybook member's own COPY statements with no
+    # resolved_member_id, ever (it parses a copybook for copies, never resolves them), so such a row says
+    # nothing - it listed a copybook every program had found as 'not found' (LESSONS 184); a program
+    # carries its own row for every nested COPY, so its rows are the whole picture
     nf_rows = []
     for book, n in conn.execute(
-            "SELECT copybook, COUNT(*) FROM copy_use WHERE resolved_member_id IS NULL AND copybook NOT IN ('SQLCA','SQLDA') "
+            "SELECT c.copybook, COUNT(*) FROM copy_use c JOIN member m ON m.id = c.member_id "
+            "WHERE c.resolved_member_id IS NULL AND m.kind = 'cobol' AND c.copybook NOT IN ('SQLCA','SQLDA') "
             "GROUP BY 1 ORDER BY 2 DESC LIMIT 40").fetchall():
-        copiers = [r[0] for r in conn.execute("SELECT DISTINCT member_id FROM copy_use WHERE UPPER(copybook)=UPPER(?) "
-                                              "AND resolved_member_id IS NULL", (book,))]
+        copiers = [r[0] for r in conn.execute("SELECT DISTINCT c.member_id FROM copy_use c JOIN member m ON m.id = c.member_id "
+                                              "WHERE UPPER(c.copybook)=UPPER(?) AND c.resolved_member_id IS NULL "
+                                              "AND m.kind = 'cobol'", (book,))]
         note = same_named_note(conn, book, copiers)
         nf_rows.append((book, n, f"yes: {note}" if note else "-"))
     out.append(table(["copybook", "uses", "a member with this name exists?"], nf_rows))
@@ -1820,7 +1847,8 @@ def cmd_coverage(conn: sqlite3.Connection, everything: bool = False) -> str:
                    "--db atlas.db` marks them, then run your usual build; or the member is filed as a kind the build never "
                    "expands, because the folder name decided its kind (a copybook with no level numbers has no signature): "
                    "rename the folder to end in COPYLIB, or declare the library's kind in the UI's table (the manifest "
-                   "kinds), and build.\n")
+                   "kinds), and build. A member filed `unknown` is expanded but has no parser of its own, so its own lines "
+                   "are not indexed or citable until that same folder fix is applied.\n")
     out.append("\n### Unresolved by kind - what the index could NOT work out, and what closes each one\n")
     rows = conn.execute("""SELECT CASE WHEN kind = 'expand' AND instr(COALESCE(detail, ''), ?) > 0
                                        THEN 'expand (copybook chosen among several)' ELSE kind END AS k, COUNT(*)

@@ -233,7 +233,10 @@ shipped alone and cost one such night; these still wait for the next one:
    area A) and no level numbers and no DIVISION is a copybook before the folder hint is consulted.
    Until then `atlas.recover` names each such member with the fix (rename the folder to end in
    COPYLIB, or declare the library's kind in the UI's table) and `coverage` / `program` /
-   `copybook` say 'filed as proc' instead of a bare NOT FOUND.
+   `copybook` say 'filed as proc' instead of a bare NOT FOUND. The same rename is what puts an
+   'unknown' member's own lines in the index: the build expands it into its programs but has no
+   parser for that kind (HANDLERS), so `paragraph` shows its lines empty and nothing can cite them
+   (LESSONS 184) - until this item, the folder fix is the one thing to do in both cases.
 21. **build.py: inventory forcing (`changed_names`) covers every kind the resolver accepts.**
    A new or changed member forces the programs that copy it to be parsed again only when its kind
    is copybook or cobol; the resolver also expands sql and unknown members, so a procedure copybook
@@ -243,7 +246,12 @@ shipped alone and cost one such night; these still wait for the next one:
    kind in (copybook, cobol, sql, unknown), so a program is re-parsed when ANY member it can copy
    arrives. Until then `atlas.recover`'s 'copybooks that have arrived since the program was parsed'
    step marks those programs pending for the next build - the query-side stand-in (item 1 of
-   LESSONS 183's fix), not the fix.
+   LESSONS 183's fix), not the fix. Marking alone is not the whole fix either: an 'unknown'
+   member's own lines stay outside the index until item 20 files it as a copybook, so every note
+   that says 'run recover, then the build' adds the folder rename (LESSONS 184). The stand-in marks
+   PROGRAMS only: a copybook member's own COPY rows are never resolved by the build (index_copybook
+   parses for copies, never resolves), so they say nothing, and a copybook marked pending is
+   re-inserted under a new id, which nulls the links of every program copying it.
 
 ### flow: known limits (open after review)
 
