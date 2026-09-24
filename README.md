@@ -66,7 +66,11 @@ python -m atlas.fetch --config sources.json --all --build   # download everythin
 
 The UI is a table of sources with Add / Edit / Remove, Plan, Fetch selected /
 Fetch all, Build index / Rebuild from empty, Coverage, and a live log that
-shows every command exactly as run. Shop-specific Zowe flags (a profile, an
+shows every command exactly as run. It explains itself: a "What to do" strip
+lists the five steps in order and marks the one possible now, a grey line
+under each field says what to type with an example, every button has a hover
+tip, the status line says what happened and what to do next, and a **Help**
+button opens it all on one page. Shop-specific Zowe flags (a profile, an
 encoding, `--preserve-original-letter-case`) go in `extra_args` — a config
 edit, not a code change. See `sources.example.json`.
 
