@@ -305,8 +305,15 @@ falls back to the bare PROC only when no indexed job expands it.
 - `dbd NAME` — an IMS database: segments and fields, XDFLD indexes, the
   PSBs/PCBs addressing it with PROCOPT, the programs whose DL/I calls
   resolve to it (and whether they update), utility jobs, online access.
-- `segment NAME` — who touches a segment: PCBs sensitive to it and the
-  programs using them; `EXEC DLI SEGMENT()` is exact.
+- `segment NAME [--dbd DBD]` — who touches a segment: PCBs sensitive to it
+  and the programs using them; `EXEC DLI SEGMENT()` is exact. Then each DBD
+  field at its bytes in every program's I/O area, whatever that program
+  calls it (`GENDER (bytes 45-45): PGMA DEP-GENDER via copybook DEPSEG
+  (X(01)) - stored by this program; PGMB WS-DEP-SEX via copybook DEPREC2
+  (X(01)) - layout differs from PGMA's; PGMC: no field at that offset`) -
+  matched by byte range, never by name; a FILLER, a longer or shorter item
+  or a run of items is said as such. `dbd NAME` counts the programs that
+  store and read each segment.
 - `layout COPYBOOK|01 [--program PGM]` — the byte layout (offset, length,
   PIC, usage, OCCURS/ODO/REDEFINES, 88 values, record length) from the
   parser's numbers; with `--program` the 01 as that program sees it after

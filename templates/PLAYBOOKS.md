@@ -122,7 +122,15 @@ steps. `field <host-var>` shows the same from the COBOL side. For an IMS
 field: `field` lists the DL/I calls whose I/O area holds it (GU/GN read into
 the area, ISRT/REPL write from it) with the database and PROCOPT already
 resolved through the PSB; `dbd <NAME>` / `segment <NAME>` give every program
-touching the database or segment and whether it updates.
+touching the database or segment and whether it updates. When the question
+is "where is the gender field of segment X populated" across databases that
+each name the byte differently, the field NAME is the wrong handle: run
+`segment <SEG> --dbd <DBD>` - it puts each DBD FIELD at its bytes in every
+program's I/O area (`GENDER (bytes 45-45): PGMA DEP-GENDER via copybook
+DEPSEG ... - stored by this program; PGMB WS-DEP-SEX via copybook DEPREC2
+... - layout differs from PGMA's; PGMC: no field at that offset`). The
+programs marked "stored by this program" are the writers; then `field` /
+`flow --up` on each program's own name for the byte.
 
 ## A5. Abend triage
 
