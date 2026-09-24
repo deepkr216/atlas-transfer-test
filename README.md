@@ -601,7 +601,13 @@ below do the same step by step, when you want to choose the report yourself:
 
 An answer is only as current as the index, so every pack and `coverage`
 start with **when the index was built**, warn when a build started and
-never finished, and warn when a fetched library is incomplete. The fetch
+never finished, and warn when a fetched library is incomplete. `coverage`
+also keeps a program whose copybook was **chosen among several** same-named
+ones with different content (the build picks by system and declared library
+order, and the `ambiguous_copybook` row names the copy used) in its own row,
+"Complete, with a copybook chosen among several", apart from the members
+parsed only in part - the index still marks it `partial` until the next
+re-parse, but every COPY expanded and `program` says so. The fetch
 reconciles each PDS folder with the host's member list (`zowe zos-files
 list all-members`): a download that stopped part-way is reported
 `INCOMPLETE n/m`, the listed-but-missing members are named, local members
