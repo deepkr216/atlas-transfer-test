@@ -192,6 +192,16 @@ shipped alone and cost one such night; these still wait for the next one:
    library's first entry is renamed as REPLACING would (cited in the copybook, a `field_alias` row both
    ways, the program's `field` row); a library that starts at 05 hangs under the program's own 01,
    kept as code. `01 X.` with the COPY after the period is unchanged (LESSONS 177).
+17. **A statement before COPY on the same line** - his `A-100-BEGIN SECTION.  COPY PROCBOOK.`
+   (also a paragraph name, `MOVE A TO B.  COPY X.`, `01 X.  COPY Y.`): the compiler keeps the text
+   before COPY and replaces only the COPY statement. expand.py commented out the whole line, so the
+   section vanished from the expanded text - `PERFORM A-100-BEGIN` pointed at nothing, the copybook's
+   paragraphs fell into the section before it, and the build's paragraph and perform_edge rows followed.
+   Now the prefix stays live on its own line number with the COPY part blanked (no line is invented,
+   so the citation line map is unchanged); only the statement's continuation lines are the comment
+   echo, and the statement is gathered from the COPY keyword, so the prefix's period no longer cuts
+   off a REPLACING continued on the next line. The OS/VS `01 X COPY Y.` rename (item 16) is decided
+   first and is unchanged; a COPY that starts its line is unchanged (LESSONS 178).
 
 ### flow: known limits (open after review)
 
