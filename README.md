@@ -442,7 +442,16 @@ where they differ the copy without a REPLACING clause wins, then the most
 common, and the report `work\recover.md` says so); when two systems hold
 different texts each system gets its own copy under its own folder. When
 the real copybook arrives in the estate the recovered one is removed on the
-next run and the programs that had expanded it are parsed again. `--from
+next run and the programs that had expanded it are parsed again. The same
+run marks for the next build every program that still says `COPY X NOT
+FOUND` although a member named X has arrived since it was parsed (a member
+typed `unknown` by its folder name forces no re-parse by itself), and names
+in `work\recover.md` every copybook whose only member is filed as a kind the
+build never expands - a procedure copybook, paragraphs and statements with
+no level numbers, in a PROCS or CNTL folder - with what to do: rename the
+folder to end in COPYLIB, or declare the library's kind in the UI's table,
+and build (`coverage`, `program` and `copybook` say the same beside each
+such NOT FOUND). `--from
 FOLDER` adds expanded programs the index does not hold; `--dry-run` says
 what would be written. The same run reads the listing of every program whose
 copybook the build chose among several same-named ones (the listing's

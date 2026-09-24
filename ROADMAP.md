@@ -222,6 +222,28 @@ shipped alone and cost one such night; these still wait for the next one:
    `library` table tie a folder to its dataset), that copy is the one to expand and the row is not
    ambiguous at all; only where no listing says does the chain guess. A contradicted choice today
    is a wrong fact in every field, offset and flow answer for that program.
+20. **classify.py: a procedure copybook is a copybook by its CONTENT, before the folder hint.**
+   His `A-100-BEGIN SECTION.  COPY PROCBOOK.` copies a member of paragraph names and statements -
+   no level numbers, no DIVISION header - which has no content signature today, so the FOLDER NAME
+   types it: PROCLIB / PROCS make it a proc (a JCL PROC), CNTL / CARDLIB a control card, a plain
+   folder a document, a dataset-named folder with no hint 'unknown'. Only copybook / cobol / sql /
+   unknown reach the resolver, so a procedure copybook fetched into a PROCS or CNTL folder is never
+   expanded ('COPY PROCBOOK NOT FOUND' with the member on disk - LESSONS 183). A member with COBOL
+   procedure statements (PERFORM / MOVE / IF / EVALUATE / EXEC CICS / GOBACK / paragraph names in
+   area A) and no level numbers and no DIVISION is a copybook before the folder hint is consulted.
+   Until then `atlas.recover` names each such member with the fix (rename the folder to end in
+   COPYLIB, or declare the library's kind in the UI's table) and `coverage` / `program` /
+   `copybook` say 'filed as proc' instead of a bare NOT FOUND.
+21. **build.py: inventory forcing (`changed_names`) covers every kind the resolver accepts.**
+   A new or changed member forces the programs that copy it to be parsed again only when its kind
+   is copybook or cobol; the resolver also expands sql and unknown members, so a procedure copybook
+   typed 'unknown' by its dataset-named folder arrives, is in the index, and forces nothing - every
+   program that copied it stays 'partial - COPY X NOT FOUND' until something else re-parses it
+   (his two builds after the fetch changed nothing; LESSONS 183). `changed_names` must take every
+   kind in (copybook, cobol, sql, unknown), so a program is re-parsed when ANY member it can copy
+   arrives. Until then `atlas.recover`'s 'copybooks that have arrived since the program was parsed'
+   step marks those programs pending for the next build - the query-side stand-in (item 1 of
+   LESSONS 183's fix), not the fix.
 
 ### flow: known limits (open after review)
 
