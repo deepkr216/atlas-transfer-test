@@ -31,6 +31,13 @@ COPYBOOK pending, and the next build re-inserted it under a new id and
 nulled the links of every program copying it. Only a PROGRAM's row says
 whether a COPY was found, and a program carries its own row for every
 nested COPY, so marking programs alone is enough (cases D and E).
+
+LESSONS 185: a PROGRAM's row is NULL for a third reason - the expander
+SKIPPED the COPY (a copybook copying itself: 'recursive'; nesting deeper
+than expand.MAX_DEPTH) without looking it up. The member exists and the
+program was parsed after it, so nothing arrived: the program's own 'expand'
+note holds the reason, and only a row whose name the program reports NOT
+FOUND is a copybook not found (cases F, G and H).
 """
 
 import contextlib
@@ -62,6 +69,20 @@ DATABOOK = ("           05  DB-FIELD-A          PIC X(5).\n           05  DB-FIE
 # a procedure copybook that copies another one (LESSONS 184)
 OUTBOOK = ("       A-110-DO.\n           MOVE 1 TO WS-X.\n           COPY INBOOK.\n       A-199-EXIT.\n           EXIT.\n")
 INBOOK = ("       A-150-SUB.\n           MOVE 2 TO WS-Y.\n")
+# a copybook copying itself: the expander skips the inner COPY as recursive (LESSONS 185)
+RECBOOK = ("       R-110-DO.\n           MOVE 1 TO WS-X.\n           COPY RECBOOK.\n       R-199-EXIT.\n           EXIT.\n")
+
+
+def chain(prefix, n, last=None):
+    """[(path, text)] for copybooks P01..Pn where each copies the next, and
+    the last copies `last` when given: with n = 13 the COPY in P12 sits at
+    depth 12 = expand.MAX_DEPTH and is skipped as nested too deep."""
+    files = []
+    for k in range(1, n + 1):
+        nxt = f"{prefix}{k + 1:02d}" if k < n else last
+        body = f"       P-{prefix}{k:02d}.\n           MOVE 1 TO WS-X.\n" + (f"           COPY {nxt}.\n" if nxt else "")
+        files.append((f"GC/PROD.GC.COPYLIB/{prefix}{k:02d}.cpy", body))
+    return files
 
 ARRIVED = "parsed before it arrived: run recover, then the build"
 UNKNOWN_FIX = ("; and rename the folder to end in COPYLIB (or declare the library's kind in the UI's table) so the "
@@ -127,7 +148,13 @@ class _Estate(unittest.TestCase):
 
     def copy_use(self, name="PROCBOOK", copier="SECPGM"):
         return self.q("SELECT c.resolved_member_id FROM copy_use c JOIN member m ON m.id=c.member_id "
-                      "WHERE UPPER(m.name)=? AND UPPER(c.copybook)=?", copier, name)
+                      "WHERE UPPER(m.name)=? AND UPPER(c.copybook)=? ORDER BY c.line", copier, name)
+
+    def member_id(self, name, kind="cobol"):
+        return self.q("SELECT id FROM member WHERE UPPER(name)=? AND kind=?", name, kind)[0][0]
+
+    def ids(self):
+        return self.q("SELECT name, kind, id, parse_status FROM member ORDER BY name, kind")
 
     def paragraphs(self, name="SECPGM"):
         return self.q("SELECT p.name, p.kind, p.section FROM paragraph p JOIN program g ON g.id=p.program_id "
@@ -250,6 +277,19 @@ class ArrivedAfterTheParse(_Estate):
         self.build()
         self.assertEqual((self.status("SECPGM"), self.status("OTHERPGM")), ("ok", "ok"))
 
+    def test_copybook_counts_programs_not_copy_sites(self):
+        # TWICEPGM copies PROCBOOK on two lines: `copybook PROCBOOK` counts it once, with SECPGM twice in all
+        self.write("GC/PROD.GC.SRC/TWICEPGM.cbl", HEAD.format(name="TWICEPGM", data="") + SECTION_COPY.format(book="PROCBOOK")
+                   + "       B-200-MORE SECTION.  COPY PROCBOOK.\n" + TAIL)
+        self.build()
+        self.assertEqual(self.copy_use("PROCBOOK", "TWICEPGM"), [(None,), (None,)])
+        self.write("SHARED/PROD.GC.CPYLIB/PROCBOOK.txt", PROCBOOK)
+        self.build()
+        _cov, _nf, _prog, book = self.outputs()
+        self.assertIn("### Programs including it (3)", book)
+        self.assertIn("> 2 of the programs above still say `COPY PROCBOOK NOT FOUND`", book)
+        self.assertNotIn("3 of the programs", book)
+
     def test_the_index_side_helpers(self):
         self.write("SHARED/PROD.GC.CPYLIB/PROCBOOK.txt", PROCBOOK)
         self.build()
@@ -292,6 +332,10 @@ class FiledAsAnotherKind(_Estate):
                       "UI's table), then run your usual build command", said)
         self.assertNotIn("has arrived since", said)
         self.assertNotIn("next: run your usual build command", said)
+        # the member is on disk: the folder fix comes first, not a hunt for the compiler listings
+        self.assertIn("missing copybooks in the index: 1", said)
+        self.assertIn("every one of them is the name of a member filed as a kind the build does not expand", said)
+        self.assertNotIn("next: run again as", said)
         self.assertEqual(self.status(), "partial", "a re-parse would find nothing: not marked")
         rep = self.report_text()
         self.assertIn("## A member with the copybook's name exists but is filed as something else", rep)
@@ -461,6 +505,182 @@ class NestedCopybookArrivesLater(_Estate):
         self.assertIn(("A-150-SUB", "paragraph", "A-100-BEGIN"), [(p[0], p[1], p[2]) for p in self.paragraphs("NESTPGM")])
         stats, said = self.recover()
         self.assertEqual((stats["arrived"], stats["misfiled"], stats["marked"]), (0, 0, 0), said)
+
+
+class _SkippedCopy(_Estate):
+    """LESSONS 185: expand.py writes a program's NULL copy_use row for a
+    system include, a COPY it SKIPPED and a COPY NOT FOUND alike; the arrived
+    scan and every note built on it read the NULL as 'not found' and told him
+    to run recover for a member the program had found, marked the program on
+    every run, and each build left the row NULL: it never settled."""
+
+    PROG = BOOK = WHY = ""
+
+    def assert_skipped_not_arrived(self):
+        prog, book, why = self.PROG, self.BOOK, self.WHY
+        self.assertEqual(self.status(prog), "partial", "a skipped COPY makes the program truly partial (LESSONS 181)")
+        mid = self.member_id(prog)
+        conn = query.connect(self.db)
+        try:
+            self.assertEqual(recover.skipped_copies(conn), {(mid, book): why})
+            self.assertEqual(recover.skipped_copies(conn, mid), {(mid, book): why})
+            self.assertEqual(recover.arrived_copybooks(conn), ([], []), "the member exists and the program was parsed after it")
+            self.assertEqual(recover.missing_copybooks(conn), {}, "a copybook copying its own name is not a missing copybook")
+        finally:
+            conn.close()
+        cov, nf, prog_out, book_out = self.outputs(prog, book)
+        # coverage: not a copybook not found - the skip is said under the table, and the reason stands
+        # beside the program under 'Members parsed only in part'
+        self.assertIn("_none_", nf)
+        self.assertNotIn(f"| {book} |", nf)
+        self.assertNotIn("yes:", nf)
+        self.assertIn(f"`COPY {book}` skipped - {why} in {prog}", nf)
+        self.assertIn("A skipped COPY is not a copybook not found", nf)
+        self.assertNotIn("parsed before it arrived", cov)
+        self.assertNotIn("A copybook marked `yes`", cov)
+        self.assertNotIn("has a member with that name in the index now", cov)
+        self.assertIn(f"| cobol | {prog} | PROD.GC.SRC | expand: ", cov.split("### Members parsed only in part")[1].split("\n###")[0])
+        # program: the cell says the skip, never NOT FOUND
+        self.assertIn(f"| {book} | **COPY skipped - {why}** - not a copybook not found: the member is in the index and the "
+                      "expander stopped there (the notes below say so) |", prog_out)
+        self.assertNotIn("NOT FOUND", prog_out)
+        # copybook: no 'still says NOT FOUND', no instruction
+        self.assertNotIn("still say", book_out)
+        self.assertNotIn("NOT FOUND", book_out)
+        self.assertIn(f"COPY skipped - {why}", book_out)
+        # recover, build, recover, build: nothing reported, nothing marked, nothing re-inserted - it settles at once
+        before = self.ids()
+        for _round in range(2):
+            stats, said = self.recover()
+            self.assertEqual((stats["missing"], stats["arrived"], stats["misfiled"], stats["marked"]), (0, 0, 0, 0), said)
+            self.assertNotIn("has arrived since", said)
+            self.assertNotIn("next:", said)
+            self.assertEqual(self.ids(), before, "no member marked pending")
+            self.assertFalse(os.path.exists(self.report) and "arrived after" in self.report_text())
+            self.build()
+            self.assertEqual(self.ids(), before, "no member re-inserted under a new id, no status changed")
+
+
+class RecursiveCopyIsNotArrived(_SkippedCopy):
+    """Case F: RECPGM copies RECBOOK, RECBOOK copies itself - both present
+    from the first build; the inner COPY is skipped as recursive."""
+
+    PROG, BOOK, WHY = "RECPGM", "RECBOOK", "recursive"
+
+    def first_files(self):
+        self.write("GC/PROD.GC.SRC/RECPGM.cbl", program("RECPGM", book="RECBOOK"))
+        self.write("GC/PROD.GC.COPYLIB/RECBOOK.cpy", RECBOOK)
+
+    def test_nothing_arrived_and_nothing_is_marked(self):
+        # the program's own rows: the outer COPY resolved, the inner one (inside the copybook) skipped
+        rows = self.copy_use("RECBOOK", "RECPGM")
+        self.assertEqual(len(rows), 2)
+        self.assertEqual([r[0] is None for r in rows], [True, False])
+        self.assertEqual(self.q("SELECT detail FROM unresolved WHERE kind='expand' AND member_id=?", self.member_id("RECPGM")),
+                         [("(in COPY RECBOOK) L3: COPY RECBOOK skipped - recursive",)])
+        self.assert_skipped_not_arrived()
+        self.assertIsNotNone(self.copy_use("RECBOOK", "RECPGM")[1][0], "the resolved row kept through the rounds")
+        # the resolved row still shows in `program`, and coverage's partial table carries the reason (LESSONS 181)
+        cov, _nf, prog_out, _book = self.outputs("RECPGM", "RECBOOK")
+        self.assertIn("| RECBOOK | RECBOOK |", prog_out)
+        self.assertIn("| cobol | RECPGM | PROD.GC.SRC | expand: (in COPY RECBOOK) L3: COPY RECBOOK skipped - recursive |", cov)
+
+
+class DeepNestingIsNotArrived(_SkippedCopy):
+    """Case G: DEEPPGM copies N01, N01 copies N02 ... N12 copies N13, all
+    present; COPY N13 sits at depth 12 and is skipped as nested too deep."""
+
+    PROG, BOOK, WHY = "DEEPPGM", "N13", "nesting deeper than 12"
+
+    def first_files(self):
+        self.write("GC/PROD.GC.SRC/DEEPPGM.cbl", program("DEEPPGM", book="N01"))
+        for rel, text in chain("N", 13):
+            self.write(rel, text)
+
+    def test_nothing_arrived_and_nothing_is_marked(self):
+        self.assertEqual(self.copy_use("N13", "DEEPPGM"), [(None,)])
+        self.assertEqual(self.book("N13"), [("copybook", "PROD.GC.COPYLIB")])
+        self.assert_skipped_not_arrived()
+
+
+class NotFoundWinsOverSkipped(_Estate):
+    """Case H: XPGM copies XBOOK on its section line (no member: NOT FOUND)
+    and M01, whose chain ends with M12 copying XBOOK at depth 12 (skipped
+    without a lookup). The program reports both for the same name; NOT FOUND
+    is the fact that holds - XBOOK stays a copybook not found."""
+
+    def first_files(self):
+        self.write("GC/PROD.GC.SRC/XPGM.cbl", HEAD.format(name="XPGM", data="") + SECTION_COPY.format(book="XBOOK")
+                   + "       B-200-MORE SECTION.\n           COPY M01.\n" + TAIL)
+        for rel, text in chain("M", 12, last="XBOOK"):
+            self.write(rel, text)
+
+    def test_the_name_stays_not_found(self):
+        mid = self.member_id("XPGM")
+        notes = [r[0] for r in self.q("SELECT detail FROM unresolved WHERE kind='expand' AND member_id=? ORDER BY id", mid)]
+        self.assertTrue(any("COPY XBOOK NOT FOUND" in n for n in notes), notes)
+        self.assertTrue(any("COPY XBOOK skipped - nesting deeper than 12" in n for n in notes), notes)
+        self.assertEqual(self.copy_use("XBOOK", "XPGM"), [(None,), (None,)])
+        conn = query.connect(self.db)
+        try:
+            self.assertEqual(recover.skipped_copies(conn), {})
+            # two places: the program's own COPY and M12's (a copybook copying a missing one counts, as ever)
+            self.assertEqual(recover.missing_copybooks(conn), {"XBOOK": 2})
+            self.assertEqual(recover.arrived_copybooks(conn), ([], []))
+        finally:
+            conn.close()
+        cov, nf, prog, book = self.outputs("XPGM", "XBOOK")
+        self.assertIn("| XBOOK | 2 | - |", nf)
+        self.assertNotIn("skipped", nf)
+        self.assertIn("| XBOOK | **NOT FOUND** |", prog)
+        self.assertNotIn("COPY skipped", prog)
+        self.assertIn("**NOT FOUND**\n", book)
+
+
+class RemovedCopiesAreNotNothingToReport(_Estate):
+    """A run whose only work is removing recovered copies (the real member
+    arrived) and marking their programs wrote 'Nothing to report on this run'
+    over the report and printed no 'next:' line, while the console had just
+    said the programs were marked."""
+
+    def first_files(self):
+        self.write("GC/PROD.GC.SRC/DATAPGM.cbl", HEAD.format(name="DATAPGM", data="       01  WS-REC.\n           COPY DATABOOK.\n")
+                   + "       A-100-BEGIN SECTION.\n           MOVE 1 TO WS-X.\n" + TAIL)
+        # a copy an earlier atlas.recover run wrote, with its marker
+        rec = os.path.join(self.root, "SHARED", recover.FOLDER)
+        self.write(f"SHARED/{recover.FOLDER}/DATABOOK.cpy", DATABOOK)
+        recover._save_marker(rec, {"DATABOOK": {"from": "DATAPGM", "how": "test fixture"}})
+        os.makedirs(os.path.dirname(self.report), exist_ok=True)
+        with open(self.report, "w", encoding="utf-8") as fh:
+            fh.write("# Recovered copybooks - an earlier run\n\n## Written\n\n| DATABOOK | 1 | ... |\n")
+
+    def test_the_report_and_the_next_line_say_what_the_console_said(self):
+        self.assertEqual(self.status("DATAPGM"), "ok")
+        self.assertIn(recover.FOLDER, self.q("SELECT path FROM member WHERE name='DATABOOK'")[0][0])
+        self.write("GC/PROD.GC.COPYLIB/DATABOOK.cpy", DATABOOK)
+        self.build()
+        self.assertEqual(len(self.book("DATABOOK")), 2)
+        stats, said = self.recover()
+        self.assertEqual((stats["removed"], stats["arrived"], stats["misfiled"], stats["marked"]), (1, 0, 0, 1), said)
+        self.assertIn("1 recovered copybook(s) removed - the estate now holds the real member: DATABOOK", said)
+        self.assertIn("1 program(s) that had expanded them are marked for the next build", said)
+        self.assertIn("next: run your usual build command", said)
+        self.assertEqual(self.status("DATAPGM"), "pending")
+        rep = self.report_text()
+        self.assertNotIn("Nothing to report on this run", rep)
+        self.assertNotIn("an earlier run", rep)
+        self.assertIn("## Recovered copies removed - the real member arrived", rep)
+        self.assertIn("DATABOOK", rep)
+        self.assertIn("1 program(s) that had expanded them are marked for the next build: run your usual build command", rep)
+        self.assertFalse(os.path.exists(os.path.join(self.root, "SHARED", recover.FOLDER, "DATABOOK.cpy")))
+        self.build()
+        self.assertEqual(self.status("DATAPGM"), "ok")
+        self.assertEqual(self.book("DATABOOK"), [("copybook", "PROD.GC.COPYLIB")])
+        # and a run with nothing left says so, replacing this one's report
+        stats, said = self.recover()
+        self.assertEqual((stats["removed"], stats["marked"]), (0, 0), said)
+        self.assertNotIn("next:", said)
+        self.assertIn("Nothing to report on this run", self.report_text())
 
 
 if __name__ == "__main__":

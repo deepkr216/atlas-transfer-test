@@ -251,7 +251,10 @@ shipped alone and cost one such night; these still wait for the next one:
    that says 'run recover, then the build' adds the folder rename (LESSONS 184). The stand-in marks
    PROGRAMS only: a copybook member's own COPY rows are never resolved by the build (index_copybook
    parses for copies, never resolves), so they say nothing, and a copybook marked pending is
-   re-inserted under a new id, which nulls the links of every program copying it.
+   re-inserted under a new id, which nulls the links of every program copying it. And it leaves
+   alone a COPY the expander SKIPPED (a copybook copying itself; nesting deeper than 12): that
+   program row is NULL too, but the member was found and the program parsed after it - the
+   program's own 'expand' note tells the two apart (recover.skipped_copies, LESSONS 185).
 
 ### flow: known limits (open after review)
 

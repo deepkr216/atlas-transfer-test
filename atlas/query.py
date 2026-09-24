@@ -1230,11 +1230,18 @@ def cmd_copybook(conn: sqlite3.Connection, name: str) -> str:
             out.append(f"  - `{c['path']}`: {r['len']} bytes, {r['n']} fields" + ("  [authoritative]" if c["authoritative"] else "") + "\n")
     from . import recover
     out.append(_listing_sources_of(conn, name, recovered=all(recover.FOLDER.lower() in (c["path"] or "").lower() for c in copies)))
-    progs = conn.execute("""SELECT DISTINCT m.name AS member_name, p.program_id, p.id AS pid, c.replacing, c.line,
+    progs = conn.execute("""SELECT DISTINCT m.name AS member_name, m.id AS mid, p.program_id, p.id AS pid, c.replacing, c.line,
                                    c.resolved_member_id, rm.path AS rpath, rm.system AS rsys, rm.norm_sha AS rsha
                             FROM copy_use c JOIN member m ON m.id=c.member_id JOIN program p ON p.member_id=m.id
                             LEFT JOIN member rm ON rm.id=c.resolved_member_id
                             WHERE UPPER(c.copybook)=? ORDER BY rm.path, p.program_id""", (name.upper(),)).fetchall()
+    # a program's row with no resolved member: a COPY not found - or one the expander SKIPPED (recursive,
+    # nested too deep), whose member the program had found (LESSONS 185)
+    skipped = recover.skipped_copies(conn)
+
+    def skip_why(p: sqlite3.Row) -> Optional[str]:
+        return skipped.get((p["mid"], name.upper())) if p["resolved_member_id"] is None else None
+
     out.append(f"\n### Programs including it ({len(progs)})\n")
     if len({p["resolved_member_id"] for p in progs}) > 1:
         # Two copies of the copybook: say which programs compile against which
@@ -1249,11 +1256,23 @@ def cmd_copybook(conn: sqlite3.Connection, name: str) -> str:
                 out.append(f"- `{ps[0]['rpath']}` ({ps[0]['rsys'] or 'no system'}, {ln} bytes): "
                            + ", ".join(f"{p['program_id']} @{p['member_name']}:{p['line']}" for p in ps) + "\n")
             else:
-                out.append("- copy NOT FOUND: " + ", ".join(f"{p['program_id']} @{p['member_name']}:{p['line']}" for p in ps) + "\n")
+                by_why: Dict[Optional[str], List[sqlite3.Row]] = defaultdict(list)
+                for p in ps:
+                    by_why[skip_why(p)].append(p)
+                for why, qs in by_why.items():
+                    out.append(("- copy NOT FOUND: " if why is None else f"- {skipped_cell(why)}: ")
+                               + ", ".join(f"{p['program_id']} @{p['member_name']}:{p['line']}" for p in qs) + "\n")
     out.append(table(["program", "member", "REPLACING", "cite"],
                      [(p["program_id"], p["member_name"], (p["replacing"] or "")[:40], f"{p['member_name']}:{p['line']}")
                       for p in progs]))
-    stale = [p for p in progs if p["resolved_member_id"] is None]
+    skips: Dict[str, List[str]] = {}                                    # why -> programs whose COPY of it was skipped
+    for p in progs:
+        w = skip_why(p)
+        if w and p["program_id"] not in skips.setdefault(w, []):
+            skips[w].append(p["program_id"])
+    if skips:
+        out.append("\n> " + "; ".join(f"{skipped_cell(w)}: {', '.join(ps)}" for w, ps in skips.items()) + ".\n")
+    stale = {p["program_id"] for p in progs if p["resolved_member_id"] is None and not skip_why(p)}   # programs, not COPY sites
     if stale:
         # the member is here and a program still says NOT FOUND: it was parsed before the member arrived, and a
         # member the build files 'unknown' (or sql) forces no re-parse by itself - say why, and the whole fix
@@ -1662,9 +1681,23 @@ def same_named_note(conn: sqlite3.Connection, copybook: str, exclude_ids: Sequen
     return ""
 
 
+def skipped_cell(why: str) -> str:
+    """`program`'s 'resolved to' cell and `copybook`'s group line for a COPY
+    the expander SKIPPED (recursive, nested too deep): the member is in the
+    index and the program was parsed after it, so it is not a copybook not
+    found and no instruction belongs beside it (LESSONS 185)."""
+    return (f"**COPY skipped - {why}** - not a copybook not found: the member is in the index and the expander stopped "
+            "there (the notes below say so)")
+
+
 def _not_found_cell(conn: sqlite3.Connection, copybook: str, member_id: int) -> str:
-    """`program`'s 'resolved to' cell for an unresolved COPY: NOT FOUND, and
-    where a member with that name exists now, why the build did not use it."""
+    """`program`'s 'resolved to' cell for an unresolved COPY: the skip reason
+    when the expander skipped it; else NOT FOUND, and where a member with
+    that name exists now, why the build did not use it."""
+    from . import recover
+    why = recover.skipped_copies(conn, member_id).get((member_id, copybook.upper()))
+    if why:
+        return skipped_cell(why)
     note = same_named_note(conn, copybook, (member_id,))
     return "**NOT FOUND**" + (f" - a member with this name exists: {note}" if note else "")
 
@@ -1829,18 +1862,38 @@ def cmd_coverage(conn: sqlite3.Connection, everything: bool = False) -> str:
     # a PROGRAM's row only: the build records a copybook member's own COPY statements with no
     # resolved_member_id, ever (it parses a copybook for copies, never resolves them), so such a row says
     # nothing - it listed a copybook every program had found as 'not found' (LESSONS 184); a program
-    # carries its own row for every nested COPY, so its rows are the whole picture
-    nf_rows = []
-    for book, n in conn.execute(
-            "SELECT c.copybook, COUNT(*) FROM copy_use c JOIN member m ON m.id = c.member_id "
+    # carries its own row for every nested COPY, so its rows are the whole picture - less the COPYs the
+    # expander SKIPPED (recursive, nested too deep), whose member the program had found: those are said
+    # under the table, not counted in it (LESSONS 185)
+    from . import recover
+    skipped = recover.skipped_copies(conn)
+    uses: Dict[str, int] = {}
+    copiers_of: Dict[str, Dict[int, None]] = defaultdict(dict)
+    skips: Dict[Tuple[str, str], List[str]] = defaultdict(list)          # (copybook, why) -> programs
+    for book, mid, mname in conn.execute(
+            "SELECT c.copybook, c.member_id, m.name FROM copy_use c JOIN member m ON m.id = c.member_id "
             "WHERE c.resolved_member_id IS NULL AND m.kind = 'cobol' AND c.copybook NOT IN ('SQLCA','SQLDA') "
-            "GROUP BY 1 ORDER BY 2 DESC LIMIT 40").fetchall():
-        copiers = [r[0] for r in conn.execute("SELECT DISTINCT c.member_id FROM copy_use c JOIN member m ON m.id = c.member_id "
-                                              "WHERE UPPER(c.copybook)=UPPER(?) AND c.resolved_member_id IS NULL "
-                                              "AND m.kind = 'cobol'", (book,))]
-        note = same_named_note(conn, book, copiers)
+            "ORDER BY c.id").fetchall():
+        why = skipped.get((int(mid), (book or "").upper()))
+        if why:
+            if mname not in skips[(book, why)]:
+                skips[(book, why)].append(mname)
+            continue
+        uses[book] = uses.get(book, 0) + 1
+        copiers_of[book][int(mid)] = None
+    nf_rows = []
+    for book, n in sorted(uses.items(), key=lambda kv: (-kv[1], kv[0]))[:40]:
+        note = same_named_note(conn, book, list(copiers_of[book]))
         nf_rows.append((book, n, f"yes: {note}" if note else "-"))
     out.append(table(["copybook", "uses", "a member with this name exists?"], nf_rows))
+    if skips:
+        out.append("\n> Not in this table: " + "; ".join(f"`COPY {b}` skipped - {w} in {', '.join(ps[:6])}"
+                                                          + (f", +{len(ps) - 6} more" if len(ps) > 6 else "")
+                                                          for (b, w), ps in sorted(skips.items()))
+                   + ". A skipped COPY is not a copybook not found: the member is in the index and the expander stopped "
+                   "there (a copybook copying itself, or nesting deeper than 12); the reason stands beside the program "
+                   "under 'Members parsed only in part' (a long chain of nested COPYs is cut short in that column; "
+                   "`program NAME` prints it whole).\n")
     if any(r[2] != "-" for r in nf_rows):
         out.append("\n> A copybook marked `yes` is not missing - a member with its name is in the index. Either the programs "
                    "that copy it were parsed before it arrived and nothing parsed them again: `python -m atlas.recover "

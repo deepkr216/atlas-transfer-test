@@ -1134,14 +1134,15 @@ def choice_report(checks: Sequence[Dict[str, object]], root: Optional[str]) -> L
 def missing_copybooks(conn: sqlite3.Connection) -> Dict[str, int]:
     """{copybook name: programs copying it} for the copybooks no member of an
     accepted kind carries (a program copying a name that is only its own
-    name counts as missing too)."""
+    name counts as missing too; a COPYBOOK copying its own name does not -
+    it is the member, and the expander skips that COPY as recursive)."""
     kinds = ",".join("?" * len(RESOLVER_KINDS))
     out: Dict[str, int] = {}
     for name, n in conn.execute(
             f"""SELECT UPPER(c.copybook), COUNT(DISTINCT c.member_id) FROM copy_use c
                 WHERE c.resolved_member_id IS NULL
                   AND NOT EXISTS (SELECT 1 FROM member m WHERE UPPER(m.name)=UPPER(c.copybook)
-                                  AND m.kind IN ({kinds}) AND m.id != c.member_id)
+                                  AND m.kind IN ({kinds}) AND (m.id != c.member_id OR m.kind = 'copybook'))
                 GROUP BY 1""", RESOLVER_KINDS):
         if name and name not in expand._SYSTEM_INCLUDES:
             out[name] = int(n)
@@ -1167,6 +1168,42 @@ def members_named(conn: sqlite3.Connection, name: str, exclude_ids: Sequence[int
             continue
         (accepted if kind in RESOLVER_KINDS else other).append((int(mid), kind, folder or "?", path))
     return accepted, other
+
+
+_SKIPPED_RE = re.compile(r"COPY (\S+) skipped - (recursive|nesting deeper than \d+)")
+
+
+def skipped_copies(conn: sqlite3.Connection, member_id: Optional[int] = None) -> Dict[Tuple[int, str], str]:
+    """{(program member id, COPYBOOK): why} for every COPY the expander
+    SKIPPED instead of looking up - a copybook copying itself (or a cycle:
+    'recursive'), or one nested deeper than expand.MAX_DEPTH ('nesting
+    deeper than 12'). expand.py writes the program's copy_use row with no
+    resolved_member_id for a system include, a skipped COPY and a COPY NOT
+    FOUND alike; the system includes are excluded by name, and a skipped
+    COPY is told apart here by the program's own 'expand' note, the one
+    place the build wrote the reason. The member exists (a recursive one
+    was resolved a level up) and the program was parsed after it, so
+    nothing arrived and nothing is missing: read as 'not found', such a row
+    told him to run recover for a member the program had found, marked the
+    program on every run, and the build left the row NULL - it never
+    settled (LESSONS 185). A name the same program also reports NOT FOUND
+    at another COPY stays not found. `member_id`: one program only."""
+    out: Dict[Tuple[int, str], str] = {}
+    sql = "SELECT member_id, detail FROM unresolved WHERE kind = 'expand' AND detail LIKE '%skipped - %'"
+    args: Tuple[object, ...] = ()
+    if member_id is not None:
+        sql += " AND member_id = ?"
+        args = (member_id,)
+    for mid, detail in conn.execute(sql, args):
+        m = _SKIPPED_RE.search(detail or "")
+        if not m or mid is None:
+            continue
+        name = m.group(1).upper()
+        not_found = conn.execute("SELECT 1 FROM unresolved WHERE member_id = ? AND kind = 'expand' AND detail LIKE ? LIMIT 1",
+                                 (mid, f"%COPY {name} NOT FOUND%")).fetchone()
+        if not not_found:
+            out[(int(mid), name)] = m.group(2)
+    return out
 
 
 def arrived_copybooks(conn: sqlite3.Connection) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
@@ -1202,14 +1239,17 @@ def arrived_copybooks(conn: sqlite3.Connection) -> Tuple[List[Dict[str, object]]
     on an estate with nothing wrong, marked the COPYBOOK pending, and the
     next build re-inserted it under a new id and nulled the links of every
     program copying it (LESSONS 184). A program carries its own row for
-    every nested COPY, so its rows are the whole picture."""
+    every nested COPY, so its rows are the whole picture - less the COPYs
+    the expander skipped (recursive, nested too deep: skipped_copies()),
+    whose member the program had found (LESSONS 185)."""
+    skipped = skipped_copies(conn)
     by_book: Dict[str, Dict[Tuple[int, str, str], None]] = defaultdict(dict)   # copybook -> copiers (ordered set)
     for book, mid, mname, mkind in conn.execute(
             "SELECT UPPER(c.copybook), m.id, UPPER(m.name), m.kind FROM copy_use c JOIN member m ON m.id = c.member_id "
             "WHERE c.resolved_member_id IS NULL AND m.kind = 'cobol' "
             "AND EXISTS (SELECT 1 FROM member x WHERE UPPER(x.name) = UPPER(c.copybook) "
             "AND x.id != c.member_id) ORDER BY 1, 3"):
-        if book and book not in expand._SYSTEM_INCLUDES:
+        if book and book not in expand._SYSTEM_INCLUDES and (int(mid), book) not in skipped:
             by_book[book][(int(mid), str(mname), str(mkind))] = None
     arrived: List[Dict[str, object]] = []
     misfiled: List[Dict[str, object]] = []
@@ -1845,15 +1885,24 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
                 ents.pop(name, None)
             elif name in ents and disk.get(name, 0) == 0:
                 ents.pop(name, None)                                    # a file that never got written whole
+    marked_removed = 0                                                  # programs marked because their recovered copy went
+    removed_lines: List[str] = []                                       # the report's section for it
     if removed:
+        names = sorted(set(removed))
         log(f"  {len(removed)} recovered copybook(s) {'would be removed' if dry_run else 'removed'} - the estate now holds "
-            "the real member: " + ", ".join(sorted(set(removed))[:8]) + (" ..." if len(set(removed)) > 8 else ""))
+            "the real member: " + ", ".join(names[:8]) + (" ..." if len(names) > 8 else ""))
         if not dry_run:
-            n = _mark_programs(db, sorted(set(removed)))
-            log(f"  {n} program(s) that had expanded them are marked for the next build")
+            marked_removed = _mark_programs(db, names)
+            log(f"  {marked_removed} program(s) that had expanded them are marked for the next build")
             for d, ents in entries.items():
                 if os.path.isdir(d):
                     _save_marker(d, ents)
+        # said in the report too: a run whose only work this was must not end as 'nothing to report'
+        removed_lines.append("\n## Recovered copies removed - the real member arrived\n\n"
+                             + ("Would be removed (dry run: nothing removed, nothing marked): " if dry_run else "Removed: ")
+                             + ", ".join(names)
+                             + ("" if dry_run else f". {marked_removed} program(s) that had expanded them are marked for the "
+                                                   "next build: run your usual build command") + ".\n")
     marked = 0
     if arrived:
         ids = sorted({i for e in arrived for i in e["ids"]})                    # type: ignore[union-attr]
@@ -1871,31 +1920,38 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
         log(f"  {len(misfiled):,} copybook name(s) exist in the index only as a member of a kind the build does not expand "
             f"({kinds}): {n_prog:,} program(s) stay parsed only in part until the folder is renamed to end in COPYLIB or "
             "the library's kind declared in the UI's table - the report names each")
-    arrival_lines = arrival_report(arrived, misfiled, dry_run)
+    arrival_lines = removed_lines + arrival_report(arrived, misfiled, dry_run)
+    # every missing name is one a member of another kind carries: the folder fix comes before any listing
+    only_misfiled = bool(missing) and set(missing) <= {str(e["copybook"]) for e in misfiled}
 
     def early(stats: Dict[str, object], nothing: str) -> Dict[str, object]:
         """A run that ends before the listings are read still reports the
-        arrived and misfiled copybooks; with nothing to say it replaces the
-        earlier run's report rather than leave it in place still saying
-        'marked for the next build' (`nothing`: why this run has nothing)."""
+        removed copies and the arrived and misfiled copybooks; with nothing
+        to say it replaces the earlier run's report rather than leave it in
+        place still saying 'marked for the next build' (`nothing`: why this
+        run has nothing)."""
         if report:
             head = [f"# Recovered copybooks - {time.strftime('%Y-%m-%d %H:%M')}\n",
-                    f"\n- missing in the index: {len(missing)}; expanded texts read: 0\n"]
+                    f"\n- missing in the index: {len(missing)}; expanded texts read: 0; removed (real member arrived): "
+                    f"{len(removed)}\n"]
             if arrival_lines:
                 _write_report(report, head + arrival_lines)
                 log(f"every name: {report}")
             elif os.path.exists(report):
                 _write_report(report, head + [f"\nNothing to report on this run: {nothing}.\n"])
                 log(f"{report} - nothing to report on this run (the earlier run's report is replaced)")
-        if marked:
+        if marked or marked_removed:
             log("next: run your usual build command - the programs marked re-expand by themselves")
         if misfiled:
             log(MISFILED_NEXT)
-        stats.update({"arrived": len(arrived), "misfiled": len(misfiled), "marked": marked})
+        stats.update({"arrived": len(arrived), "misfiled": len(misfiled), "marked": marked + marked_removed})
         return stats
 
     log(f"missing copybooks in the index: {len(missing):,}, used in {sum(missing.values()):,} places (a place = one program "
         "copying one of them)")
+    if only_misfiled:
+        log("  every one of them is the name of a member filed as a kind the build does not expand (above): the folder fix "
+            "comes first - the listings only if a program still says NOT FOUND after the build")
     if recovered:
         log(f"  held only as recovered copies: {len(recovered):,} - the build has read them, so they are not missing any more; "
             "their libraries stay on the fetch list until the real members arrive")
@@ -1910,8 +1966,9 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
         check_only = True                                              # ... and to name the libraries of the recovered copies
     if not sources:
         log("expanded texts to read: 0 - the index holds no compiler listings and no --from folder was given")
-        log('next: run again as  python -m atlas.recover --db atlas.db --from "FOLDER"  with the folder that holds the '
-            "programs' compiler listings or expanded source")
+        if not only_misfiled:
+            log('next: run again as  python -m atlas.recover --db atlas.db --from "FOLDER"  with the folder that holds the '
+                "programs' compiler listings or expanded source")
         checked = None
         if chosen:
             checks, _fetch, _unnamed = _check_after(db, {}, True, to_fetch_for, True, recovered)
@@ -2197,8 +2254,8 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
         log(f"every name: {report}")
     if written and not dry_run:
         log("next: run your usual build command - the programs that copy them re-expand by themselves"
-            + (" (and the programs marked above)" if marked else ""))
-    elif marked:
+            + (" (and the programs marked above)" if marked or marked_removed else ""))
+    elif marked or marked_removed:
         log("next: run your usual build command - the programs marked re-expand by themselves")
     if misfiled:
         log(MISFILED_NEXT)
@@ -2207,7 +2264,7 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
             "out": out_dir, "unconfirmed": len(unconfirmed), "per_system": per_system,
             "checked": choice_counts(checks) if checks else None,
             "fetch": (len(fetch), to_fetch), "unnamed": len(unnamed),
-            "arrived": len(arrived), "misfiled": len(misfiled), "marked": marked}
+            "arrived": len(arrived), "misfiled": len(misfiled), "marked": marked + marked_removed}
 
 
 def trace(db: str, name: str, folders: Sequence[str] = (), log=print) -> int:
