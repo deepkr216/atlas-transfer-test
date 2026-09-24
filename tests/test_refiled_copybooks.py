@@ -30,7 +30,9 @@ copybook in a PROCS folder (the folder decided) keeps the rename sentence;
 """
 
 import contextlib
+import hashlib
 import io
+import json
 import os
 import shutil
 import sqlite3
@@ -69,11 +71,19 @@ MSGBK = "       MSG SECTION.\n       M-110-DO.\n           MOVE 2 TO WS-Y.\n"
 ASMBK = ("ASMBK    CSECT\n         USING *,15\nSTID     DS    CL5\nSTDATE   DS    CL8\n         BR    14\n         END\n")
 # a plain procedure copybook: no signature at all, the folder name types it (LESSONS 183)
 PLAINBK = "       A-110-DO.\n           MOVE 1 TO WS-X.\n       A-199-EXIT.\n           EXIT.\n"
+# three REAL Assembler members the first shape guard let through (LESSONS 187): a label longer than 8 characters
+# before CSECT with only address constants, an unlabelled CSECT, START with a hexadecimal operand
+LONGLBL = ("PLLONGLABEL CSECT\n         USING *,15\nTABLE    DC    A(TABLE)\n         DC    AL2(5)\n         BR    14\n"
+           "         END\n")
+NOLABEL = "         CSECT\n         USING *,12\n         LA    1,4(0,1)\n         BR    14\n         END\n"
+HEXSTART = "PLHEX    START X'100'\n         LA    1,4\n         END\n"
 
 ITEM = "ROADMAP re-parse item 22"
 CONTENT = "filed as asm by its content"
 SEEN = ("line 2 `START-DATE` reads as Assembler - a first or second word beginning with START, CSECT or DSECT, checked "
         "before the level numbers and the folder name; " + ITEM)
+ASM_SEEN = ("reads as Assembler - a first or second word beginning with START, CSECT or DSECT, checked before the level "
+            "numbers and the folder name; " + ITEM)
 RECOVER_FIX = ("no folder change helps (the content decided): run `python -m atlas.recover --db atlas.db`, which re-files "
                "it as a copybook in the index, then the build")
 MISFILED_FIX = ("the folder name decided the kind (a copybook with no level numbers has no signature): rename the folder to "
@@ -97,6 +107,7 @@ class _Estate(unittest.TestCase):
     built together with --rebuild (the copybook is in the estate from the first build: nothing arrived)."""
 
     files = ()
+    manifest = None                     # a manifest.json path: every build runs with --manifest (DeclaredKindDecided)
 
     def setUp(self):
         self.td = tempfile.mkdtemp()
@@ -105,7 +116,11 @@ class _Estate(unittest.TestCase):
         self.report = os.path.join(self.td, "work", "recover.md")
         for rel, text in self.files:
             self.write(rel, text)
+        self.before_build()
         self.build(["--rebuild"])
+
+    def before_build(self):
+        """A hook for what the first build needs on disk besides the estate (a manifest)."""
 
     def tearDown(self):
         shutil.rmtree(self.td, ignore_errors=True)
@@ -119,7 +134,8 @@ class _Estate(unittest.TestCase):
     def build(self, extra=()):
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            rc = build._main([self.root, "--db", self.db, "--quiet", *extra])
+            rc = build._main([self.root, "--db", self.db, "--quiet", *extra,
+                              *(["--manifest", self.manifest] if self.manifest else [])])
         self.assertEqual(rc, 0, buf.getvalue())
         return buf.getvalue()
 
@@ -432,10 +448,9 @@ class GenuineAssemblerIsNotRefiled(_Estate):
 
     def test_reported_by_its_content_with_an_honest_sentence(self):
         self.assert_the_bug("ASMPGM", "ASMBK", "asm")
-        why_not = ("no folder change helps (the content decided); not re-filed: it has the shape of an Assembler member (a label "
-                   "in column 1 before CSECT or DSECT, START alone or with a numeric operand, DFHEIENT, or DS / DC with a type) - "
-                   "the copybook the programs copy is then another member, still to fetch; if this member IS the COBOL copybook, "
-                   f"wait for {ITEM}")
+        why_not = ("no folder change helps (the content decided); not re-filed: it has the shape of an Assembler member "
+                   f"({recover.ASM_SHAPES}) - the copybook the programs copy is then another member, still to fetch; if this "
+                   f"member IS the COBOL copybook, wait for {ITEM}")
         seen = ("line 1 `CSECT` reads as Assembler - a first or second word beginning with START, CSECT or DSECT, checked before "
                 f"the level numbers and the folder name; {ITEM}")
         for dry in (True, False):
@@ -538,6 +553,259 @@ class RebuildRefilesAgain(_Estate):
         self.assertEqual(self.copy_use("STPGM", "STARTBK"), [(self.member_id("STARTBK"),)])
 
 
+class RealAssemblerShapesAreNotRefiled(_Estate):
+    """LESSONS 187 (1): three real Assembler members in a COPYLIB folder that the first shape guard judged
+    'no Assembler shape' and re-filed - their copiers then went 'ok' with Assembler text expanded as COBOL. A
+    label of any length (or none) before CSECT, START with a quoted operand, DC with an address constant: refused,
+    with the honest sentence, and the build after it expands nothing."""
+
+    files = (("GC/PROD.GC.SRC/TRK1P.cbl", data_program("TRK1P", "LONGLBL")),
+             ("GC/PROD.GC.SRC/TRK2P.cbl", data_program("TRK2P", "NOLABEL")),
+             ("GC/PROD.GC.SRC/TRK3P.cbl", data_program("TRK3P", "HEXSTART")),
+             ("SHARED/PROD.GC.COPYLIB/LONGLBL.txt", LONGLBL),
+             ("SHARED/PROD.GC.COPYLIB/NOLABEL.txt", NOLABEL),
+             ("SHARED/PROD.GC.COPYLIB/HEXSTART.txt", HEXSTART))
+    pairs = (("TRK1P", "LONGLBL"), ("TRK2P", "NOLABEL"), ("TRK3P", "HEXSTART"))
+
+    def test_the_three_shapes_are_refused_and_nothing_is_expanded(self):
+        for prog, book in self.pairs:
+            self.assert_the_bug(prog, book, "asm")
+        stats, said = self.recover()
+        self.assertEqual((stats["refiled"], stats["misfiled"], stats["marked"]), (0, 3, 0), said)
+        self.assertIn("  3 copybook name(s) exist in the index only as a member the classifier typed by a line of its text (asm) "
+                      "and this run could not re-file: 3 program(s) stay parsed only in part - no folder change helps; the "
+                      f"report says why for each ({ITEM})", said)
+        self.assertNotIn("re-filed as copybook", said)
+        rep = self.report_text()
+        self.assertNotIn("## Re-filed as copybook", rep)
+        for prog, book in self.pairs:
+            self.assertEqual(self.member(book)[:3], ("asm", "PROD.GC.COPYLIB", "skipped"))
+            self.assertIn(f"| {book} | asm | PROD.GC.COPYLIB | {prog} | no folder change helps (the content decided); not re-filed: "
+                          f"it has the shape of an Assembler member ({recover.ASM_SHAPES}) - the copybook the programs copy is "
+                          f"then another member, still to fetch; if this member IS the COBOL copybook, wait for {ITEM} | "
+                          f"filed as asm by its content (line 1 ", rep)
+        # the build after the run: the programs stay partial, no Assembler line was expanded as COBOL
+        self.build()
+        for prog, book in self.pairs:
+            self.assertEqual(self.status(prog), "partial")
+            self.assertEqual(self.copy_use(prog, book), [(None,)])
+            self.assertEqual(self.q("SELECT COUNT(*) FROM pfield f JOIN program p ON p.id=f.program_id JOIN member m ON "
+                                    "m.id=p.member_id WHERE m.name=? AND f.name IN ('TABLE','PLHEX','PLLONGLABEL')", prog), [(0,)])
+        cov, nf, _prog, _book, _as_prog = self.outputs("TRK1P", "LONGLBL")
+        self.assertIn("3 exist only as a member the classifier typed by a line of its text (asm - ", cov)
+        self.assertIn("no folder change helps - atlas.recover cannot re-file them; the 'Copybooks not found' table says why", cov)
+        for _prog, book in self.pairs:
+            self.assertIn(f"| {book} | 1 | yes: PROD.GC.COPYLIB, filed as asm by its content (line 1 ", nf)
+
+
+class NoHintFolderStartPara(_Estate):
+    """LESSONS 187 (2): PROCBOOK (PERFORM START-PARA, no level numbers) in SHARED\\PROD.GC.PLIB - a dataset-named
+    folder with no COPY hint, as his hand-fetched libraries land (LESSONS 183). Asm by its content, and nothing
+    says copybook, so this tool does not re-file it - the instruction is the folder fix and a second run, never
+    'no folder change helps' beside it; and the instruction, followed, makes the program whole."""
+
+    files = (("GC/PROD.GC.SRC/SECPGM.cbl", section_program("SECPGM", "PROCBOOK")),
+             ("SHARED/PROD.GC.PLIB/PROCBOOK.txt", PROCBOOK))
+
+    def test_the_folder_fix_then_a_second_run_and_the_instruction_proves_true(self):
+        self.assert_the_bug("SECPGM", "PROCBOOK", "asm", "PROD.GC.PLIB")
+        fix = recover.FOLDER_THEN_RECOVER
+        self.assertTrue(fix.startswith("the content decided the kind, and neither the folder name (no COPYLIB) nor the text "
+                                       "(no level numbers) says copybook, so this tool did not re-file it: rename the folder to "
+                                       "end in COPYLIB"), fix)
+        for dry in (True, False):
+            stats, said = self.recover(dry_run=dry)
+            self.assertEqual((stats["refiled"], stats["misfiled"], stats["marked"]), (0, 1, 0), said)
+            self.assertIn("  1 copybook name(s) exist in the index only as a member the classifier typed by a line of its text "
+                          "(asm) in a folder with no COPY hint and with no level numbers to go by: 1 program(s) stay parsed only "
+                          "in part until the folder is renamed to end in COPYLIB and this tool is run again - it then re-files "
+                          f"the member ({ITEM})", said)
+            self.assertIn(recover.NEXT_FOLDER_REFILE, said)
+            self.assertIn("every one of them is the name of a member a COPYLIB folder would let this tool re-file (above): the "
+                          "folder fix and a second run come first - the listings only if a program still says NOT FOUND after "
+                          "the build", said)
+            self.assertNotIn("next: run again as", said)
+            self.assertNotIn("no folder change helps", said)
+            self.assertNotIn("could not re-file", said)
+            self.assertNotIn("next: rename the folder(s) the report names to end in COPYLIB (or declare", said)
+            rep = self.report_text()
+            self.assertIn(f"| PROCBOOK | asm | PROD.GC.PLIB | SECPGM | {fix} | filed as asm by its content (line 2 `START-PARA` "
+                          f"{ASM_SEEN}) |", rep)
+            self.assertNotIn("no folder change helps", rep.split("| PROCBOOK |")[1])
+            self.assertIn("needs the folder renamed to end in COPYLIB first, then a second run", rep)
+        cov, nf, prog, book, as_prog = self.outputs("SECPGM", "PROCBOOK")
+        cell = (f"| PROCBOOK | 1 | yes: PROD.GC.PLIB, filed as asm by its content (line 2 `START-PARA` {ASM_SEEN}) - not a kind "
+                f"the build expands, and {fix} |")
+        self.assertIn(cell, nf)
+        self.assertIn(f"1 exists only as a member the classifier typed by a line of its text (asm - a START- name, a MODULE MAP "
+                      f"comment, a first word MSG; {ITEM}): 1 sits in a folder with no COPY hint and has no level numbers to go "
+                      "by: rename the folder to end in COPYLIB, then `python -m atlas.recover --db atlas.db` re-files it; then "
+                      "build", cov)
+        self.assertNotIn("no folder change helps - atlas.recover cannot re-file", cov)
+        self.assertIn(f"| PROCBOOK | **NOT FOUND** - a member with this name exists: PROD.GC.PLIB, filed as asm by its content "
+                      f"(line 2 `START-PARA` {ASM_SEEN}) - not a kind the build expands, and {fix} |", prog)
+        self.assertIn(f"filed as asm by its content (folder PROD.GC.PLIB; line 2 `START-PARA` {ASM_SEEN}): not a kind the build "
+                      f"expands, so every program that copies it is parsed only in part. {fix[0].upper() + fix[1:]}.", book)
+        self.assertIn(f"in PROD.GC.PLIB it is filed as asm by its content (line 2 `START-PARA` {ASM_SEEN}) - {fix}.", as_prog)
+        # the instruction, followed: the folder renamed to end in COPYLIB, the build (the classifier still reads the
+        # content: asm, until item 22), this tool re-files it, the build makes the program whole
+        os.rename(os.path.join(self.root, "SHARED", "PROD.GC.PLIB"), os.path.join(self.root, "SHARED", "PROD.GC.COPYLIB"))
+        self.build()
+        self.assert_the_bug("SECPGM", "PROCBOOK", "asm")
+        stats, said = self.recover()
+        self.assertEqual((stats["refiled"], stats["misfiled"], stats["marked"]), (1, 0, 1), said)
+        self.assertIn("1 misfiled copybook(s) re-filed as copybook in the index", said)
+        self.build()
+        self.assertEqual(self.status("SECPGM"), "ok")
+        self.assertEqual(self.copy_use("SECPGM", "PROCBOOK"), [(self.member_id("PROCBOOK"),)])
+        paras = [(p[0], p[1], p[2]) for p in self.paragraphs("SECPGM")]
+        self.assertIn(("START-PARA", "paragraph", "A-100-BEGIN"), paras)
+        _cov, nf, prog, _book, _as_prog = self.outputs("SECPGM", "PROCBOOK")
+        self.assertIn("_none_", nf)
+        self.assertNotIn("NOT FOUND", prog)
+
+
+class DeclaredKindDecided(_Estate):
+    """LESSONS 187 (3): PLAINBK (no signature) in SHARED\\PROD.GC.MISC, a folder with no hint, and the UI's table
+    declares that library 'proc' (manifest kinds): the build files it proc. The reading says 'by its declared
+    kind' with 'declare it copybook there' - never 'the file now reads as unknown ... run the build first', which
+    the build would not change; declared copybook, the build makes the program whole."""
+
+    files = (("GC/PROD.GC.SRC/SECPGM.cbl", section_program("SECPGM", "PLAINBK")),
+             ("SHARED/PROD.GC.MISC/PLAINBK.txt", PLAINBK))
+    SEEN = ("the kind declared for library PROD.GC.MISC in the UI's table (sources.json, the manifest kinds) - the classifier "
+            "itself read no signature and no folder hint (unrecognised member of library PROD.GC.MISC (extension .txt ignored))")
+
+    def before_build(self):
+        self.manifest = os.path.join(self.td, "manifest.json")
+        self.declare("proc")
+
+    def declare(self, kind):
+        with open(self.manifest, "w", encoding="utf-8") as fh:
+            json.dump({"kinds": {"PROD.GC.MISC": kind}}, fh)
+
+    def test_by_its_declared_kind_never_run_the_build_first(self):
+        self.assert_the_bug("SECPGM", "PLAINBK", "proc", "PROD.GC.MISC")
+        conn = query.connect(self.db)
+        try:
+            other = recover.members_named(conn, "PLAINBK")[1]
+            rs = recover.member_readings(other, conn)
+            self.assertEqual([(r["kind"], r["by"], r["refile"], r["why_not"]) for r in rs], [("proc", "declared", False, "")])
+            self.assertEqual(rs[0]["seen"], self.SEEN)
+            self.assertEqual(recover.filed_phrase(rs[0]), f"filed as proc by its declared kind ({self.SEEN})")
+            self.assertEqual(recover.folder_fix(rs[0]), recover.DECLARED_FIX)
+            self.assertFalse(recover.folder_helps(rs[0]))
+            # without the stored sha the reading cannot tell a declared kind from a file changed since the build
+            self.assertEqual(recover.member_readings(other)[0]["by"], "changed")
+            arrived, misfiled = recover.arrived_copybooks(conn)
+            recover.read_misfiled(misfiled, conn)
+            self.assertTrue(recover.folder_decided(misfiled[0]))
+            self.assertEqual(recover.misfiled_cells(misfiled[0]),
+                             (recover.DECLARED_FIX, f"filed as proc by its declared kind ({self.SEEN})"))
+        finally:
+            conn.close()
+        stats, said = self.recover()
+        self.assertEqual((stats["refiled"], stats["misfiled"], stats["marked"]), (0, 1, 0), said)
+        self.assertIn("1 copybook name(s) exist in the index only as a member of a kind the build does not expand (proc): "
+                      "1 program(s) stay parsed only in part until the folder is renamed to end in COPYLIB or the library's "
+                      "kind declared in the UI's table - the report names each", said)
+        self.assertIn("next: rename the folder(s) the report names to end in COPYLIB", said)
+        rep = self.report_text()
+        self.assertIn(f"| PLAINBK | proc | PROD.GC.MISC | SECPGM | {recover.DECLARED_FIX} | filed as proc by its declared kind "
+                      f"({self.SEEN}) |", rep)
+        self.assertNotIn("run the build first", rep)
+        self.assertNotIn("the folder name decided", rep.split("| PLAINBK |")[1])
+        self.assertIn("takes the kind declared for its library in the UI's table: declare it copybook there", rep)
+        cov, nf, prog, book, as_prog = self.outputs("SECPGM", "PLAINBK")
+        self.assertIn(f"| PLAINBK | 1 | yes: PROD.GC.MISC, filed as proc by its declared kind - not a kind the build expands: "
+                      f"{recover.DECLARED_CELL} |", nf)
+        self.assertIn("1 exists only as a member of a kind the build does not expand (the kind declared for the library in the "
+                      "UI's table decided it): rename the folder to end in COPYLIB or declare the library's kind in the UI, "
+                      "then build", cov)
+        self.assertIn(f"a member with this name exists: PROD.GC.MISC, filed as proc by its declared kind - not a kind the build "
+                      f"expands: {recover.DECLARED_CELL} |", prog)
+        self.assertIn(f"filed as proc by its declared kind (folder PROD.GC.MISC; {self.SEEN}): not a kind the build expands, so "
+                      f"every program that copies it is parsed only in part. "
+                      f"{recover.DECLARED_FIX[0].upper() + recover.DECLARED_FIX[1:]}.", book)
+        self.assertIn(f"> 1 program copies it as a copybook and says `COPY PLAINBK NOT FOUND` (SECPGM): in PROD.GC.MISC it is "
+                      f"filed as proc by its declared kind ({self.SEEN}) - {recover.DECLARED_FIX}.", as_prog)
+        for text in (cov, prog, book, as_prog):
+            self.assertNotIn("run the build first", text)
+            self.assertNotIn("the folder name decided the kind", text)
+        # the instruction, followed: the library declared copybook in the table - the build (the manifest changed:
+        # every member re-parsed) files it as a copybook and the program is whole
+        self.declare("copybook")
+        self.build()
+        self.assertEqual((self.member("PLAINBK")[:3], self.status("SECPGM")), (("copybook", "PROD.GC.MISC", "ok"), "ok"))
+        self.assertEqual(self.copy_use("SECPGM", "PLAINBK"), [(self.member_id("PLAINBK"),)])
+
+
+class SecondRunBeforeTheBuild(_Estate):
+    """LESSONS 187 (4): a second run of this tool before the build finds the member it re-filed a run earlier as
+    a copybook-kind member and the program's COPY still unresolved - not 'a copybook that has arrived since they
+    were parsed' (nothing arrived; nothing parsed them, by design): it waits for the build, and says so."""
+
+    files = DataCopybookWithStartDate.files
+
+    def test_waiting_for_the_build_not_arrived(self):
+        stats, said = self.recover()
+        self.assertEqual((stats["refiled"], stats["waiting"]), (1, 0), said)
+        stats, said = self.recover()
+        self.assertEqual((stats["arrived"], stats["misfiled"], stats["refiled"], stats["waiting"], stats["marked"]),
+                         (0, 0, 0, 1, 0), said)
+        self.assertIn("  1 copybook(s) re-filed on an earlier run wait for the build (1 program(s) marked already): run your "
+                      "usual build command", said)
+        self.assertNotIn("has arrived since", said)
+        self.assertNotIn("re-filed as copybook in the index", said)
+        self.assertIn("next: run your usual build command", said)
+        self.assertEqual(self.status("STPGM"), "pending")
+        rep = self.report_text()
+        self.assertIn("## Re-filed on an earlier run - waiting for the build", rep)
+        self.assertIn("| copybook | folder | programs |\n|---|---|---|\n| STARTBK | PROD.GC.COPYLIB | STPGM |", rep)
+        self.assertNotIn("## Copybooks that arrived after the program was parsed", rep)
+        self.assertNotIn("## Re-filed as copybook", rep)
+        self.assertNotIn("Nothing to report", rep)
+        cov, nf, prog, book, _as_prog = self.outputs("STPGM", "STARTBK")
+        # the program is pending, not partial, so coverage's partial-members note is '_none_' here; its not-found
+        # cell and its Members line carry the instruction (the note's own waiting clause is for a mixed estate)
+        self.assertIn("| STARTBK | 1 | yes: PROD.GC.COPYLIB (copybook, re-filed by atlas.recover) - the programs copying it are "
+                      "marked: run your usual build command |", nf)
+        self.assertIn("### Members parsed only in part\n_none_", cov)
+        self.assertIn("- 1 copybook marked `skipped` was re-filed by atlas.recover", cov)
+        # (the legend under coverage's not-found table describes the arrived case in general; the ROWS, the program
+        # and the copybook must not say it of this member)
+        for text in (nf.split("\n>")[0], prog, book):
+            self.assertNotIn("parsed before it arrived", text)
+        self.assertNotIn("has a member with that name in the index now", cov)
+        conn = query.connect(self.db)
+        try:
+            arrived, misfiled, waiting = recover.arrival_scan(conn)
+            self.assertEqual((arrived, misfiled, [e["copybook"] for e in waiting]), ([], [], ["STARTBK"]))
+            self.assertEqual(recover.arrived_copybooks(conn), ([], []))
+        finally:
+            conn.close()
+        self.build()
+        self.assertEqual(self.status("STPGM"), "ok")
+        stats, said = self.recover()
+        self.assertEqual((stats["arrived"], stats["waiting"], stats["marked"]), (0, 0, 0), said)
+        self.assertNotIn("STARTBK", said)
+        self.assertNotIn("wait for the build", said)
+
+
+class TheDocsSayIt(unittest.TestCase):
+    """ROADMAP item 22 names the window a re-filed member's changed text opens (LESSONS 187 (5)), and LESSONS
+    has the row."""
+
+    def test_roadmap_22_and_lessons_187(self):
+        root = os.path.dirname(HERE)
+        with open(os.path.join(root, "ROADMAP.md"), encoding="utf-8") as fh:
+            item = fh.read().split("\n22. ")[1].split("\n###")[0]
+        self.assertIn("changes on disk", item)
+        self.assertIn("recover._ASM_SHAPE", item)
+        with open(os.path.join(root, "LESSONS.md"), encoding="utf-8") as fh:
+            self.assertIn("\n| 187 | ", fh.read())
+
+
 class TheVerdict(unittest.TestCase):
     """refile_verdict() line by line: what is re-filed and what is not, with the reason."""
 
@@ -592,6 +860,25 @@ class TheVerdict(unittest.TestCase):
             r, ok, why = self.reading("PROD.GC.COPYLIB", text)
             self.assertEqual((r["kind"], ok), ("asm", False), text)
             self.assertIn("it has the shape of an Assembler member", why)
+        # the shapes the first guard let through (LESSONS 187): a label of any length or none before CSECT, START
+        # with a quoted operand or a remark, one bare symbol, address constants, USING * - and never a COBOL line
+        for text in (LONGLBL, NOLABEL, HEXSTART, "PGM      START 0   BEGIN HERE\n", "         START SYM\n",
+                     "      * 05 START-DATE\nX        CSECT\n", "D        DSECT\n         B     START\n",
+                     "         USING *,12\n         B     START\n", "V        DC    V(SUBPGM)\n         B     START\n"):
+            r, ok, why = self.reading("PROD.GC.COPYLIB", text)
+            self.assertEqual((r["kind"], ok), ("asm", False), text)
+            self.assertIn("it has the shape of an Assembler member", why)
+        # the COBOL START verb with a file name that carries no hyphen, its KEY clause on the same line: no shape
+        r, ok, why = self.reading("PROD.GC.COPYLIB", "       S-100.\n           START CUSTFILE KEY IS > CUST-KEY.\n")
+        self.assertEqual((r["kind"], r["word"], ok), ("asm", "START", True))
+        # ... and alone on its line it reads as START with a symbol operand: refused, the honest sentence (the price of
+        # erring towards refusing - item 22 closes it)
+        r, ok, why = self.reading("PROD.GC.COPYLIB", "       S-100.\n           START CUSTFILE\n               KEY IS > K.\n")
+        self.assertEqual((r["kind"], ok), ("asm", False))
+        self.assertIn("if this member IS the COBOL copybook", why)
+        for text in ("           05  CSECT-NAME   PIC X(8).\n           PERFORM CSECT-PARA.\n           B START\n",
+                     "           MOVE DS TO WS-X.\n           PERFORM DC-PARA.\n           B START\n"):
+            self.assertIsNone(recover._ASM_SHAPE.search(text), text)
         for text in ("MYFMT    FMT\n         DEV   TYPE=3270-A2\n", "         MSG   TYPE=INPUT,SOR=(MYFMT,IGNORE)\n",
                      "         DFLD  POS=(1,2),LTH=8\n"):
             r, ok, why = self.reading("PROD.GC.COPYLIB", text)
@@ -616,6 +903,37 @@ class TheVerdict(unittest.TestCase):
         r, ok, why = self.reading("PROD.GC.COPYLIB", STARTBK, kind="proc")
         self.assertEqual((r["kind"], r["by"], ok), ("proc", "changed", False))
         self.assertIn("run the build first", r["seen"])
+        # the folder fix is the instruction only for a content case nothing but a COPYLIB folder is missing for
+        r, ok, why = self.reading("PROD.GC.CPYSRC", PROCBOOK)
+        r.update(refile=ok, why_not=why)
+        self.assertTrue(recover.folder_helps(r))
+        self.assertEqual(recover.content_fix(r), recover.FOLDER_THEN_RECOVER)
+        r, ok, why = self.reading("PROD.GC.COPYLIB", ASMBK)
+        r.update(refile=ok, why_not=why)
+        self.assertFalse(recover.folder_helps(r))
+        self.assertTrue(recover.content_fix(r).startswith("no folder change helps (the content decided); not re-filed: "))
+
+    def test_declared_kind_against_a_changed_file(self):
+        # the same bytes the build read, the classifier says 'unknown', the index holds a kind the UI's table can
+        # declare: the declared kind decided - with a different sha the file changed; without a sha nothing can tell
+        p = os.path.join(self.td, "PROD.GC.MISC", "PLAINBK.txt")
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w", encoding="utf-8") as fh:
+            fh.write(PLAINBK)
+        with open(p, "rb") as fh:
+            sha = hashlib.sha256(fh.read()).hexdigest()
+        r = recover.how_classified(p, "proc", sha)
+        self.assertEqual((r["kind"], r["by"]), ("proc", "declared"))
+        self.assertEqual(r["seen"], DeclaredKindDecided.SEEN)
+        self.assertEqual(recover.refile_verdict(r, "PROD.GC.MISC"), (False, ""))
+        self.assertEqual(recover.how_classified(p, "proc", "0" * 64)["by"], "changed")
+        self.assertEqual(recover.how_classified(p, "proc")["by"], "changed")
+        # the same bytes, a kind the table cannot declare: the build's own rule, not the file
+        r = recover.how_classified(p, "binary", sha)
+        self.assertEqual(r["by"], "build")
+        self.assertIn("the file unchanged since", r["seen"])
+        # a kind the classifier itself gives is never 'declared', sha or not
+        self.assertEqual(recover.how_classified(p, "unknown", sha)["by"], "extension")
         # unreadable
         r = recover.how_classified(os.path.join(self.td, "nope", "X.txt"), "asm")
         self.assertEqual((r["kind"], r["by"]), ("asm", "unreadable"))

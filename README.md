@@ -464,7 +464,11 @@ a program), marks the programs copying it, and the next build expands it;
 its own field rows wait for the next full re-parse, the report's 'Re-filed
 as copybook' section names each, and `coverage`, `program` and `copybook`
 say 'filed as asm by its content' with the recover instruction instead of
-the rename. `--from
+the rename. Such a member in a folder with no COPY hint and with no level
+numbers to go by is not re-filed - nothing says copybook - and every note
+says the folder fix first, then a second run; a member typed by the kind
+declared for its library in the UI's table reads 'by its declared kind'
+with 'declare it copybook there'. `--from
 FOLDER` adds expanded programs the index does not hold; `--dry-run` says
 what would be written. The same run reads the listing of every program whose
 copybook the build chose among several same-named ones (the listing's

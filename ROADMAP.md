@@ -279,7 +279,14 @@ shipped alone and cost one such night; these still wait for the next one:
    stay absent, a `--rebuild` files it as before and recover re-files it again; a real Assembler, listing
    or MFS member with a copybook's name is never re-filed (its shape is checked) and the report says so.
    This item makes the stand-in unnecessary: once the classifier files these as copybooks the re-parse
-   gives them their own rows and `refile_misfiled()` finds nothing to do.
+   gives them their own rows and `refile_misfiled()` finds nothing to do. Two windows the stand-in leaves
+   open, closed by this item as well (LESSONS 187): a re-filed member whose text changes on disk before
+   the re-parse is filed as before again by the next build, under a new member id, which un-links the
+   programs copying it without parsing them again - they read 'ok' with the old text's fields until
+   recover has run again and the build after it (the report's 'Re-filed as copybook' section says so);
+   and the stand-in's shape guard (`recover._ASM_SHAPE`) errs towards refusing, so a COBOL `START CUSTFILE`
+   alone on its line (a file name with no hyphen, the KEY clause on the next line) reads as an Assembler
+   START with a symbol operand and is left, with the honest sentence, for this item.
 
 ### flow: known limits (open after review)
 
