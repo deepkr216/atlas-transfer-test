@@ -276,7 +276,10 @@ shipped alone and cost one such night; these still wait for the next one:
    `parse_status='skipped'`, the reason in `parse_error`; `refile_misfiled()`) and marks its programs:
    the build keeps the stored kind of an unchanged, settled member and the expander reads the copybook's
    text from disk, so the next incremental build makes the programs whole; the member's own field rows
-   stay absent, a `--rebuild` files it as before and recover re-files it again; a real Assembler, listing
+   stay absent, a `--rebuild` files it as before and recover re-files it again (so does any build that
+   re-parses every member: the manifest changed - the UI rewrites manifest.json from the sources table on
+   every build, so every library he adds or re-kinds in its table changes it - or a parser module changed;
+   run recover after such a build, and it re-files them again - LESSONS 188); a real Assembler, listing
    or MFS member with a copybook's name is never re-filed (its shape is checked) and the report says so.
    This item makes the stand-in unnecessary: once the classifier files these as copybooks the re-parse
    gives them their own rows and `refile_misfiled()` finds nothing to do. Two windows the stand-in leaves

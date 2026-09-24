@@ -244,6 +244,51 @@ def parse_label(conn: sqlite3.Connection, member_id: int, status: Optional[str])
     return PARSE_CHOSEN if partial_kind(conn, member_id) == "chosen" else (status or "?")
 
 
+# a program marked `ok` whose COPY row no member resolves any more: the build un-links a program's copy_use row
+# when the member it had expanded leaves the index (its text changed on disk, or the file went) and parses the
+# program again only when the new text is filed as copybook or cobol - a re-filed copybook (atlas.recover, ROADMAP
+# re-parse item 22) re-fetched with new text is filed by its weak signature again, so the program reads 'ok' with
+# the fields of the earlier read and a NULL row beside 'NOT FOUND' on the same page (LESSONS 188); said here and
+# counted in coverage, apart from the partial members
+UNLINKED_WHY = ("the member it had expanded went out of the index since - its text changed on disk and the classifier "
+                "filed the new text as another kind, or the file went - and nothing parsed the program again")
+UNLINKED_FIX = "run `python -m atlas.recover --db atlas.db`, then the build"
+
+
+def unlinked_ok_note(conn: sqlite3.Connection, member_id: int, status: Optional[str]) -> str:
+    """`program`'s clause after 'parse: ok' when a COPY row of the program is
+    unresolved although the parse was whole: its fields are those of the
+    earlier read of that copybook (recover.unlinked_ok_programs)."""
+    if status != "ok":
+        return ""
+    from . import recover
+    entry = recover.unlinked_ok_programs(conn, member_id).get(int(member_id))
+    if not entry:
+        return ""
+    books = entry[1]
+    n = len(books)
+    return (f", but {n} COPY row{'s' if n != 1 else ''} {'is' if n == 1 else 'are'} unresolved ({', '.join(books)}): "
+            f"{UNLINKED_WHY}, so its fields are those of the earlier read of "
+            f"{'that copybook' if n == 1 else 'those copybooks'}; {UNLINKED_FIX} (the Copybooks table below says what "
+            "happened to each)")
+
+
+def unlinked_ok_clause(stale: Dict[int, Tuple[str, List[str]]]) -> str:
+    """`coverage`'s note under 'Members parsed only in part' for the programs
+    recover.unlinked_ok_programs() found: not partial, not counted in that
+    table, and not whole either."""
+    if not stale:
+        return ""
+    n = len(stale)
+    names = sorted(name for name, _b in stale.values())
+    books = sorted({b for _n, bs in stale.values() for b in bs})
+    return (f"\n> Not counted above: {n} program{'s' if n != 1 else ''} marked `ok` {'has' if n == 1 else 'have'} a COPY row "
+            f"no member resolves any more ({', '.join(names[:8])}{f', +{n - 8:,} more' if n > 8 else ''}; "
+            f"copybook{'s' if len(books) != 1 else ''} {', '.join(books[:8])}{f', +{len(books) - 8:,} more' if len(books) > 8 else ''}): "
+            f"{UNLINKED_WHY}, so its fields are those of the earlier read. `program NAME` says so beside `parse: ok`; "
+            f"{UNLINKED_FIX} - the 'Copybooks not found' table names each copybook with what to do.\n")
+
+
 def unresolved_for(conn: sqlite3.Connection, member_ids: Sequence[int], limit: int = 40) -> str:
     if not member_ids:
         return ""
@@ -349,7 +394,8 @@ def cmd_program(conn: sqlite3.Connection, name: str) -> str:
                    + ("  **[authoritative]**" if p["authoritative"] else "") + "\n")
         out.append(f"- PROGRAM-ID `{p['program_id']}` - {p['src_lines']} source lines, "
                    f"{p['exp_lines']} after COPY expansion - parse: "
-                   f"{parse_label(conn, p['member_id'], p['parse_status'])}\n")
+                   f"{parse_label(conn, p['member_id'], p['parse_status'])}"
+                   f"{unlinked_ok_note(conn, p['member_id'], p['parse_status'])}\n")
         out.append(f"- system: {p['system'] or 'not declared (add it to sources.json / manifest systems)'}\n")
         flags = [k for k in ("sql", "cics", "dli", "mq") if p[f"uses_{k}"]]
         out.append(f"- uses: {', '.join(flags) if flags else 'files only'}\n")
@@ -1610,8 +1656,12 @@ def _partial_members(conn: sqlite3.Connection, limit: int = COVERAGE_ROWS) -> st
                 AND i.ocr_text <> '') AS ocr_read
         FROM member m WHERE m.parse_status = 'partial' AND NOT ({_CHOSEN_PRED})
         ORDER BY m.kind, m.name""", (AMBIGUOUS_PICK, AMBIGUOUS_PICK)).fetchall()
+    from . import recover
+    # a program marked `ok` whose COPY row no member resolves any more (the copybook it had expanded changed on
+    # disk or went, and nothing parsed it again): not in this table, not whole either - said under it
+    stale = recover.unlinked_ok_programs(conn)
     if not rows:
-        return "\n### Members parsed only in part\n_none_\n"
+        return "\n### Members parsed only in part\n_none_\n" + unlinked_ok_clause(stale)
     by_kind: Dict[str, List[sqlite3.Row]] = defaultdict(list)
     for r in rows:
         by_kind[r["kind"]].append(r)
@@ -1635,7 +1685,6 @@ def _partial_members(conn: sqlite3.Connection, limit: int = COVERAGE_ROWS) -> st
                "document is partial when no text could be extracted (a scan - run `OCR images`). A screen member "
                "is partial when no map or format macro was recognised.\n")
     if any(r["kind"] in ("cobol", "copybook") for r in rows):
-        from . import recover
         arrived, misfiled, waiting = recover.arrival_scan(conn)
         clauses = []                                                    # only the clause whose count is not zero
         if waiting:
@@ -1700,6 +1749,7 @@ def _partial_members(conn: sqlite3.Connection, limit: int = COVERAGE_ROWS) -> st
                                f"({kinds} - a START- name, a MODULE MAP comment, a first word MSG; {recover.REFILED_ITEM}): {fix}")
         if clauses:
             out.append("\n> " + "; ".join(clauses) + ". The 'Copybooks not found' table below says which.\n")
+    out.append(unlinked_ok_clause(stale))
     return "".join(out)
 
 

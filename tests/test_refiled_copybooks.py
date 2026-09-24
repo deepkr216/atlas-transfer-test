@@ -27,6 +27,14 @@ MSG (mfs) re-filed in one run; (D) a genuine Assembler member in a COPYLIB
 folder is NOT re-filed and the sentence is honest; (E) a procedure
 copybook in a PROCS folder (the folder decided) keeps the rename sentence;
 (F) --rebuild files it as asm again and recover re-files it again.
+
+A round later (LESSONS 188): (G) a build that re-parses every member for
+its own reasons - the manifest changed - reverts a re-file like --rebuild
+does, and the docs say so after the pinned --rebuild sentence; (H) a name
+carried by a re-filable COPYLIB copy AND a folder-typed PROCS copy sends
+him to no folder on a dry run; (I) a re-filed copybook whose text changed
+on disk leaves its program 'ok' with a NULL COPY row and the old fields -
+`program` and coverage say so, and recover then the build heal it.
 """
 
 import contextlib
@@ -792,9 +800,214 @@ class SecondRunBeforeTheBuild(_Estate):
         self.assertNotIn("wait for the build", said)
 
 
+class ManifestChangeRefilesAgain(_Estate):
+    """Case G (LESSONS 188 (1)): --rebuild is not the one build that undoes a re-file. The stored kind survives only
+    while the build keeps every unchanged member's kind, and a build re-parses every member when the manifest
+    changed (the UI rewrites manifest.json from the sources table on every build, so every library he adds or
+    re-kinds in its table changes it - his routine of LESSONS 183) or a parser module changed. An UNRELATED library
+    declared in the manifest after the re-file: the build files STARTBK asm again and un-links the program; recover
+    re-files it again and the build makes the program whole - and the report says so after the --rebuild sentence."""
+
+    files = DataCopybookWithStartDate.files + (("SHARED/PROD.GC.MISC/PLAINBK.txt", PLAINBK),)
+
+    def before_build(self):
+        self.manifest = os.path.join(self.td, "manifest.json")
+        self.declare({})
+
+    def declare(self, kinds):
+        with open(self.manifest, "w", encoding="utf-8") as fh:
+            json.dump({"kinds": kinds}, fh)
+
+    def test_a_library_re_kinded_in_the_table_reverts_the_re_file_and_recover_re_files_it(self):
+        self.assert_the_bug("STPGM", "STARTBK", "asm")
+        self.assertEqual(self.member("PLAINBK")[:2], ("unknown", "PROD.GC.MISC"))
+        stats, _said = self.recover()
+        self.assertEqual(stats["refiled"], 1)
+        # the sentence: the pinned --rebuild one stays, the manifest / parser one follows it
+        self.assertIn("a --rebuild before that files them as before, and this tool re-files them again. "
+                      + recover.REPARSE_UNDOES + " If a re-filed member's text changes on disk", self.report_text())
+        self.assertIn("So does any build that re-parses every member - the manifest changed (a library added or re-kinded "
+                      "in the UI's table rewrites it) or a parser module changed: run this tool after such a build and it "
+                      "re-files them again.", recover.REPARSE_UNDOES)
+        self.build()
+        self.assertEqual((self.member("STARTBK")[:3], self.status("STPGM")), (("copybook", "PROD.GC.COPYLIB", "skipped"), "ok"))
+        # an unrelated library re-kinded in the UI's table: nothing about STARTBK changed, yet the build re-parses
+        # every member and the classifier reads it asm again - the program is partial again, its COPY row NULL
+        self.declare({"PROD.GC.MISC": "proc"})
+        self.build()
+        self.assertEqual(self.member("PLAINBK")[:2], ("proc", "PROD.GC.MISC"))
+        self.assert_the_bug("STPGM", "STARTBK", "asm")
+        self.assertIsNone(self.member("STARTBK")[3])
+        cov, nf, prog, _book, _as_prog = self.outputs("STPGM", "STARTBK")
+        self.assertIn(f"| STARTBK | 1 | yes: PROD.GC.COPYLIB, {CONTENT} ({SEEN}) - not a kind the build expands, and "
+                      f"{RECOVER_FIX} |", nf)
+        # the instruction, followed: recover re-files it again and the build makes the program whole
+        stats, said = self.recover()
+        self.assertEqual((stats["refiled"], stats["misfiled"], stats["marked"]), (1, 0, 1), said)
+        self.assertIn("1 misfiled copybook(s) re-filed as copybook in the index", said)
+        self.assertIn("## Re-filed as copybook", self.report_text())
+        self.build()
+        self.assertEqual((self.member("STARTBK")[:3], self.status("STPGM")), (("copybook", "PROD.GC.COPYLIB", "skipped"), "ok"))
+        self.assertEqual(self.copy_use("STPGM", "STARTBK"), [(self.member_id("STARTBK"),)])
+        self.assertEqual(self.not_found_note("STPGM", "STARTBK"), [])
+
+
+class DryRunWithAFolderTypedCopyToo(_Estate):
+    """Case H (LESSONS 188 (2)): STARTBK.txt in PROD.GC.COPYLIB (asm by its content, re-filable) and STARTBK.txt
+    in PROD.GC.PROCS (a plain procedure copybook: proc by its folder), one program. The dry run counted the name
+    among the folder-decided - the entry stays in `misfiled` on a dry run, and folder_decided() is true through
+    the PROCS reading - and sent him to rename a folder no fix needs. Now it says 'run without --dry-run first'
+    and no folder line; the run re-files the COPYLIB copy, leaves the PROCS copy alone, and the build resolves the
+    program to the copybook member."""
+
+    files = (("GC/PROD.GC.SRC/STPGM.cbl", data_program("STPGM", "STARTBK", "START-DATE")),
+             ("SHARED/PROD.GC.COPYLIB/STARTBK.txt", STARTBK),
+             ("SHARED/PROD.GC.PROCS/STARTBK.txt", PLAINBK))
+
+    def members(self):
+        return self.q("SELECT kind, library, parse_status FROM member WHERE name='STARTBK' ORDER BY library")
+
+    def test_the_dry_run_sends_him_to_no_folder_and_the_run_re_files_the_one_copy(self):
+        self.assertEqual([(k, f) for k, f, _s in self.members()], [("asm", "PROD.GC.COPYLIB"), ("proc", "PROD.GC.PROCS")])
+        self.assertEqual((self.status("STPGM"), self.copy_use("STPGM", "STARTBK")), ("partial", [(None,)]))
+        stats, said = self.recover(dry_run=True)
+        self.assertEqual((stats["refiled"], stats["misfiled"], stats["marked"]), (0, 1, 0), said)
+        self.assertIn("1 misfiled copybook(s) would be re-filed as copybook in the index (the classifier had read them as asm "
+                      "by a line of their text): 1 program(s) would be marked for the next build (dry run: nothing changed)",
+                      said)
+        self.assertIn("every one of them is the name of a member this run would re-file as a copybook (above): run without "
+                      "--dry-run first - the listings only if a program still says NOT FOUND after the build", said)
+        for wrong in ("does not expand", "next: rename the folder", "the folder fix comes first", "next: run your usual build"):
+            self.assertNotIn(wrong, said)
+        # the report's cell says both: the rename for the PROCS copy, the re-file for the COPYLIB one (dry run)
+        rep = self.report_text()
+        row = [ln for ln in rep.splitlines() if ln.startswith("| STARTBK | ") and " STPGM | " in ln and "PROCS" in ln]
+        self.assertEqual(len(row), 1, rep)
+        self.assertIn(MISFILED_FIX, row[0])
+        self.assertIn("the copy filed by its content: " + recover.CONTENT_FIX_DRY, row[0])
+        self.assertIn("filed as proc by its folder (the folder name ends in PROCS)", row[0])
+        self.assertIn(f"{CONTENT} ({SEEN})", row[0])
+        self.assertEqual(self.members()[0][:2], ("asm", "PROD.GC.COPYLIB"))                   # a dry run changes nothing
+        # the run: the COPYLIB copy re-filed, the PROCS copy left alone, no folder advice anywhere
+        stats, said = self.recover()
+        self.assertEqual((stats["refiled"], stats["misfiled"], stats["marked"]), (1, 0, 1), said)
+        self.assertIn("1 misfiled copybook(s) re-filed as copybook in the index", said)
+        self.assertIn("next: run your usual build command", said)
+        for wrong in ("does not expand", "next: rename the folder", "the folder fix comes first"):
+            self.assertNotIn(wrong, said)
+        self.assertEqual(self.members(), [("copybook", "PROD.GC.COPYLIB", "skipped"), ("proc", "PROD.GC.PROCS", "ok")])
+        self.assertNotIn("filed as something else", self.report_text())
+        self.build()
+        self.assertEqual(self.status("STPGM"), "ok")
+        cid = self.q("SELECT id FROM member WHERE name='STARTBK' AND kind='copybook'")[0][0]
+        self.assertEqual(self.copy_use("STPGM", "STARTBK"), [(cid,)])
+        self.assertEqual(self.q("SELECT name, offset FROM pfield WHERE name='START-DATE'"), [("START-DATE", 5)])
+        stats, said = self.recover()
+        self.assertEqual((stats["refiled"], stats["misfiled"], stats["marked"]), (0, 0, 0), said)
+        self.assertNotIn("STARTBK", said)
+
+
+class OkWithAnUnlinkedCopyRow(_Estate):
+    """Case I (LESSONS 188 (3)): the window ROADMAP 22 names, said on the query side. After the re-file and the
+    build (STPGM ok), STARTBK's text changes on disk (a field ST-NEW added) and the build files the new text asm
+    again under a new member id, un-links STPGM's COPY row and parses nothing again: STPGM reads 'ok' with the old
+    text's fields. `program` says so beside 'parse: ok', coverage counts it apart from the partial members; recover
+    re-files the new member and the build makes the program whole with ST-NEW at offset 16."""
+
+    files = DataCopybookWithStartDate.files
+    NOTE = ("parse: ok, but 1 COPY row is unresolved (STARTBK): the member it had expanded went out of the index since - "
+            "its text changed on disk and the classifier filed the new text as another kind, or the file went - and "
+            "nothing parsed the program again, so its fields are those of the earlier read of that copybook; run "
+            "`python -m atlas.recover --db atlas.db`, then the build (the Copybooks table below says what happened to each)")
+    CLAUSE = ("### Members parsed only in part\n_none_\n\n> Not counted above: 1 program marked `ok` has a COPY row no "
+              "member resolves any more (STPGM; copybook STARTBK): the member it had expanded went out of the index since "
+              "- its text changed on disk and the classifier filed the new text as another kind, or the file went - and "
+              "nothing parsed the program again, so its fields are those of the earlier read. `program NAME` says so "
+              "beside `parse: ok`; run `python -m atlas.recover --db atlas.db`, then the build - the 'Copybooks not "
+              "found' table names each copybook with what to do.\n")
+
+    def fields(self):
+        return self.q("SELECT f.name, f.offset, f.length, f.src_member FROM pfield f JOIN program p ON p.id=f.program_id "
+                      "JOIN member m ON m.id=p.member_id WHERE m.name='STPGM' AND f.name IN ('ST-ID','START-DATE','ST-AMT',"
+                      "'ST-NEW') ORDER BY f.offset")
+
+    def test_program_and_coverage_say_it_and_recover_then_the_build_heal_it(self):
+        self.recover()
+        self.build()
+        old = self.member_id("STARTBK")
+        self.assertEqual((self.status("STPGM"), self.copy_use("STPGM", "STARTBK")), ("ok", [(old,)]))
+        conn = query.connect(self.db)
+        try:
+            self.assertEqual(recover.unlinked_ok_programs(conn), {})
+        finally:
+            conn.close()
+        # the copybook re-fetched with a new field: the new text is filed asm again, the program's row un-linked
+        self.write("SHARED/PROD.GC.COPYLIB/STARTBK.txt", STARTBK + "           05  ST-NEW              PIC X(4).\n")
+        self.build()
+        kind, _folder, _status, error = self.member("STARTBK")
+        new = self.member_id("STARTBK")
+        self.assertEqual((kind, error), ("asm", None))
+        self.assertNotEqual(new, old)
+        self.assertEqual((self.status("STPGM"), self.copy_use("STPGM", "STARTBK")), ("ok", [(None,)]))
+        self.assertEqual(self.not_found_note("STPGM", "STARTBK"), [])
+        self.assertEqual(self.fields(), [("ST-ID", 0, 5, old), ("START-DATE", 5, 8, old), ("ST-AMT", 13, 3, old)])
+        self.assertEqual(self.q("SELECT name, length FROM pfield WHERE name='WS-REC'"), [("WS-REC", 16)])
+        pid = self.member_id("STPGM")
+        conn = query.connect(self.db)
+        try:
+            self.assertEqual(recover.unlinked_ok_programs(conn), {pid: ("STPGM", ["STARTBK"])})
+            self.assertEqual(recover.unlinked_ok_programs(conn, pid), {pid: ("STPGM", ["STARTBK"])})
+            self.assertEqual(recover.unlinked_ok_programs(conn, new), {})
+            self.assertEqual(query.unlinked_ok_note(conn, pid, "ok"), ", but" + self.NOTE.split(", but")[1])
+            self.assertEqual(query.unlinked_ok_note(conn, pid, "partial"), "")
+            self.assertEqual(query.unlinked_ok_clause({}), "")
+        finally:
+            conn.close()
+        cov, nf, prog, book, as_prog = self.outputs("STPGM", "STARTBK")
+        self.assertIn(self.NOTE, prog)
+        self.assertIn(f"| STARTBK | **NOT FOUND** - a member with this name exists: PROD.GC.COPYLIB, {CONTENT} ({SEEN}) - not a "
+                      f"kind the build expands, and {RECOVER_FIX} |", prog)
+        self.assertIn(self.CLAUSE, cov)
+        self.assertIn(f"| STARTBK | 1 | yes: PROD.GC.COPYLIB, {CONTENT} ({SEEN}) - not a kind the build expands, and "
+                      f"{RECOVER_FIX} |", nf)
+        self.assertIn(f"{CONTENT} (folder PROD.GC.COPYLIB; {SEEN})", book)
+        self.assertIn("**Not a program**: indexed as a `asm` member", as_prog)
+        # the heal: recover re-files the new member and marks the program by name; the build makes it whole
+        stats, said = self.recover()
+        self.assertEqual((stats["refiled"], stats["misfiled"], stats["marked"]), (1, 0, 1), said)
+        self.assertEqual(self.status("STPGM"), "pending")
+        self.build()
+        self.assertEqual((self.member("STARTBK")[:3], self.status("STPGM")), (("copybook", "PROD.GC.COPYLIB", "skipped"), "ok"))
+        self.assertEqual(self.copy_use("STPGM", "STARTBK"), [(new,)])
+        self.assertEqual(self.fields(), [("ST-ID", 0, 5, new), ("START-DATE", 5, 8, new), ("ST-AMT", 13, 3, new),
+                                         ("ST-NEW", 16, 4, new)])
+        self.assertEqual(self.q("SELECT name, length FROM pfield WHERE name='WS-REC'"), [("WS-REC", 20)])
+        cov, nf, prog, _book, _as_prog = self.outputs("STPGM", "STARTBK")
+        self.assertNotIn("but 1 COPY row", prog)
+        self.assertNotIn("NOT FOUND", prog)
+        self.assertNotIn("Not counted above", cov)
+        self.assertIn("### Members parsed only in part\n_none_", cov)
+        self.assertIn("_none_", nf)
+
+    def test_a_system_include_is_never_counted(self):
+        """A program copying SQLCA (the compiler supplies it: a NULL row by design) is not an un-linked one."""
+        self.write("GC/PROD.GC.SRC/SQLPGM.cbl", HEAD.format(name="SQLPGM", data="           EXEC SQL INCLUDE SQLCA END-EXEC.\n",
+                                                                    main="") + PLAIN_SECTION + TAIL)
+        self.build()
+        self.assertEqual(self.status("SQLPGM"), "ok")
+        self.assertEqual(self.copy_use("SQLPGM", "SQLCA"), [(None,)])
+        conn = query.connect(self.db)
+        try:
+            self.assertEqual(recover.unlinked_ok_programs(conn), {})
+            self.assertNotIn("but 1 COPY row", query.cmd_program(conn, "SQLPGM"))
+            self.assertNotIn("Not counted above", query.cmd_coverage(conn))
+        finally:
+            conn.close()
+
+
 class TheDocsSayIt(unittest.TestCase):
-    """ROADMAP item 22 names the window a re-filed member's changed text opens (LESSONS 187 (5)), and LESSONS
-    has the row."""
+    """ROADMAP item 22 names the window a re-filed member's changed text opens (LESSONS 187 (5)) and the builds
+    that undo a re-file (LESSONS 188 (1)); LESSONS has the rows; README and the Field Manual carry the clause."""
 
     def test_roadmap_22_and_lessons_187(self):
         root = os.path.dirname(HERE)
@@ -804,6 +1017,31 @@ class TheDocsSayIt(unittest.TestCase):
         self.assertIn("recover._ASM_SHAPE", item)
         with open(os.path.join(root, "LESSONS.md"), encoding="utf-8") as fh:
             self.assertIn("\n| 187 | ", fh.read())
+
+    def test_the_manifest_and_parser_builds_are_named_after_the_rebuild_sentence(self):
+        root = os.path.dirname(HERE)
+        with open(os.path.join(root, "ROADMAP.md"), encoding="utf-8") as fh:
+            item = fh.read().split("\n22. ")[1].split("\n###")[0]
+        self.assertIn("a `--rebuild` files it as before and recover re-files it again (so does any build that\n"
+                      "   re-parses every member: the manifest changed", item)
+        self.assertIn("or a parser module changed", item)
+        with open(os.path.join(root, "LESSONS.md"), encoding="utf-8") as fh:
+            lessons = fh.read()
+        self.assertIn("\n| 188 | ", lessons)
+        row_186 = [ln for ln in lessons.splitlines() if ln.startswith("| 186 | ")][0]
+        self.assertIn("a --rebuild files it as asm again until item 22 and recover re-files it again; so does any build that "
+                      "re-parses every member - the manifest changed (a library added or re-kinded in the UI's table rewrites "
+                      "it) or a parser module changed", row_186)
+        with open(os.path.join(root, "README.md"), encoding="utf-8") as fh:
+            self.assertIn("the rename. A build that re-parses every member - `--rebuild`, the\nmanifest changed (every library "
+                          "added or re-kinded in the UI's table\nrewrites it), a parser module changed - files such a member "
+                          "as before\nand un-links its programs: run recover after such a build and it\nre-files them.",
+                          fh.read())
+        with open(os.path.join(root, "docs", "FieldManual.html"), encoding="utf-8") as fh:
+            self.assertIn("instead of the rename. A build that re-parses every member — <code>--rebuild</code>, the manifest "
+                          "changed (every library added or re-kinded in the UI's table rewrites it), a parser module changed "
+                          "— files such a member as before and un-links its programs: run recover after such a build and it "
+                          "re-files them. Such a member", fh.read())
 
 
 class TheVerdict(unittest.TestCase):

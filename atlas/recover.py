@@ -1216,6 +1216,41 @@ def skipped_copies(conn: sqlite3.Connection, member_id: Optional[int] = None) ->
     return out
 
 
+def unlinked_ok_programs(conn: sqlite3.Connection, member_id: Optional[int] = None) -> Dict[int, Tuple[str, List[str]]]:
+    """{program member id: (program name, [COPYBOOK, ...])} for every program
+    marked `ok` that has a COPY row no member resolves any more - not a
+    system include, not a COPY the expander skipped. The build sets a
+    program's copy_use row to NULL when the member it had expanded leaves
+    the index (`_forget_member`: the file changed on disk, or went), and
+    parses the program again only when the member's NEW text is filed as
+    copybook or cobol; a re-filed copybook re-fetched with new text is filed
+    by its weak signature again (asm / listing / mfs), so its programs keep
+    'ok' with the fields of the earlier read and a NULL row nothing explains
+    (LESSONS 188). `program` says so beside 'parse: ok' and `coverage`
+    counts them apart from the partial members; a run of this tool re-files
+    the member and marks them by name, and the build makes them whole."""
+    out: Dict[int, Tuple[str, List[str]]] = {}
+    sql = ("SELECT c.member_id, m.name, c.copybook FROM copy_use c JOIN member m ON m.id = c.member_id "
+           "WHERE c.resolved_member_id IS NULL AND m.kind = 'cobol' AND m.parse_status = 'ok' "
+           "AND UPPER(c.copybook) NOT IN ('SQLCA', 'SQLDA')")
+    args: Tuple[object, ...] = ()
+    if member_id is not None:
+        sql += " AND c.member_id = ?"
+        args = (member_id,)
+    rows = conn.execute(sql + " ORDER BY c.member_id, c.line", args).fetchall()
+    if not rows:
+        return out
+    skipped = skipped_copies(conn, member_id)
+    for mid, name, book in rows:
+        key = (int(mid), (book or "").upper())
+        if key in skipped:
+            continue
+        entry = out.setdefault(int(mid), (str(name), []))
+        if key[1] not in entry[1]:
+            entry[1].append(key[1])
+    return out
+
+
 def arrived_copybooks(conn: sqlite3.Connection) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
     """The COPY statements the build could not resolve whose copybook's name
     the index DOES hold now, in two lists, one entry per copybook name:
@@ -1390,6 +1425,15 @@ CONTENT_FIX = ("no folder change helps (the content decided): run `python -m atl
 CONTENT_FIX_DRY = ("no folder change helps (the content decided): a run without --dry-run re-files it as a copybook in the "
                    "index and marks the programs")
 REFILED_NOTE = "indexed as a copybook (re-filed by atlas.recover; its own layout rows arrive with the next full re-parse)"
+# a re-file lives in the member row, and the build keeps that row only while it keeps every unchanged member's
+# stored kind (build.py: `not force_all`): --rebuild is one way to lose it, and a build that re-parses every member
+# for its own reasons is another - the manifest changed (the UI rewrites manifest.json from the sources table on
+# every build, so every library he adds or re-kinds in its table changes it - his routine of LESSONS 183) or a
+# parser module changed. Such a build files the member as before and un-links its programs; nothing but a run of
+# this tool re-files it (LESSONS 188).
+REPARSE_UNDOES = ("So does any build that re-parses every member - the manifest changed (a library added or re-kinded in "
+                  "the UI's table rewrites it) or a parser module changed: run this tool after such a build and it "
+                  "re-files them again.")
 # a member a weak signature typed that sits in a folder with no COPY hint and carries no level numbers (a procedure
 # copybook he fetched by hand into a dataset-named folder - LESSONS 183): nothing says copybook, so this tool does
 # not re-file it - but a COPYLIB folder would let it, so the folder IS the fix here, then a second run; the cell
@@ -1810,6 +1854,7 @@ def arrival_report(arrived: Sequence[Dict[str, object]], misfiled: Sequence[Dict
                         "the expander reads the copybook's text from disk). ")
                      + "Their own layout rows - fields, offsets - stay absent until the next full re-parse files them as "
                      "copybooks itself; a --rebuild before that files them as before, and this tool re-files them again. "
+                     f"{REPARSE_UNDOES} "
                      "If a re-filed member's text changes on disk before the re-parse, the next build files the new text as "
                      "before too (under a new member id) and un-links the programs copying it without parsing them again - "
                      "they read 'ok' with the fields of the old text until this tool has run again and the build after it.\n\n"
@@ -2445,8 +2490,11 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
     # still misfiled: the folder name (or the declared kind) decided (the rename / declare sentence); a line of the
     # text decided and only a COPYLIB folder is missing for this tool to re-file it (the folder fix, then a second
     # run); or a line of the text decided and this run could not re-file it (the report says why); on a dry run
-    # the would-be re-filed stay here too
-    folder_fix = [e for e in misfiled if folder_decided(e)]
+    # the would-be re-filed stay in `misfiled` too, and are left out of every list here: a name carried by a
+    # re-filable COPYLIB copy AND a folder-typed PROCS copy needs no folder change - the run without --dry-run
+    # re-files the one copy and the build resolves it (the real run drops the entry from `misfiled`, so only the
+    # dry run could send him to rename a folder; LESSONS 188)
+    folder_fix = [e for e in misfiled if folder_decided(e) and not any(e is x for x in refiled)]
     by_content = [e for e in misfiled if not folder_decided(e) and not any(e is x for x in refiled)]
     content_folder = [e for e in by_content if folder_would_let(e)]
     content_left = [e for e in by_content if not folder_would_let(e)]

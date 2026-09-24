@@ -464,7 +464,12 @@ a program), marks the programs copying it, and the next build expands it;
 its own field rows wait for the next full re-parse, the report's 'Re-filed
 as copybook' section names each, and `coverage`, `program` and `copybook`
 say 'filed as asm by its content' with the recover instruction instead of
-the rename. Such a member in a folder with no COPY hint and with no level
+the rename. A build that re-parses every member - `--rebuild`, the
+manifest changed (every library added or re-kinded in the UI's table
+rewrites it), a parser module changed - files such a member as before
+and un-links its programs: run recover after such a build and it
+re-files them.
+Such a member in a folder with no COPY hint and with no level
 numbers to go by is not re-filed - nothing says copybook - and every note
 says the folder fix first, then a second run; a member typed by the kind
 declared for its library in the UI's table reads 'by its declared kind'
