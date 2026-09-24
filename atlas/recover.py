@@ -55,6 +55,16 @@ every such program too, stores the rows (listing_copy_source) and checks
 each choice: CONFIRMED, CONTRADICTED (a wrong fact - the report names every
 one with the library the listing says) or UNKNOWN. The build does not read
 the table yet (ROADMAP re-parse item 19); nothing in the fact tables changes.
+
+The same rows are the FETCH LIST: per library dataset the listings name,
+which copybooks came from it (the missing ones, the ones chosen among
+several, the rest), how many programs' listings name it, and whether the
+index already holds it (the `library` table, or a folder named after the
+dataset). The report tables it, datasets with missing copybooks first, and
+work\fetch-list.txt holds the not-fetched ones one per line - datasets only,
+never a member name - to paste into the UI's Bulk add or give to zowe. Once
+a library is fetched and the build has run, its copybooks resolve and the
+recovered copies of them go on the next run.
 """
 
 from __future__ import annotations
@@ -75,6 +85,8 @@ from . import classify, copybook, expand, reader
 FOLDER = "RECOVERED-COPYBOOKS"
 MARKER = ".atlas-recovered.json"
 REPORT = os.path.join("work", "recover.md")
+FETCH_LIST = "fetch-list.txt"                                       # next to the report: the datasets to fetch, one per line
+FETCH_NAMES = 12                                                    # copybook names shown per dataset in the report's table
 RESOLVER_KINDS = ("copybook", "cobol", "sql", "unknown")          # what the build's resolver accepts
 MAX_SOURCE_BYTES = 64 * 1024 * 1024
 SHAPE_OK = 0.98                                                  # records that must look like 80-column source
@@ -1429,17 +1441,125 @@ def _mark_programs(db: str, names: Sequence[str]) -> int:
         conn.close()
 
 
-def _check_after(db: str, per_program: Dict[str, List[CopySource]], dry_run: bool) -> List[Dict[str, object]]:
-    """Store this run's copybook-source rows (not on a dry run) and check
-    every choice against the rows now known: this run's for the programs
-    read, the stored ones for the rest."""
+def held_datasets(conn: sqlite3.Connection, libs: Dict[str, str]) -> Dict[str, str]:
+    """{dataset: a folder the index holds it as} - the `library` table first
+    (the fetcher's marker), then every member's folder that is named after a
+    dataset (the fetcher names each folder after its dataset)."""
+    out: Dict[str, str] = {}
+    try:                                                               # the folder as the table spells it: `libs` keys are
+        for folder, dsn in conn.execute("SELECT folder, dataset FROM library WHERE folder IS NOT NULL AND dataset IS NOT NULL "
+                                        "ORDER BY id"):                # normalised (lower-cased on Windows), not for showing
+            out.setdefault(str(dsn).strip().upper(), str(folder))
+    except sqlite3.OperationalError:
+        pass
+    try:
+        paths = [str(p) for (p,) in conn.execute("SELECT DISTINCT path FROM member WHERE path IS NOT NULL")]
+    except sqlite3.OperationalError:
+        return out
+    for folder in sorted({os.path.dirname(p) for p in paths}):
+        dsn = dataset_of(os.path.join(folder, "x"), libs)
+        if dsn:
+            out.setdefault(dsn, folder)
+    return out
+
+
+def fetch_list(conn: sqlite3.Connection, sources: Dict[str, List[CopySource]], missing: Dict[str, int],
+               checks: Sequence[Dict[str, object]]) -> Tuple[List[Dict[str, object]], List[str]]:
+    """The libraries the listings name, one entry per dataset, and the missing
+    copybooks no listing's table names. Each entry: dataset, held (a folder
+    the index holds it as, or None), programs (whose listings name it), and
+    the copybooks that came from it in three lists - missing (the index lacks
+    them: the ones to fetch for), chosen (the build chose among several and
+    this listing says this dataset), other. Datasets with missing copybooks
+    first, then the most programs first: the order to fetch in."""
+    holders = held_datasets(conn, library_datasets(conn))
+    chosen_at: Dict[str, Set[str]] = defaultdict(set)                  # dataset -> copybooks chosen among several
+    for v in checks:
+        for d in v["listing_datasets"]:                                 # type: ignore[union-attr]
+            chosen_at[str(d)].add(str(v["copybook"]))
+    per: Dict[str, Dict[str, object]] = {}
+    named: Set[str] = set()
+    for program, rows in sources.items():
+        for cb, _dd, dsn, _lst in rows:
+            if not dsn or not cb:
+                continue
+            named.add(cb)
+            e = per.setdefault(dsn, {"dataset": dsn, "programs": set(), "missing": set(), "chosen": set(), "other": set()})
+            e["programs"].add(program)                                  # type: ignore[union-attr]
+            bucket = "missing" if cb in missing else "chosen" if cb in chosen_at.get(dsn, ()) else "other"
+            e[bucket].add(cb)                                           # type: ignore[union-attr]
+    out: List[Dict[str, object]] = []
+    for dsn, e in per.items():
+        e["held"] = holders.get(dsn)
+        e["programs"] = len(e["programs"])                              # type: ignore[arg-type]
+        for k in ("missing", "chosen", "other"):
+            e[k] = sorted(e[k])                                         # type: ignore[arg-type]
+        out.append(e)
+    out.sort(key=lambda e: (0 if e["missing"] else 1, -int(e["programs"]), str(e["dataset"])))  # type: ignore[arg-type]
+    unnamed = sorted(n for n in missing if n not in named)
+    return out, unnamed
+
+
+def _names(names: Sequence[str], limit: int = FETCH_NAMES) -> str:
+    if not names:
+        return "-"
+    return ", ".join(names[:limit]) + (f", +{len(names) - limit:,}" if len(names) > limit else "")
+
+
+def fetch_report(fetch: Sequence[Dict[str, object]], unnamed: Sequence[str], root: Optional[str], list_file: str) -> List[str]:
+    """The report section: the table of libraries the listings name, the
+    sentence on how to fetch one, and the missing copybooks no table names."""
+    lines = ["\n## Libraries the listings name (fetch list)\n\n"
+             "After the source, a compiler listing names the library dataset each copybook was read from. A dataset "
+             "that holds a missing copybook and is not fetched yet is the one to fetch: its members, once in the "
+             "estate, make the recovered copies unnecessary.\n\n"]
+    if fetch:
+        lines.append("| dataset | held? | copybooks missing from the index | copybooks the build chose among several | programs |\n"
+                     "|---|---|---|---|---|\n")
+        for e in fetch:
+            held = f"held as {_tail(str(e['held']), 2)}" if e["held"] else "not fetched"
+            lines.append(f"| {e['dataset']} | {held} | {_names(e['missing'])} | {_names(e['chosen'])} | {e['programs']} |\n")  # type: ignore[arg-type]
+        to_fetch = [e for e in fetch if not e["held"]]
+        lines.append("\nFetch a dataset with the UI's Bulk add (paste the dataset names) or your zowe command; then run the "
+                     "build; the missing copybooks it holds resolve, and the recovered copies of them are removed on the next "
+                     f"recover run. `{list_file}` holds the {len(to_fetch)} not-fetched dataset{'s' if len(to_fetch) != 1 else ''}, "
+                     "one per line, the ones with missing copybooks first, datasets only - paste it into Bulk add.\n")
+    else:
+        lines.append("_no listing read has a copybook-source table (an older compiler's listing prints none), so no library "
+                     "is named_\n")
+    n = len(unnamed)
+    lines.append(f"\n- {n} missing copybook{'s are' if n != 1 else ' is'} named by no listing's table"
+                 + (": " + _names(unnamed) if unnamed else "") + "\n")
+    return lines
+
+
+def _write_fetch_list(path: str, fetch: Sequence[Dict[str, object]]) -> int:
+    """work/fetch-list.txt: the not-fetched datasets, one per line, the ones
+    with missing copybooks first - datasets only, never a member name, so it
+    pastes into the UI's Bulk add as it is. Rewritten on every run."""
+    to_fetch = [str(e["dataset"]) for e in fetch if not e["held"]]
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write("".join(d + "\n" for d in to_fetch))
+    return len(to_fetch)
+
+
+def _check_after(db: str, per_program: Dict[str, List[CopySource]], dry_run: bool, missing: Dict[str, int],
+                 chosen: bool) -> Tuple[List[Dict[str, object]], List[Dict[str, object]], List[str]]:
+    """Store this run's copybook-source rows (not on a dry run); check every
+    choice against the rows now known (this run's for the programs read, the
+    stored ones for the rest) when there is a choice to check; and build the
+    fetch list from the same rows. Returns (checks, fetch list, the missing
+    copybooks no table names)."""
     conn = sqlite3.connect(db)
     try:
         if per_program and not dry_run:
             store_copy_sources(conn, per_program)
         known = stored_copy_sources(conn)
         known.update(per_program)
-        return check_choices(conn, known)
+        checks = check_choices(conn, known) if (per_program or chosen) else []
+        fetch, unnamed = fetch_list(conn, known, missing, checks)
+        return checks, fetch, unnamed
     finally:
         conn.close()
 
@@ -1516,7 +1636,7 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
             "programs' compiler listings or expanded source")
         checked = None
         if chosen:
-            checks = _check_after(db, {}, dry_run=True)
+            checks, _fetch, _unnamed = _check_after(db, {}, True, missing, True)
             log(choice_line(checks) + " - the listings would say which copy of a copybook chosen among several was right")
             checked = choice_counts(checks)
         return {"missing": len(missing), "sources": 0, "written": 0, "rejected": 0, "not_found": len(missing), "removed": 0,
@@ -1675,7 +1795,9 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
             if ents or os.path.isdir(d):
                 _save_marker(d, ents)
     # the listings' copybook-source rows, stored per program read, and every choice the build made checked against them
-    checks = _check_after(db, copy_src, dry_run) if (copy_src or chosen) else []
+    # ... and, from the same rows, the libraries the listings name: the fetch list
+    checks, fetch, unnamed = _check_after(db, copy_src, dry_run, missing, bool(chosen))
+    list_file = os.path.join(os.path.dirname(report) or ".", FETCH_LIST) if report else None
     seen_names = set(by_name) | have_now
     unread = sorted(n for n in missing if n not in seen_names and n in unprovable)   # in a listing, column unproven
     not_found = sorted(n for n in missing if n not in seen_names and n not in unprovable)
@@ -1709,6 +1831,8 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
             inside = ", ".join(f"{o} ({k} listing{'s' if k != 1 else ''})" for o, k in nested_in[n].most_common(3)) if nested_in.get(n) else "-"
             lines.append(f"| {n} | {p} program{'s' if p != 1 else ''}, {b} copybook{'s' if b != 1 else ''} | "
                          f"{users.get(n, '?')} | {inside} |\n")
+    if fetch or missing:
+        lines += fetch_report(fetch, unnamed, root, list_file.replace("\\", "/") if list_file else FETCH_LIST)
     if unread:
         lines.append("\n## In an older listing whose source column could not be proven\n\nThe copybook IS in the listing, but "
                      "the tool could not prove at which column the listing's records start, so it read nothing rather than "
@@ -1742,11 +1866,14 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
         lines.append(f"\n### Rejected block {name}\n\n- {why}\n- Questions: open the listing at that line: (1) at what "
                      "column does the copied record start there, against the column on the IDENTIFICATION DIVISION line? "
                      "(2) is the first copied line a data item (a level number and a name), a comment, or something else?\n")
+    to_fetch = sum(1 for e in fetch if not e["held"])
     if report:
         os.makedirs(os.path.dirname(report) or ".", exist_ok=True)
         with open(report, "w", encoding="utf-8", newline="\n") as fh:
             fh.write("".join(lines))
-    agree = sum(1 for _n, _f, how in written if "identical in" in how or "confirmed by a second" in how)
+    if list_file:
+        _write_fetch_list(list_file, fetch)                             # rewritten each run: never stale, never a member name
+    agree =sum(1 for _n, _f, how in written if "identical in" in how or "confirmed by a second" in how)
     differ = sum(1 for _n, _f, how in written if "different texts" in how)
     per_system = sum(1 for _n, _f, how in written if "differs between systems" in how)
     if check_only:
@@ -1768,6 +1895,12 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
         n_contra = choice_counts(checks)[1]
         log(choice_line(checks) + (" - every contradicted choice is a wrong fact in the index: the report names each "
                                    "one with the library the listing says" if n_contra else ""))
+    if fetch:
+        log(f"libraries the listings name: {len(fetch):,} datasets, {to_fetch:,} not fetched yet - the report's fetch list "
+            "names them" + (f"; {list_file} holds the {to_fetch:,} to fetch, one dataset per line, for the UI's Bulk add"
+                            if list_file and to_fetch else ""))
+    if unnamed and (fetch or not_found):
+        log(f"  {len(unnamed):,} missing copybook{'s are' if len(unnamed) != 1 else ' is'} named by no listing's table")
     if nested_only:
         log(f"  {len(nested_only):,} of the {len(not_found):,} not found are copied from INSIDE another copybook: their lines sit "
             "inside that copybook's block in the listings, which this tool does not cut apart yet - the report's table names the "
@@ -1785,7 +1918,8 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
     return {"missing": len(missing), "sources": len(sources), "written": len(written), "rejected": len(rejected),
             "not_found": len(not_found), "removed": len(removed), "kept": kept, "formats": dict(formats),
             "out": out_dir, "unconfirmed": len(unconfirmed), "per_system": per_system,
-            "checked": choice_counts(checks) if checks else None}
+            "checked": choice_counts(checks) if checks else None,
+            "fetch": (len(fetch), to_fetch), "unnamed": len(unnamed)}
 
 
 def trace(db: str, name: str, folders: Sequence[str] = (), log=print) -> int:

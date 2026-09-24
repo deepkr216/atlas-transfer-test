@@ -1203,7 +1203,7 @@ def cmd_copybook(conn: sqlite3.Connection, name: str) -> str:
     copies = conn.execute("SELECT m.* FROM member m WHERE UPPER(m.name)=? AND m.kind IN ('copybook','cobol','unknown')",
                           (name.upper(),)).fetchall()
     if not copies:
-        return out[0] + "\n**NOT FOUND**\n"
+        return out[0] + "\n**NOT FOUND**\n" + _listing_sources_of(conn, name, missing=True)
     if len(copies) > 1:
         out.append(f"> **{len(copies)} copies of this member** ({len({c['norm_sha'] for c in copies})} distinct contents). "
                    f"Record lengths per copy:\n")
@@ -1560,18 +1560,25 @@ def _listing_says(conn: sqlite3.Connection, member_id: int) -> str:
     return "".join(out)
 
 
-def _listing_sources_of(conn: sqlite3.Connection, copybook: str) -> str:
-    """`copybook`: the datasets the programs' listings say this copybook came from, per program count."""
+def _listing_sources_of(conn: sqlite3.Connection, copybook: str, missing: bool = False) -> str:
+    """`copybook`: the datasets the programs' listings say this copybook came
+    from, per program count. For a copybook the index lacks (`missing`), the
+    library named is the one to fetch - the same rows atlas.recover puts in
+    its fetch list (work/fetch-list.txt)."""
     from . import recover
     if not recover.has_copy_sources(conn):
         return ""
     rows = conn.execute("SELECT dataset, COUNT(DISTINCT program) AS n FROM listing_copy_source WHERE copybook=? "
-                        "GROUP BY dataset ORDER BY n DESC, dataset", (copybook.upper(),)).fetchall()
+                        "AND dataset IS NOT NULL AND dataset<>'' GROUP BY dataset ORDER BY n DESC, dataset",
+                        (copybook.upper(),)).fetchall()
     if not rows:
         return ""
-    return ("\nThe programs' compiler listings say this copybook came from: "
-            + ", ".join(f"{r['dataset']} ({r['n']} program{'s' if r['n'] != 1 else ''})" for r in rows)
-            + " - the library the compiler read, per listing; `program NAME` shows each one.\n")
+    said = ", ".join(f"{r['dataset']} ({r['n']} program{'s' if r['n'] != 1 else ''})" for r in rows)
+    if missing:
+        return (f"\nNot in the index, but the listings say it came from: {said} - fetch that library (the UI's Bulk add "
+                "takes the dataset name; `python -m atlas.recover` writes every such dataset to work/fetch-list.txt).\n")
+    return (f"\nThe programs' compiler listings say this copybook came from: {said}"
+            " - the library the compiler read, per listing; `program NAME` shows each one.\n")
 
 
 def _chosen_members(conn: sqlite3.Connection, limit: int = COVERAGE_ROWS) -> str:
