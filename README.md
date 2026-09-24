@@ -444,7 +444,12 @@ different texts each system gets its own copy under its own folder. When
 the real copybook arrives in the estate the recovered one is removed on the
 next run and the programs that had expanded it are parsed again. `--from
 FOLDER` adds expanded programs the index does not hold; `--dry-run` says
-what would be written.
+what would be written. The same run reads the listing of every program whose
+copybook the build chose among several same-named ones (the listing's
+copybook-source table names the library the compiler read each copybook
+from) and checks each choice: confirmed, contradicted - a wrong fact, named
+in `work\recover.md` with the library the listing says - or unknown; `coverage`,
+`program` and `copybook` repeat what the listings say.
 
 **Pictures are read, not just counted.** `OCR images` (UI) or
 `python -m atlas.ocr --db atlas.db --out out/images` pulls every image out of

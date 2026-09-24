@@ -211,6 +211,17 @@ shipped alone and cost one such night; these still wait for the next one:
    "partial" COBOL programs with ~60 copybooks missing). Until the re-parse, query.py tells the two
    apart (`partial_kind` / `is_truly_partial`: every 'expand' note is the resolver's wording) and
    `coverage` prints them as "Complete, with a copybook chosen among several" (LESSONS 181).
+19. **The resolver reads `listing_copy_source` first: the listing's library beats every guess.**
+   His compiler listings end with a table naming, per copybook, the DD name and the LIBRARY DATASET
+   the compiler read it from. `atlas.recover` reads that table from every program's listing into
+   `listing_copy_source(program, copybook, ddname, dataset, listing, seen)` and checks each
+   'ambiguous_copybook' choice against it (confirmed / contradicted / unknown - `work\recover.md`
+   names every contradicted one; LESSONS 182). At the re-parse `make_resolver` must look that table
+   up before its precedence chain (COPY..OF > same system in declared order > authoritative > same
+   folder > first): where the listing names a dataset the index holds (member.library / the
+   `library` table tie a folder to its dataset), that copy is the one to expand and the row is not
+   ambiguous at all; only where no listing says does the chain guess. A contradicted choice today
+   is a wrong fact in every field, offset and flow answer for that program.
 
 ### flow: known limits (open after review)
 
