@@ -316,5 +316,57 @@ class TheMarkedSentence(unittest.TestCase):
         self.assertIn("the other 1 is marked `partial`", query._chosen_marked(1, 2))
 
 
+class TheWordsInTheDocs(unittest.TestCase):
+    """The manual, the README, LESSONS 181 and ROADMAP item 18 say what the
+    index built by the batch does: the program is `ok`, and only an index
+    built before the batch marks it `partial`. The manual said the opposite
+    ("although the index marks it partial until the next re-parse") after the
+    build had changed - a wrong fact from the first morning after the
+    re-parse night; the LESSONS row pointed at this file's first class for
+    the earlier shape after that class had come to assert the new one."""
+
+    root = os.path.dirname(HERE)
+
+    def read(self, *parts):
+        with open(os.path.join(self.root, *parts), encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_the_field_manual_says_the_program_is_ok(self):
+        manual = self.read("docs", "FieldManual.html")
+        self.assertNotIn("although the index marks it <em>partial</em> until the next re-parse", manual)
+        self.assertNotIn("until the next re-parse", manual)
+        self.assertIn('"Complete, with a copybook chosen among several": every COPY expanded, the program is <em>ok</em> '
+                      "(an index built before the re-parse batch still marks it <em>partial</em>, and <code>coverage</code> "
+                      "says which word the index uses), the <code>ambiguous_copybook</code> row names the copy used, and "
+                      "<code>program</code> reads <em>complete (copybook chosen among several)</em> on either", manual)
+
+    def test_the_readme_says_the_same(self):
+        self.assertIn("every COPY expanded, the program is `ok` (an index\nbuilt before the re-parse batch still marks it "
+                      "`partial`, and `coverage`\nsays so), and `program` says so.", self.read("README.md"))
+
+    def test_lessons_181_points_at_both_shapes(self):
+        rows = [ln for ln in self.read("LESSONS.md").splitlines() if ln.startswith("| 181 | ")]
+        self.assertEqual(len(rows), 1)
+        tests = rows[0].split(" | ")[-1]
+        self.assertIn("tests/test_chosen_copybook.py, both shapes of the index: ChosenCopybookIsNotPartial (the build of the "
+                      "batch: the chosen program is 'ok' with its 'ambiguous_copybook' row alone, no 'expand' note) and "
+                      "AnIndexBuiltBeforeTheBatch (the earlier shape, written by hand with age_index: the chosen program "
+                      "'partial' in the db with the resolver's wording in its 'expand' note;", tests)
+        self.assertNotIn("the build unchanged", tests)
+        # the classes the row names are the ones in this file, and each asserts the shape the row gives it
+        for name in ("ChosenCopybookIsNotPartial", "AnIndexBuiltBeforeTheBatch"):
+            self.assertIn(name, tests)
+            self.assertTrue(issubclass(globals()[name], _Estate), name)
+        self.assertFalse(ChosenCopybookIsNotPartial.aged)
+        self.assertTrue(AnIndexBuiltBeforeTheBatch.aged)
+
+    def test_roadmap_item_18_is_delivered(self):
+        item = self.read("ROADMAP.md").split("\n18. ")[1].split("\n19. ")[0]
+        self.assertTrue(item.startswith("**Delivered in the batch - an ambiguous-copybook pick is not a partial parse.**"), item[:120])
+        self.assertIn("program's parse_status is `ok`", item)
+        self.assertIn("on an index built before the batch `partial_kind` / `is_truly_partial` read the\n   resolver's wording "
+                      "in the 'expand' notes, on one built by it the program is `ok` with the row\n   alone", item)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
