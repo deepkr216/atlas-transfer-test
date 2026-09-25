@@ -1351,6 +1351,18 @@ def _exists_as_other_kind(conn: sqlite3.Connection, name: str) -> str:
     if not accepted and not other:
         return ""
     stub = f" {_cap(recover.stub_note_of(conn, name))}." if recover.stubs_named(conn, name) else ""
+    if other and not accepted and not conn.execute("SELECT 1 FROM copy_use WHERE UPPER(copybook)=? LIMIT 1",
+                                                   (name.upper(),)).fetchone():
+        # no program copies the name - a date or a sort card the jobs read, one system's card a stub (LESSONS 206):
+        # nothing is parsed in part for it, and renaming the folder or declaring its kind copybook would file a card
+        # as a copybook, which no card lookup reads - what it is, and the jobs naming a card member of it
+        where = "; ".join(f"filed as {k} (folder {f})" for _i, k, f, _p in other[:4]) + (" ..." if len(other) > 4 else "")
+        jobs = recover.card_jobs(conn, name)
+        cards = (f" The DDs of job{'s' if len(jobs) != 1 else ''} {', '.join(jobs[:8])}"
+                 + (f", +{len(jobs) - 8} more" if len(jobs) > 8 else "")
+                 + f" name a card member {name.upper()}: `job NAME` shows the cards each one read." if jobs else "")
+        return (f" as a copybook - no program copies it; a member with this name exists, {where}: nothing is parsed in "
+                "part for it, so there is no folder to rename and no kind to declare." + cards + stub)
     if accepted:                                                        # sql: the resolver expands it, this report does not read it
         where = "; ".join(f"filed as {k} (folder {f})" for _i, k, f, _p in accepted[:4]) + (" ..." if len(accepted) > 4 else "")
         return (f" as a copybook - a member with this name exists, {where}: a kind the build expands, but not one this "
@@ -2047,7 +2059,8 @@ def _choices_checked(conn: sqlite3.Connection) -> str:
     # undated listing is never counted as a current one
     return (f"\n{a} of these choices {'is' if a == 1 else 'are'} confirmed by the program's listing, "
             f"{recover.contradicted_words(checks)} (see work/recover.md), {o} named by an older listing, {h} name a "
-            f"library the index does not hold, {u} unknown - the listing names the library the compiler read the copybook "
+            f"library the index does not hold{recover.stub_named_words(recover.stub_named(checks))}, {u} unknown - the "
+            "listing names the library the compiler read the copybook "
             "from; a name is not a fact "
             "about content, so the listing's copy is compared by text with the copy used before a choice is called wrong.\n")
 
@@ -2100,6 +2113,11 @@ def _listing_says(conn: sqlite3.Connection, member_id: int) -> str:
                      "differs from the copy used)")
         elif v["verdict"] == "NOT HELD":
             line += f" - names {v['named']}, a library the index does not hold - the copy the build used stands"
+        elif v["verdict"] == recover.STUB_NAMED:
+            # the library is held, its member of the name only a stub (ROADMAP re-parse item 23, LESSONS 206)
+            line += (f" - names {v['named']}, which holds only a stub of {cb}: the program was compiled against the text "
+                     f"the listing prints, which the index does not hold - the copy the build used ({v['used_dataset']}) "
+                     "may differ from it")
         out.append(line + "\n")
     return "".join(out)
 

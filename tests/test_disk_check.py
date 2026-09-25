@@ -550,16 +550,34 @@ class TheHelpers(unittest.TestCase):
         self.assertEqual(recover.stub_lines("1234567\n"), 1)
         self.assertEqual(recover.stub_lines("1234567"), 1)          # no line end at all
         self.assertEqual(recover.stub_lines("1234567\n7654321\n\n"), 2)
-        self.assertEqual(recover.stub_lines("      *\n"), 1)         # the indicator alone is still within column 7
+        # a comment mark alone in column 7 is a comment line, not the number of ROADMAP re-parse item 23 (LESSONS 206)
+        self.assertEqual(recover.stub_lines("      *\n"), 0)
+        self.assertEqual(recover.stub_lines("000100*\n1234567\n"), 0)
         self.assertEqual(recover.stub_lines("12345678\n"), 0)        # column 8 is code
         self.assertEqual(recover.stub_lines("1234567\n       05 X PIC X.\n"), 0)
         self.assertEqual(recover.stub_lines("      * A COMMENT\n"), 0)
         self.assertEqual(recover.stub_lines(""), 0)
         self.assertEqual(recover.stub_lines("\n\n   \n"), 0)
-        self.assertEqual(recover.stub_lines("\t1\n"), 1)             # a tab is four blanks to the reader
+        self.assertEqual(recover.stub_lines("\t  1\n"), 1)           # a tab is four blanks to the reader: the 1 in column 7
+        self.assertEqual(recover.stub_lines("1234567\n000200\n"), 2)  # a number in column 7 beside a sequence number alone
+        # only a sequence number, in columns 1-6: a blank line to the compiler - never the columns-1-7 sentence, which
+        # points at ROADMAP re-parse item 23 (LESSONS 206); sequence_lines counts it
+        for text, n in (("123456\n", 1), ("000100\n000200\n000300\n", 3), ("\t1\n", 1), (" " * 72 + "00010000\n", 1),
+                        ("000100".ljust(72) + "00010000\n", 1)):
+            self.assertEqual((recover.stub_lines(text), recover.sequence_lines(text)), (0, n), text)
+        for text in ("1234567\n", "000100* RETIRED\n000200\n", "      *\n", "", "\n\n", "000100\n       05 X PIC X.\n"):
+            self.assertEqual(recover.sequence_lines(text), 0, text)
         self.assertEqual(recover.stub_sentence(3), "the file holds 3 line(s) whose text sits in columns 1-7 - the sequence area "
                                                     "and the indicator column of fixed-format COBOL - so the reader sees no "
                                                     f"code ({ITEM})")
+        self.assertEqual(recover.sequence_sentence(1), "the file holds only sequence numbers (1 line: text in columns 1-6 or "
+                                                       "73-80 alone) - blank lines to the compiler, so no code: nothing a "
+                                                       "program could copy")
+        self.assertIn("(3 lines: text", recover.sequence_sentence(3))
+        self.assertEqual(recover.empty_sentence(0, 0, 0, "none"), "none")
+        self.assertEqual(recover.empty_sentence(2, 2, 0, "none"), recover.stub_sentence(2))
+        self.assertEqual(recover.empty_sentence(0, 1, 0, "none"), recover.numbers_sentence(1))
+        self.assertEqual(recover.empty_sentence(0, 0, 3, "none"), recover.sequence_sentence(3))
 
     def test_near_names_order_and_cap(self):
         stems = sorted(["BOOKB-V2", "BOOKBX", "BOOKA", "BOOKC", "BOOK", "B", "ZZZ", "BOOKB.CPY"])

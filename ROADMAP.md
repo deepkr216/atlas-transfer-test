@@ -477,7 +477,9 @@ shipped alone and cost one such night; these still wait for the next one:
    columns) - is filed `stub` (`build.STUB_KIND`). The sequence area (1-6) and the identification area (73-80) are
    the compiler's to ignore: a sequence number alone in columns 1-6 or 73-80 is a blank line, so a retired
    copybook of comments and ISPF-numbered blank lines (NUM ON STD or NUM ON COBOL) stays `empty`, as before the
-   item, and a 7- or 8-digit stub stays a stub with or without such numbers (LESSONS 205). The resolver never
+   item, and a 7- or 8-digit stub stays a stub with or without such numbers (LESSONS 205). In fixed format a comment
+   is '*' or '/' in column 7, as the reader has it: `*0000100` leaves digits in columns 7-8, which the reader reads
+   as code, so it is a stub, never a copybook `ok` expanded into its program (LESSONS 206). The resolver never
    expands a stub: a real copy of the name in any library comes first (also for a `COPY ... OF` naming the stub's
    library), and with none the program keeps its own lines, is `partial`, and carries in place of NOT FOUND the
    note 'COPY X: the member in LIBRARY holds only numbers (N lines) - a stub, not the copybook's text; the program
@@ -491,17 +493,28 @@ shipped alone and cost one such night; these still wait for the next one:
    text' with its own 'next:', and the same run writes the copybook from the listings of the programs copying it;
    coverage's 'Copybooks not found' table, its partial-members note, `copybook NAME` and `program NAME` say 'a
    stub' in the same words, fitted to the programs copying the name - several ('the programs were compiled against
-   another copy'), or none ('a stub; no program copies it', with the jobs whose DDs name a card member of the
-   name). A stub is neither arrived nor misfiled: `recover.members_named` leaves it out, so nothing re-files,
-   renames or declares it. On an index built before the item the 7-digit stub is still `empty` and the stand-ins
+   another copy'), one ('the program copying it', recover's disk check too), or none ('a stub; no program copies
+   it', with the jobs whose DDs name a card member of the name). `copybook NAME` of a name no program copies - a
+   card, one system's a stub, another's a card member filed ctlcard - says no program copies it, what each member
+   is and the jobs naming a card member of it, never 'rename the folder' or 'declare the library's kind', which
+   would file a card as a copybook no card lookup reads (LESSONS 206). A stub is neither arrived nor misfiled:
+   `recover.members_named` leaves it out, so nothing re-files, renames or declares it. The listing check gives a
+   listing naming a library whose member of the name is only a stub its own verdict, STUB (counted beside the five:
+   'N name a library holding only a stub of the copybook'): the program was compiled against the text the listing
+   prints, which the index does not hold, and the copy the build used may differ from it - never 'a library the
+   index does not hold'. On an index built before the item the 7-digit stub is still `empty` and the stand-ins
    say where its text sits, as before; a member filed `empty` whose file holds a number with a sequence number
-   beside it says 'the file holds only numbers', and one whose file holds none says it holds only comments and
-   blank lines, with its own 'what to do'. The first build of this toolkit re-parses every member and files a
-   stub `stub`. tests/test_stub_copybooks.py (TheReader, SevenAndEightDigits, ARealCopyBeatsTheStub,
-   AStubArrivesChangesAndGoes, TheListingHoldsTheText, CardsHoldingOnlyNumbers, TheReproduction,
-   AnIndexBuiltBeforeTheItem, TheDocsSayIt, NumberedBlankLines, CardsOfTheirOwnDepartment, TheWordsFitTheCopiers),
-   tests/test_disk_check.py (TheStubFiledEmpty, TheNumberedStubFiledEmpty and CoverageAndCopybookCarryTheVerdicts
-   on an aged index), LESSONS 192, 204, 205.
+   beside it says 'the file holds only numbers', one whose lines hold sequence numbers alone says 'the file holds
+   only sequence numbers' - blank lines to the compiler, on either index, never the columns-1-7 sentence
+   (`recover.sequence_lines`; `recover.stub_lines` wants a digit in column 7) - and one whose file holds neither
+   says it holds only comments and blank lines, with its own 'what to do'. The first build of this toolkit
+   re-parses every member and files a stub `stub`. tests/test_stub_copybooks.py (TheReader, SevenAndEightDigits,
+   ARealCopyBeatsTheStub, AStubArrivesChangesAndGoes, TheListingHoldsTheText, CardsHoldingOnlyNumbers,
+   TheReproduction, AnIndexBuiltBeforeTheItem, TheDocsSayIt, NumberedBlankLines, CardsOfTheirOwnDepartment,
+   TheWordsFitTheCopiers, SequenceNumbersAlone, AStarInTheSequenceArea, TheListingNamesTheStubsLibrary,
+   ACardNoProgramCopies, FlowNamesTheCopybook), tests/test_disk_check.py (TheStubFiledEmpty,
+   TheNumberedStubFiledEmpty and CoverageAndCopybookCarryTheVerdicts on an aged index, TheHelpers), LESSONS 192,
+   204, 205, 206.
 24. **Two facts an incremental build keeps after their source is gone: the list of dataset names keeps a name no DD
    names any more, and a DD keeps the direction an OPEN verb gave it after the program stops opening the file.**
    The build adds a row to `dataset` for every

@@ -72,6 +72,9 @@ END_SCREEN = "screen field - a human sees it"
 END_MQ = "MQ PUT to {q} (peer from manifest)"
 END_ODO = "offset is a maximum (ODO)"
 END_MISSING = "field not declared in this program (missing copybook {x})"
+# the copybook's name in a program's 'expand' note: 'COPY X NOT FOUND ...' or, for a stub, 'COPY X: the member in ...'
+# (ROADMAP re-parse item 23) - the colon is the note's, never the name's (LESSONS 206)
+_MISSING_COPY = re.compile(r"COPY\s+([^\s:]+)")
 END_AMBIGUOUS = "ambiguous name - HUMAN MUST VERIFY"
 END_HOPS = "hop limit {n}"
 END_WIDTH = "width cap"
@@ -1494,7 +1497,7 @@ class _Walker(_Report):
         """The COPY a callee's parameter would have come from (END_MISSING)."""
         miss = self.conn.execute("""SELECT detail FROM unresolved WHERE member_id=? AND kind IN ('expand','missing_copybook')
                                     LIMIT 1""", (callee["member_id"],)).fetchone()
-        m = re.search(r"COPY\s+(\S+)", miss["detail"]) if miss else None
+        m = _MISSING_COPY.search(miss["detail"]) if miss else None
         return m.group(1) if m else "?"
 
     def address_of_edges(self, node: _Node, a, callee, ppf, cites: str, callname: str) -> List[_Edge]:
@@ -3379,7 +3382,7 @@ def _resolve_starts(conn: sqlite3.Connection, name: str, program: Optional[str])
                                    WHERE p.id IN ({}) AND u.kind IN ('expand','missing_copybook')""".format(",".join("?" * len(pids))),
                                 tuple(pids)).fetchall() if pids else []
             if miss:
-                x = re.search(r"COPY\s+(\S+)", miss[0]["detail"])
+                x = _MISSING_COPY.search(miss[0]["detail"])
                 problems.append(f"{base}: {END_MISSING.format(x=x.group(1) if x else '?')} in {pname}")
             else:
                 pruned = conn.execute(f"""SELECT 1 FROM field f JOIN member m ON m.id=f.member_id

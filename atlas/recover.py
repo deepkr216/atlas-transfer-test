@@ -61,9 +61,11 @@ Every missing name is also looked for ON DISK before any listing is read -
 the estate root walked once - and the report's first table says per name
 what the disk holds: a file with that name that is not in the index (arrived
 after the last build: build again; or there at the last build and skipped:
-atlas-problems.txt), a member the build filed 'empty' because its text sits
-in columns 1-7 (a bare number: the sequence area and the indicator column,
-where the reader sees no code - ROADMAP re-parse item 23), the nearest
+atlas-problems.txt), a member the build filed 'empty' (comments and blank
+lines - a sequence number alone is a blank line - or, on an index built
+before ROADMAP re-parse item 23, a bare number in columns 1-7, the
+sequence area and the indicator column, where that reader saw no code), a
+member filed `stub` (only numbers where the compiler reads), the nearest
 names in the copybook folders when no file carries the name (an extension
 or a suffix in the stem, another spelling), or nothing near (fetch the
 library, or it is gone from the host). The misfiled scan reads the index
@@ -133,7 +135,7 @@ import sqlite3
 import sys
 import time
 from collections import Counter, defaultdict
-from typing import AbstractSet, Dict, List, Optional, Sequence, Set, Tuple
+from typing import AbstractSet, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from . import classify, copybook, expand, reader
 
@@ -1329,6 +1331,17 @@ NOT_IN_INDEX_TO_DATE = "the program itself is not in the index to date the listi
 NOT_HELD_WHY = ("the build could only choose among the copies it has: the copy it used stands; the listing names the "
                 "library the program was compiled against (a staging library, or one gone from the host) - if it still "
                 "exists and matters, the fetch list names it")
+# the listing names a library the index holds whose member of the name is only a stub (numbers - ROADMAP re-parse item
+# 23): not 'a library the index does not hold' - the program was compiled against a text that library no longer holds,
+# and the listing prints it (LESSONS 206)
+STUB_NAMED = "STUB"
+
+
+def stub_named_why(when: str, dsn: str, copybook: str) -> str:
+    """The why of a STUB verdict: `when` 'a current', 'an older' or 'the'."""
+    return (f"{when} listing names {dsn}, whose {copybook} is only a stub (numbers, not the copybook's text): the program "
+            "was compiled against the text the listing prints, which the index does not hold, and the copy the build used "
+            "may differ from it - compare the listing's copied lines with the copy used")
 
 
 def _dating(rows: Sequence[CopySource]) -> Tuple[Optional[bool], Optional[int]]:
@@ -1364,6 +1377,10 @@ def check_choices(conn: sqlite3.Connection, sources: Optional[Dict[str, List[Cop
     NOT HELD - the listing names a dataset the index does not hold at all,
       or holds without that member: the build could only choose among the
       copies it has, and the copy it used stands;
+    STUB - the listing names a dataset the index holds whose member of the
+      name is only a stub (ROADMAP re-parse item 23): the program was
+      compiled against a text the index does not hold, which the listing
+      prints; the copy used may differ from it (LESSONS 206);
     OLDER - the index holds the listing's copy, the texts differ, and the
       listing is an older compile's (its source is not the program as
       indexed): the program may use another copy now - not a wrong fact;
@@ -1396,6 +1413,7 @@ def check_choices(conn: sqlite3.Connection, sources: Optional[Dict[str, List[Cop
     except sqlite3.OperationalError:
         indexed = set()
     copies: Dict[str, List[Tuple[str, Optional[str]]]] = {}           # copybook -> [(path, norm_sha)] the index holds
+    stubs: Dict[str, List[str]] = {}                                    # copybook -> [path] of its stubs
 
     def copies_of(name: str) -> List[Tuple[str, Optional[str]]]:
         if name not in copies:
@@ -1403,6 +1421,12 @@ def check_choices(conn: sqlite3.Connection, sources: Optional[Dict[str, List[Cop
                 f"SELECT path, norm_sha FROM member WHERE UPPER(name) = ? AND kind IN ({','.join('?' * len(RESOLVER_KINDS))}) "
                 "ORDER BY id", (name, *RESOLVER_KINDS))]
         return copies[name]
+
+    def stubs_of(name: str) -> List[str]:
+        if name not in stubs:
+            stubs[name] = [str(p) for (p,) in conn.execute(
+                "SELECT path FROM member WHERE UPPER(name) = ? AND kind = ? ORDER BY id", (name, STUB_KIND))]
+        return stubs[name]
 
     out: List[Dict[str, object]] = []
     for program, copybook, used, how, mid, system in chosen_picks(conn):
@@ -1468,9 +1492,12 @@ def check_choices(conn: sqlite3.Connection, sources: Optional[Dict[str, List[Cop
             for d in [d for d in said if d != used_dsn]:
                 at = [(p, s) for p, s in held if dataset_of(p, libs) == d]
                 dating = _dating([r for r in rows if r[2] == d])
+                stub_at = [p for p in stubs_of(copybook) if dataset_of(p, libs) == d]
                 if at:
                     same = [p for p, s in at if s is not None and s == used_sha]
                     findings.append(("same", d, same[0], dating) if same else ("differs", d, at[0][0], dating))
+                elif stub_at:
+                    findings.append(("stub", d, stub_at[0], dating))
                 elif d in holders:
                     findings.append(("no member", d, holders[d], dating))
                 else:
@@ -1479,7 +1506,7 @@ def check_choices(conn: sqlite3.Connection, sources: Optional[Dict[str, List[Cop
             # then a different text before a same text before a library not held - the resolver's order - and an
             # undated listing before an older one
             ranked = [f for f in findings if f[3][0] is True] or findings
-            rank = {"differs": 0, "same": 1, "no member": 2, "not held": 2}
+            rank = {"differs": 0, "same": 1, "stub": 2, "no member": 3, "not held": 3}
             ranked = sorted(ranked, key=lambda f: (rank[f[0]], {True: 0, None: 1, False: 2}[f[3][0]]))
             what, d, p, (cur, matched) = ranked[0]
             if what == "differs":
@@ -1498,6 +1525,10 @@ def check_choices(conn: sqlite3.Connection, sources: Optional[Dict[str, List[Cop
             elif what == "same":
                 v.update(verdict="CONFIRMED", why=f"same text as the copy the listing names in {d} - promoted",
                          index_has=f"the index holds that copy at {_tail(str(p))}", current=cur, matched=matched, named=d)
+            elif what == "stub":
+                when = "a current" if cur is True else "an older" if cur is False else "the"
+                v.update(verdict=STUB_NAMED, why=stub_named_why(when, d, copybook), current=cur, matched=matched, named=d,
+                         index_has=f"the index holds that library ({_tail(str(p))}) with only a stub of {copybook}")
             else:
                 have = (f"the index holds that library ({_tail(str(p))}) but no {copybook} in it" if what == "no member"
                         else "not a library the index holds")
@@ -1588,9 +1619,23 @@ def contradicted_lines(checks: Sequence[Dict[str, object]], dry_run: bool, toolk
 
 
 def choice_counts(checks: Sequence[Dict[str, object]]) -> Tuple[int, int, int, int, int]:
-    """(confirmed, contradicted, older, not held, unknown) - the VERDICTS order."""
+    """(confirmed, contradicted, older, not held, unknown) - the VERDICTS order.
+    A choice whose listing names a library holding only a stub (STUB) is in
+    none of them: stub_named() counts it."""
     c = Counter(str(v["verdict"]) for v in checks)
     return c["CONFIRMED"], c["CONTRADICTED"], c["OLDER"], c["NOT HELD"], c["UNKNOWN"]
+
+
+def stub_named(checks: Sequence[Dict[str, object]]) -> int:
+    """The choices whose listing names a library holding only a stub of the
+    copybook (the STUB verdict) - said beside the five counts when there is
+    one (LESSONS 206)."""
+    return sum(1 for v in checks if v["verdict"] == STUB_NAMED)
+
+
+def stub_named_words(n: int) -> str:
+    """', N name a library holding only a stub of the copybook' - '' for 0."""
+    return f", {n} name a library holding only a stub of the copybook" if n else ""
 
 
 def contradicted_split(checks: Sequence[Dict[str, object]]) -> Tuple[int, int]:
@@ -1616,7 +1661,7 @@ def choice_words(checks: Sequence[Dict[str, object]]) -> str:
     (the contradicted ones in their two parts: contradicted_words)."""
     a, _b, o, h, u = choice_counts(checks)
     return (f"{a} confirmed, {contradicted_words(checks)}, {o} named by an older listing, {h} name a library "
-            f"the index does not hold, {u} unknown")
+            f"the index does not hold{stub_named_words(stub_named(checks))}, {u} unknown")
 
 
 def choice_line(checks: Sequence[Dict[str, object]]) -> str:
@@ -1649,7 +1694,10 @@ def choice_report(checks: Sequence[Dict[str, object]], root: Optional[str]) -> L
              "build (an index this toolkit built) or the next build re-parses every member anyway (the toolkit changed "
              "since), and `program NAME` shows the listing's library under its notes. A choice contradicted by a "
              "listing not yet dated is not marked: the build follows a current listing only. "
-             f"{LISTING_RULE}\n\n"
+             + ("A listing naming a library whose member of the copybook's name is only a stub (numbers, ROADMAP re-parse "
+                "item 23) says the program was compiled against a text the index does not hold - the listing prints it, and "
+                "the copy used may differ from it. " if stub_named(checks) else "")
+             + f"{LISTING_RULE}\n\n"
              f"- {len(checks)} choice{'s' if len(checks) != 1 else ''} checked: {choice_words(checks)}"
              + ("" if not whys else " (" + "; ".join(f"{n}: {w}" for w, n in sorted(whys.items(), key=lambda kv: (-kv[1], kv[0])))
                                            + ")") + "\n"]
@@ -1669,7 +1717,8 @@ def choice_report(checks: Sequence[Dict[str, object]], root: Optional[str]) -> L
                      f"dated - {UNDATED_NEXT}\n")
     if not held:
         lines.append("\n_no choice contradicted by a current listing_\n")
-    order = {"CONTRADICTED": 0, "OLDER": 1, "NOT HELD": 2, "CONFIRMED": 3}   # a confirmed choice is shown only when promoted
+    # a confirmed choice is shown only when promoted
+    order = {"CONTRADICTED": 0, "OLDER": 1, STUB_NAMED: 2, "NOT HELD": 3, "CONFIRMED": 4}
     shown = [v for v in checks if v["verdict"] in order and (v["verdict"] != "CONFIRMED" or v["why"])]
     if not shown:
         return lines
@@ -2233,27 +2282,89 @@ EMPTY_WHY_NOT = "it has no code lines (comments and blanks only): nothing a prog
 
 def stub_lines(text: str, data: bytes = b"", enc: str = "utf-8") -> int:
     """How many non-blank lines the text has when EVERY one of them keeps its
-    text within columns 1-7 - the sequence area and the indicator column of
-    fixed-format COBOL, which the reader never reads as code: `1234567` in
-    column 1 gives build.code_line_count 0 and the build files the member
-    'empty'. 0 when the text has no line or any non-blank line reaches
-    column 8 (a member of comments only: the old sentence stands). Records
+    text within columns 1-7 and a digit stands in column 7 - the indicator
+    column of fixed-format COBOL - on one at least: `1234567` in column 1,
+    which the reader of an index built before ROADMAP re-parse item 23 took
+    for the sequence area and the indicator (build.code_line_count 0, the
+    member filed 'empty'; the build of the item files it `stub`). 0 when the
+    text has no line, a non-blank line reaches column 8 (a member of
+    comments only: the old sentence stands), a column 7 holds anything but a
+    digit (a comment mark: a comment line), or no line reaches column 7 - a
+    line with nothing but a sequence number in columns 1-6 is a blank line
+    to the compiler, which sequence_lines() counts (LESSONS 206). Records
     split as the reader splits them, tabs widened as it widens them."""
     n = 0
+    digit = False
     for rec in reader._split_records(text, data, enc):
-        rec = rec.replace("\t", "    ")
+        rec = rec.replace("\t", "    ").translate(reader._STUB_BLANKS)
         if not rec.strip():
             continue
         if rec[7:].strip():
+            return 0
+        mark = rec[6:7].strip()
+        if mark:
+            if mark not in "0123456789":
+                return 0
+            digit = True
+        n += 1
+    return n if digit else 0
+
+
+def sequence_lines(text: str, data: bytes = b"", enc: str = "utf-8") -> int:
+    """How many non-blank lines the text has when EVERY one of them holds
+    nothing where the compiler reads - text in the sequence area (columns
+    1-6) or the identification area (73-80) alone: ISPF numbering on blank
+    lines (NUM ON COBOL, NUM ON STD), `123456`. Blank lines to the compiler:
+    every build files such a member 'empty' (reader.stub_count gives 0), and
+    its sentence is sequence_sentence(), never the columns-1-7 one, which
+    points at ROADMAP re-parse item 23 (LESSONS 206). 0 when the text has no
+    line, or any line holds something in columns 7-72, a comment mark
+    included. The columns are the reader's: fixed format as
+    reader.looks_fixed_format decides (free format has no sequence area: 0),
+    the code area ending where reader.detect_code_end finds a shifted
+    stamp."""
+    records = reader._split_records(text, data, enc)
+    if not reader.looks_fixed_format(records):
+        return 0
+    end = reader.detect_code_end(records)
+    n = 0
+    for rec in records:
+        rec = rec.replace("\t", "    ").translate(reader._STUB_BLANKS)
+        if not rec.strip():
+            continue
+        if rec[6:end].strip():
             return 0
         n += 1
     return n
 
 
 def stub_sentence(n: int) -> str:
-    """The sentence for a member whose every non-blank line sits in columns 1-7."""
+    """The sentence for a member whose every non-blank line sits in columns
+    1-7 with a digit in column 7 (stub_lines)."""
     return (f"the file holds {n} line(s) whose text sits in columns 1-7 - the sequence area and the indicator column of "
             f"fixed-format COBOL - so the reader sees no code ({STUB_ITEM})")
+
+
+def sequence_sentence(n: int) -> str:
+    """The sentence for a member whose every non-blank line holds a sequence
+    number alone (sequence_lines): blank lines to the compiler."""
+    return (f"the file holds only sequence numbers ({n} line{'' if n == 1 else 's'}: text in columns 1-6 or 73-80 "
+            "alone) - blank lines to the compiler, so no code: nothing a program could copy")
+
+
+def empty_sentence(stub: int, numbers: int, seq: int, none: str) -> str:
+    """What the file of a member filed 'empty' holds, in words: a number in
+    columns 1-7 (stub_lines - an index built before ROADMAP re-parse item
+    23), a number where the compiler reads beside a sequence number or a
+    comment (numbers_sentence), sequence numbers alone (sequence_sentence:
+    blank lines), else `none` - comments and blank lines."""
+    if stub:
+        return stub_sentence(stub)
+    if numbers:
+        return numbers_sentence(numbers)
+    if seq:
+        return sequence_sentence(seq)
+    return none
 
 
 def numbers_sentence(n: int) -> str:
@@ -2475,11 +2586,13 @@ def how_classified(path: str, stored_kind: Optional[str] = None, stored_sha: Opt
                 whole = text
         n = stub_lines(whole, data, enc)
         # a number where the compiler reads with a sequence number or a comment beside it reaches past column 7:
-        # stub_lines gives 0, and the sentence says the numbers (LESSONS 205)
+        # stub_lines gives 0, and the sentence says the numbers (LESSONS 205); sequence numbers alone are blank lines,
+        # said as such - never the columns-1-7 sentence (LESSONS 206)
         numbers = 0 if n or kind not in RESOLVER_KINDS else reader.stub_count(whole, data, enc)
-        out.update(kind="empty", by="content", stub=n, numbers=numbers,
+        seq = 0 if n or numbers else sequence_lines(whole, data, enc)
+        out.update(kind="empty", by="content", stub=n, numbers=numbers, seq=seq,
                    seen=f"the classifier read it as {kind} ({reason}) and the build filed it empty: "
-                        + (stub_sentence(n) if n else numbers_sentence(numbers) if numbers else EMPTY_SEEN))
+                        + empty_sentence(n, numbers, seq, EMPTY_SEEN))
     elif stored_kind and kind != stored_kind and files_as == stored_kind:
         # the build's step AFTER the classifier decided: the kind declared for the library (classify.declared_wins),
         # known from the kinds the index was built with - a build files it the same again
@@ -2591,10 +2704,11 @@ def refile_verdict(r: Dict[str, object], folder: str) -> Tuple[bool, str]:
     if kind == STUB_KIND:
         return False, f"{stub_what(int(r.get('stub') or 0))} - {STUB_TODO}"   # type: ignore[arg-type]
     if kind == "empty":
-        # the reader would expand nothing: comments and blanks only - or text in columns 1-7 alone, said as such
+        # the reader would expand nothing: comments and blanks only - or a number, or sequence numbers alone, said as such
         n = int(r.get("stub") or 0)                                 # type: ignore[arg-type]
         numbers = int(r.get("numbers") or 0)                        # type: ignore[arg-type]
-        return False, stub_sentence(n) if n else numbers_sentence(numbers) if numbers else EMPTY_WHY_NOT
+        seq = int(r.get("seq") or 0)                                # type: ignore[arg-type]
+        return False, empty_sentence(n, numbers, seq, EMPTY_WHY_NOT)
     if kind not in WEAK_KINDS and not _signature_only_in_comments(kind, text):
         return False, (f"its text carries a {kind} signature ({r['reason']}): not a COBOL copybook - the copybook the "
                        "programs copy is another member, still to fetch")
@@ -3123,10 +3237,12 @@ def file_reading(path: str) -> Dict[str, object]:
     (build._inventory_one), `code_lines` for a copybook / cobol kind
     (build.code_line_count), `stub` for an empty one or a stub - the lines
     within columns 1-7 by which an index built before the item filed it
-    'empty' (stub_lines) - and `what`, the sentence for the report's 'what
-    the file is' cell. Reads the first DISK_READ_BYTES."""
+    'empty' (stub_lines) - `seq` for an empty one whose lines hold sequence
+    numbers alone (sequence_lines: blank lines to the compiler) and `what`,
+    the sentence for the report's 'what the file is' cell. Reads the first
+    DISK_READ_BYTES."""
     from . import build as _build
-    out: Dict[str, object] = {"kind": "?", "reason": "", "code_lines": None, "stub": 0, "numbers": 0, "what": ""}
+    out: Dict[str, object] = {"kind": "?", "reason": "", "code_lines": None, "stub": 0, "numbers": 0, "seq": 0, "what": ""}
     try:
         size = os.path.getsize(path)
         with open(path, "rb") as fh:
@@ -3154,9 +3270,10 @@ def file_reading(path: str) -> Dict[str, object]:
         out["code_lines"] = n
         if n == 0:
             stub = stub_lines(text, data, enc)
-            out["stub"] = stub
+            seq = 0 if stub else sequence_lines(text, data, enc)
+            out.update(stub=stub, seq=seq)
             kind = "empty"
-            what = ("the build files it empty: " + (stub_sentence(stub) if stub else "no code lines (comments and blanks only)"))
+            what = "the build files it empty: " + empty_sentence(stub, 0, seq, "no code lines (comments and blanks only)")
         else:
             what = f"{kind} ({reason}), {n:,} code line(s)" + (f" in the first {DISK_READ_BYTES // 1024 // 1024} MB"
                                                                if size > DISK_READ_BYTES else "")
@@ -3242,7 +3359,9 @@ def disk_check(missing: "Sequence[str] | Dict[str, int]", root: str, conn: sqlit
             continue
         paths = files.get(name, [])
         if paths:
-            out[name] = _found_verdict(name, paths, indexed, started, root)
+            # the programs copying it, counted only for a stub's 'what to do' (one, several: LESSONS 206)
+            out[name] = _found_verdict(name, paths, indexed, started, root,
+                                       programs=lambda n=name: len(stub_copiers(conn, n)))
             continue
         near = near_names(name, copy_stems, files, root)
         if near:
@@ -3257,10 +3376,18 @@ def disk_check(missing: "Sequence[str] | Dict[str, int]", root: str, conn: sqlit
     return out
 
 
-def _found_verdict(name: str, paths: Sequence[str], indexed: Dict[str, str], started: Optional[float], root: str
-                   ) -> Dict[str, object]:
+def _found_verdict(name: str, paths: Sequence[str], indexed: Dict[str, str], started: Optional[float], root: str,
+                   programs: Optional[Callable[[], int]] = None) -> Dict[str, object]:
     """The verdict for a name a file carries: a copy the index holds first
-    (the misfiled section says the rest), else the one dated latest."""
+    (the misfiled section says the rest), else the one dated latest.
+    `programs`: how many programs copy the name, asked only for a stub - its
+    'what to do' speaks of one or several (stub_todo); STUB_TODO without it,
+    or when no program is found (a name the disk check looks for is one
+    something copies: a copybook's nested COPY is never 'no program')."""
+
+    def todo_of_stub() -> str:
+        n = programs() if programs is not None else 0
+        return stub_todo(n) if n else STUB_TODO
     in_index = [(p, indexed[os.path.normcase(os.path.abspath(p))]) for p in paths
                 if os.path.normcase(os.path.abspath(p)) in indexed]
     rels = [_rel(p, root) for p in paths]
@@ -3278,20 +3405,16 @@ def _found_verdict(name: str, paths: Sequence[str], indexed: Dict[str, str], sta
             return {"status": "stub", "path": _rel(path, root), "paths": rels, "kind": kind,
                     "what": stub_what(int(reading["numbers"] or 0) or None),          # type: ignore[arg-type]
                     "near": [], "dated": file_dated(path),
-                    "on_disk": f"yes: {_rel(path, root)} - in the index as a stub{more(path)}", "todo": STUB_TODO}
+                    "on_disk": f"yes: {_rel(path, root)} - in the index as a stub{more(path)}", "todo": todo_of_stub()}
         numbers = 0
         todo = EMPTY_TODO
         if kind == "empty":
             # the file on disk read as a stub (numbers where the compiler reads): an index built before ROADMAP re-parse
-            # item 23, and EMPTY_TODO's 'open the file' stands; else comments and blank lines only (LESSONS 205)
-            stub = int(reading["stub"] or 0)                        # type: ignore[arg-type]
+            # item 23, and EMPTY_TODO's 'open the file' stands; else comments and blank lines only (LESSONS 205) - a
+            # line with a sequence number alone among them, said as such, never the columns-1-7 sentence (LESSONS 206)
             numbers = int(reading["numbers"] or 0)                  # type: ignore[arg-type]
-            if stub:
-                what = stub_sentence(stub)
-            elif numbers:
-                what = numbers_sentence(numbers)     # a number with a sequence number or a comment beside it
-            else:
-                what = "no code lines (comments and blanks only): nothing a program could copy"
+            what = empty_sentence(int(reading["stub"] or 0), numbers, int(reading.get("seq") or 0),   # type: ignore[arg-type]
+                                  "no code lines (comments and blanks only): nothing a program could copy")
             todo = EMPTY_TODO if numbers else EMPTY_BLANK_TODO
         return {"status": "indexed", "path": _rel(path, root), "paths": rels, "kind": kind, "what": what,
                 "near": [], "dated": file_dated(path), "numbers": numbers,
@@ -3302,7 +3425,7 @@ def _found_verdict(name: str, paths: Sequence[str], indexed: Dict[str, str], sta
     kind = str(reading["kind"])
     late = started is not None and when > started
     on_disk = f"yes: {_rel(path, root)} - not in the index{more(path)}"
-    stub = f"; it holds only numbers - a stub, {STUB_TODO}" if kind == STUB_KIND else ""
+    stub = f"; it holds only numbers - a stub, {todo_of_stub()}" if kind == STUB_KIND else ""
     if late:
         todo = (f"arrived after the last build (file dated {_stamp(when)}, last build started {_stamp(started)}): run your "
                 f"usual build command{stub}")
@@ -3390,8 +3513,10 @@ def disk_report(checked: Dict[str, Dict[str, object]], missing: Dict[str, int], 
              "is the copybook's name, then as a near name in the copybook folders. A file on disk that is not in the index "
              "either arrived after the last build started (run your usual build command) or was there and the build did "
              "not index it (atlas-problems.txt and the coverage report's 'failed' table say why a file was skipped). A "
-             "member the build filed 'empty' holds no code the reader sees: when its text sits in columns 1-7 - the "
-             f"sequence area and the indicator column of fixed-format COBOL - the table says so ({STUB_ITEM})."
+             "member the build filed 'empty' holds no code the reader sees: comments and blank lines (a line with "
+             "nothing but a sequence number in columns 1-6 or 73-80 is a blank one to the compiler, and the table says "
+             f"so) - or, on an index built before {STUB_ITEM}, a number the reader of that build saw no code in (in "
+             "columns 1-7, the sequence area and the indicator column of fixed-format COBOL), which the table says too."
              + (" A member the build filed `stub` holds only numbers where the compiler reads (columns 7-72) - not the "
                 "copybook's text, which no compiler could compile: the programs copying it were compiled against another "
                 "copy, and the build never expands a stub. A sequence number alone in columns 1-6 or 73-80 is a blank "

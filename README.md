@@ -548,7 +548,10 @@ copybook from the programs' listings. A sequence number alone in columns
 numbered blank lines stays `empty`; a job reads a card holding only
 numbers as it did before (on an index built before the batch a 7-digit
 stub is still filed `empty`, and the report says its text sits in columns
-1-7).
+1-7). A member whose lines hold sequence numbers alone reads 'the file
+holds only sequence numbers' - blank lines to the compiler - on any index,
+and `copybook` of a name no program copies (a card, one system's a stub)
+says so and names the jobs, with no folder to rename.
 A member typed by the kind declared for its library in the UI's table reads
 'by its declared kind' with 'declare it copybook there' - each build records
 the kinds it was declared (an older index: the manifest.json beside it tells),
@@ -558,7 +561,7 @@ FOLDER` adds expanded programs the index does not hold; `--dry-run` says
 what would be written. The same run reads the listing of every program whose
 copybook the build chose among several same-named ones (the listing's
 copybook-source table names the library the compiler read each copybook
-from) and checks each choice, in five verdicts: confirmed - the listing names
+from) and checks each choice, in six verdicts: confirmed - the listing names
 the library the copy used came from, or a library the index holds whose copy
 has the same text (a copybook compiled against staging and promoted to
 production unchanged); contradicted by a current listing - the index holds
@@ -566,7 +569,10 @@ the listing's copy, its text differs, and the listing's source is the program
 as indexed: a wrong fact, named in `work\recover.md` with the library the
 listing says; named by an older listing - the text differs, but the listing's
 source is not the program as indexed, so it is not counted as a wrong fact; a
-library the index does not hold - the copy the build used stands; or unknown.
+library the index does not hold - the copy the build used stands; a library
+the index holds with only a stub of the copybook - the program was compiled
+against the text the listing prints, which the index does not hold, so the
+copy used may differ from it; or unknown.
 A name is not a fact about content: two copies are the same when their text
 is (columns 8-72, comments dropped), whatever their libraries are called. A
 listing is current when its own program lines match the member as indexed;

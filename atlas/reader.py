@@ -125,8 +125,14 @@ def stub_count(text: str, data: bytes = b"", enc: str = "utf-8") -> int:
     the reader's: fixed or free format as reader.looks_fixed_format decides
     (free format: the whole record is code), the code area ending where
     reader.detect_code_end finds a shifted stamp, a tab four columns wide.
-    A comment record is '*' or '/' in column 7, or '*' as its first
-    non-blank character; NULs, an end-of-file mark and form feeds count as
+    A comment record is, in fixed format, '*' or '/' in column 7 - the
+    reader's rule: a '*' in the sequence area (`*0000100`) leaves a digit
+    in the indicator and one in column 8, which the reader takes for code,
+    so such a record counts as numbers (LESSONS 206) - or a record whose
+    first non-blank character is '*' with text other than digits where the
+    compiler reads (a floating `*>` remark from column 1: never the text of
+    a member); in free format '*' as the first non-blank character or '*'
+    / '/' in column 7. NULs, an end-of-file mark and form feeds count as
     blanks. 0 for a member with no record holding a digit in those columns
     (blank or comments only: `empty`) and for one with any record holding
     anything else there. Records split as the reader splits them."""
@@ -136,11 +142,11 @@ def stub_count(text: str, data: bytes = b"", enc: str = "utf-8") -> int:
         rec = rec.replace("\t", "    ").translate(_STUB_BLANKS)
         if not rec.strip():
             continue
-        if rec.lstrip().startswith("*") or (len(rec) > 6 and rec[6] in "*/"):
-            continue
-        if rec[6:65].strip(_STUB_DIGITS):
+        starred = rec.lstrip().startswith("*") or (len(rec) > 6 and rec[6] in "*/")
+        if not starred and rec[6:65].strip(_STUB_DIGITS):
             # text in columns 7-65, which the compiler reads in either format (detect_code_end never cuts before
-            # column 65): no stub - every real member stops here, at its first code line, before the format is read
+            # column 65), on a record no rule reads as a comment: no stub - every real member stops here, at its
+            # first code line, before the format is read
             return 0
         kept.append(rec)
     if not kept:
@@ -149,12 +155,18 @@ def stub_count(text: str, data: bytes = b"", enc: str = "utf-8") -> int:
     code_end = detect_code_end(records) if fixed else None
     n = 0
     for rec in kept:
+        if fixed and len(rec) > 6 and rec[6] in "*/":
+            continue                     # the reader's comment: '*' or '/' in the indicator column
+        if not fixed and (rec.lstrip().startswith("*") or (len(rec) > 6 and rec[6] in "*/")):
+            continue
         area = rec[6:code_end] if fixed else rec
         if not area.strip():
             continue                     # a sequence number, a stamp - nothing the compiler reads: a blank line
         if area.strip(_STUB_DIGITS):
+            if fixed and rec.lstrip().startswith("*"):
+                continue                 # '*' first, words where the compiler reads: a remark, never the member's text
             return 0
-        n += 1
+        n += 1                           # digits where the compiler reads - `*0000100` too: the reader's code '0'
     return n
 
 
