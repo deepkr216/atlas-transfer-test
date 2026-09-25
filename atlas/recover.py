@@ -1765,15 +1765,50 @@ def skipped_copies(conn: sqlite3.Connection, member_id: Optional[int] = None) ->
     return out
 
 
+_NOT_FOUND_RE = re.compile(r"COPY (\S+) NOT FOUND")
+
+
+def not_found_copies(conn: sqlite3.Connection, member_ids: Optional[Sequence[int]] = None) -> Set[Tuple[int, str]]:
+    """{(program member id, COPYBOOK)} for every COPY a program's own
+    'expand' note reports NOT FOUND - the copybook was not in the index when
+    the program was parsed (`member_ids`: those programs only, 500 to a
+    query). A program's copy_use row with no resolved member and NO such
+    note - not a system include, not a COPY the expander skipped - is one
+    the build HAD resolved: the member it expanded left the index after the
+    parse (the file went while another copy of the name stays, its text
+    changed, or it was recorded again under a new id - a copybook marked
+    pending, a build stopped before it was parsed, a parser exception) and
+    `_forget_member` set the row to NULL, and the build before ROADMAP
+    re-parse item 21 did not parse the program again. The two states read
+    alike by the row and need different words: 'parsed before it arrived'
+    said of the second sent him looking for an arrival that never happened
+    (LESSONS 202)."""
+    out: Set[Tuple[int, str]] = set()
+    sql = "SELECT member_id, detail FROM unresolved WHERE kind = 'expand' AND detail LIKE '%NOT FOUND%'"
+    if member_ids is None:
+        chunks: List[Optional[List[int]]] = [None]
+    else:
+        ids = sorted({int(i) for i in member_ids})
+        chunks = [ids[k:k + 500] for k in range(0, len(ids), 500)]
+    for chunk in chunks:
+        q = sql + (f" AND member_id IN ({','.join('?' * len(chunk))})" if chunk is not None else "")
+        for mid, detail in conn.execute(q, tuple(chunk or ())):
+            if mid is None:
+                continue
+            for m in _NOT_FOUND_RE.finditer(detail or ""):
+                out.add((int(mid), m.group(1).upper()))
+    return out
+
+
 def unlinked_ok_programs(conn: sqlite3.Connection, member_id: Optional[int] = None) -> Dict[int, Tuple[str, List[str]]]:
     """{program member id: (program name, [COPYBOOK, ...])} for every program
     marked `ok` that has a COPY row no member resolves any more - not a
     system include, not a COPY the expander skipped. The build sets a
     program's copy_use row to NULL when the member it had expanded leaves
     the index (`_forget_member`: the file changed on disk, went, or was
-    recorded again under a new id); the build before ROADMAP re-parse item
-    21 parsed the program again only when the member's NEW text was filed as
-    copybook or cobol, and on an index built before ROADMAP re-parse items 20
+    recorded again under a new id with its text unchanged); the build before
+    ROADMAP re-parse item 21 parsed the program again only when the member's
+    NEW text was filed as copybook or cobol, and on an index built before ROADMAP re-parse items 20
     and 22 a re-filed copybook re-fetched with new text was filed by its
     weak signature again (asm / listing / mfs), so its programs kept 'ok'
     with the fields of the earlier read and a NULL row nothing explains
@@ -1810,15 +1845,22 @@ def arrived_copybooks(conn: sqlite3.Connection) -> Tuple[List[Dict[str, object]]
     the index DOES hold now, in two lists, one entry per copybook name:
 
       arrived  - a member of a kind the resolver expands exists (copybook,
-                 cobol, sql, unknown), so the programs were parsed BEFORE it
-                 arrived and nothing parsed them again: the build before
+                 cobol, sql, unknown) and nothing parsed the programs again
+                 since, for one of two causes told apart by the program's
+                 own note (not_found_copies; each entry's `left` lists the
+                 programs of the second): the program was parsed BEFORE the
+                 member arrived and says COPY X NOT FOUND - the build before
                  ROADMAP re-parse item 21 re-parsed the copiers of a NEW
                  member only when it was filed as copybook or cobol, so a
-                 member typed 'unknown' by its folder forced nothing. These
+                 member typed 'unknown' by its folder forced nothing; or the
+                 program had expanded a copy that LEFT the index after the
+                 parse (the file went while another copy of the name stays,
+                 its text changed, or it was recorded again under a new id)
+                 and that build did not parse it again, so it keeps the
+                 fields of the earlier read and no NOT FOUND note. These
                  programs are marked for the next build. The build of this
-                 toolkit parses them again for every kind the resolver
-                 expands (build.moved_names), so on an index it built the
-                 list is empty.
+                 toolkit parses them again in both cases (build.moved_names),
+                 so on an index it built the list is empty.
       misfiled - the only members with that name are of a kind the resolver
                  never looks at (proc, ctlcard, doc, jcl, listing ...): a
                  re-parse would find nothing; the folder name decided the
@@ -1884,12 +1926,15 @@ def arrival_scan(conn: sqlite3.Connection
     arrived: List[Dict[str, object]] = []
     misfiled: List[Dict[str, object]] = []
     waiting: List[Dict[str, object]] = []
+    noted = not_found_copies(conn) if by_book else set()
     for book in sorted(by_book):
         copiers = list(by_book[book])
         accepted, other = members_named(conn, book, [c[0] for c in copiers])
         if accepted:
+            # `left`: the programs whose row carries no NOT FOUND note - they had expanded a copy that left the index
+            # after the parse; the others were parsed before the member arrived (not_found_copies)
             entry = {"copybook": book, "members": [(k, f) for _i, k, f, _p in accepted], "programs": copiers,
-                     "ids": [c[0] for c in copiers]}
+                     "ids": [c[0] for c in copiers], "left": [c for c in copiers if (c[0], book) not in noted]}
             if refiled and all(i in refiled for i, _k, _f, _p in accepted) and all(status.get(c[0]) == "pending" for c in copiers):
                 waiting.append(entry)                            # re-filed earlier, marked already: the build is next
             else:
@@ -1920,6 +1965,12 @@ UNKNOWN_FIX = ("rename the folder to end in COPYLIB (or declare the library's ki
                "own lines are indexed and citable")
 MISFILED_NEXT = ("next: rename the folder(s) the report names to end in COPYLIB (or declare the library's kind in the UI's "
                  "table), then run your usual build command")
+# why a copy a program had expanded is no longer in the index, while the program was not parsed again (a program's
+# row with no resolved member and no NOT FOUND note: not_found_copies) - said by the report, `program`, `copybook`
+# and coverage alike
+LEFT_CAUSES = ("the file went while another copy of the name stays, its text changed, or it was recorded again under a "
+               "new id with its text unchanged (a copybook marked pending, a build stopped before it was parsed, a parser "
+               "exception)")
 
 
 # --------------------------------------------------------------------------
@@ -2657,21 +2708,45 @@ def arrival_report(arrived: Sequence[Dict[str, object]], misfiled: Sequence[Dict
         names = [n + (" (copybook)" if k == "copybook" else "") for _i, n, k in e["programs"]]   # type: ignore[union-attr]
         return ", ".join(names[:limit]) + (f", +{len(names) - limit:,} more" if len(names) > limit else "")
 
+    def unknown_clause(entries: Sequence[Dict[str, object]]) -> str:
+        n = _unknown_among(entries)
+        return (f"A member filed 'unknown' ({n} below) is expanded into its programs but has no parser of its own, so its "
+                f"own lines are not indexed - `paragraph` shows them empty and nothing can cite them: {UNKNOWN_FIX}.\n\n"
+                if n else "\n\n")
+
+    marked_words = ("They would be marked for the next build (dry run: nothing marked). " if dry_run
+                    else "They are marked for the next build: run your usual build command. ")
+    table_head = "| copybook | kind the index filed it as | folder | programs |\n|---|---|---|---|\n"
+    # the two causes, told apart by the program's own note (arrival_scan's `left`): parsed before the member arrived,
+    # or parsed with a copy that left the index after the parse
+    late = [dict(e, programs=[c for c in e["programs"] if c not in e.get("left", [])]) for e in arrived   # type: ignore
+            if len(e.get("left", [])) < len(e["programs"])]                                             # type: ignore
+    left = [dict(e, programs=list(e["left"])) for e in arrived if e.get("left")]                         # type: ignore
     lines: List[str] = []
-    if arrived:
+    if late:
+        # why nothing parsed them: said for a member of a kind the earlier forcing left out (unknown, sql) - a new
+        # member filed copybook or cobol did force its copiers
+        odd = any(k not in ("copybook", "cobol") for e in late for k, _f in e["members"])      # type: ignore[union-attr]
         lines.append("\n## Copybooks that arrived after the program was parsed\n\n"
                      "The index holds a member with the copybook's name, but the programs below were parsed while it was "
-                     "missing and nothing parsed them again: the build that made this index re-parsed the copiers of a "
-                     "new member only when it was filed as copybook or cobol, so one typed by its folder name - "
-                     "'unknown' in a dataset-named folder - forced nothing (ROADMAP re-parse item 21: the build of this "
-                     "toolkit parses them again for every kind it expands). "
-                     + ("They would be marked for the next build (dry run: nothing marked). " if dry_run
-                        else "They are marked for the next build: run your usual build command. ")
-                     + (f"A member filed 'unknown' ({_unknown_among(arrived)} below) is expanded into its programs but has no "
-                        f"parser of its own, so its own lines are not indexed - `paragraph` shows them empty and nothing can "
-                        f"cite them: {UNKNOWN_FIX}.\n\n" if _unknown_among(arrived) else "\n\n")
-                     + "| copybook | kind the index filed it as | folder | programs |\n|---|---|---|---|\n")
-        for e in arrived:
+                     "missing and nothing parsed them again"
+                     + (": the build that made this index re-parsed the copiers of a new member only when it was filed "
+                        "as copybook or cobol, so one typed by its folder name - 'unknown' in a dataset-named folder - "
+                        "forced nothing (ROADMAP re-parse item 21: the build of this toolkit parses them again for every "
+                        "kind it expands). " if odd else ". ")
+                     + marked_words + unknown_clause(late) + table_head)
+        for e in late:
+            kinds, folders = _kinds_folders(e["members"])                            # type: ignore[arg-type]
+            lines.append(f"| {e['copybook']} | {kinds} | {folders} | {progs(e)} |\n")
+    if left:
+        lines.append("\n## Programs parsed with a copy that has left the index since\n\n"
+                     "Each program below had expanded a copy of the copybook when it was parsed, and says no COPY NOT "
+                     "FOUND for it. That copy has left the index since - " + LEFT_CAUSES + " - and the build that made "
+                     "this index did not parse the program again (ROADMAP re-parse item 21: the build of this toolkit "
+                     "does), so its fields are those of the earlier read; a member with the copybook's name is in the "
+                     "index now (the columns say which). `program NAME` says so beside `parse: ok`. "
+                     + marked_words + unknown_clause(left) + table_head)
+        for e in left:
             kinds, folders = _kinds_folders(e["members"])                            # type: ignore[arg-type]
             lines.append(f"| {e['copybook']} | {kinds} | {folders} | {progs(e)} |\n")
     if misfiled:
@@ -3680,9 +3755,21 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
         ids = sorted({i for e in arrived for i in e["ids"]})                    # type: ignore[union-attr]
         if not dry_run:
             marked = _mark_members(db, ids)
-        log(f"  {len(ids):,} program(s) copy a copybook that has arrived since they were parsed "
-            f"({len(arrived):,} copybook{'s' if len(arrived) != 1 else ''}): "
-            f"{'would be marked' if dry_run else 'marked'} for the next build")
+        # the two causes apart (arrival_scan's `left`): parsed before the member arrived, or parsed with a copy that
+        # left the index since - one line each, the same mark
+        late = [e for e in arrived if len(e.get("left", [])) < len(e["programs"])]         # type: ignore[arg-type]
+        gone = [e for e in arrived if e.get("left")]
+        late_ids = {c[0] for e in late for c in e["programs"] if c not in e.get("left", [])}   # type: ignore[union-attr]
+        gone_ids = {c[0] for e in gone for c in e["left"]}                                   # type: ignore[union-attr]
+        if late_ids:
+            log(f"  {len(late_ids):,} program(s) copy a copybook that has arrived since they were parsed "
+                f"({len(late):,} copybook{'s' if len(late) != 1 else ''}): "
+                f"{'would be marked' if dry_run else 'marked'} for the next build")
+        if gone_ids:
+            log(f"  {len(gone_ids):,} program(s) were parsed with a copy of a copybook that has left the index since - "
+                "the file went, its text changed, or it was recorded again under a new id - and the build that made "
+                f"this index did not parse them again ({len(gone):,} copybook{'s' if len(gone) != 1 else ''}, a member of "
+                f"that name in the index now): {'would be marked' if dry_run else 'marked'} for the next build")
         if _unknown_among(arrived):
             log(f"  {_unknown_among(arrived):,} of them filed 'unknown' (a folder with no COPY hint): the build expands it but "
                 f"has no parser for it, so its own lines are not indexed - {UNKNOWN_FIX}")

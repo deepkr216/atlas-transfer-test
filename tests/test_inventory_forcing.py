@@ -67,6 +67,12 @@ DDLBK = "  CREATE TABLE PROD.POLICY_TAB\n  ( POL_ID CHAR(10) NOT NULL\n  , POL_A
 STARTBK_SHARED = ("           05  ST-ID               PIC X(5).\n           05  ST-REGION           PIC X(10).\n"
                   "           05  START-DATE          PIC X(8).\n           05  ST-AMT              PIC 9(3).\n")
 UNLINKED = "but 1 COPY row is unresolved (STARTBK)"
+# what the stand-ins say of a program that had expanded a copy which left the index after the parse (LESSONS 202)
+LEFT_CELL = ("the copy the program had expanded left the index after the parse and the build that made this index did "
+             "not parse it again: run recover, then the build")
+LEFT_CONSOLE = ("1 program(s) were parsed with a copy of a copybook that has left the index since - the file went, its "
+                "text changed, or it was recorded again under a new id - and the build that made this index did not parse "
+                "them again (1 copybook, a member of that name in the index now): marked for the next build")
 
 
 # a job that reads a cataloged PROC, a card member by DSN=LIB(MEMBER), a card taken by its sequential dataset's last
@@ -332,6 +338,49 @@ class _Forcing(_Estate):
         self.assertNotIn("marked for the next build", said)
         return cov, prog
 
+    def assert_left_words(self, where, program="STPGM", book="STARTBK"):
+        """On an index the build before item 21 left, the program HAD expanded a copy of the copybook that left the
+        index after the parse (no NOT FOUND note), and a member of that name is in the index (`where`: its folder and
+        kind): every stand-in says so - and none says it was parsed before the member arrived, nor why an arrival
+        forced nothing (LESSONS 202). recover marks it with the words of that cause, and the build makes it whole."""
+        self.assertEqual(self.not_found_note(program, book), [], "the program's own notes say no COPY NOT FOUND")
+        cov, nf, prog, bk, _as_prog = self.outputs(program, book)
+        self.assertIn(f"| {book} | 1 | yes: {where} - {LEFT_CELL} |", nf)
+        self.assertIn("A copybook marked `yes` is not missing - a member with its name is in the index. Either the "
+                      "programs had expanded a copy of it that left the index after their parse - the file went while "
+                      "another copy of the name stays, its text changed, or it was recorded again under a new id with its "
+                      "text unchanged (a copybook marked pending, a build stopped before it was parsed, a parser "
+                      "exception) - and the build that made this index did not parse them again", cov)
+        self.assertIn(f"| {book} | **no longer linked** - a member with this name exists: {where} - {LEFT_CELL} |", prog)
+        self.assertIn(UNLINKED.replace("STARTBK", book) + ": the member it had expanded went out of the index since - its "
+                      "text changed on disk and the classifier filed the new text as another kind, the file went, or it "
+                      "was recorded again under a new id with its text unchanged - and the build that made this index did "
+                      "not parse the program again", prog)
+        self.assertIn("> 1 of the programs above was parsed with a copy of this copybook that has left the index since - "
+                      "the file went while another copy of the name stays", bk)
+        for text in (cov, prog, bk):
+            self.assertNotIn("parsed before it arrived", text)
+            self.assertNotIn("parsed before this member arrived", text)
+            self.assertNotIn("only for a member filed copybook or cobol", text)
+            self.assertNotIn("still say", text)
+        self.assertNotIn("reported NOT FOUND has a member", cov)
+        stats, said = self.recover(dry_run=True)
+        self.assertEqual((stats["arrived"], stats["marked"]), (1, 0), said)
+        self.assertIn(LEFT_CONSOLE.replace(": marked", ": would be marked"), said)
+        self.assertNotIn("has arrived since", said)
+        rep = self.report_text()
+        self.assertIn("## Programs parsed with a copy that has left the index since", rep)
+        self.assertIn(f"| {book} | {where.split(' (')[1].rstrip(')')} | {where.split(' (')[0]} | {program} |", rep)
+        self.assertNotIn("arrived after the program was parsed", rep)
+        self.assertNotIn("forced nothing", rep)
+        stats, said = self.recover()
+        self.assertEqual((stats["arrived"], stats["marked"]), (1, 1), said)
+        self.assertIn(LEFT_CONSOLE, said)
+        self.assertEqual(self.status(program), "pending")
+        self.build()
+        self.assertEqual(self.status(program), "ok")
+        self.stand_ins_say_nothing(program, book)
+
     def assert_ok_and_linked(self, program="STPGM", book="STARTBK", library=None):
         self.assertEqual(self.status(program), "ok")
         self.assertEqual(self.copy_use(program, book), [(self.member_id(book, library),)])
@@ -416,6 +465,21 @@ class RemovedFromDisk(_Forcing):
         self.build()
         self.assert_not_found()
         self.stand_ins_say_nothing("STPGM", "STARTBK")
+
+    def test_before_the_batch_the_other_copy_left_it_un_linked(self):
+        # the copy the program expanded goes while the shared one stays: the build before the item parsed nothing
+        # again, the program kept 'ok', the fields of the copy that went and a NULL row - the stand-ins say that copy
+        # left, then recover and the build link it to the shared copy with its own offsets
+        self.write("SHARED/PROD.CMN.COPYLIB/STARTBK.cpy", STARTBK_SHARED)
+        self.build()
+        self.remove("GC/PROD.GC.COPYLIB/STARTBK.cpy")
+        with build_before_item_21():
+            self.build()
+        self.assertEqual((self.status("STPGM"), self.copy_use("STPGM", "STARTBK")), ("ok", [(None,)]))
+        self.assertEqual([f[:3] for f in self.fields("STPGM", "START-DATE")], [("START-DATE", 5, 8)])
+        self.assert_left_words("PROD.CMN.COPYLIB (copybook)")
+        self.assert_ok_and_linked(library="PROD.CMN.COPYLIB")
+        self.assertEqual([f[:3] for f in self.fields("STPGM", "START-DATE")], [("START-DATE", 15, 8)])
 
     def test_the_other_copy_takes_over(self):
         # STARTBK in the program's own system and in the shared library, with different text: the chain picks the
@@ -520,6 +584,55 @@ class RecordedAgain(_Forcing):
         with build_before_item_21():
             self.build()
         self.assertEqual((self.status("STPGM"), self.copy_use("STPGM", "STARTBK")), ("ok", [(None,)]))
+        # the member was there all along: the stand-ins say the copy was recorded again, not that it arrived
+        self.assert_left_words("PROD.GC.COPYLIB (copybook)")
+        self.assert_ok_and_linked()
+
+    def test_before_the_batch_both_causes_under_one_name(self):
+        # NEWPGM as a program parsed while STARTBK was missing and not parsed again (its NOT FOUND note, set by SQL as
+        # that build left it), STPGM un-linked by STARTBK recorded again: one name, each program with its own cause
+        self.write("GC/PROD.GC.SRC/NEWPGM.cbl", data_program("NEWPGM", "STARTBK", "START-DATE"))
+        self.build()
+        new = self.q("SELECT id FROM member WHERE name='NEWPGM'")[0][0]
+        self.q_write("UPDATE copy_use SET resolved_member_id=NULL WHERE member_id=?", new)
+        self.q_write("INSERT INTO unresolved(member_id,kind,detail) VALUES(?,'expand',?)", new,
+                     "L8: COPY STARTBK NOT FOUND - fields/code from it are missing from this program's facts")
+        self.q_write("UPDATE member SET parse_status='partial' WHERE id=?", new)
+        self.q_write("UPDATE member SET parse_status='pending' WHERE name='STARTBK'")
+        with build_before_item_21():
+            self.build()
+        self.assertEqual((self.status("STPGM"), self.status("NEWPGM")), ("ok", "partial"))
+        cov, nf, prog, bk, _as_prog = self.outputs("STPGM", "STARTBK")
+        self.assertIn("| STARTBK | 2 | yes: PROD.GC.COPYLIB (copybook) - 1 program(s) parsed before it arrived, 1 parsed "
+                      "with a copy that left the index after the parse: run recover, then the build |", nf)
+        # both causes in the legend; no 'only for a member filed copybook or cobol' - the member IS a copybook
+        self.assertIn("Either the programs that copy it were parsed before it arrived and nothing parsed them again: "
+                      "`python -m atlas.recover --db atlas.db` marks them, then run your usual build; or the programs had "
+                      "expanded a copy of it that left the index after their parse", cov)
+        self.assertNotIn("only for a member filed copybook or cobol", cov)
+        self.assertIn("| STARTBK | **no longer linked** - a member with this name exists: PROD.GC.COPYLIB (copybook) - "
+                      + LEFT_CELL + " |", prog)
+        newprog = self.outputs("NEWPGM", "STARTBK")[2]
+        self.assertIn("| STARTBK | **NOT FOUND** - a member with this name exists: PROD.GC.COPYLIB (copybook) - parsed "
+                      "before it arrived: run recover, then the build |", newprog)
+        self.assertIn("> 1 of the programs above still says `COPY STARTBK NOT FOUND` (under 'Unresolved in scope' below): "
+                      "parsed before this member arrived and nothing parsed them again. `python -m atlas.recover", bk)
+        self.assertIn("> 1 of the programs above was parsed with a copy of this copybook that has left the index since", bk)
+        stats, said = self.recover()
+        self.assertEqual((stats["arrived"], stats["marked"]), (1, 2), said)
+        self.assertIn("1 program(s) copy a copybook that has arrived since they were parsed (1 copybook): marked for the "
+                      "next build", said)
+        self.assertIn(LEFT_CONSOLE, said)
+        rep = self.report_text()
+        late = rep.split("## Copybooks that arrived after the program was parsed")[1].split("\n## ")[0]
+        gone = rep.split("## Programs parsed with a copy that has left the index since")[1].split("\n## ")[0]
+        self.assertIn("| STARTBK | copybook | PROD.GC.COPYLIB | NEWPGM |", late)
+        self.assertNotIn("forced nothing", late, "a copybook is a kind the earlier forcing did follow")
+        self.assertIn("| STARTBK | copybook | PROD.GC.COPYLIB | STPGM |", gone)
+        self.build()
+        self.assert_ok_and_linked()
+        self.assert_ok_and_linked("NEWPGM")
+        self.stand_ins_say_nothing("NEWPGM", "STARTBK")
 
     def test_a_copybook_the_parser_fails_on(self):
         # a parser exception is not a settled outcome: the member is parsed again - and recorded again - on every

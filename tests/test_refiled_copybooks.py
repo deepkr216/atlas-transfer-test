@@ -942,13 +942,15 @@ class OkWithAnUnlinkedCopyRow(_Estate):
     files = (("GC/PROD.GC.SRC/STPGM.cbl", data_program("STPGM", "STARTBK", "START-DATE")),
              ("SHARED/PROD.GC.COPYLIB/STARTBK.txt", STARTBK))
     NOTE = ("parse: ok, but 1 COPY row is unresolved (STARTBK): the member it had expanded went out of the index since - "
-            "its text changed on disk and the classifier filed the new text as another kind, or the file went - and "
-            "nothing parsed the program again, so its fields are those of the earlier read of that copybook; run "
+            "its text changed on disk and the classifier filed the new text as another kind, the file went, or it was "
+            "recorded again under a new id with its text unchanged - and the build that made this index did not parse "
+            "the program again, so its fields are those of the earlier read of that copybook; run "
             "`python -m atlas.recover --db atlas.db`, then the build (the Copybooks table below says what happened to each)")
     CLAUSE = ("### Members parsed only in part\n_none_\n\n> Not counted above: 1 program marked `ok` has a COPY row no "
               "member resolves any more (STPGM; copybook STARTBK): the member it had expanded went out of the index since "
-              "- its text changed on disk and the classifier filed the new text as another kind, or the file went - and "
-              "nothing parsed the program again, so its fields are those of the earlier read. `program NAME` says so "
+              "- its text changed on disk and the classifier filed the new text as another kind, the file went, or it was "
+              "recorded again under a new id with its text unchanged - and the build that made this index did not parse "
+              "the program again, so its fields are those of the earlier read. `program NAME` says so "
               "beside `parse: ok`; run `python -m atlas.recover --db atlas.db`, then the build - the 'Copybooks not "
               "found' table names each copybook with what to do.\n")
 

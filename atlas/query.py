@@ -280,10 +280,13 @@ def parse_label(conn: sqlite3.Connection, member_id: int, status: Optional[str])
 # index built before ROADMAP re-parse items 20 and 22, a copybook atlas.recover re-filed and then re-fetched with new
 # text was filed by its weak signature again, so the program read 'ok' with the fields of the earlier read and a NULL
 # row beside 'NOT FOUND' on the same page (LESSONS 188); said here and counted in coverage, apart from the partial
-# members. The build of this toolkit parses the program again whenever the member goes, changes or is re-typed
-# (build.moved_names), so on an index it built nothing is said
+# members. The same build left it for a copybook recorded again under a new id with its text unchanged - marked
+# pending, a build stopped before it was parsed, a parser exception (LESSONS 201, 202). The build of this toolkit
+# parses the program again whenever the member goes, changes, is re-typed or recorded again (build.moved_names), so on
+# an index it built nothing is said
 UNLINKED_WHY = ("the member it had expanded went out of the index since - its text changed on disk and the classifier "
-                "filed the new text as another kind, or the file went - and nothing parsed the program again")
+                "filed the new text as another kind, the file went, or it was recorded again under a new id with its "
+                "text unchanged - and the build that made this index did not parse the program again")
 UNLINKED_FIX = "run `python -m atlas.recover --db atlas.db`, then the build"
 
 
@@ -296,9 +299,11 @@ def unlinked_why(programs: int, books: int) -> str:
         else "the members it had expanded"
     text = "its text changed" if books == 1 else "their text changed"
     file = "the file went" if books == 1 else "the files went"
+    again = "it was recorded again under a new id with its text" if books == 1 else \
+        "they were recorded again under a new id with their text"
     program = "the program" if programs == 1 else "the programs"
     return (f"{member} went out of the index since - {text} on disk and the classifier filed the new text as another "
-            f"kind, or {file} - and nothing parsed {program} again")
+            f"kind, {file}, or {again} unchanged - and the build that made this index did not parse {program} again")
 
 
 def unlinked_ok_note(conn: sqlite3.Connection, member_id: int, status: Optional[str]) -> str:
@@ -1464,6 +1469,13 @@ def cmd_copybook(conn: sqlite3.Connection, name: str) -> str:
     def skip_why(p: sqlite3.Row) -> Optional[str]:
         return skipped.get((p["mid"], name.upper())) if p["resolved_member_id"] is None else None
 
+    # a row with no resolved member and no skip: NOT FOUND when the program's own note says so; otherwise the
+    # program had expanded a copy that left the index after the parse (recover.not_found_copies, LESSONS 202)
+    noted = recover.not_found_copies(conn, [p["mid"] for p in progs if p["resolved_member_id"] is None])
+
+    def left_since(p: sqlite3.Row) -> bool:
+        return p["resolved_member_id"] is None and not skip_why(p) and (p["mid"], name.upper()) not in noted
+
     out.append(f"\n### Programs including it ({len(progs)})\n")
     if len({p["resolved_member_id"] for p in progs}) > 1:
         # Two copies of the copybook: say which programs compile against which
@@ -1480,9 +1492,11 @@ def cmd_copybook(conn: sqlite3.Connection, name: str) -> str:
             else:
                 by_why: Dict[Optional[str], List[sqlite3.Row]] = defaultdict(list)
                 for p in ps:
-                    by_why[skip_why(p)].append(p)
+                    by_why["" if left_since(p) else skip_why(p)].append(p)
                 for why, qs in by_why.items():
-                    out.append(("- copy NOT FOUND: " if why is None else f"- {skipped_cell(why)}: ")
+                    out.append(("- copy NOT FOUND: " if why is None
+                                else "- no longer linked (the copy it had expanded left the index after the parse): "
+                                if why == "" else f"- {skipped_cell(why)}: ")
                                + ", ".join(f"{p['program_id']} @{p['member_name']}:{p['line']}" for p in qs) + "\n")
     out.append(table(["program", "member", "REPLACING", "cite"],
                      [(p["program_id"], p["member_name"], (p["replacing"] or "")[:40], f"{p['member_name']}:{p['line']}")
@@ -1494,7 +1508,9 @@ def cmd_copybook(conn: sqlite3.Connection, name: str) -> str:
             skips[w].append(p["program_id"])
     if skips:
         out.append("\n> " + "; ".join(f"{skipped_cell(w)}: {', '.join(ps)}" for w, ps in skips.items()) + ".\n")
-    stale = {p["program_id"] for p in progs if p["resolved_member_id"] is None and not skip_why(p)}   # programs, not COPY sites
+    stale = {p["program_id"] for p in progs if p["resolved_member_id"] is None and not skip_why(p)
+             and not left_since(p)}                                                     # programs, not COPY sites
+    gone = {p["program_id"] for p in progs if left_since(p)}
     if stale and refiled and len(refiled) == len(copies):
         # re-filed by atlas.recover: the programs were parsed while it was filed as the other kind, and the same run
         # marked them - unless something un-marked them since
@@ -1517,6 +1533,18 @@ def cmd_copybook(conn: sqlite3.Connection, name: str) -> str:
         out.append(f"\n> {len(stale)} of the programs above still say{'s' if len(stale) == 1 else ''} `COPY {name.upper()} NOT "
                    "FOUND` (under 'Unresolved in scope' below): parsed before this member arrived and nothing parsed them "
                    f"again{why}. `python -m atlas.recover --db atlas.db` marks them, then run your usual build"
+                   + (f"; and {recover.UNKNOWN_FIX}" if any(c["kind"] == "unknown" for c in copies) else "") + ".\n")
+    if gone:
+        # parsed with a copy of this copybook that left the index after the parse - no NOT FOUND note, the fields of
+        # that copy - and the build that made the index did not parse them again (LESSONS 188, 202)
+        one = len(gone) == 1
+        pending = all(p["mstatus"] == "pending" for p in progs if p["program_id"] in gone)
+        out.append(f"\n> {len(gone)} of the programs above {'was' if one else 'were'} parsed with a copy of this copybook "
+                   f"that has left the index since - {recover.LEFT_CAUSES} - and the build that made this index did not "
+                   f"parse {'it' if one else 'them'} again (ROADMAP re-parse item 21): {'its' if one else 'their'} fields "
+                   "are those of the earlier read. "
+                   + ("atlas.recover marked them - run your usual build command" if pending
+                      else "`python -m atlas.recover --db atlas.db` marks them, then run your usual build")
                    + (f"; and {recover.UNKNOWN_FIX}" if any(c["kind"] == "unknown" for c in copies) else "") + ".\n")
     pnames = [p["program_id"].upper() for p in progs]
     if pnames:
@@ -1820,6 +1848,9 @@ def _partial_members(conn: sqlite3.Connection, limit: int = COVERAGE_ROWS) -> st
             clauses.append(f"{len(waiting)} of the copybooks reported NOT FOUND {'was' if len(waiting) == 1 else 'were'} "
                            "re-filed as a copybook by atlas.recover on an earlier run and the programs copying "
                            f"{'it' if len(waiting) == 1 else 'them'} are marked: run your usual build command")
+        # a copybook whose programs only lost their link to it (a copy that left the index after the parse) is not one
+        # 'reported NOT FOUND': those programs are said under the table (unlinked_ok_clause) and in its cell
+        arrived = [e for e in arrived if len(e.get("left", [])) < len(e["programs"])]      # type: ignore[arg-type]
         if arrived:
             unknown = any(k == "unknown" for e in arrived for k, _f in e["members"])   # type: ignore[union-attr]
             clauses.append(f"{len(arrived)} of the copybooks reported NOT FOUND {'has' if len(arrived) == 1 else 'have'} a "
@@ -2024,7 +2055,16 @@ def _listing_sources_of(conn: sqlite3.Connection, copybook: str, missing: bool =
 
 
 def same_named_note(conn: sqlite3.Connection, copybook: str, exclude_ids: Sequence[int] = ()) -> str:
-    """For a COPY the build could not resolve: '' when no member carries the
+    """same_named_state()'s note alone."""
+    return same_named_state(conn, copybook, exclude_ids)[0]
+
+
+def same_named_state(conn: sqlite3.Connection, copybook: str, exclude_ids: Sequence[int] = ()
+                     ) -> Tuple[str, Dict[str, object]]:
+    """(note, state) - state: `late` / `left` the copiers of each cause
+    below, `kinds` the kinds of the members of a kind the resolver expands.
+
+    The note, for a COPY the build could not resolve: '' when no member carries the
     copybook's name; otherwise where that member is and what to do. Two
     cases, both of which coverage used to print as a bare NOT FOUND while
     the member sat on disk: the member is of a kind the resolver expands
@@ -2034,7 +2074,14 @@ def same_named_note(conn: sqlite3.Connection, copybook: str, exclude_ids: Sequen
     never expands (proc, ctlcard, doc ...), because a procedure copybook has
     no content signature and the folder name decided its kind - the folder
     must be renamed or the library's kind declared. `exclude_ids`: the
-    copiers themselves. 'Run recover, then the build' is not the whole fix
+    copiers themselves. A member of a kind the resolver expands may be
+    there for a second reason, told apart by the program's own note
+    (recover.not_found_copies): a program with no NOT FOUND note for it HAD
+    expanded a copy of it, which left the index after the parse (the file
+    went while another copy stays, its text changed, or it was recorded
+    again under a new id), and the build that made the index did not parse
+    it again - 'parsed before it arrived' said of it sent him looking for an
+    arrival that never happened (LESSONS 202). 'Run recover, then the build' is not the whole fix
     for a member typed 'unknown': the build has no parser for it, so its
     own lines are not in the index (`paragraph` shows them empty, nothing
     can cite them) until the same folder fix is applied - the note says so.
@@ -2050,6 +2097,7 @@ def same_named_note(conn: sqlite3.Connection, copybook: str, exclude_ids: Sequen
     the COPY resolves)."""
     from . import recover
     accepted, other = recover.members_named(conn, copybook, exclude_ids)
+    state: Dict[str, object] = {"late": [], "left": [], "kinds": []}
     if accepted:
         refiled = recover.refiled_members(conn)
         if all(i in refiled for i, _k, _f, _p in accepted):
@@ -2061,10 +2109,23 @@ def same_named_note(conn: sqlite3.Connection, copybook: str, exclude_ids: Sequen
                 r[0] == "pending" for r in conn.execute(f"SELECT parse_status FROM member WHERE id IN ({','.join('?' * len(ids))})",
                                                         ids))
             return f"{where} - " + ("the programs copying it are marked: run your usual build command" if pending
-                                    else "parsed before it was re-filed: run recover, then the build")
+                                    else "parsed before it was re-filed: run recover, then the build"), state
         where = ", ".join(sorted({f"{f} ({k})" for _i, k, f, _p in accepted}))
-        return (f"{where} - parsed before it arrived: run recover, then the build"
-                + (f"; and {recover.UNKNOWN_FIX}" if any(k == "unknown" for _i, k, _f, _p in accepted) else ""))
+        ids = [int(i) for i in exclude_ids]
+        noted = recover.not_found_copies(conn, ids)
+        late = [i for i in ids if (i, copybook.upper()) in noted]
+        left = [i for i in ids if (i, copybook.upper()) not in noted]
+        state = {"late": late, "left": left, "kinds": sorted({k for _i, k, _f, _p in accepted})}
+        if left and not late:
+            why = (f"the copy {'the program' if len(left) == 1 else 'the programs'} had expanded left the index after the "
+                   f"parse and the build that made this index did not parse {'it' if len(left) == 1 else 'them'} again")
+        elif left:
+            why = (f"{len(late)} program(s) parsed before it arrived, {len(left)} parsed with a copy that left the index "
+                   "after the parse")
+        else:
+            why = "parsed before it arrived"
+        return (f"{where} - {why}: run recover, then the build"
+                + (f"; and {recover.UNKNOWN_FIX}" if any(k == "unknown" for _i, k, _f, _p in accepted) else "")), state
     if other:
         # the folder name decided the kind for some members, a line of the text for others (a START- name reads
         # as Assembler: no folder change helps, atlas.recover re-files it) - each with its own instruction
@@ -2087,8 +2148,8 @@ def same_named_note(conn: sqlite3.Connection, copybook: str, exclude_ids: Sequen
             where = "; ".join(dict.fromkeys(f"{r['folder']}, {recover.filed_phrase(r)}" for r in by_content))
             fixes = "; ".join(dict.fromkeys(recover.content_fix(r) for r in by_content))
             parts.append(f"{where} - not a kind the build expands, and {fixes}")
-        return "; ".join(parts)
-    return ""
+        return "; ".join(parts), state
+    return "", state
 
 
 def skipped_cell(why: str) -> str:
@@ -2109,6 +2170,12 @@ def _not_found_cell(conn: sqlite3.Connection, copybook: str, member_id: int) -> 
     if why:
         return skipped_cell(why)
     note = same_named_note(conn, copybook, (member_id,))
+    if (member_id, copybook.upper()) not in recover.not_found_copies(conn, [member_id]):
+        # no NOT FOUND note: the program had expanded a copy that left the index after the parse, and the build that
+        # made the index did not parse it again (LESSONS 188, 202) - its fields are of that copy, not missing
+        return ("**no longer linked** - " + (f"a member with this name exists: {note}" if note else
+                                             "the copy this program had expanded left the index after the parse and no "
+                                             "member carries the name now: run recover, then the build"))
     return "**NOT FOUND**" + (f" - a member with this name exists: {note}" if note else "")
 
 
@@ -2377,9 +2444,11 @@ def cmd_coverage(conn: sqlite3.Connection, everything: bool = False) -> str:
         uses[book] = uses.get(book, 0) + 1
         copiers_of[book][int(mid)] = None
     nf_rows = []
+    states: List[Dict[str, object]] = []
     for book, n in sorted(uses.items(), key=lambda kv: (-kv[1], kv[0]))[:40]:
-        note = same_named_note(conn, book, list(copiers_of[book]))
+        note, st = same_named_state(conn, book, list(copiers_of[book]))
         nf_rows.append((book, n, f"yes: {note}" if note else "-"))
+        states.append(st)
     # the names no member carries, looked for on disk - one walk of the estate root, only when the table has such a
     # name (LESSONS 192); a name a member carries is said by the column before
     _root, cells = disk_verdicts(conn, [b for b, _n, note in nf_rows if note == "-"])
@@ -2395,21 +2464,34 @@ def cmd_coverage(conn: sqlite3.Connection, everything: bool = False) -> str:
                    "under 'Members parsed only in part' (a long chain of nested COPYs is cut short in that column; "
                    "`program NAME` prints it whole).\n")
     if any(r[2] != "-" for r in nf_rows):
-        # 'parsed before it arrived' is a state only a build before ROADMAP re-parse item 21 left (the build of this
-        # toolkit parses the programs again for every kind the resolver expands): said when a cell says it, not
-        # offered as a cause on an index where no row is of that sort
-        arrived_cell = any("parsed before it arrived" in str(r[2]) for r in nf_rows)
+        # 'parsed before it arrived' and 'left the index after the parse' are states only a build before ROADMAP
+        # re-parse item 21 left (the build of this toolkit parses the programs again for every kind the resolver
+        # expands, and whenever a member they expanded goes, changes or is recorded again): each is said when a cell
+        # says it, not offered as a cause on an index where no row is of that sort; and why nothing parsed them again
+        # after an arrival - the kind - only for a member of a kind the earlier forcing left out (LESSONS 202)
+        late = [st for st in states if st.get("late")]
+        left = [st for st in states if st.get("left")]
+        odd = any(k not in ("copybook", "cobol") for st in late for k in st["kinds"])      # type: ignore[union-attr]
+        causes = []
+        if late:
+            causes.append("the programs that copy it were parsed before it arrived and nothing parsed them again"
+                          + (" (the build that made this index parsed them again only for a member filed copybook or "
+                             "cobol - ROADMAP re-parse item 21)" if odd else "")
+                          + ": `python -m atlas.recover --db atlas.db` marks them, then run your usual build")
+        if left:
+            causes.append("the programs had expanded a copy of it that left the index after their parse - "
+                          f"{recover.LEFT_CAUSES} - and the build that made this index did not parse them again (ROADMAP "
+                          "re-parse item 21), so their fields are those of the earlier read: the same run of recover marks "
+                          "them, then run your usual build")
         out.append("\n> A copybook marked `yes` is not missing - a member with its name is in the index. "
-                   + ("Either the programs that copy it were parsed before it arrived and nothing parsed them again (the "
-                      "build that made this index parsed them again only for a member filed copybook or cobol - ROADMAP "
-                      "re-parse item 21): `python -m atlas.recover --db atlas.db` marks them, then run your usual build; or "
-                      "the member" if arrived_cell else "Where the cell says so, the member")
+                   + ("Either " + "; or ".join(causes) + "; or the member" if causes else "Where the cell says so, the member")
                    + " is filed as a kind the build never "
                    "expands, because the folder name decided its kind (its text carries no signature - no level numbers, "
                    "no COBOL statements): rename the folder to end in COPYLIB, or declare the library's kind in the UI's "
                    "table (the manifest kinds), and build. "
                    + ("A member filed `unknown` is expanded but has no parser of its own, so its own lines are not indexed "
-                      "or citable until that same folder fix is applied. " if arrived_cell else "")
+                      "or citable until that same folder fix is applied. "
+                      if any("unknown" in st["kinds"] for st in late + left) else "")      # type: ignore[operator]
                    + "Where the cell "
                    "says `by its content`, a line of the member's own text has the shape of an Assembler, listing or MFS "
                    "member, which no folder change alters - the cell says what does. On an index built before "
