@@ -136,7 +136,11 @@ everything else:
   CLAIMS copy, never POLICY's: candidates are ranked `COPY … OF lib` › same
   department in its **declared order** › same department › authoritative ›
   same folder › first found — and the choice is written into the
-  `ambiguous_copybook` note either way. The declared order is simply the
+  `ambiguous_copybook` note either way. Where `atlas.recover` has stored the
+  program's compiler listing's copybook-source table (`listing_copy_source`),
+  the build reads it first: the copy in the library the listing names is
+  expanded and the note says `the program's compiler listing names DATASET`
+  — the chain guesses only where no listing says. The declared order is simply the
   order of a department's copybook rows in the table (Move up / Move down):
   that is the SYSLIB concatenation its programs compile against.
 - **Cross-department flow** — `dataset X` shows each writer's and reader's

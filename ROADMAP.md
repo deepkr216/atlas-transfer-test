@@ -211,17 +211,28 @@ shipped alone and cost one such night; these still wait for the next one:
    "partial" COBOL programs with ~60 copybooks missing). Until the re-parse, query.py tells the two
    apart (`partial_kind` / `is_truly_partial`: every 'expand' note is the resolver's wording) and
    `coverage` prints them as "Complete, with a copybook chosen among several" (LESSONS 181).
-19. **The resolver reads `listing_copy_source` first: the listing's library beats every guess.**
-   His compiler listings end with a table naming, per copybook, the DD name and the LIBRARY DATASET
-   the compiler read it from. `atlas.recover` reads that table from every program's listing into
-   `listing_copy_source(program, copybook, ddname, dataset, listing, seen)` and checks each
-   'ambiguous_copybook' choice against it (confirmed / contradicted / unknown - `work\recover.md`
-   names every contradicted one; LESSONS 182). At the re-parse `make_resolver` must look that table
-   up before its precedence chain (COPY..OF > same system in declared order > authoritative > same
-   folder > first): where the listing names a dataset the index holds (member.library / the
-   `library` table tie a folder to its dataset), that copy is the one to expand and the row is not
-   ambiguous at all; only where no listing says does the chain guess. A contradicted choice today
-   is a wrong fact in every field, offset and flow answer for that program.
+19. **Delivered in the batch - the resolver reads `listing_copy_source` first: the listing's library
+   beats every guess.** His compiler listings end with a table naming, per copybook, the DD name and
+   the LIBRARY DATASET the compiler read it from. `atlas.recover` reads that table from every
+   program's listing into `listing_copy_source(program, copybook, ddname, dataset, listing, seen)`
+   and checks each 'ambiguous_copybook' choice against it (confirmed / contradicted / unknown -
+   `work\recover.md` names every contradicted one; LESSONS 182). Now `make_resolver` reads that
+   table once for the whole build (`load_listing_sources`: a dict keyed (program, copybook), so
+   121k members cost one lookup per COPY) and looks the pair up before its precedence chain
+   (COPY..OF > same system in declared order > authoritative > same folder > first): where the
+   listing names a dataset and the index holds a candidate in a folder tied to it (the `library`
+   table from the fetcher's `.atlas-library.json`, else the folder named after the dataset -
+   `folder_dataset`, cached per folder), that copy is expanded and the 'ambiguous_copybook' row
+   says 'the program's compiler listing names DATASET' as its how - the compiler's fact, not a
+   guess; a nested COPY is looked up by the program's name, as the listing lists it; only where no
+   listing says (none read, no table, no row, no candidate in the dataset it names) does the chain
+   decide as before. The table absent (recover never ran on that index) or empty changes nothing,
+   and the build never creates it. Two things follow for the re-parse night: run `python -m
+   atlas.recover --db atlas.db` BEFORE the build so the rows are stored (a `--rebuild` deletes the
+   index and the table with it - the toolkit change re-parses every member without it), and a
+   program parsed before its rows were stored keeps the chain's guess until it is parsed again
+   (`recover` still reports it CONTRADICTED; it does not yet mark such a program pending).
+   tests/test_listing_resolver.py.
 20. **classify.py: a procedure copybook is a copybook by its CONTENT, before the folder hint.**
    His `A-100-BEGIN SECTION.  COPY PROCBOOK.` copies a member of paragraph names and statements -
    no level numbers, no DIVISION header - which has no content signature today, so the FOLDER NAME
