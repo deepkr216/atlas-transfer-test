@@ -7,13 +7,19 @@ and every program copying it said COPY X NOT FOUND; an 8-digit one (column 8 hol
 no fields, and expanded into `01 WS-STUB-AREA.` it ran that data entry on into the PROCEDURE DIVISION and erased every
 paragraph, PERFORM and reference of the program while it read `parse: ok` (the synthetic reproduction
 tools/synth/repro/F08-stub-8-digits). The compiler could compile neither text, so the program was compiled against
-another copy. Now a member of a kind the resolver expands whose every non-blank, non-comment line holds only digits,
-whatever the columns, is filed `stub`; the resolver never expands one - a real copy of the name in any library comes
-first - and with none the program is `partial` with the note 'COPY X: the member in LIBRARY holds only numbers (N
-lines) - a stub, not the copybook's text; the program was compiled against another copy (its listing, or another
-library, holds it)', its own facts kept. recover's disk check, coverage, `copybook` and `program` say 'a stub'; the
-stand-ins of this week (the arrived / misfiled / re-file steps) find nothing to do on such an index, and on an index
-built before the item they say what they said (tests/test_disk_check.py TheStubFiledEmpty, aged).
+another copy. Now a member of a kind the resolver expands whose every non-blank, non-comment line holds only digits
+where the compiler reads (columns 7-72) is filed `stub`; the resolver never expands one - a real copy of the name in
+any library comes first - and with none the program is `partial` with the note 'COPY X: the member in LIBRARY holds
+only numbers (N lines) - a stub, not the copybook's text; the program was compiled against another copy (its listing,
+or another library, holds it)', its own facts kept. recover's disk check, coverage, `copybook` and `program` say 'a
+stub'; the stand-ins of this week (the arrived / misfiled / re-file steps) find nothing to do on such an index, and on
+an index built before the item they say what they said (tests/test_disk_check.py TheStubFiledEmpty, aged).
+
+The verifier's round (LESSONS 205): a sequence number alone on a line (ISPF numbering: NUM ON STD in columns 73-80,
+NUM ON COBOL in 1-6) made a retired copybook of comments and numbered blank lines a `stub` - the compiler reads it as an
+empty copybook; a job read another department's card in place of its own date card holding only numbers; recover's
+'what to do' for an `empty` member sent him to look for a number the build had ruled out; the stub wording spoke of
+'the program' where none or several copy the name.
 
 Cases: TheReader (reader.stub_count, expand.stub_note and its pattern); SevenAndEightDigits (both stubs filed `stub`,
 the programs partial with the note and their own paragraphs, every report, recover twice, a dry run, an incremental
@@ -22,7 +28,10 @@ removed, the stub note; back, whole again); AStubArrivesChangesAndGoes (the incr
 each time); TheListingHoldsTheText (recover writes the copybook from the program's listing, the build expands it over
 the stub); CardsHoldingOnlyNumbers (a date card filed `stub` is still a job's cards; a copybook stub never takes a
 card member's place); TheReproduction (F08's estate, in process); AnIndexBuiltBeforeTheItem (aged: no stub word);
-TheDocsSayIt.
+TheDocsSayIt; NumberedBlankLines (both ISPF numbering styles: comments and numbered blank lines stay `empty`, a 7- or
+8-digit stub with a sequence number stays a stub); CardsOfTheirOwnDepartment (a department's own card holding only
+numbers before another department's card, a copybook stub never before a card of the same system, nor alone);
+TheWordsFitTheCopiers (several programs, none, a stub beside a card, coverage's rows).
 """
 
 import contextlib
@@ -143,14 +152,19 @@ class TheReader(unittest.TestCase):
         self.assertEqual(sc(STUB8), 6)                                  # a digit in column 8
         self.assertEqual(sc("1234567"), 1)                              # no line end at all
         self.assertEqual(sc("  0001  0002\n\n   \n00000300\n"), 2)       # blanks between digits, blank lines skipped
-        self.assertEqual(sc(" " * 72 + "00010000\n"), 1)                 # only the sequence in columns 73-80
-        self.assertEqual(sc("\t0001\n"), 1)                              # a tab is a blank
+        self.assertEqual(sc(" " * 72 + "00010000\n"), 0)                 # only a sequence number in 73-80: a blank line
+        self.assertEqual(sc("000100\n"), 0)                             # only a sequence number in 1-6: a blank line
+        self.assertEqual(sc("\t0001\n"), 1)                              # a tab is four columns: the 0 and 1 in 7-8
+        self.assertEqual(sc("\t01\n"), 0)                                # ... and here both sit in 5-6
         self.assertEqual(sc("00000100\x1a"), 1)                          # an end-of-file mark
         self.assertEqual(sc("      * A STUB LEFT BY THE PROMOTION\n00000100\n000200* A REMARK\n"), 1)   # comments skipped
         self.assertEqual(sc("*> FREE-FORM REMARK\n1234567\n"), 1)
         self.assertEqual(sc("00000100\n" + BOOK), 0)                    # a real line: not a stub
         self.assertEqual(sc("000100 05 X PIC X.\n"), 0)
-        self.assertEqual(sc("0001-0002\n"), 0)                          # a hyphen is not a digit
+        self.assertEqual(sc("       0001-0002\n"), 0)                   # a hyphen where the compiler reads is not a digit
+        # the sequence area is the compiler's to ignore: '0001-0' there, '002' from column 7 - no text it could compile
+        self.assertEqual(sc("0001-0002\n"), 1)
+        self.assertEqual(sc("00000100".ljust(66) + "ABC\n"), 0)          # text in 67-69: still the code area, no stub
         self.assertEqual(sc("           00125.\n"), 0)                  # a literal copied into a VALUE clause ends in its period
         self.assertEqual(sc("      * COMMENTS ONLY\n"), 0)             # comments and blanks only: empty, as before
         self.assertEqual(sc(""), 0)
@@ -232,9 +246,10 @@ class SevenAndEightDigits(_Stubs):
         rep = self.report_text()
         self.assertNotIn("## A member with the copybook's name exists but is filed as something else", rep)
         self.assertNotIn("## Re-filed as copybook", rep)
-        self.assertIn("A member the build filed `stub` holds only numbers, whatever the columns - not the copybook's text, "
-                      "which no compiler could compile: the program was compiled against another copy, and the build never "
-                      "expands a stub.", rep)
+        self.assertIn("A member the build filed `stub` holds only numbers where the compiler reads (columns 7-72) - not "
+                      "the copybook's text, which no compiler could compile: the programs copying it were compiled against "
+                      "another copy, and the build never expands a stub. A sequence number alone in columns 1-6 or 73-80 is "
+                      "a blank line, not a stub.", rep)
         todo = ("never expanded: the programs copying it were compiled against another copy - this tool writes the copybook "
                 "from their compiler listings (--from FOLDER), or fetch the library the listings name")
         self.assertEqual(self.disk_row("STUB7"), r"| STUB7 | 1 (PGM7:11) | yes: SHARED\PROD.GC.COPYLIB\STUB7.txt - in the "
@@ -269,14 +284,22 @@ class SevenAndEightDigits(_Stubs):
                       "from their compiler listings (or fetch the library the listings name)", part)
         for word in ("rename the folder", "re-files", "parsed before it arrived", "filed as stub"):
             self.assertNotIn(word, nf + part)
-        self.assertIn("| stub | 2 | NO | only numbers - never expanded: the programs copying it were compiled against "
-                      "another copy |", cov)
+        self.assertIn("| stub | 2 | NO | nothing: only numbers, never expanded - a program copying one was compiled "
+                      "against another copy |", cov)
+        self.assertIn("| expand | 2 | a COPY statement whose copybook is not in the index, or is held only as a stub of "
+                      "numbers (or skipped: recursive, nested too deep) | fetch that copybook library and build again (a "
+                      "stub's copybook: `python -m atlas.recover --db atlas.db --from FOLDER` writes it from the compiler "
+                      "listings) - until then the program's fields are incomplete |", cov)
 
     def test_copybook_and_program_say_a_stub(self):
         book = self.page(query.cmd_copybook, "STUB8")
         self.assertIn("**NOT FOUND** as a copybook - " + body("PROD.GC.COPYLIB", 6) + ".\n", book)
         self.assertIn("1 program copies it and is parsed only in part: PGM8.", book)
-        self.assertIn("A stub is never expanded: the programs copying it were compiled against another copy", book)
+        # one program copies it: said of one (LESSONS 205)
+        self.assertIn("\nA stub is never expanded: the program copying it was compiled against another copy - this tool "
+                      "writes the copybook from its compiler listing (--from FOLDER), or fetch the library the listing "
+                      "names.\n", book)
+        self.assertNotIn("programs", book.split("**NOT FOUND**")[1])
         self.assertNotIn("Looked for on disk", book)
         prog = self.page(query.cmd_program, "PGM8")
         self.assertIn("parse: partial", prog)
@@ -482,17 +505,236 @@ class TheDocsSayIt(unittest.TestCase):
         readme = " ".join(self.read("README.md").split())
         manual = " ".join(self.read("docs", "FieldManual.html").split())
         for text in (readme, manual):
-            self.assertIn("A member holding only numbers is a stub: whatever the columns its digits sit in, no compiler could "
-                          "compile it", text)
+            self.assertIn("A member holding only numbers is a stub: a number in the columns the compiler reads (7-72) is "
+                          "no text it could compile", text)
+            self.assertIn("A sequence number alone in columns 1-6 or 73-80 is a blank line, so a retired copybook of "
+                          "comments and numbered blank lines stays", text)
+            self.assertNotIn("whatever the columns", text)
             self.assertIn("'COPY X: the member in LIBRARY holds only numbers (N lines) - a stub, not the copybook's text; the "
                           f"program was compiled against another copy (its listing, or another library, holds it)'", text)
             self.assertNotIn("filed `empty` because its text sits in columns 1-7", text)
             self.assertNotIn("filed <code>empty</code> because its text sits in columns 1-7", text)
         lessons = self.read("LESSONS.md")
-        row = [ln for ln in lessons.splitlines() if ln.startswith("| 204 | ")]
-        self.assertEqual(len(row), 1)
-        self.assertEqual(row[0].count(" | "), 4)                      # four cells: saw / why / changed / tests
-        self.assertIn("test_stub_copybooks.py", row[0])
+        for n in (204, 205):
+            row = [ln for ln in lessons.splitlines() if ln.startswith(f"| {n} | ")]
+            self.assertEqual(len(row), 1)
+            self.assertEqual(row[0].count(" | "), 4)                  # four cells: saw / why / changed / tests
+            self.assertIn("test_stub_copybooks.py", row[0])
+        item = " ".join(self.read("ROADMAP.md").split("\n23. ")[1].split("\n24. ")[0].split())
+        self.assertNotIn("whatever the columns", item)
+        self.assertIn("a sequence number alone in columns 1-6 or 73-80 is a blank line", item)
+        self.assertNotIn("never in place of another member of the name", item)
+
+
+
+def ispf_std(text, start=10000, step=10000):
+    """ISPF NUM ON STD: every record padded to column 72 and numbered in columns 73-80, blank lines too."""
+    out, n = [], start
+    for line in text.splitlines():
+        out.append(f"{line:<72.72}{n:08d}")
+        n += step
+    return "\n".join(out) + "\n"
+
+
+RETIRED = "      * RETIRED 2019 - KEPT FOR THE OLD RELEASE\n      * DO NOT ADD FIELDS HERE\n\n"
+BLANK_TODO = ("it holds only comments and blank lines (a line with nothing but a sequence number in columns 1-6 or 73-80 is a "
+              "blank one to the compiler), so nothing is there to copy: the copybook's text is in the listings of the "
+              "programs copying it (this run reads them) or on the host (fetch the member again) - unless the copybook was "
+              "retired and adds nothing")
+
+
+class NumberedBlankLines(_Stubs):
+    """The verifier's round (LESSONS 205): a sequence number alone on a line is a blank line to the compiler. RETSTD is
+    two comments and a blank line numbered in columns 73-80 (NUM ON STD), RETCOB a comment and two blank lines numbered
+    in columns 1-6 (NUM ON COBOL): both were `empty` before the item and stay `empty` - the stub rule of fe0109d filed
+    them `stub` and told their programs they were compiled against another copy. NUMSTD7 / NUMSTD8 are the 7- and
+    8-digit stubs numbered in columns 73-80 (a digit in column 7, the indicator): stubs, with or without the numbers;
+    STAMP8 an 8-digit stub with a change stamp in 73-80, which the compiler ignores as it ignores the number."""
+
+    files = (("GC/PROD.GC.SRC/PGMRS.cbl", data_program("PGMRS", "RETSTD", "WS-REC")),
+             ("GC/PROD.GC.SRC/PGMRC.cbl", data_program("PGMRC", "RETCOB", "WS-REC")),
+             ("GC/PROD.GC.SRC/PGMN7.cbl", section_program("PGMN7", "NUMSTD7")),
+             ("GC/PROD.GC.SRC/PGMN8.cbl", area_program("PGMN8", "NUMSTD8")),
+             ("GC/PROD.GC.SRC/PGMSP.cbl", area_program("PGMSP", "STAMP8")),
+             ("SHARED/PROD.GC.COPYLIB/RETSTD.txt", ispf_std(RETIRED)),
+             ("SHARED/PROD.GC.COPYLIB/RETCOB.txt", "000100* RETIRED 2019\n000200\n000300\n"),
+             ("SHARED/PROD.GC.COPYLIB/NUMSTD7.txt", ispf_std(STUB7)),
+             ("SHARED/PROD.GC.COPYLIB/NUMSTD8.txt", ispf_std("00000100\n00000200\n")),
+             ("SHARED/PROD.GC.COPYLIB/STAMP8.txt", "00000100".ljust(72) + "CHG00123\n"))
+
+    def test_the_reader_counts_them_right(self):
+        sc = reader.stub_count
+        self.assertEqual(sc(ispf_std(RETIRED)), 0)
+        self.assertEqual(sc("000100* RETIRED 2019\n000200\n000300\n"), 0)
+        self.assertEqual(sc(ispf_std("\n\n\n\n\n\n")), 0)               # six numbered blank lines: the tag block too
+        self.assertEqual(sc(ispf_std(STUB7)), 1)
+        self.assertEqual(sc(ispf_std(STUB8)), 6)
+        self.assertEqual(sc("0001001234567\n0002007654321\n"), 2)       # NUM ON COBOL before a number from column 7
+        self.assertEqual(sc("00000100".ljust(72) + "CHG00123\n"), 1)
+        self.assertEqual(sc("      * RETIRED".ljust(72) + "CHG00123\n" + " " * 72 + "CHG00124\n"), 0)
+
+    def test_empty_as_before_and_the_stubs_stay_stubs(self):
+        for book in ("RETSTD", "RETCOB"):
+            self.assertEqual(self.member(book), ("empty", "PROD.GC.COPYLIB", "skipped"))
+        for book in ("NUMSTD7", "NUMSTD8", "STAMP8"):
+            self.assertEqual(self.member(book), ("stub", "PROD.GC.COPYLIB", "skipped"))
+        # a retired copybook's programs say what they said before the item - no stub note, no 'compiled against'
+        self.assertEqual(self.notes("PGMRS"), ["L8: COPY RETSTD NOT FOUND - fields/code from it are missing from this "
+                                               "program's facts"])
+        self.assertEqual(self.notes("PGMRC"), ["L8: COPY RETCOB NOT FOUND - fields/code from it are missing from this "
+                                               "program's facts"])
+        self.assertEqual(self.notes("PGMN7"), ["L11: " + note("NUMSTD7", "PROD.GC.COPYLIB", 1)])
+        self.assertEqual(self.notes("PGMN8"), ["L7: " + note("NUMSTD8", "PROD.GC.COPYLIB", 2)])
+        self.assertEqual(self.notes("PGMSP"), ["L7: " + note("STAMP8", "PROD.GC.COPYLIB", 1)])
+        for pg in ("PGMN8", "PGMSP"):
+            self.assertEqual(self.paragraph_names(pg), ["0000-MAIN", "1000-COUNT"])
+
+    def test_recover_says_comments_and_blank_lines(self):
+        stats, said = self.recover()
+        self.assertIn(CHECKED + "5 on disk (2 in the index filed empty - no code lines the reader sees, 3 in the index as "
+                      "a stub - only numbers, not the copybook's text)", said)
+        # an empty member here holds no number on disk: the 'next:' does not send him to columns 1-7
+        self.assertIn("  next: the report's table says per file why the build did not index it as a copybook - a member "
+                      "filed empty (comments and blank lines only), a skipped file (atlas-problems.txt)", said)
+        for book, line in (("RETSTD", "PGMRS:8"), ("RETCOB", "PGMRC:8")):
+            self.assertEqual(self.disk_row(book), f"| {book} | 1 ({line}) | yes: SHARED\\PROD.GC.COPYLIB\\{book}.txt - in the "
+                                                  "index, filed as empty | no code lines (comments and blanks only): "
+                                                  f"nothing a program could copy | {BLANK_TODO} |")
+        self.assertEqual(recover.EMPTY_BLANK_TODO, BLANK_TODO)
+        for book in ("NUMSTD7", "NUMSTD8", "STAMP8"):
+            self.assertIn("in the index as a stub | a stub: it holds only numbers", self.disk_row(book))
+        rep = self.report_text()
+        self.assertNotIn("if the number is all it holds", rep)
+        for book in ("RETSTD", "RETCOB"):
+            self.assertNotIn("a stub", self.disk_row(book))
+            self.assertNotIn("stub", self.page(query.cmd_copybook, book))
+
+
+def sort_job(job, dsn):
+    """A SORT step whose SYSIN is the card member `dsn` names."""
+    return (f"//{job:<8} JOB (ACCT),'NIGHT',CLASS=A\n"
+            "//STEP1    EXEC PGM=SORT\n"
+            "//SORTIN   DD DSN=PROD.GC.IN,DISP=SHR\n"
+            "//SORTOUT  DD DSN=PROD.GC.SORTED,DISP=(NEW,CATLG)\n"
+            f"//SYSIN    DD DSN={dsn},DISP=SHR\n")
+
+
+class CardsOfTheirOwnDepartment(_Stubs):
+    """The verifier's round (LESSONS 205). GC's date card DATECARD holds only numbers in a library with no hint (filed
+    'unknown' before the item, `stub` now); GB's PARMLIB holds a sort card of the same name. GC's job reads its own
+    card - fe0109d dropped every stub when another member of the name existed and credited GB's card to GC's job - and
+    GB's job reads GB's. The other way: GC's copybook stub RUNCARD never takes the place of GC's own sort card RUNCARD,
+    and a copybook stub alone under a card name is no job's cards (`empty` or a copybook before the item, never read)."""
+
+    files = (("GC/PROD.GC.DATA/DATECARD.txt", "20260925\n"),
+             ("GB/PROD.GB.PARMLIB/DATECARD.txt", "  SORT FIELDS=(1,8,CH,A)\n"),
+             ("GC/PROD.GC.JCL/GCJOBD.jcl", sort_job("GCJOBD", "PROD.GC.DATA(DATECARD)")),
+             ("GB/PROD.GB.JCL/GBJOBD.jcl", sort_job("GBJOBD", "PROD.GB.PARMLIB(DATECARD)")),
+             ("GC/PROD.GC.COPYLIB/RUNCARD.txt", "00000100\n"),
+             ("GC/PROD.GC.PARMLIB/RUNCARD.txt", "  SORT FIELDS=(1,4,CH,A)\n"),
+             ("GC/PROD.GC.JCL/GCJOBR.jcl", sort_job("GCJOBR", "PROD.GC.PARMLIB(RUNCARD)")),
+             ("GC/PROD.GC.COPYLIB/ONLYSTUB.txt", "00000100\n"),
+             ("GC/PROD.GC.JCL/GCJOBO.jcl", sort_job("GCJOBO", "PROD.GC.PARMS(ONLYSTUB)")))
+
+    def sysin(self, job):
+        rows = self.q("SELECT d.card_member, d.sysin_text FROM dd d JOIN step s ON s.id=d.step_id JOIN job j ON "
+                      "j.id=s.job_id WHERE j.job_name=? AND d.dd_name='SYSIN'", job)
+        self.assertEqual(len(rows), 1, rows)
+        return rows[0]
+
+    def sort_fields(self, job):
+        return self.q("SELECT c.card_kind, c.pos, c.length, c.fmt FROM card_field_ref c JOIN step s ON s.id=c.step_id "
+                      "JOIN job j ON j.id=s.job_id WHERE j.job_name=? ORDER BY c.id", job)
+
+    def test_each_job_reads_its_own_card(self):
+        self.assertEqual(self.member("DATECARD", "PROD.GC.DATA"), ("stub", "PROD.GC.DATA", "skipped"))
+        self.assertEqual(self.member("DATECARD", "PROD.GB.PARMLIB")[0], "ctlcard")
+        self.assertEqual(self.member("RUNCARD", "PROD.GC.COPYLIB")[0], "stub")
+        self.assertEqual(self.member("RUNCARD", "PROD.GC.PARMLIB")[0], "ctlcard")
+        self.assertEqual(self.member("ONLYSTUB")[0], "stub")
+        # a card stub against another department's card: its own department's comes first, as before the item
+        member, text = self.sysin("GCJOBD")
+        self.assertEqual(member, "DATECARD")
+        self.assertIn("20260925", text or "")
+        self.assertNotIn("SORT FIELDS", text or "")
+        self.assertEqual(self.sort_fields("GCJOBD"), [])
+        self.assertIn("SORT FIELDS=(1,8,CH,A)", self.sysin("GBJOBD")[1] or "")
+        self.assertEqual(self.sort_fields("GBJOBD"), [("SORT", 1, 8, "CH")])
+        # a copybook stub against a card of the same system: the card, with no 'several copies' choice to make
+        self.assertIn("SORT FIELDS=(1,4,CH,A)", self.sysin("GCJOBR")[1] or "")
+        self.assertEqual(self.sort_fields("GCJOBR"), [("SORT", 1, 4, "CH")])
+        # a copybook stub alone under a card name: no job's cards
+        self.assertNotIn("00000100", self.sysin("GCJOBO")[1] or "")
+        conn = query.connect(self.db)
+        try:
+            self.assertNotIn("SORT 1-8 CH", query.cmd_job(conn, "GCJOBD"))
+            self.assertIn("SORT 1-8 CH", query.cmd_job(conn, "GBJOBD"))
+        finally:
+            conn.close()
+
+
+class TheWordsFitTheCopiers(_Stubs):
+    """The verifier's round (LESSONS 205): the stub wording fitted to who copies the name. TWOSTUB is copied by two
+    programs (said of both: 'the programs were compiled'); CNTCARD, a count card a job reads, by none ('no program
+    copies it', the jobs naming it, nothing to write); RUNBOOK is a copybook stub beside a card of its name that no
+    program copies."""
+
+    files = (("GC/PROD.GC.SRC/PGMT1.cbl", data_program("PGMT1", "TWOSTUB", "BK-ID")),
+             ("GC/PROD.GC.SRC/PGMT2.cbl", data_program("PGMT2", "TWOSTUB", "BK-ID")),
+             ("SHARED/PROD.GC.COPYLIB/TWOSTUB.txt", STUB8),
+             ("GC/PROD.GC.DATA/CNTCARD.txt", "00000042\n"),
+             ("GC/PROD.GC.JCL/GCJOBC.jcl", "//GCJOBC   JOB (ACCT),'NIGHT',CLASS=A\n"
+                                           "//STEP1    EXEC PGM=PGMT1\n"
+                                           "//SYSIN    DD DSN=PROD.GC.DATA(CNTCARD),DISP=SHR\n"),
+             ("SHARED/PROD.GC.COPYLIB/RUNBOOK.txt", "00000100\n"),
+             ("GC/PROD.GC.PARMLIB/RUNBOOK.txt", "  SORT FIELDS=(1,4,CH,A)\n"))
+
+    MANY = ("the member in PROD.GC.COPYLIB holds only numbers (6 lines) - a stub, not the copybook's text; the programs "
+            "were compiled against another copy (their listings, or another library, hold it)")
+
+    def test_several_programs(self):
+        self.assertEqual(expand.stub_fitted(body("PROD.GC.COPYLIB", 6), 2), self.MANY)
+        self.assertEqual(expand.stub_fitted(body("PROD.GC.COPYLIB", 6), 1), body("PROD.GC.COPYLIB", 6))
+        self.assertEqual(self.notes("PGMT1"), ["L8: " + note("TWOSTUB", "PROD.GC.COPYLIB", 6)])   # one program's note
+        as_prog = self.page(query.cmd_program, "TWOSTUB")
+        self.assertIn(f"> 2 programs copy it as a copybook and are parsed only in part (PGMT1, PGMT2): {self.MANY}.", as_prog)
+        self.assertNotIn("the program was compiled", as_prog)
+        book = self.page(query.cmd_copybook, "TWOSTUB")
+        self.assertIn(f"**NOT FOUND** as a copybook - {self.MANY}.\n", book)
+        self.assertIn("2 programs copy it and are parsed only in part: PGMT1, PGMT2.", book)
+        self.assertIn(f"A stub is {recover.STUB_TODO}.", book)
+        cov = self.coverage()
+        self.assertIn(f"| TWOSTUB | 2 | yes: {self.MANY} | in the index (the column before says as what) |", cov)
+        prog = self.page(query.cmd_program, "PGMT1")
+        self.assertIn("| TWOSTUB | **a stub - not expanded**: " + body("PROD.GC.COPYLIB", 6) + " |", prog)
+
+    def test_no_program_copies_it(self):
+        self.assertEqual(self.member("CNTCARD"), ("stub", "PROD.GC.DATA", "skipped"))
+        rows = self.q("SELECT d.sysin_text FROM dd d JOIN step s ON s.id=d.step_id JOIN job j ON j.id=s.job_id "
+                      "WHERE j.job_name='GCJOBC' AND d.dd_name='SYSIN'")
+        self.assertIn("00000042", rows[0][0] or "")                        # the job reads its count card, as before
+        book = self.page(query.cmd_copybook, "CNTCARD")
+        self.assertIn("**NOT FOUND** as a copybook - the member in PROD.GC.DATA holds only numbers (1 line) - a stub; no "
+                      "program copies it.\n", book)
+        self.assertIn("The DDs of job GCJOBC name a card member CNTCARD: `job NAME` shows the cards each one read.", book)
+        self.assertIn("A stub is never expanded as a copybook, and no program copies it: there is no copybook to write.",
+                      book)
+        other = self.page(query.cmd_copybook, "RUNBOOK")
+        self.assertIn("The member in PROD.GC.COPYLIB holds only numbers (1 line) - a stub; no program copies it.", other)
+        for page in (book, other, self.page(query.cmd_program, "CNTCARD")):
+            self.assertNotIn("compiled against another copy", page)
+            self.assertNotIn("programs copying it", page)
+        self.assertEqual(expand.stub_note([("A.DATA", 1)], programs=0),
+                         "the member in A.DATA holds only numbers (1 line) - a stub; no program copies it")
+        self.assertEqual(expand.stub_note([("A.DATA", 1), ("B.DATA", 2)], programs=0),
+                         "the members in A.DATA (1 line), B.DATA (2 lines) hold only numbers - stubs; no program copies it")
+        self.assertEqual(recover.stub_todo(0), recover.STUB_NO_COPY_TODO)
+        self.assertEqual(recover.stub_todo(2), recover.STUB_TODO)
+        cov = self.coverage()
+        self.assertIn("| stub | 3 | NO | nothing: only numbers, never expanded - a program copying one was compiled against "
+                      "another copy |", cov)
+        self.assertIn("| expand | 2 | a COPY statement whose copybook is not in the index, or is held only as a stub of "
+                      "numbers", cov)
 
 
 if __name__ == "__main__":

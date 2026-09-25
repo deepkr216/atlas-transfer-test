@@ -100,32 +100,59 @@ def _split_records(text: str, data: bytes, enc: str) -> List[str]:
     return [text]
 
 
-_STUB_BLANKS = str.maketrans({"\t": " ", "\x00": " ", "\x1a": " ", "\f": " "})
+_STUB_BLANKS = str.maketrans({"\x00": " ", "\x1a": " ", "\f": " "})
+_STUB_DIGITS = " 0123456789"
 
 
 def stub_count(text: str, data: bytes = b"", enc: str = "utf-8") -> int:
     """How many lines a STUB holds, or 0: a member whose every non-blank,
-    non-comment record holds only digits and blanks, whatever the columns
-    (ROADMAP re-parse item 23). `1234567` in column 1 is the sequence area
-    and the indicator column of fixed-format COBOL - no code; `12345678`
-    puts a digit in column 8, which the reader takes for code, and expanded
-    into a program it runs the data entry before the COPY on into the
-    PROCEDURE DIVISION and erases every paragraph (tools/synth/repro/F08).
-    The compiler could compile neither text, so the program was compiled
-    against another copy: a stub is never COBOL to expand. A comment record
-    is '*' or '/' in column 7, or '*' as its first non-blank character; tabs,
-    NULs, an end-of-file mark and form feeds count as blanks. 0 for a member
-    with no such record (blank or comments only: `empty`, as before) and for
-    one with any record holding anything else. Records split as the reader
-    splits them."""
-    n = 0
-    for rec in _split_records(text, data, enc):
-        rec = rec.translate(_STUB_BLANKS)
+    non-comment record holds only digits and blanks in the columns the
+    compiler reads - the indicator column 7 and the code area to column 72
+    (ROADMAP re-parse item 23). `1234567` puts a digit in column 7, the
+    indicator, which no compiler accepts; `12345678` puts one in column 8
+    too, which the reader takes for code, and expanded into a program it
+    runs the data entry before the COPY on into the PROCEDURE DIVISION and
+    erases every paragraph (tools/synth/repro/F08). The compiler could
+    compile neither text, so the program was compiled against another copy:
+    a stub is never COBOL to expand.
+
+    The sequence area (columns 1-6) and the identification area (73-80) are
+    the compiler's to ignore, and so they are here: a record whose columns
+    7-72 are blank is a BLANK line whatever those two areas hold - ISPF
+    numbering puts a number on every blank line (NUM ON COBOL in 1-6, NUM
+    ON STD in 73-80), and a retired copybook of comments and such numbered
+    blank lines is `empty`, as it always was (LESSONS 205). The columns are
+    the reader's: fixed or free format as reader.looks_fixed_format decides
+    (free format: the whole record is code), the code area ending where
+    reader.detect_code_end finds a shifted stamp, a tab four columns wide.
+    A comment record is '*' or '/' in column 7, or '*' as its first
+    non-blank character; NULs, an end-of-file mark and form feeds count as
+    blanks. 0 for a member with no record holding a digit in those columns
+    (blank or comments only: `empty`) and for one with any record holding
+    anything else there. Records split as the reader splits them."""
+    records = _split_records(text, data, enc)
+    kept: List[str] = []
+    for rec in records:
+        rec = rec.replace("\t", "    ").translate(_STUB_BLANKS)
         if not rec.strip():
             continue
         if rec.lstrip().startswith("*") or (len(rec) > 6 and rec[6] in "*/"):
             continue
-        if rec.strip(" 0123456789"):
+        if rec[6:65].strip(_STUB_DIGITS):
+            # text in columns 7-65, which the compiler reads in either format (detect_code_end never cuts before
+            # column 65): no stub - every real member stops here, at its first code line, before the format is read
+            return 0
+        kept.append(rec)
+    if not kept:
+        return 0
+    fixed = looks_fixed_format(records)
+    code_end = detect_code_end(records) if fixed else None
+    n = 0
+    for rec in kept:
+        area = rec[6:code_end] if fixed else rec
+        if not area.strip():
+            continue                     # a sequence number, a stamp - nothing the compiler reads: a blank line
+        if area.strip(_STUB_DIGITS):
             return 0
         n += 1
     return n

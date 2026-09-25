@@ -307,9 +307,12 @@ COPY_KINDS = RESOLVER_KINDS + (STUB_KIND,)
 # that, when nothing was found) - so an incremental build parses every job and PROC again (moved_names with
 # again=False: a job holds no member id of what it read, so a member recorded again with the same bytes changes
 # nothing in it; ROADMAP re-parse item 21)
-# A stub is read by the jobs wherever a member filed 'unknown' is: a card member holding only numbers (a date or a
-# count in a PARMS library with no hint) was filed 'unknown' and read as a job's cards before ROADMAP re-parse item 23
-# filed it `stub` - only a COPY never expands it
+# A stub is read by the jobs exactly where the member its classifier made of it was read before ROADMAP re-parse item
+# 23 filed it `stub` (_stub_read_as): one read as 'unknown' - a date or a count card in a library with no hint - as an
+# INCLUDE or cards, one read as 'sql' as cards, and one read as a copybook or a program never (it was `empty` or a
+# copybook then) - on equal terms with the other members of the name in _pick_member's JCLLIB / department / manifest
+# order, so a department's own card holding only numbers is still its job's cards (LESSONS 205). Only a COPY never
+# expands a stub
 PROC_KINDS = ("proc", "jcl")
 INCLUDE_KINDS = ("jcl", "proc", "ctlcard", "unknown", STUB_KIND)
 CARD_KINDS = ("ctlcard", "unknown", STUB_KIND, "sql", "jcl", "proc")
@@ -390,6 +393,7 @@ class Ctx:
         self.listing_sources: Dict[Tuple[str, str], Tuple[ListingRow, ...]] = {}
         self.folder_dataset: Dict[str, Optional[str]] = {}
         self.stub_lines: Dict[int, Optional[int]] = {}  # member id -> lines holding numbers, for a stub a COPY names
+        self.stub_kinds: Dict[int, str] = {}            # member id -> the classifier's kind of a stub a job names
 
     def problem(self, kind: str, path: str, detail: str, line: Optional[str] = None) -> None:
         """A member or file that could not be indexed: shown now (with the time),
@@ -1421,13 +1425,33 @@ def _pick_member(ctx: Ctx, cands: List[Mem], name: str, job_mem: Optional[Mem] =
     return best, note
 
 
+def _stub_read_as(ctx: Ctx, m: Mem) -> str:
+    """The kind the classifier gives a member filed `stub` - the kind the
+    build filed it before ROADMAP re-parse item 23 (a stub is one of
+    RESOLVER_KINDS holding only numbers): 'unknown' for a date or a count
+    card in a library with no hint, 'sql', or a copybook / program by its
+    folder or extension. Read again as _inventory_one read it (the same
+    bytes, the same kinds declared for the libraries: a change of either
+    re-parses every job), once per build; 'copybook' when the file cannot
+    be read now, which no job reads."""
+    cache = ctx.stub_kinds
+    if m.id not in cache:
+        try:
+            text, _data, _enc = reader.load(m.path)
+            cache[m.id] = classify.decide(m.path, text[:8192], ctx.kind_of.get((m.library or "").upper()))[0]
+        except OSError:
+            cache[m.id] = "copybook"
+    return cache[m.id]
+
+
 def _member_text(ctx: Ctx, name: str, kinds: Tuple[str, ...], job_mem: Optional[Mem] = None,
                  jcllib: Sequence[str] = ()) -> Optional[str]:
-    cands = [m for m in ctx.by_name.get(name.upper(), []) if m.kind in kinds]
-    if any(m.kind != STUB_KIND for m in cands):
-        # a member holding only numbers is read as cards only when no other member of the name is: a copybook stub
-        # (filed copybook or empty before ROADMAP re-parse item 23, never a card) must not take a card member's place
-        cands = [m for m in cands if m.kind != STUB_KIND]
+    # a stub (only numbers - ROADMAP re-parse item 23) is a candidate where the member its classifier made of it was
+    # one before the item: a card read as 'unknown' or 'sql' on equal terms with the other members of the name - its
+    # own department's card comes first by _pick_member, as before - and a copybook's or a program's stub (`empty` or
+    # a copybook then) never, so it takes no card member's place (LESSONS 205)
+    cands = [m for m in ctx.by_name.get(name.upper(), [])
+             if m.kind in kinds and (m.kind != STUB_KIND or _stub_read_as(ctx, m) in kinds)]
     m, _note = _pick_member(ctx, cands, name, job_mem, jcllib)
     if m is None:
         return None

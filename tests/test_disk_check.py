@@ -45,7 +45,7 @@ ROOT = os.path.dirname(HERE)
 sys.path.insert(0, ROOT)
 sys.path.insert(0, HERE)
 
-from atlas import build, query, recover  # noqa: E402
+from atlas import build, query, reader, recover  # noqa: E402
 from test_refiled_copybooks import data_program, section_program  # noqa: E402
 
 BOOK = "           05  BK-ID               PIC X(5).\n           05  BK-AMT              PIC 9(3).\n"
@@ -69,6 +69,8 @@ NEXT_FETCH = ("  next: fetch the libraries that hold these copybooks - the repor
               r"listings say (work\fetch-list.txt)")
 NEXT_TABLE = ("  next: the report's table says per file why the build did not index it as a copybook - a member filed "
               "empty (its text in columns 1-7), a skipped file (atlas-problems.txt)")
+# no member filed empty holds a number on disk (an index this toolkit built): comments and blank lines only (LESSONS 205)
+NEXT_TABLE_BLANK = NEXT_TABLE.replace("(its text in columns 1-7)", "(comments and blank lines only)")
 
 
 def age_stubs(db):
@@ -81,8 +83,10 @@ def age_stubs(db):
         rows = conn.execute("SELECT id, path FROM member WHERE kind = 'stub'").fetchall()
         assert rows, "the estate must hold a stub to age"
         for mid, path in rows:
-            with open(path, encoding="utf-8") as fh:
-                assert recover.stub_lines(fh.read()), f"{path}: only a stub within columns 1-7 was filed empty"
+            text, data, enc = reader.load(path)
+            # what that build did: no code the reader sees in columns 8-72 - a number within columns 1-7, with or without
+            # a sequence number in 73-80 beside it (LESSONS 205) - and the member was filed empty
+            assert build.code_line_count("copybook", text, data, enc) == 0, f"{path}: only a stub the reader saw no code in"
             conn.execute("UPDATE member SET kind = 'empty' WHERE id = ?", (mid,))
         for uid, detail in conn.execute("SELECT id, detail FROM unresolved WHERE kind = 'expand' "
                                         "AND detail LIKE '%only numbers%'").fetchall():
@@ -293,6 +297,50 @@ class TheStubFiledEmpty(_Estate):
         self.assertIn("holds 2 line(s) whose text sits in columns 1-7", why)
 
 
+class TheNumberedStubFiledEmpty(_Estate):
+    """The verifier's round (LESSONS 205), on an index built before ROADMAP re-parse item 23: BOOKN holds `1234567`
+    with an ISPF sequence number in columns 73-80, BOOKM two comments and a blank line numbered there. That build filed
+    both empty. BOOKN's row said 'no code lines (comments and blanks only)' - stub_lines() counts text within columns
+    1-7 only - and BOOKM's 'open the file: if the number is all it holds'. Now each says what the file holds, and the
+    'what to do' comes from the file on disk: EMPTY_TODO for the number, the comments-and-blank-lines one for BOOKM."""
+
+    aged = True
+
+    files = (("GC/PROD.GC.SRC/PGMN.cbl", section_program("PGMN", "BOOKN")),
+             ("GC/PROD.GC.SRC/PGMM.cbl", section_program("PGMM", "BOOKM")),
+             ("SHARED/PROD.GC.COPYLIB/BOOKN.txt", "1234567".ljust(72) + "00010000\n"),
+             # filed empty by this build too (no number where the compiler reads): not aged, the same row either way
+             ("SHARED/PROD.GC.COPYLIB/BOOKM.txt", "      * RETIRED".ljust(72) + "00010000\n"
+              + "      * NO FIELDS".ljust(72) + "00020000\n" + " " * 72 + "00030000\n"))
+
+    def test_what_the_file_holds_and_what_to_do(self):
+        self.assertEqual(self.q("SELECT name, kind FROM member WHERE name IN ('BOOKN', 'BOOKM') ORDER BY name"),
+                         [("BOOKM", "empty"), ("BOOKN", "empty")])
+        stats, said = self.recover()
+        self.assertIn(CHECKED + "2 on disk (2 in the index filed empty - no code lines the reader sees)", said)
+        self.assertIn(NEXT_TABLE, said)                                 # BOOKN holds a number: columns 1-7, as before
+        numbers = ("the file holds only numbers (1 line) and no code the reader sees - a stub, not the copybook's text; "
+                   f"the build of {ITEM} files such a member `stub` and never expands it")
+        self.assertEqual(recover.numbers_sentence(1), numbers)
+        self.assertEqual(self.disk_row("BOOKN"), r"| BOOKN | 1 (PGMN:11) | yes: SHARED\PROD.GC.COPYLIB\BOOKN.txt - in the "
+                                                 f"index, filed as empty | {numbers} | {recover.EMPTY_TODO} |")
+        self.assertEqual(self.disk_row("BOOKM"), r"| BOOKM | 1 (PGMM:11) | yes: SHARED\PROD.GC.COPYLIB\BOOKM.txt - in the "
+                                                 "index, filed as empty | no code lines (comments and blanks only): nothing "
+                                                 f"a program could copy | {recover.EMPTY_BLANK_TODO} |")
+        rep = self.report_text()
+        misfiled = rep.split("## A member with the copybook's name exists but is filed as something else")[1]
+        cell = [ln for ln in misfiled.splitlines() if ln.startswith("| BOOKN | empty | ")][0]
+        self.assertIn(f"not re-filed: {numbers} |", cell)
+        self.assertNotIn("comments and blanks only", cell)
+        r = recover.how_classified(os.path.join(self.root, "SHARED", "PROD.GC.COPYLIB", "BOOKN.txt"), "empty")
+        self.assertEqual((r["stub"], r["numbers"]), (0, 1))
+        self.assertTrue(str(r["seen"]).endswith("the build filed it empty: " + numbers), r["seen"])
+        _cov, nf, book = self.outputs("BOOKN")
+        self.assertIn(numbers, nf)
+        self.assertIn(numbers, book)
+        self.assertNotIn("comments and blanks only", book)
+
+
 class NothingNearAnywhere(_Estate):
     """Case D: PGMD copies QZXWVUTS, a name no file comes near."""
 
@@ -459,7 +507,7 @@ class ThereAtTheLastBuild(_Estate):
         stats, said = self.recover()
         self.assertEqual((stats["missing"], stats["on_disk"], stats["arrived_late"], stats["no_file"]), (1, 1, 0, 0), said)
         self.assertIn(CHECKED + "1 on disk (1 there at the last build yet not in the index)", said)
-        self.assertIn(NEXT_TABLE, said)
+        self.assertIn(NEXT_TABLE_BLANK, said)
         row = self.disk_row("BOOKE")
         self.assertIn(r"| BOOKE | 1 (PGME:8) | yes: SHARED\PROD.GC.COPYLIB\BOOKE.txt - not in the index | copybook (COBOL level "
                       "numbers with no PROCEDURE DIVISION), 2 code line(s) | was there at the last build (file dated ", row)
@@ -544,7 +592,10 @@ class TheHelpers(unittest.TestCase):
                          NEXT_FETCH + "; the 1 near name(s) the report lists may be the members under another name: check "
                                       "them against the COPY statements")
         self.assertEqual(recover.disk_next({"F": v("none")}), NEXT_FETCH)
-        self.assertEqual(recover.disk_next({"C": v("indexed"), "D": v("there")}), NEXT_TABLE)
+        self.assertEqual(recover.disk_next({"C": v("indexed"), "D": v("there")}), NEXT_TABLE_BLANK)
+        numbered = {"status": "indexed", "numbers": 1}                  # a number on disk: an index built before item 23
+        self.assertEqual(recover.disk_next({"C": numbered, "D": v("there")}), NEXT_TABLE)
+        self.assertEqual(recover.disk_next({"D": v("there")}), NEXT_TABLE_BLANK)
         self.assertEqual(recover.disk_line({"F": v("none")}), CHECKED + "1 with no file under the estate")
         self.assertEqual(recover.disk_counts({}), {"on_disk": 0, "arrived_late": 0, "no_file": 0, "there": 0, "indexed": 0,
                                                    "near": 0, "stub": 0})
@@ -556,7 +607,7 @@ class TheHelpers(unittest.TestCase):
         self.assertEqual(recover.disk_next({"S": v("stub")}), recover.STUB_NEXT)
         self.assertEqual(recover.disk_next({"S": v("stub"), "F": v("none")}), NEXT_FETCH)
         self.assertEqual(recover.disk_next({"S": v("stub"), "A": v("late")})[:40], NEXT_BUILD[:40])
-        self.assertEqual(recover.disk_next({"S": v("stub"), "C": v("indexed")}), NEXT_TABLE)
+        self.assertEqual(recover.disk_next({"S": v("stub"), "C": v("indexed")}), NEXT_TABLE_BLANK)
 
     def test_last_build_started(self):
         conn = sqlite3.connect(":memory:")

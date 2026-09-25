@@ -1317,9 +1317,8 @@ def _copied_as_copybook(conn: sqlite3.Connection, name: str) -> str:
         return ""
     if not other:
         # a stub (only numbers - ROADMAP re-parse item 23): what it is to the programs copying it, in their own note
-        copiers = [(int(r[0]), str(r[1])) for r in conn.execute(
-            "SELECT DISTINCT m.id, UPPER(m.name) FROM copy_use c JOIN member m ON m.id=c.member_id "
-            "WHERE UPPER(c.copybook)=? AND m.kind='cobol' AND c.resolved_member_id IS NULL ORDER BY 2", (name.upper(),))]
+        # said of as many programs as copy it (LESSONS 205)
+        copiers = recover.stub_copiers(conn, name)
         note = recover.stub_note_of(conn, name, [i for i, _n in copiers]) if copiers else ""
         if not note:
             return ""
@@ -1487,14 +1486,18 @@ def cmd_copybook(conn: sqlite3.Connection, name: str) -> str:
         if not other and recover.stubs_named(conn, name):
             # only a stub carries the name (ROADMAP re-parse item 23): what it holds, who copies it, what to do - the
             # disk has nothing to add
-            users = conn.execute("SELECT DISTINCT m.id, UPPER(m.name) FROM copy_use c JOIN member m ON m.id=c.member_id "
-                                 "WHERE UPPER(c.copybook)=? AND m.kind='cobol' AND c.resolved_member_id IS NULL "
-                                 "ORDER BY 2", (name.upper(),)).fetchall()
+            users = recover.stub_copiers(conn, name)
             who = ", ".join(u[1] for u in users[:8]) + (f", +{len(users) - 8} more" if len(users) > 8 else "")
+            # no program copying it (a date or a count card a job names): what it is, and the jobs naming a card member
+            # of the name - no COPY clause, nothing to write (LESSONS 205)
+            jobs = [] if users else recover.card_jobs(conn, name)
             return (out[0] + f"\n**NOT FOUND** as a copybook - {recover.stub_note_of(conn, name, [u[0] for u in users])}.\n"
                     + (f"\n{len(users)} program{'s' if len(users) != 1 else ''} cop{'y' if len(users) != 1 else 'ies'} it and "
                        f"{'are' if len(users) != 1 else 'is'} parsed only in part: {who}.\n" if users else "")
-                    + f"\nA stub is {recover.STUB_TODO}.\n" + _listing_sources_of(conn, name, missing=True))
+                    + (f"\nThe DDs of job{'s' if len(jobs) != 1 else ''} {', '.join(jobs[:8])}"
+                       + (f", +{len(jobs) - 8} more" if len(jobs) > 8 else "")
+                       + f" name a card member {name.upper()}: `job NAME` shows the cards each one read.\n" if jobs else "")
+                    + f"\nA stub is {recover.stub_todo(len(users))}.\n" + _listing_sources_of(conn, name, missing=True))
         # no member at all under the name: the estate root is walked once for a file with that name, or a near one
         # (LESSONS 192) - a member of another kind is said by the note above, the disk check has nothing to add
         disk = "" if other else _disk_note(conn, name)
@@ -1775,8 +1778,10 @@ def index_header(conn: sqlite3.Connection) -> str:
 # What each blind spot in `unresolved` means, and what closes it. The parsers
 # record the kind; a reader should not have to guess what the word implies.
 UNRESOLVED_MEANING = {
-    "expand": ("a COPY statement whose copybook is not in the index (or skipped: recursive, nested too deep)",
-               "fetch that copybook library and build again - until then the program's fields are incomplete"),
+    "expand": ("a COPY statement whose copybook is not in the index, or is held only as a stub of numbers (or skipped: "
+               "recursive, nested too deep)",
+               "fetch that copybook library and build again (a stub's copybook: `python -m atlas.recover --db atlas.db "
+               "--from FOLDER` writes it from the compiler listings) - until then the program's fields are incomplete"),
     "expand (copybook chosen among several)": (
         "the resolver's own choice repeated as a COPY warning: the program expanded completely with the copy its "
         "'ambiguous_copybook' row names - not a missing copybook",
@@ -5575,7 +5580,7 @@ def _coverage_extras(conn: sqlite3.Connection) -> str:
             "sql": "DDL not parsed (columns, views, triggers unknown)", "unknown": "nothing - misfiled library?",
             "doc": "prose only, never facts", "listing": "not parsed (offsets unknown)", "other": "nothing",
             "empty": "no code lines",
-            "stub": "only numbers - never expanded: the programs copying it were compiled against another copy"}
+            "stub": "nothing: only numbers, never expanded - a program copying one was compiled against another copy"}
     out.append(table(["kind", "members", "handler", "what is lost without one"],
                      [(k["kind"], k["n"], "yes" if k["kind"] in _build.HANDLERS else "NO",
                        "" if k["kind"] in _build.HANDLERS else lost.get(k["kind"], "not parsed")) for k in kinds]))

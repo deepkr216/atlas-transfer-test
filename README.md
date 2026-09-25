@@ -536,15 +536,19 @@ once: the report's first table says per name whether a file with that name
 is there and not in the index (arrived after the last build, or skipped by
 it), a stub, under a near name in the copybook folders, or not there at
 all - and what to do for each; `coverage` and `copybook NAME` say the same.
-A member holding only numbers is a stub: whatever the columns its digits
-sit in, no compiler could compile it, so the build files it `stub`, never
-expands it - a real copy of the name in any library comes first - and a
-program with no other copy says 'COPY X: the member in LIBRARY holds only
-numbers (N lines) - a stub, not the copybook's text; the program was
-compiled against another copy (its listing, or another library, holds it)'
-in place of NOT FOUND; the same recover run writes that copybook from the
-programs' listings (on an index built before the batch a 7-digit stub is
-still filed `empty`, and the report says its text sits in columns 1-7).
+A member holding only numbers is a stub: a number in the columns the
+compiler reads (7-72) is no text it could compile, so the build files it
+`stub`, never expands it - a real copy of the name in any library comes
+first - and a program with no other copy says 'COPY X: the member in
+LIBRARY holds only numbers (N lines) - a stub, not the copybook's text; the
+program was compiled against another copy (its listing, or another
+library, holds it)' in place of NOT FOUND; the same recover run writes that
+copybook from the programs' listings. A sequence number alone in columns
+1-6 or 73-80 is a blank line, so a retired copybook of comments and
+numbered blank lines stays `empty`; a job reads a card holding only
+numbers as it did before (on an index built before the batch a 7-digit
+stub is still filed `empty`, and the report says its text sits in columns
+1-7).
 A member typed by the kind declared for its library in the UI's table reads
 'by its declared kind' with 'declare it copybook there' - each build records
 the kinds it was declared (an older index: the manifest.json beside it tells),

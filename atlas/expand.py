@@ -77,22 +77,40 @@ Resolver = Callable[[str, Optional[str]], Optional[Tuple[Optional[int], List[Lin
 # in place of NOT FOUND and is `partial`. STUB_NOTE_RE finds it again (atlas.
 # recover and atlas.query read it: group 1 the copybook, group 2 the note).
 STUB_COMPILED = "the program was compiled against another copy (its listing, or another library, holds it)"
+# the same said of several programs (a page naming them all), and of none (a card holding only numbers a job reads,
+# which no program copies): the COPY clause is left out there (LESSONS 205)
+STUB_COMPILED_MANY = "the programs were compiled against another copy (their listings, or another library, hold it)"
+STUB_NO_COPY = "no program copies it"
 STUB_NOTE_RE = re.compile(r"COPY (\S+): (the members? in .+? holds? only numbers\b.*)$", re.S)
 
 
-def stub_note(stubs: Sequence[Tuple[str, Optional[int]]]) -> str:
+def stub_note(stubs: Sequence[Tuple[str, Optional[int]]], programs: int = 1) -> str:
     """The note for a COPY whose only members of the name are stubs, from
     (library folder, lines holding numbers) per stub - the count left out
     when it is not known: 'the member in PROD.POL.COPYLIB holds only numbers
     (6 lines) - a stub, not the copybook's text; the program was compiled
-    against another copy (its listing, or another library, holds it)'."""
+    against another copy (its listing, or another library, holds it)'.
+    `programs`: how many programs copy the name - the build writes the note
+    of one program; a page on the name says it of several
+    (STUB_COMPILED_MANY) or, when none copies it, what the member is and
+    that no program copies it, the COPY clause left out (stub_fitted says a
+    stored note of one program the same way)."""
     def count(n: Optional[int]) -> str:
         return f" ({n} line{'' if n == 1 else 's'})" if n else ""
     if len(stubs) == 1:
         lib, n = stubs[0]
-        return f"the member in {lib} holds only numbers{count(n)} - a stub, not the copybook's text; {STUB_COMPILED}"
-    where = ", ".join(f"{lib}{count(n)}" for lib, n in stubs)
-    return f"the members in {where} hold only numbers - stubs, not the copybook's text; {STUB_COMPILED}"
+        head = f"the member in {lib} holds only numbers{count(n)} - a stub"
+    else:
+        head = "the members in " + ", ".join(f"{lib}{count(n)}" for lib, n in stubs) + " hold only numbers - stubs"
+    if programs <= 0:
+        return f"{head}; {STUB_NO_COPY}"
+    return f"{head}, not the copybook's text; {STUB_COMPILED if programs == 1 else STUB_COMPILED_MANY}"
+
+
+def stub_fitted(note: str, programs: int) -> str:
+    """A program's stored stub note (stub_note of one program) said on a page
+    naming `programs` programs: the plural when several copy the name."""
+    return note.replace(STUB_COMPILED, STUB_COMPILED_MANY) if programs > 1 else note
 
 
 @dataclass
