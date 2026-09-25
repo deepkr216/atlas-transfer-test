@@ -287,9 +287,19 @@ shipped alone and cost one such night; these still wait for the next one:
    the re-parse is filed as before again by the next build, under a new member id, which un-links the
    programs copying it without parsing them again - they read 'ok' with the old text's fields until
    recover has run again and the build after it (the report's 'Re-filed as copybook' section says so);
-   and the stand-in's shape guard (`recover._ASM_SHAPE`) errs towards refusing, so a COBOL `START CUSTFILE`
-   alone on its line (a file name with no hyphen, the KEY clause on the next line) reads as an Assembler
-   START with a symbol operand and is left, with the honest sentence, for this item.
+   and the stand-in's shape guard (`recover._ASM_SHAPE`) first erred towards refusing, so a COBOL `START
+   CUSTFILE` alone on its line (the KEY clause on the next line) read as an Assembler START - his procedure
+   copybook, LESSONS 189; the guard now takes START as Assembler only with a label in column 1 or a numeric
+   or quoted operand, and a strong signature found only in comment lines refuses nothing.
+23. **reader.py: a copybook member whose every non-blank line keeps its text within columns 1-7 is read as
+   code.** Two of his missing copybooks hold a 7-8 digit number in column 1 and nothing else (a stub, or a
+   value meant to be copied): fixed-format reading takes columns 1-6 as the sequence area and column 7 as
+   the indicator, `read_cobol_lines` yields no code, `build.code_line_count` gives 0 and the build files the
+   member `empty` - the resolver never looks at it and every program copying it says COPY X NOT FOUND
+   (LESSONS 192). At the re-parse: a member with no line reaching column 8 is read as free format (its
+   text is the code) and counted; the reader says so in the member's note. Until then `atlas.recover`,
+   `coverage` and `copybook NAME` say where the text sits ('the file holds N line(s) whose text sits in
+   columns 1-7 ...') instead of the bare word `empty`, and the disk check names the file.
 
 ### flow: known limits (open after review)
 

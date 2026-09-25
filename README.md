@@ -469,6 +469,12 @@ manifest changed (every library added or re-kinded in the UI's table
 rewrites it), a parser module changed - files such a member as before
 and parses its programs again without it, so they read partial with
 COPY NOT FOUND: run recover after such a build and it re-files them.
+Every missing copybook is also looked for on disk, the estate root walked
+once: the report's first table says per name whether a file with that name
+is there and not in the index (arrived after the last build, or skipped by
+it), filed `empty` because its text sits in columns 1-7, under a near name
+in the copybook folders, or not there at all - and what to do for each;
+`coverage` and `copybook NAME` say the same.
 Such a member in a folder with no COPY hint and with no level
 numbers to go by is not re-filed - nothing says copybook - and every note
 says the folder fix first, then a second run; a member typed by the kind
