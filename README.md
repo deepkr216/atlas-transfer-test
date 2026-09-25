@@ -87,12 +87,18 @@ it (`zowe.daemon: "window"`; tick **Zowe daemon off** only if zowe hangs).
 word for word; **Check Zowe** lists the configuration files zowe finds from
 that folder (paths only, never a value) or says in words that it found none.
 
-Re-indexing is **incremental**: unchanged members keep their facts, a
+Re-indexing is **incremental**: unchanged members keep their facts; a
 member a COPY can expand (filed copybook, cobol, sql or unknown) that
-arrives, changes, disappears or is filed as another kind forces every
-program that copies it to be re-parsed, and members that disappeared are
-pruned - an incremental build gives what a full one would. A full estate
-re-run after a small change takes seconds, not minutes.
+arrives, changes, disappears, is filed as another kind or is recorded again
+forces every program that copies it to be re-parsed; a member a job reads -
+a PROC, an INCLUDE member, a control-card member (filed proc, jcl, ctlcard,
+unknown or sql) - that arrives, changes, disappears or is filed as another
+kind forces every job to be re-parsed; and members that disappeared are
+pruned. An incremental build gives the facts a full one would, save one
+list: a dataset name no DD names any more stays in the index's list of
+dataset names until a `--rebuild` (the list is read only for an IDCAMS
+DEFINE's attributes; ROADMAP re-parse item 24). A full estate re-run after
+a small change takes seconds, not minutes.
 
 ### When zowe asks for a host, a user or a password
 
@@ -468,7 +474,11 @@ built before ROADMAP re-parse item 21, the same run marks for the next build
 every program that still says `COPY X NOT FOUND` although a member named X
 has arrived since it was parsed (that build did not parse them again for a
 member typed `unknown` by its folder name; the build of this toolkit does),
-and on any index it names
+and every program that had expanded a copy of X which has left the index
+since - the file went while another copy of the name stays, or it was
+recorded again under a new id - which that build did not parse again
+either (the report gives each cause its own section, and `coverage`,
+`program` and `copybook` say which it was); and on any index it names
 in `work\recover.md` every copybook whose only member is filed as a kind the
 build never expands, with what to do (`coverage`, `program` and `copybook`
 say the same beside each such NOT FOUND). A COBOL copybook is typed by its own
@@ -731,7 +741,8 @@ the host no longer lists are moved to `<folder>/.stale/`, and the record
 instead of NOT FOUND. The build re-parses everything when a **parser**
 module changed (`git pull` that touches `cobol.py`, `jcl.py`, `docs.py`… -
 never for a query, prompt or UI change) or the manifest changed, re-parses
-every job when a PROC / INCLUDE / card member changed, announces every step
+every job when a PROC / INCLUDE / card member arrived, changed, disappeared
+or was filed as another kind, announces every step
 with the time (`== inventory`, `== removing the old facts of N member(s)`, `== parsing`, `== post: ...`),
 reports each folder when it is done and each kind of member when it is done, prints every 10 s
 how many members are parsed, the member in hand with its size, the rate and the **time left at that rate**,
