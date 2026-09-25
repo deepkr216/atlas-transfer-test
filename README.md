@@ -471,16 +471,24 @@ say the same beside each such NOT FOUND). A COBOL copybook is typed by its own
 lines first - level numbers, or COBOL statements (MOVE ... TO, PERFORM, a
 paragraph name in area A ...) with no DIVISION header - before the shape of
 an Assembler, listing or MFS member, the kind declared for its library in the
-UI's table and the folder name (ROADMAP re-parse items 20 and 22). The COBOL
-statements say only as much as the library lets them (LESSONS 199): an
+UI's table and the folder name (ROADMAP re-parse items 20 and 22); the
+statements an Assembler or MFS member writes too - COPY, IF, CALL, EXEC,
+CLOSE, START - count only after those shapes, so an MFS member that COPYs its
+device header stays MFS. A data description entry types a copybook in any
+library - a tagged `WS-:XR:-ID` and one written from column 1 too. The COBOL
+statements say only as much as the library lets them (LESSONS 199, 200): an
 Easytrieve program or a Connect:Direct process - read by its job through
 SYSIN - is never typed by them; in a library of documents (a folder named
-DOCS, SPECS or DESIGN, a library declared doc, or a .txt or .md file with a
-line of prose) they count for nothing; in a library of control cards (a
-folder named CNTL, PARMLIB, CARDLIB ..., or a library declared ctlcard) two
-statement lines are needed, one of a form no card language has - a single
-MOVE line, an IDCAMS `IF LASTCC` or an ICETOOL `DISPLAY FROM(` keeps the
-folder's kind. A member with no signature at all (a literal copied into a
+DOCS, SPECS or DESIGN, a library declared doc, a .md, .html or .csv file, or
+a .txt with a line of prose - a letter in column 1, a numbered line, or an
+English word such as THE outside a literal) they count for nothing; in a
+library of control cards (a folder named CNTL, PARMLIB, CARDLIB ..., or a
+library declared ctlcard) two statement lines are needed, one of a form no
+card language has - a single MOVE or START line, an IDCAMS `IF LASTCC` or an
+ICETOOL `DISPLAY FROM(` keeps the folder's kind; in a library of MFS, BMS or
+other macro source (its folder name, its declared kind or its extension) the
+statements an Assembler or MFS member writes too count for nothing. A member
+with no signature at all (a literal copied into a
 VALUE clause) takes the declared kind or its folder's kind: rename the folder
 to end in COPYLIB, or declare the library's kind in the UI's table, and
 build. A declared kind wins over a shape, a folder name and an extension -

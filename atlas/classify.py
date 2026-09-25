@@ -12,21 +12,25 @@ PSB, BMS), a compiler listing (it echoes a program), IDENTIFICATION
 DIVISION / PROGRAM-ID, REXX, CREATE TABLE, a JCL EXEC; then a COBOL copybook
 by its own lines - level numbers, or COBOL procedure statements with no
 DIVISION header; then the shape of an Assembler or MFS member; then the
-kind declared for the library in the UI's table (declared_wins), the folder
-name and the extension (ROADMAP re-parse items 20 and 22, LESSONS 183, 186).
-A signature a comment line carries (a remark naming DFHMDF, PROGRAM-ID,
-CREATE TABLE or the compiler, a REXX header behind a slash in column 7)
-says nothing about the member (LESSONS 189).
+COBOL statements an Assembler or MFS member writes too (COPY, IF, CALL ...);
+then the kind declared for the library in the UI's table (declared_wins),
+the folder name and the extension (ROADMAP re-parse items 20 and 22,
+LESSONS 183, 186, 200). A signature a comment line carries (a remark naming
+DFHMDF, PROGRAM-ID, CREATE TABLE or the compiler, a REXX header behind a
+slash in column 7) says nothing about the member (LESSONS 189).
 
 The COBOL statements are words other texts use too, so the library says
-how much they need to say (LESSONS 199): an Easytrieve program or a
+how much they need to say (LESSONS 199, 200): an Easytrieve program or a
 Connect:Direct process - read by the jobs through SYSIN - is neither a
 copybook nor typed by them at all; in a library of documents (its folder
-name, its declared kind, or a document's extension on a text with prose
-lines) they count for nothing - a run book says PERFORM THE FOLLOWING
-STEPS, a design note quotes a paragraph; in a library of control cards
-(its folder name or its declared kind) two statement lines are needed, one
-of a form no card language has.
+name, its declared kind, a document's extension other than .txt, or a .txt
+with a line of prose) they count for nothing - a run book says PERFORM THE
+FOLLOWING STEPS, a design note quotes a paragraph; in a library of control
+cards (its folder name or its declared kind) two statement lines are
+needed, one of a form no card language has; in a library of Assembler or
+macro source (MFS, BMS, DBD, PSB, stage-1 - its declared kind, folder name
+or extension) the statements an Assembler member writes too count for
+nothing - an MFS member COPYs its device headers.
 """
 
 from __future__ import annotations
@@ -137,22 +141,31 @@ _LEVEL_NO = r"(?:0[1-9]|[1-4][0-9]|66|77|88)"
 _DATA_CLAUSE = (r"(?:PIC|PICTURE|VALUES?|REDEFINES|OCCURS|USAGE|COMP(?:UTATIONAL)?(?:-[1-6X])?|BINARY|PACKED-DECIMAL|"
                 r"DISPLAY(?:-1)?|NATIONAL|INDEX|POINTER|SIGN|JUST(?:IFIED)?|SYNC(?:HRONIZED)?|BLANK|RENAMES|EXTERNAL|"
                 r"GLOBAL|COPY)(?![A-Z0-9\-])")
+# A data-name, with a letter in it: `WS-ID`, and the tagged `WS-:XR:-ID` / `:XR:-REC` a program's COPY ... REPLACING
+# ==:XR:== BY ==...== fills in (a tag is a word between two colons, so a prose `NOTE:` is none - LESSONS 200)
+_DATA_NAME = r"(?=[A-Z0-9\-:@#$]*[A-Z])(?:[A-Z0-9]|:[A-Z0-9@#$\-]+:)(?:[A-Z0-9\-]|:[A-Z0-9@#$\-]+:)*"
 # A data description entry: a level number where a COBOL line's code begins, then a data-name ended by a period,
 # the end of the line or a clause - or a clause at once (`05 PIC X.`). A level number alone is not enough this
 # early: `R12      EQU   12` (the register equates of nearly every Assembler member) and `LBL12345 DS F` carry
 # a number after a label; the looser signature below, checked after the Assembler shape as before, takes the rest.
-_SIG_DATA_LEVEL = re.compile(_CODE_AT + _LEVEL_NO + r"[ \t]+(?:" + _DATA_CLAUSE + r"|(?=[A-Z0-9\-]*[A-Z])[A-Z0-9][A-Z0-9\-]*"
-                             r"(?:[ \t]*\.|[ \t]*$|[ \t]+" + _DATA_CLAUSE + r"))", re.I | re.M)
+# A copybook written from column 1, with no sequence area (`05 WS-ID PIC X(10).`), is one by a level number in
+# column 1 with a data-name and a PIC, VALUE, REDEFINES, OCCURS or USAGE clause - no card, prose or Assembler line
+# starts so (an Assembler label never starts with a digit; `01 20260925` has no data-name) - LESSONS 200.
+_SIG_DATA_LEVEL = re.compile(_CODE_AT + _LEVEL_NO + r"[ \t]+(?:" + _DATA_CLAUSE + r"|" + _DATA_NAME +
+                             r"(?:[ \t]*\.|[ \t]*$|[ \t]+" + _DATA_CLAUSE + r"))"
+                             r"|^" + _LEVEL_NO + r"[ \t]+" + _DATA_NAME +
+                             r"[ \t]+(?:PIC|PICTURE|VALUES?|REDEFINES|OCCURS|USAGE)(?![A-Z0-9\-])", re.I | re.M)
 # Any level 01-49 plus 66/77/88. Level 49 is the DCLGEN VARCHAR structure and
 # 02/03/04/06/07/15/20 are all common; testing only 01/05/10 misfiles them.
 _SIG_LEVEL_NUMBER = re.compile(r"^.{0,6}.?[ \t]*(0[1-9]|[1-4]\d|66|77|88)[ \t]+[A-Z0-9][A-Z0-9\-]*", re.I | re.M)
 # COBOL procedure statements no Assembler, listing or MFS member carries (upper case, as mainframe COBOL is
 # written): MOVE ... TO, ADD ... TO and the other arithmetic verbs with their preposition, SET ... TO, PERFORM,
 # GOBACK, GO TO, EVALUATE, STOP RUN, EXIT., NEXT SENTENCE, CONTINUE, COMPUTE, INITIALIZE, ACCEPT ... FROM,
-# STRING / UNSTRING ... DELIMITED, INSPECT ... TALLYING, OPEN INPUT, the COBOL forms of CLOSE / READ / WRITE (an
-# Assembler OPEN / CLOSE / READ / WRITE macro takes parentheses or commas, a CLIST WRITE no period), a scope
-# terminator (END-IF ...) - and a paragraph or section name in area A (columns 8-11) ended by a period
-# (`S-110-DO.`, `A-100-BEGIN SECTION.  COPY X.`).
+# STRING / UNSTRING ... DELIMITED, INSPECT ... TALLYING, OPEN INPUT, the COBOL forms of READ / WRITE (an Assembler
+# OPEN / READ / WRITE macro takes parentheses or commas, a CLIST WRITE no period), a scope terminator (END-IF ...)
+# - and a paragraph or section name in area A (columns 8-11) ended by a period (`S-110-DO.`, `A-100-BEGIN
+# SECTION.  COPY X.`). CLOSE is no such statement: the Assembler CLOSE macro takes one DCB name bare (`CLOSE
+# INFILE`) and a remark may follow it - it is one of the statements an Assembler member writes too (LESSONS 200).
 _NAME = r"[A-Z][A-Z0-9\-]*"
 _COBOL_VERB = (r"(?:MOVE[ \t][^\n]*?[ \t]TO(?:[ \t]|$)"
                r"|(?:ADD|SUBTRACT|MULTIPLY|DIVIDE)[ \t][^\n]*?[ \t](?:TO|FROM|BY|INTO|GIVING)(?:[ \t]|$)"
@@ -162,7 +175,7 @@ _COBOL_VERB = (r"(?:MOVE[ \t][^\n]*?[ \t]TO(?:[ \t]|$)"
                r"|PERFORM(?:[ \t.]|$)|GOBACK(?:[ \t.]|$)|GO[ \t]+TO(?:[ \t.]|$)|EVALUATE[ \t]|STOP[ \t]+RUN(?:[ \t.]|$)"
                r"|EXIT(?:[ \t]+(?:PROGRAM|PARAGRAPH|SECTION|PERFORM(?:[ \t]+CYCLE)?))?[ \t]*\.(?:[ \t]|$)"
                r"|NEXT[ \t]+SENTENCE(?:[ \t.]|$)|CONTINUE(?:[ \t.]|$)|COMPUTE[ \t][^\n]*=|INITIALIZE[ \t]+[A-Z0-9]"
-               r"|OPEN[ \t]+(?:INPUT|OUTPUT|I-O|EXTEND)(?:[ \t]|$)|CLOSE[ \t]+" + _NAME + r"(?:[ \t]*\.?[ \t]*$|[ \t]+[A-Z])"
+               r"|OPEN[ \t]+(?:INPUT|OUTPUT|I-O|EXTEND)(?:[ \t]|$)"
                r"|READ[ \t]+" + _NAME + r"(?:[ \t]+(?:NEXT|INTO|RECORD|KEY|AT|INVALID)(?:[ \t]|$)|[ \t]*\.?[ \t]*$)"
                r"|(?:RE)?WRITE[ \t]+" + _NAME + r"(?:[ \t]+(?:FROM|AFTER|BEFORE|INVALID)(?:[ \t]|$)|[ \t]*\.)"
                r"|END-(?:IF|PERFORM|EVALUATE|READ|WRITE|REWRITE|START|DELETE|CALL|EXEC|COMPUTE|STRING|UNSTRING|SEARCH|"
@@ -170,15 +183,22 @@ _COBOL_VERB = (r"(?:MOVE[ \t][^\n]*?[ \t]TO(?:[ \t]|$)"
 _PARAGRAPH = (r"^(?!//|/\*|\*|\.\*)[^\n]{6}[ Dd] {0,3}(?=[A-Z0-9\-]*[A-Z])[A-Z0-9][A-Z0-9\-]*(?:[ \t]+SECTION)?[ \t]*\."
               r"(?:[ \t]|$)")
 _SIG_COBOL_PROC = re.compile(_CODE_AT + _COBOL_VERB + "|" + _PARAGRAPH, re.M)
-# COBOL statements an Assembler member uses as well - the CALL and COPY instructions, the structured-programming
-# IF, EXEC CICS / EXEC SQL in a CICS or DB2 Assembler program - count only where the Assembler shape did not fire.
-# Neither the IDCAMS `IF LASTCC` / `IF MAXCC`, a CLIST `IF &RC`, ICETOOL's `DISPLAY FROM(`, the IEBCOPY and
-# ICETOOL `COPY OUTDD=` / `COPY FROM(`, nor a TSO `CALL 'LIB(PGM)'` has the COBOL form.
+# COBOL statements an Assembler or MFS member writes as well - the CALL and COPY instructions (an MFS member COPYs
+# its device headers), the structured-programming IF and MFS's IF in an operator control table, EXEC CICS / EXEC
+# SQL in a CICS or DB2 Assembler program, the CLOSE macro with a DCB name, START with a symbol - count only where
+# neither the Assembler nor the MFS shape fired, and only in a library that says nothing (library_says). Neither the
+# IDCAMS `IF LASTCC` / `IF MAXCC`, a CLIST `IF &RC`, ICETOOL's `DISPLAY FROM(`, the IEBCOPY and ICETOOL `COPY
+# OUTDD=` / `COPY FROM(`, nor a TSO `CALL 'LIB(PGM)'` has the COBOL form. The COBOL START verb is here, not among
+# the statements above: unlabelled with a file name (`START CUSTFILE`, its KEY IS on the next line) it is the
+# Assembler shape's own exception, and a label of six characters or fewer before an Assembler `START SYM` sits
+# where a COBOL member's sequence area does (LESSONS 189, 200).
 _SHARED_VERB = (r"(?:IF[ \t]+(?!LASTCC\b|MAXCC\b|&)[^\n;]*$|DISPLAY[ \t]+(?!FROM\()[^\n;]*$"
                 r"|CALL[ \t]+(?:'[A-Z0-9@#$\-]{1,30}'|\"[A-Z0-9@#$\-]{1,30}\"|[A-Z][A-Z0-9\-]*)"
                 r"(?:[ \t]*\.?[ \t]*$|[ \t]+(?:USING|RETURNING|ON|END-CALL)\b)"
                 r"|EXEC[ \t]+(?:CICS|SQL|SQLIMS|DLI)\b"
-                r"|COPY[ \t]+['\"]?[A-Z0-9@#$][A-Z0-9@#$\-]*['\"]?(?:[ \t]*\.|[ \t]*$|[ \t]+(?:OF|IN|REPLACING|SUPPRESS)\b))")
+                r"|COPY[ \t]+['\"]?[A-Z0-9@#$][A-Z0-9@#$\-]*['\"]?(?:[ \t]*\.|[ \t]*$|[ \t]+(?:OF|IN|REPLACING|SUPPRESS)\b)"
+                r"|CLOSE[ \t]+" + _NAME + r"(?:[ \t]*\.?[ \t]*$|[ \t]+[A-Z])"
+                r"|START[ \t]+" + _NAME + r"(?:[ \t]*\.?[ \t]*$|[ \t]+(?:KEY|INVALID)(?:[ \t]|$)))")
 _SIG_COBOL_SHARED = re.compile(_CODE_AT + _SHARED_VERB, re.M)
 # a DIVISION header on a code line: such a member is a program's part, not a procedure copybook
 _SIG_DIVISION = re.compile(_CODE_AT + r"(?:IDENTIFICATION|ID|ENVIRONMENT|DATA|PROCEDURE)[ \t]+DIVISION\b", re.I | re.M)
@@ -206,8 +226,29 @@ EZT_WORDS = "an Easytrieve program"
 NDM_WORDS = "a Connect:Direct process"
 # A line of prose or Markdown: a letter in column 1 and, in column 7, neither a blank nor a COBOL indicator - no line
 # of a COBOL member in reference format has that (columns 1-6 are its sequence area, column 7 its indicator) - or a
-# Markdown heading or code fence. It makes a text with a document's extension a document for the COBOL statements.
-_PROSE = re.compile(r"^[A-Za-z][^\n]{5}[^ \t*/\-Dd\n]|^#{1,6}[ \t]|^```", re.M)
+# Markdown heading or code fence. It makes a .txt a document for the COBOL statements (a .md, .html or .csv is one
+# by its extension alone). So does a run book's numbered line - a list number in column 1 (`2.`, `3)`), where a COBOL
+# member holds a sequence number or blanks - and an indented one, by an English word no COBOL statement carries
+# (THE, YOU, PLEASE ...) outside a literal on a line that is not a comment: `PERFORM THE RESTART FROM STEP S020.`
+# (LESSONS 200).
+_PROSE = re.compile(r"^[A-Za-z][^\n]{5}[^ \t*/\-Dd\n]|^#{1,6}[ \t]|^```|^\d{1,3}[.)][ \t]+[A-Za-z]", re.M)
+_PROSE_WORD = re.compile(r"(?<![A-Z0-9\-])(?:THE|YOU|YOUR|PLEASE|THIS|THESE|THOSE|THAT|WHICH|SHOULD|MUST)(?![A-Z0-9\-])",
+                         re.I)
+_LITERAL = re.compile(r"'[^'\n]*'?|\"[^\"\n]*\"?|\*>.*")         # a literal (to the line's end when open), a *> remark
+# the document extensions a COBOL member never carries: every one but .txt, the extension his downloads arrive with
+DOC_ONLY_EXTS = tuple(e for e, k in EXT_HINTS.items() if k == "doc" and e != ".txt")
+# the kinds of Assembler or macro source - whose members write COPY, IF, CALL, EXEC, CLOSE and START as well
+MACRO_KINDS = ("asm", "mfs", "bms", "dbd", "psb", "imsgen")
+
+
+def _is_prose(head: str) -> bool:
+    """Whether `head` (normalized) has a line of prose (_PROSE, _PROSE_WORD)."""
+    if _PROSE.search(head):
+        return True
+    for line in head.split("\n"):
+        if line.strip() and not _is_comment_line(line) and _PROSE_WORD.search(_LITERAL.sub(" ", line)):
+            return True
+    return False
 
 
 def not_cobol(head: str) -> str:
@@ -223,22 +264,30 @@ def not_cobol(head: str) -> str:
 
 def library_says(path: str, head: str, declared: Optional[str] = None) -> str:
     """What the member's library says it holds, for how much the COBOL
-    statements must say (LESSONS 199): 'doc' - the kind declared for the
-    library, else its folder name, is doc, or a text with a document's
-    extension outside a dataset-named folder has a line of prose - where
-    a run book's PERFORM THE FOLLOWING STEPS or a design note's quoted
-    paragraph count for nothing; 'cards' - declared or named ctlcard (or
-    declared sched) - where two statement lines are needed, one of a form
-    no card language has; '' otherwise. 'cobol', the UI table's default,
-    says nothing."""
+    statements must say (LESSONS 199, 200): 'doc' - the kind declared for
+    the library, else its folder name, is doc; or, neither saying a kind,
+    the file has a document's extension other than .txt (.md, .html,
+    .csv ...), or is a .txt outside a dataset-named folder with a line of
+    prose (_is_prose) - where a run book's PERFORM THE FOLLOWING STEPS or a
+    design note's quoted paragraph count for nothing; 'cards' - declared or
+    named ctlcard (or declared sched) - where two statement lines are
+    needed, one of a form no card language has; 'macro' - declared or named
+    Assembler or macro source (MACRO_KINDS: MFS, BMS, DBD, PSB, stage-1),
+    or so by its extension (.asm, .mfs ...) - where the statements an
+    Assembler or MFS member writes too (COPY, IF, CALL ...) count for
+    nothing; '' otherwise. 'cobol', the UI table's default, says nothing."""
     parent = os.path.basename(os.path.dirname(path))
+    ext = os.path.splitext(path)[1].lower()
     said = declared if declared in DECLARABLE and declared != "cobol" else None
     if said is None:
         said = next((k for rx, k in DIR_HINTS if rx.search(parent)), None)
-        if (said is None and EXT_HINTS.get(os.path.splitext(path)[1].lower()) == "doc"
-                and not _DATASET_FOLDER.match(parent.upper()) and _PROSE.search(head)):
+    if said is None:
+        if ext in DOC_ONLY_EXTS or (ext == ".txt" and not _DATASET_FOLDER.match(parent.upper()) and _is_prose(head)):
             said = "doc"
-    return "doc" if said == "doc" else "cards" if said in ("ctlcard", "sched") else ""
+        elif EXT_HINTS.get(ext) in MACRO_KINDS:
+            said = EXT_HINTS[ext]
+    return ("doc" if said == "doc" else "cards" if said in ("ctlcard", "sched") else "macro" if said in MACRO_KINDS
+            else "")
 
 
 def statement_lines(head: str) -> Tuple[int, int]:
@@ -273,11 +322,16 @@ _ASM_SHAPE = re.compile(
     rf"|^{_ASM_LABEL}[ \t]+(?:BR|BALR|BASR)[ \t]+R?1[45]\b", re.I | re.M)
 ASM_SHAPES = ("CSECT or DSECT as the operation, with a label of any length or none; START with a label in column 1, or with a "
               "numeric or quoted operand; DFHEIENT; DS / DC with a type, address constants included; USING * or EQU *; BR 14")
-# MFS: a statement with a label in column 1, TYPE= / POS= / LTH= operands, MSGEND / FMTEND - never a line whose
-# first word is MSG alone (a COBOL section named MSG)
-_MFS_SHAPE = re.compile(r"^[A-Z@#$][A-Z0-9@#$]{0,7}[ \t]+(?:MSG|FMT|DEV|DFLD|MFLD)\b"
-                        r"|[ \t](?:MSG|DEV)[ \t]+TYPE=|[ \t]DFLD[ \t]+(?:POS|LTH)=|^[ \t]+(?:MSGEND|FMTEND)\b", re.I | re.M)
-MFS_SHAPES = "a labelled MSG / FMT / DEV / DFLD / MFLD, TYPE= / POS= / LTH= operands, MSGEND / FMTEND"
+# MFS: a statement with a label in column 1, TYPE= / POS= / LTH= operands, MSGEND / FMTEND / TABLEEND, an
+# operator control table's `IF DATA=` / `IF LENGTH=` (DATA and LENGTH are COBOL reserved words: no COBOL IF reads
+# so) - never a line whose first word is MSG alone (a COBOL section named MSG), nor a name that only begins with
+# one of the words (`DEV-CODE` on a continuation line behind a change tag). Checked before the COBOL statements an
+# MFS member writes too - its COPY of a device header, its IF (LESSONS 200).
+_MFS_SHAPE = re.compile(r"^[A-Z@#$][A-Z0-9@#$]{0,7}[ \t]+(?:MSG|FMT|DEV|DFLD|MFLD)(?=[ \t]|$)"
+                        r"|[ \t](?:MSG|DEV)[ \t]+TYPE=|[ \t]DFLD[ \t]+(?:POS|LTH)=|^[ \t]+(?:MSGEND|FMTEND|TABLEEND)(?=[ \t]|$)"
+                        r"|^[ \t]+IF[ \t]+(?:DATA|LENGTH)[=<>^\u00ac]", re.I | re.M)
+MFS_SHAPES = ("a labelled MSG / FMT / DEV / DFLD / MFLD, TYPE= / POS= / LTH= operands, MSGEND / FMTEND / TABLEEND, IF DATA= "
+              "/ IF LENGTH=")
 # A compiler listing echoes the source: without this it is filed as a second copy of the program, with line-number
 # prefixes as fields - so it is looked for BEFORE the COBOL signatures. Its shape: the compiler's banner at the
 # start of a line (`1PP 5655-EC6 IBM Enterprise COBOL for z/OS ...`, the carriage control optional) or the source
@@ -287,7 +341,9 @@ MFS_SHAPES = "a labelled MSG / FMT / DEV / DFLD / MFLD, TYPE= / POS= / LTH= oper
 # no banner: a program's `DISPLAY 'BUILT WITH IBM ENTERPRISE COBOL'` or a copybook's VALUE literal names it too
 # (LESSONS 199).
 _LISTING_SHAPE = re.compile(r"^[ 01\-+]?\s*\d{6}[^\s\d]*\s+\d{6}[ *\-/D]")
-_LISTING_HEAD = re.compile(r"^[ \t\f]*LineID[ \t]+PL[ \t]+SL\b|^[ \t\f]*1?[ \t]*PP[ \t]+5655-", re.I | re.M)
+# (one run of blanks before the carriage control and one after it: two stars over the same blanks made a 64 KB blank
+# line take 15 s - LESSONS 148, 200)
+_LISTING_HEAD = re.compile(r"^[ \t\f]*LineID[ \t]+PL[ \t]+SL\b|^[ \t\f]*(?:1[ \t]*)?PP[ \t]+5655-", re.I | re.M)
 # ... and, in a text already known to be a listing (atlas.recover reading one: its page headers, its sections),
 # the compiler's name anywhere on a line counts as the banner as well
 _LISTING_BANNER = re.compile(r"^[ \t\f]*LineID[ \t]+PL[ \t]+SL\b|IBM Enterprise COBOL|^1?PP[ \t]+5655-", re.I | re.M)
@@ -381,7 +437,8 @@ def _cobol_statements(head: str, says: str) -> bool:
     procedure copybook, before the Assembler shape, where the library says
     `says` (library_says): never in a library of documents; in a library of
     control cards, CARD_LINES lines of statements, one of a form no card
-    language has; elsewhere one statement of such a form."""
+    language has; elsewhere (Assembler or macro source too) one statement of
+    such a form."""
     if says == "doc":
         return False
     if says != "cards":
@@ -454,13 +511,13 @@ def reading(path: str, head: str, declared: Optional[str] = None) -> Tuple[str, 
     if rexx_after_cobol:
         return "rexx", "REXX comment header", "strong"
 
-    # ---- the Assembler and MFS shapes -------------------------------------
+    # ---- the Assembler and MFS shapes, then the COBOL statements they write too (LESSONS 200) ----------------
     if _ASM_SHAPE.search(head):
         return "asm", REASON_ASM, "weak"
-    if not other and not says and cobol_proc_hit(head, shared=True):
-        return "copybook", REASON_PROC, "cobol"
     if _MFS_SHAPE.search(head):
         return "mfs", REASON_MFS, "weak"
+    if not other and not says and cobol_proc_hit(head, shared=True):
+        return "copybook", REASON_PROC, "cobol"
     if not other and not says and _SIG_LEVEL_NUMBER.search(head):
         return "copybook", REASON_DATA, "cobol"
     also = f" - {other}, whose statements are not COBOL" if other else ""

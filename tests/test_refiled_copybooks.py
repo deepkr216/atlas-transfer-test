@@ -380,11 +380,22 @@ class ClassifierShapes(unittest.TestCase):
                      "MYPGM    CSECT\nR12      EQU   12\nR1       EQU   1\n",                 # register equates: no level
                      "PGM      CSECT\n         COPY  REGEQU\n         CALL  SUB,(A,B),VL\n",   # shared verbs after the shape
                      "PGM      DFHEIENT CODEREG=(12)\n         EXEC CICS RETURN\n",
-                     "         CSECT\r\n         BR    14\r\n"):                                 # CR LF
+                     "         CSECT\r\n         BR    14\r\n",                                   # CR LF
+                     # the CLOSE macro with a bare DCB name, a remark after it (LESSONS 200)
+                     "PGMCL    CSECT\n         USING *,15\n         OPEN  (INFILE,(INPUT))\n         CLOSE INFILE\n"
+                     "         CLOSE OUTFILE          CLOSE THE REPORT\n         BR    14\n"
+                     "INFILE   DCB   DDNAME=INFILE,DSORG=PS,MACRF=GM\n         END\n"):
             self.assertEqual(self.kind(text), "asm", text)
         for text in ("MYFMT    FMT\n         DEV   TYPE=3270-A2\n", "         MSG   TYPE=INPUT,SOR=(MYFMT,IGNORE)\n",
-                     "         DFLD  POS=(1,2),LTH=8\n", "MEMMSG   MSG   TYPE=INPUT\n         MFLD  'MEMB'\n         MSGEND\n"):
-            self.assertEqual(self.kind(text), "mfs", text)
+                     "         DFLD  POS=(1,2),LTH=8\n", "MEMMSG   MSG   TYPE=INPUT\n         MFLD  'MEMB'\n         MSGEND\n",
+                     # the MFS COPY of a device header, and an operator control table's IF (LESSONS 200)
+                     "PLMSG2   MSG   TYPE=OUTPUT,SOR=(PLFMT2,IGNORE)\n         SEG\n         MFLD  PLFLD2,LTH=10\n"
+                     "         MSGEND\nPLFMT2   FMT\n         COPY  PLDEVHD\n         DIV   TYPE=INOUT\n"
+                     "PLFLD2   DFLD  POS=(1,2),LTH=10\n         FMTEND\n         END\n",
+                     "PLTAB    TABLE\n         IF    DATA=' ',NOFLDEXIT\n         IF    LENGTH=,NOFLDEXIT\n         TABLEEND\n",
+                     "         IF    DATA>'5',PLEXIT\n"):
+            for folder in ("PROD.GC.COPYLIB", "PROD.GC.MFS", "downloads"):
+                self.assertEqual(self.kind(text, folder), "mfs", (text, folder))
         banner = "1PP 5655-EC6 IBM Enterprise COBOL for z/OS  6.3.0\n" + MMAPBK
         numbered = "".join(f"  {n:06d}         {n:06d}     05  A{n}  PIC X.\n" for n in range(1, 5))
         for text in (banner, numbered, "   LineID  PL SL  ----+-*A-1-B--+----2\n   000002         PROGRAM-ID. X.\n",
@@ -406,7 +417,15 @@ class ClassifierShapes(unittest.TestCase):
                      "      * COMPILED WITH IBM Enterprise COBOL 6.3\n" + STARTBK,
                      "      * BMS FIELD DFHMDF MAPPED HERE\n" + PLAINBK,
                      "      /* REXX */\n" + PLAINBK,
-                     "      * PROGRAM-ID. OLDPGM - SEE CREATE TABLE CLAIM\n" + PLAINBK):
+                     "      * PROGRAM-ID. OLDPGM - SEE CREATE TABLE CLAIM\n" + PLAINBK,
+                     # the COBOL START verb alone - its KEY IS on the next line, no paragraph name (LESSONS 189, 200)
+                     "           START CUSTFILE\n               KEY IS NOT LESS THAN CUST-KEY.\n",
+                     "           START CUSTFILE KEY IS > CUST-KEY\n",
+                     # a CLOSE with its period, a tagged data copybook, a name that only begins with an MFS word
+                     "           CLOSE CUSTFILE.\n", "       01  WS-:XR:-REC.\n           05  WS-:XR:-ID  PIC X(10).\n",
+                     "           05  :XR:-KEY                PIC X(8).\n",
+                     "CR1234     IF WS-A = 1\nCR1234        DISPLAY\nCR1234          DEV-CODE\n",
+                     "           DISPLAY 'THE END OF THE RUN'.\n           CALL 'PLSUB' USING WS-A.\n"):
             for folder in ("PROD.GC.COPYLIB", "PROD.GC.PROCS", "downloads"):
                 self.assertEqual(self.kind(text, folder), "copybook", (text, folder))
 
@@ -459,6 +478,11 @@ class ClassifierShapes(unittest.TestCase):
         t0 = time.time()
         for head in (((" " * 80) + "\n") * 101, "\r\n" * 4096, ("\t" * 70 + "\n") * 115, (" " * 67 + "\n") * 120):
             classify.classify("X/PROD.GC.UTL/CARD1", head)
+        # one long blank line: recover reads 64 KB of a member stored as a listing (the banner's two runs of blanks
+        # took 15 s over it - LESSONS 200)
+        for head in (" " * 65536, "\t" * 65536, " " * 65536 + "1"):
+            classify.listing_hit(head)
+            classify.classify("X/PROD.GC.UTL/CARD1", head[:8192])
         self.assertLess(time.time() - t0, 0.5)
 
 
@@ -758,6 +782,39 @@ class AnIndexBuiltBeforeTheBatch(_Estate):
         self.assertEqual((self.member("STARTBK")[:3], self.member("PLAINBK")[:3]),
                          (("copybook", "PROD.GC.COPYLIB", "ok"), ("copybook", "PROD.GC.PROCS", "ok")))
         self.assertEqual(self.q("SELECT COUNT(*) FROM field WHERE member_id=?", self.member_id("STARTBK")), [(3,)])
+        self.assert_nothing_to_do()
+
+
+class OneProgramCopyingTwoRefiled(_Estate):
+    """LESSONS 200, on an index built before the batch: STARTBK (aged asm) and MMAPBK (aged listing) are re-filed;
+    TWOPGM copies both, STPGM copies STARTBK. The dry run said 2 programs would be marked and the run said 3 - it
+    counted a program once for each re-filed copybook it copies. Both say 2 now, and 2 are pending."""
+
+    files = (("GC/PROD.GC.SRC/TWOPGM.cbl",
+              HEAD.format(name="TWOPGM", data="       01  WS-REC.\n           COPY STARTBK.\n       01  WS-MM.\n"
+                                              "           COPY MMAPBK.\n",
+                          main="           MOVE SPACES TO START-DATE.\n           MOVE SPACES TO MM-ID.\n")
+              + PLAIN_SECTION + TAIL),
+             ("GC/PROD.GC.SRC/STPGM.cbl", data_program("STPGM", "STARTBK", "START-DATE")),
+             ("SHARED/PROD.GC.COPYLIB/STARTBK.txt", STARTBK), ("SHARED/PROD.GC.COPYLIB/MMAPBK.txt", MMAPBK))
+
+    def setUp(self):
+        super().setUp()
+        self.age("STARTBK", "asm")
+        self.age("MMAPBK", "listing")
+
+    def test_each_program_counted_once(self):
+        self.assert_not_found("TWOPGM", "MMAPBK", "listing")
+        stats, said = self.recover(dry_run=True)
+        self.assertIn("): 2 program(s) would be marked for the next build (dry run: nothing changed)", said)
+        stats, said = self.recover()
+        self.assertEqual((stats["refiled"], stats["marked"]), (2, 2), said)
+        self.assertIn("  2 misfiled copybook(s) re-filed as copybook in the index (", said)
+        self.assertIn("): 2 program(s) marked for the next build", said)
+        self.assertEqual(self.q("SELECT name FROM member WHERE parse_status='pending' ORDER BY name"),
+                         [("STPGM",), ("TWOPGM",)])
+        self.build()
+        self.assertEqual((self.status("TWOPGM"), self.status("STPGM")), ("ok", "ok"))
         self.assert_nothing_to_do()
 
 

@@ -2588,7 +2588,6 @@ def refile_misfiled(conn: sqlite3.Connection, misfiled: Sequence[Dict[str, objec
     read_misfiled(misfiled, conn)
     refiled: List[Dict[str, object]] = []
     remaining: List[Dict[str, object]] = []
-    marked = 0
     today = time.strftime("%Y-%m-%d")
     for e in misfiled:
         todo = [r for r in e["readings"] if r["refile"]]                         # type: ignore[union-attr]
@@ -2610,7 +2609,8 @@ def refile_misfiled(conn: sqlite3.Connection, misfiled: Sequence[Dict[str, objec
             remaining.append(e)
             continue
         refiled.append(e)
-        marked += _mark_programs_in(conn, [str(e["copybook"])])
+    # the programs copying any re-filed member, each once however many of them it copies - as the dry run counts
+    marked = 0 if dry_run else _mark_programs_in(conn, [str(e["copybook"]) for e in refiled])
     if refiled and not dry_run:
         conn.commit()
     return refiled, remaining, marked
@@ -3383,12 +3383,19 @@ def _mark_programs(db: str, names: Sequence[str]) -> int:
 
 
 def _mark_programs_in(conn: sqlite3.Connection, names: Sequence[str]) -> int:
-    """_mark_programs on an open connection (the caller commits)."""
-    n = 0
-    for name in names:
-        n += conn.execute("UPDATE member SET parse_status='pending', parse_error=NULL WHERE kind='cobol' AND id IN "
-                          "(SELECT member_id FROM copy_use WHERE UPPER(copybook)=?)", (name.upper(),)).rowcount
-    return n
+    """_mark_programs on an open connection (the caller commits). Returns
+    how many programs were marked: a program copying two of the names is
+    one program (LESSONS 200 - the run said 7 where the dry run said 5)."""
+    ids: set = set()
+    for name in sorted({n.upper() for n in names}):
+        ids.update(r[0] for r in conn.execute("SELECT m.id FROM member m JOIN copy_use c ON c.member_id=m.id "
+                                              "WHERE m.kind='cobol' AND UPPER(c.copybook)=?", (name,)))
+    todo = sorted(ids)
+    for k in range(0, len(todo), 500):
+        chunk = todo[k:k + 500]
+        conn.execute(f"UPDATE member SET parse_status='pending', parse_error=NULL WHERE id IN ({','.join('?' * len(chunk))})",
+                     tuple(chunk))
+    return len(todo)
 
 
 def _mark_members(db: str, ids: Sequence[int]) -> int:

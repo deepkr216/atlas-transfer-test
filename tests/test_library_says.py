@@ -31,6 +31,19 @@ a form no card language has; CREATE TABLE counts where a statement begins; the
 compiler's banner at the start of a line; the build records the kinds it was
 declared, recover reads them (or the manifest beside an older index), and a
 declared copybook over a shape carries a note the pages print.
+
+The verifier's second round (LESSONS 200): an MFS member that COPYs its device
+header, an operator control table's IF, a member of COPY lines only in an MFS
+library, and an Assembler member with `CLOSE INFILE` were filed as copybooks;
+an indented or numbered run book and an HTML page in a folder with no hint
+dropped out of `docs`; a tagged data copybook in a CNTL library was filed
+ctlcard; the declared_kind note was lost when an incremental build re-parsed
+the member because a member it copies changed. Now the Assembler and MFS
+shapes come before the statements their members write too, a library of
+macro source says those statements count for nothing, every document
+extension but .txt is a document, a .txt's prose includes a numbered line and
+an English word outside a literal, a data-name may carry a tag, and a forced
+re-parse carries the note over.
 """
 
 import hashlib
@@ -47,8 +60,8 @@ sys.path.insert(0, os.path.dirname(HERE))
 sys.path.insert(0, HERE)
 
 from atlas import classify, query, recover  # noqa: E402
-from test_refiled_copybooks import (ASMBK, PLAINBK, PRE_BATCH, STARTBK, _Estate, data_program,  # noqa: E402
-                                    section_program)
+from test_refiled_copybooks import (ASMBK, HEAD, PLAIN_SECTION, PLAINBK, PRE_BATCH, STARTBK, TAIL, _Estate,  # noqa: E402
+                                    data_program, section_program)
 
 # ---- fictional members (the KW system) ---------------------------------------------------------------------------
 EZT = ("FILE POLIN\n  IN-POL-ID     1  10 A\n  IN-POL-AMT   11   5 P 2\nFILE RPTOUT PRINTER\n"
@@ -80,6 +93,17 @@ NOTES = ("# Policy update - design notes\n\nThe edit paragraph does this:\n\n```
 # a procedure copybook in the CNTL library: still a copybook (ROADMAP item 20)
 PRCB = "       A-110-DO.\n           IF WS-X = 1\n              MOVE 2 TO WS-Y\n           END-IF.\n"
 SRTCARD = "  SORT FIELDS=(1,10,CH,A)\n"
+# documents with no line that starts with a letter (LESSONS 200): an indented run book, a numbered one, an HTML page
+RUNBOOK_INDENTED = ("   KW RESTART\n   ----------\n       PERFORM THE RESTART FROM STEP S020 AFTER A SORT FAILURE.\n"
+                    "       MOVE THE FAILED GENERATION TO THE HOLD QUEUE.\n")
+RUNBOOK_NUMBERED = "1. LOG ON TO TSO.\n2.     PERFORM A RESTART FROM STEP S030.\n3.     MOVE WS-OUT TO HOLD-CLASS.\n"
+EDIT_HTML = ("<html><head><title>KW edit</title></head><body><h1>KW policy edit</h1>\n"
+             "<p>The edit paragraph restarts the policy update:</p>\n<pre>\n       2000-EDIT.\n"
+             "           IF POL-STATUS = 'A'\n              PERFORM 2100-ACTIVE\n           END-IF.\n</pre>\n</body></html>\n")
+# data copybooks the strict data-name missed (LESSONS 200): a tag a COPY ... REPLACING fills in, and one written
+# from column 1 with no sequence area
+TAGBK = "       01  WS-:KW:-REC.\n           05  WS-:KW:-ID          PIC X(10).\n"
+COL1BK = "01 KW-REC.\n05 KW-ID PIC X(10).\n05 KW-AMT PIC 9(5).\n"
 
 
 def kind(path, text, declared=None):
@@ -122,6 +146,28 @@ class TheClassifierReadsTheLibrary(unittest.TestCase):
         # a copybook declared copybook in a DOCS folder: the declaration speaks for the library
         self.assertEqual(kind("DOCS/PRCB.txt", PRCB, "copybook"), "copybook")
 
+    def test_documents_with_no_line_starting_with_a_letter(self):
+        # LESSONS 200: an indented run book, a numbered one and an HTML page in a folder with no hint (his run-book
+        # folders) have no line with a letter in column 1 - they were filed as copybooks and dropped out of `docs`
+        for path, text in (("ops/kw-restart.txt", RUNBOOK_INDENTED), ("ops/kw-steps.txt", RUNBOOK_NUMBERED),
+                           ("ops/kw-edit.html", EDIT_HTML), ("ops/kw-edit.htm", EDIT_HTML),
+                           ("ops/kw-notes.md", "       2000-EDIT.\n           PERFORM 2100-ACTIVE.\n"),
+                           ("ops/kw-list.csv", "       MOVE,WS-A,TO,WS-B\n       PERFORM,A-100\n"),
+                           ("ops/kw-please.txt", "       PLEASE MOVE THE TAPE TO THE VAULT.\n"),
+                           ("ops/kw-two.txt", "3)     PERFORM A RESTART.\n")):
+            self.assertEqual(kind(path, text), "doc", (path, text))
+        # a .txt procedure copybook in the same folder: an English word inside a literal, a remark or a comment line
+        # is no prose, nor is a number in its sequence area
+        for text in (PRCB, "           DISPLAY 'THE END OF THE RUN'.\n           PERFORM A-100.\n",
+                     "      * THE EDIT OF THE POLICY\n           MOVE WS-A TO WS-B.\n",
+                     "           MOVE 'THE QUICK BROWN FOX JUMPS OVER\n      -    'THE LAZY DOG' TO WS-X.\n"
+                     "           PERFORM A-100.\n",
+                     "000100     PERFORM A-100.                                             THISPGM\n",
+                     "           MOVE WS-THE-END TO WS-B.  *> THE LAST ONE\n"):
+            self.assertEqual(kind("ops/kwprcb.txt", text), "copybook", text)
+        # a member of a dataset-named folder, as his downloads arrive, is never a document by its words
+        self.assertEqual(kind("SHARED/KW.PROD.MISC/KWPRCB.txt", "           PERFORM THE-RESTART.\n"), "copybook")
+
     def test_card_libraries(self):
         # one statement line, or statements every card language shares: the folder's kind (the declared one)
         for text in ("           MOVE WS-A TO WS-B.\n", "       END.\n", "01 20260925\n",
@@ -140,6 +186,37 @@ class TheClassifierReadsTheLibrary(unittest.TestCase):
         # 'cobol', the UI table's default, says nothing about the library: the folder name does
         self.assertEqual(kind("KW/KW.PROD.CNTL/X.txt", "           MOVE WS-A TO WS-B.\n", "cobol"), "ctlcard")
         self.assertEqual(kind("KW/KW.PROD.MISC/X.txt", "           MOVE WS-A TO WS-B.\n", "cobol"), "copybook")
+
+    def test_a_data_copybook_in_a_card_library(self):
+        # LESSONS 200: a tagged data copybook, and one written from column 1, in a CNTL folder or a library declared
+        # ctlcard or doc - the strict data-name stopped at ':', and the looser level number counts nowhere a library
+        # says what it holds
+        for text in (TAGBK, "       01  :KW:-REC.\n           05  :KW:-ID   PIC X(10).\n", COL1BK):
+            for path, declared in (("KW/KW.PROD.CNTL/X.txt", None), ("KW/KW.PROD.MISC/X.txt", "ctlcard"),
+                                   ("KW/KW.PROD.MISC/X.txt", "doc"), ("DOCS/X.txt", None)):
+                self.assertEqual(classify.classify("C:/estate/" + path, text, declared=declared),
+                                 ("copybook", classify.REASON_DATA), (text, path, declared))
+        # ... and a card or a line of prose is still none: no data-name, a colon that closes no tag, no clause
+        for text in ("01 20260925\n", "  01 CHECK:\n", "      01 NOTE: RESTART\n", "01 JAN 2026\n", "10 DAYS.\n",
+                     "05 COPIES\n"):
+            self.assertEqual(kind("KW/KW.PROD.CNTL/X.txt", text), "ctlcard", text)
+
+    def test_a_library_of_assembler_or_macro_source(self):
+        # LESSONS 200: in a library of MFS, Assembler or macro source - its folder name, its declared kind, its
+        # extension - the statements such a member writes too (COPY, IF, CALL ...) count for nothing: an MFS member of
+        # COPY lines only takes the library's kind, and one with its shape is MFS wherever it is
+        copies = "         COPY  KWDEVHD\n         COPY  KWDEVTL\n"
+        for path, declared, want in (("KW/KW.PROD.MFS/X.txt", None, "mfs"), ("KW/KW.PROD.MIXED/X.txt", "mfs", "mfs"),
+                                     ("KW/KW.PROD.MIXED/X.mfs", None, "mfs"), ("KW/KW.PROD.MIXED/X.asm", None, "asm"),
+                                     ("KW/KW.PROD.BMS/X.txt", None, "bms"), ("KW/KW.PROD.MIXED/X.txt", "bms", "bms"),
+                                     ("KW/KW.PROD.MIXED/X.txt", None, "copybook"),     # a library that says nothing
+                                     ("KW/KW.PROD.COPYLIB/X.txt", None, "copybook")):
+            self.assertEqual(kind(path, copies, declared), want, (path, declared))
+        self.assertEqual(kind("KW/KW.PROD.MFS/X.txt", "         IF    WS-A = 1\n         CALL  KWSUB\n"), "mfs")
+        # a COBOL copybook's own lines still type it there (ROADMAP item 20)
+        for text in (PRCB, STARTBK, TAGBK):
+            self.assertEqual(kind("KW/KW.PROD.MFS/X.txt", text), "copybook", text)
+            self.assertEqual(kind("KW/KW.PROD.MIXED/X.txt", text, "mfs"), "copybook", text)
 
     def test_create_table_where_a_statement_begins(self):
         for text in ("ASMCT    CSECT\n         USING *,15\n         BAL   14,BLDTAB          CREATE TABLE OF RATES\n"
@@ -226,6 +303,65 @@ class JobsReadTheirCards(_Estate):
         for name in ("RUNBOOK", "RESTART", "KWNOTES"):
             self.assertIn(f"## {name}  `", found)
         self.assertIn("| documents | 3 |", cov)
+
+
+KWMFS2 = ("KWMSG2   MSG   TYPE=OUTPUT,SOR=(KWFMT2,IGNORE)\n         SEG\n         MFLD  KWFLD2,LTH=10\n         MSGEND\n"
+          "KWFMT2   FMT\n         COPY  KWDEVHD\n         DIV   TYPE=INOUT\nKWFLD2   DFLD  POS=(1,2),LTH=10\n"
+          "         FMTEND\n         END\n")
+KWASM2 = ("KWASM2   CSECT\n         USING *,15\n         OPEN  (INFILE,(INPUT))\n         CLOSE INFILE\n         BR    14\n"
+          "INFILE   DCB   DDNAME=INFILE,DSORG=PS,MACRF=GM\n         END\n")
+STARTO = "           START CUSTFILE\n               KEY IS NOT LESS THAN CUST-KEY.\n"
+
+
+class TheSecondRoundInABuild(_Estate):
+    """LESSONS 200, the verifier's second round on a build: an MFS member that COPYs its device header and one of
+    COPY lines only (in an MFS library declared mfs), an Assembler member with `CLOSE INFILE`, a tagged data
+    copybook in a CNTL library declared ctlcard, a procedure copybook of one START statement in a PROCS folder, and
+    three documents in a folder with no hint - an indented run book, a numbered one, an HTML page. Each is filed as
+    what it is: the screens are found, the programs are whole, `docs` finds the documents, and recover finds
+    nothing to do."""
+
+    files = (("KW/KW.PROD.MFS/KWMFS2.txt", KWMFS2), ("KW/KW.PROD.MFS/KWDEVHD.txt", "         DEV   TYPE=(3270,2)\n"),
+             ("KW/KW.PROD.MFS/KWCPYO.txt", "         COPY  KWDEVHD\n         COPY  KWDEVTL\n"),
+             ("KW/KW.PROD.ASM/KWASM2.txt", KWASM2),
+             ("KW/KW.PROD.SRC/KWP03.cbl", HEAD.format(name="KWP03", data="           COPY KWTAG2.\n", main="")
+              + PLAIN_SECTION + TAIL),
+             ("KW/KW.PROD.CNTL/KWTAG2.txt", TAGBK),
+             ("KW/KW.PROD.SRC/KWP02.cbl", section_program("KWP02", "KWSTRO")), ("KW/KW.PROD.PROCS/KWSTRO.txt", STARTO),
+             ("ops/kw-restart.txt", RUNBOOK_INDENTED), ("ops/kw-steps.txt", RUNBOOK_NUMBERED),
+             ("ops/kw-edit.html", EDIT_HTML))
+
+    def before_build(self):
+        self.manifest = os.path.join(self.td, "manifest.json")
+        with open(self.manifest, "w", encoding="utf-8") as fh:
+            json.dump({"kinds": {"KW.PROD.CNTL": "ctlcard", "KW.PROD.MFS": "mfs", "KW.PROD.SRC": "cobol"}}, fh)
+
+    def test_each_is_what_it_is(self):
+        for name, want in (("KWMFS2", "mfs"), ("KWCPYO", "mfs"), ("KWASM2", "asm"), ("KWTAG2", "copybook"),
+                           ("KWSTRO", "copybook"), ("KW-RESTART", "doc"), ("KW-STEPS", "doc"), ("KW-EDIT", "doc")):
+            self.assertEqual(self.member(name)[0], want, name)
+        for prog, book in (("KWP03", "KWTAG2"), ("KWP02", "KWSTRO")):
+            self.assertEqual(self.status(prog), "ok", prog)
+            self.assertEqual(self.copy_use(prog, book), [(self.member_id(book),)], prog)
+        conn = query.connect(self.db)
+        try:
+            fmt, msg = query.cmd_screen(conn, "KWFMT2"), query.cmd_screen(conn, "KWMSG2")
+            restart, edit = query.cmd_docs(conn, "RESTART"), query.cmd_docs(conn, "edit")
+            cov = query.cmd_coverage(conn)
+            prog = query.cmd_program(conn, "KWP03")
+        finally:
+            conn.close()
+        self.assertNotIn("NOT FOUND", fmt + msg)
+        self.assertIn("KWFLD2", fmt)
+        for name in ("KW-RESTART", "KW-STEPS"):
+            self.assertIn(f"## {name}  `", restart)
+        self.assertIn("## KW-EDIT  `", edit)
+        self.assertIn("| documents | 3 |", cov)
+        self.assertNotIn("NOT FOUND", prog)
+        # an MFS COPY is no missing COBOL copybook
+        self.assertEqual(cov.split("### Copybooks not found")[1].split("\n###")[0].strip(), "_none_")
+        self.assertIn("| BMS / MFS screens | 2 |", cov)
+        self.assert_nothing_to_do()
 
 
 class TheBuildsOwnRuleIsNoDeclaration(_Estate):
@@ -378,6 +514,45 @@ class ADeclaredCopybookOverAShape(_Estate):
         self.build()
         self.assertEqual((self.member("ASMBK")[:3], self.status("ASMPGM")), (("copybook", "KW.PROD.ASMCPY", "ok"), "ok"))
         self.assert_nothing_to_do()
+
+
+class TheNoteOutlivesAForcedReparse(_Estate):
+    """LESSONS 200: KWASMD, an Assembler DSECT in a library declared copybook, COPYs KWASME, another there; both
+    carry a 'declared_kind' row. A line appended to KWASME makes the incremental build re-parse KWASMD and the
+    program copying it - KWASMD keeps its stored classification (the same bytes), and its row must come with it:
+    the build re-inserted it without one, so `program` showed a plain name and `copybook` no note."""
+
+    files = (("KW/KW.PROD.SRC/KWP04.cbl", data_program("KWP04", "KWASMD")),
+             ("KW/KW.PROD.MIXED/KWASMD.txt", "KWASMD   DSECT\nKWA1     DS    CL8\nKWA2     DS    F\n         COPY  KWASME\n"),
+             ("KW/KW.PROD.MIXED/KWASME.txt", "KWASME   DSECT\nKWE1     DS    CL4\n"))
+
+    def before_build(self):
+        self.manifest = os.path.join(self.td, "manifest.json")
+        with open(self.manifest, "w", encoding="utf-8") as fh:
+            json.dump({"kinds": {"KW.PROD.MIXED": "copybook"}}, fh)
+
+    def notes(self):
+        return self.q("SELECT m.name, u.line FROM unresolved u JOIN member m ON m.id=u.member_id "
+                      "WHERE u.kind='declared_kind' ORDER BY m.name")
+
+    def test_a_copied_member_changes(self):
+        self.assertEqual(self.notes(), [("KWASMD", 1), ("KWASME", 1)])
+        with open(os.path.join(self.root, "KW", "KW.PROD.MIXED", "KWASME.txt"), "a", encoding="utf-8", newline="\n") as fh:
+            fh.write("KWE2     DS    CL4\n")
+        out = self.build()
+        self.assertIn("changed 3  unchanged 0", out)                    # KWASME, KWASMD that copies it, the program
+        self.assertEqual(self.notes(), [("KWASMD", 1), ("KWASME", 1)])
+        conn = query.connect(self.db)
+        try:
+            prog, book = query.cmd_program(conn, "KWP04"), query.cmd_copybook(conn, "KWASMD")
+        finally:
+            conn.close()
+        self.assertIn("| KWASMD | KWASMD (filed copybook by its library's declared kind, over the shape of an Assembler "
+                      "member on line 1 - see `copybook KWASMD`) |", prog)
+        self.assertIn("**Declared copybook over a shape**", book)
+        # a build that re-parses nothing keeps both rows, once
+        self.build()
+        self.assertEqual(self.notes(), [("KWASMD", 1), ("KWASME", 1)])
 
 
 class DeclaredKindsUsed(unittest.TestCase):

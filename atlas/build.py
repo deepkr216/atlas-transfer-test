@@ -822,6 +822,9 @@ def inventory(ctx: Ctx, roots, limit: Optional[int] = None, force_all: bool = Fa
     skip_classify = getattr(ctx, "inventory_skips", set())
 
     found: List[tuple] = []
+    # members whose stored classification stands (same bytes, settled): not classified again, so ctx.shape_over has
+    # nothing for them - a forced re-parse re-inserts them with their stored kind and their 'declared_kind' row
+    stored: set = set()
     progress.phase("inventory: reading and fingerprinting every file", limit=INVENTORY_TIME_LIMIT)
     ctx.say(f"  a line every {int(PROGRESS_SECONDS)} s says how far and which file is in hand; a line when a folder "
             f"is done; a file still in hand after {SLOW_MEMBER_SECONDS} s is flagged, and given up on after "
@@ -892,6 +895,7 @@ def inventory(ctx: Ctx, roots, limit: Optional[int] = None, force_all: bool = Fa
                     # inventory once gave up on is not read again for another limit)
                     found.append((path, os.path.splitext(fn)[0].upper(), ex[4], ex[5], ex[6], sha_, ex[7], len(data),
                                   ex[8] or 0, ex[9] or 0, None))
+                    stored.add(path)
                     continue
                 label = f"file {fn} ({len(data) // 1024} KB) in {fold}"
                 if os.path.normcase(os.path.abspath(path)) in skip_classify:
@@ -975,6 +979,15 @@ def inventory(ctx: Ctx, roots, limit: Optional[int] = None, force_all: bool = Fa
                 ctx.bump("changed")
         ctx.say(f"{_stamp()}  {len(kept):,} member(s) unchanged and kept, {len(to_forget):,} to redo "
                 f"({ctx.stats.get('pruned', 0):,} gone from disk), {len(found) - len(kept) - ctx.stats.get('changed', 0):,} new")
+        # a member re-parsed because a member it copies changed keeps its stored classification (the same bytes, the
+        # same toolkit and declared kinds: a change of either re-parses every member and classifies it again), so
+        # the 'declared_kind' row its classification wrote is carried over, not lost with its old facts (LESSONS 200)
+        carried: Dict[str, List[tuple]] = {}
+        again = {existing[p][0]: p for p in stored if p not in kept}
+        if again:
+            for mid, detail, line in conn.execute("SELECT member_id, detail, line FROM unresolved WHERE kind='declared_kind'"):
+                if mid in again:
+                    carried.setdefault(again[mid], []).append((detail, line))
         if to_forget:
             progress.phase(f"removing the old facts of {len(to_forget):,} member(s)")
             _forget_members(conn, to_forget, progress)
@@ -1001,6 +1014,9 @@ def inventory(ctx: Ctx, roots, limit: Optional[int] = None, force_all: bool = Fa
                 if over:
                     conn.execute("INSERT INTO unresolved(member_id,kind,detail,line) VALUES(?,?,?,?)",
                                  (mem.id, "declared_kind", declared_note(library, *over), over[1] or None))
+                elif kind == "copybook":
+                    conn.executemany("INSERT INTO unresolved(member_id,kind,detail,line) VALUES(?,?,?,?)",
+                                     [(mem.id, "declared_kind", detail, line) for detail, line in carried.get(path, ())])
             ctx.members.append(mem)
             ctx.by_name.setdefault(name, []).append(mem)
             ctx.bump(f"kind:{kind}")

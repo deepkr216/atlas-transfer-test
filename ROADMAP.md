@@ -291,25 +291,32 @@ shipped alone and cost one such night; these still wait for the next one:
    procedure statements and no DIVISION header as a copybook before the Assembler and MFS shapes and
    before the folder hint (`_SIG_COBOL_PROC`): MOVE ... TO, the arithmetic verbs with their preposition,
    SET ... TO, PERFORM, GOBACK, GO TO, EVALUATE, STOP RUN, EXIT., CONTINUE, COMPUTE, INITIALIZE, ACCEPT ...
-   FROM, STRING / UNSTRING ... DELIMITED, INSPECT, OPEN INPUT and the COBOL forms of CLOSE / READ / WRITE,
-   a scope terminator, a paragraph or section name in area A (columns 8-11) ended by a period - in upper
-   case, where a COBOL line's code begins (never column 1, a `//` line or a `*` comment). The statements
-   an Assembler member uses too - IF, DISPLAY, CALL, COPY, EXEC CICS / SQL / DLI - count only where the
-   Assembler shape did not fire (`_SIG_COBOL_SHARED`), and the IDCAMS `IF LASTCC`, ICETOOL `DISPLAY FROM(`
-   / `COPY FROM(`, IEBCOPY `COPY OUTDD=` and TSO `CALL 'LIB(PGM)'` forms never count. The library says how
-   much the statements must say (`classify.library_says`, LESSONS 199), so control cards and documents keep
-   their kind: an Easytrieve program (JOB INPUT, END-PROC, FILE with its field definitions) or a
+   FROM, STRING / UNSTRING ... DELIMITED, INSPECT, OPEN INPUT and the COBOL forms of READ / WRITE, a scope
+   terminator, a paragraph or section name in area A (columns 8-11) ended by a period - in upper case, where
+   a COBOL line's code begins (never column 1, a `//` line or a `*` comment). The statements an Assembler or
+   MFS member writes too - IF, DISPLAY, CALL, COPY, EXEC CICS / SQL / DLI, CLOSE with a file name (the
+   Assembler CLOSE macro takes one DCB name bare), START with a file name (the COBOL verb alone on its line,
+   its KEY IS on the next) - count only where neither the Assembler nor the MFS shape fired and the library
+   says nothing (`_SIG_COBOL_SHARED`), and the IDCAMS `IF LASTCC`, ICETOOL `DISPLAY FROM(` / `COPY FROM(`,
+   IEBCOPY `COPY OUTDD=` and TSO `CALL 'LIB(PGM)'` forms never count. The library says how much the
+   statements must say (`classify.library_says`, LESSONS 199, 200), so control cards, documents and MFS
+   source keep their kind: an Easytrieve program (JOB INPUT, END-PROC, FILE with its field definitions) or a
    Connect:Direct process (label PROCESS SNODE=, COPY FROM (DSN=, RUN TASK, EIF) is never typed by a COBOL
    signature (`classify.not_cobol`) - its job reads it through SYSIN, which `build._card_text` does only for
    a control-card member, never a copybook; in a library of documents (a folder named DOCS / SPECS / DESIGN,
-   a library declared doc, or a document's extension on a text with a line of prose) the statements and the
-   loose level number count for nothing - a run book says PERFORM THE FOLLOWING STEPS, a design note quotes a
-   paragraph - while a data description entry still types a copybook, as before the batch; in a library of
-   control cards (a folder named CNTL / PARMLIB / CARDLIB ..., a library declared ctlcard or sched) two
-   statement lines are needed, one of a form no card language has, and the loose level number counts for
-   nothing. So a procedure copybook - paragraph names and statements - is a copybook in any library but one
-   of documents, and in a library of control cards when it has two statement lines (a single MOVE line keeps
-   the folder's kind). A member with no signature at all (a literal copied into a VALUE clause)
+   a library declared doc, a document's extension other than .txt - .md, .html, .csv ... - or a .txt outside
+   a dataset-named folder with a line of prose: a letter in column 1, a Markdown heading, a numbered line
+   `2.`, or an English word no COBOL statement carries - THE, YOU, PLEASE ... - outside a literal on a line
+   that is not a comment) the statements and the loose level number count for nothing - a run book says
+   PERFORM THE FOLLOWING STEPS, a design note quotes a paragraph - while a data description entry still
+   types a copybook, as before the batch; in a library of control cards (a folder named CNTL / PARMLIB /
+   CARDLIB ..., a library declared ctlcard or sched) two statement lines are needed, one of a form no card
+   language has, and the loose level number counts for nothing; in a library of Assembler or macro source
+   (a folder named MFS / BMS / DBD / PSB ..., a library declared mfs, bms, dbd, psb or imsgen, an extension
+   .asm / .mfs ...) the statements an Assembler or MFS member writes too and the loose level number count
+   for nothing - an MFS member of COPY lines only takes its library's kind. So a procedure copybook -
+   paragraph names and statements - is a copybook in any library but one of documents, and in a library of
+   control cards when it has two statement lines (a single MOVE or START line keeps the folder's kind). A member with no signature at all (a literal copied into a VALUE clause)
    still takes its folder's kind or the declared one, and `atlas.recover`, `coverage`, `program` and
    `copybook` name it with the fix - rename the folder to end in COPYLIB, or declare the library's kind
    in the UI's table: both are true now, since item 22 lets a declaration win over the folder name. The
@@ -317,7 +324,7 @@ shipped alone and cost one such night; these still wait for the next one:
    expands it into its programs but has no parser for that kind (LESSONS 184).
    tests/test_refiled_copybooks.py TheBuildFilesThemRight, ClassifierShapes; tests/test_arrived_copybooks.py
    ArrivedAfterTheParse, FiledAsAnotherKind, NestedCopybookArrivesLater; tests/test_library_says.py
-   TheClassifierReadsTheLibrary, JobsReadTheirCards (LESSONS 198, 199).
+   TheClassifierReadsTheLibrary, JobsReadTheirCards, TheSecondRoundInABuild (LESSONS 198, 199, 200).
 21. **build.py: inventory forcing (`changed_names`) covers every kind the resolver accepts.**
    A new or changed member forces the programs that copy it to be parsed again only when its kind
    is copybook or cobol; the resolver also expands sql and unknown members, so a procedure copybook
@@ -347,8 +354,10 @@ shipped alone and cost one such night; these still wait for the next one:
    resolver never looks at asm / listing / mfs, so every program copying such a member said COPY X NOT FOUND
    while the file was in the estate, and no folder change helped - the content decided (LESSONS 186). Now,
    in classify.py: (a) a data description entry (a level number where a COBOL line's code begins, then a
-   data-name ended by a period, the end of the line or a clause - `_SIG_DATA_LEVEL`) and the COBOL-statement
-   signature of item 20 are checked before the Assembler and MFS shapes; the looser level-number signature
+   data-name ended by a period, the end of the line or a clause - `_SIG_DATA_LEVEL`; the data-name may carry
+   a tag, `WS-:XR:-ID`, and a copybook written from column 1 is one by a level number there, a data-name and
+   a PIC / VALUE / REDEFINES / OCCURS / USAGE clause - LESSONS 200) and the COBOL-statement signature of item
+   20 are checked before the Assembler and MFS shapes; the looser level-number signature
    (`_SIG_LEVEL_NUMBER`), which an Assembler register equate `R12 EQU 12` trips, stays after them as before.
    A compiler listing is still looked for before every COBOL signature - it echoes the program's level
    numbers and PROGRAM-ID - but by its shape alone: the compiler's banner on a line that is not a comment,
@@ -357,7 +366,10 @@ shipped alone and cost one such night; these still wait for the next one:
    `_MFS_SHAPE`, `_LISTING_SHAPE` / `_LISTING_HEAD` moved into classify.py and recover imports them (LESSONS
    187-189): CSECT / DSECT as the operation after a label of any length or none, START with a label in
    column 1 or a numeric or quoted operand, DFHEIENT, DS / DC with a type, `USING *`, `EQU *`, `BR 14`; a
-   labelled MFS statement or TYPE= / POS= / LTH= operands. So `05 START-DATE`, `PERFORM START-PARA`, `START
+   labelled MFS statement, TYPE= / POS= / LTH= operands, MSGEND / FMTEND / TABLEEND, an operator control
+   table's `IF DATA=` / `IF LENGTH=` - and both shapes are checked before the statements such a member writes
+   too, so an MFS member that COPYs its device header, or an Assembler member with `CLOSE INFILE`, keeps its
+   kind (LESSONS 200). So `05 START-DATE`, `PERFORM START-PARA`, `START
    CUSTFILE` alone on its line, a comment naming MODULE MAP and a line whose first word is MSG no longer
    type a copybook as something else; nor does a signature on a comment line - a remark naming DFHMDF,
    PROGRAM-ID, CREATE TABLE or the compiler (`_code_hit`). CREATE TABLE counts where a statement begins, so
@@ -379,7 +391,9 @@ shipped alone and cost one such night; these still wait for the next one:
    kind filed as a copybook over the shape of an Assembler, listing or MFS member carries a `declared_kind`
    row that `program` (beside the copy), `copybook` and `coverage` print - fetch.infer_kind declares every
    COPYLIB copybook, so a real Assembler member there is expanded into its programs, and 'ok' must not be
-   silent about it. atlas.recover and `coverage` say 'by its declared kind' only for a library declared so
+   silent about it; a member the build re-parses because a member it copies changed keeps its stored
+   classification, and its `declared_kind` row with it (LESSONS 200). atlas.recover and `coverage` say 'by
+   its declared kind' only for a library declared so
    (`recover.declared_kinds_used`: the run's record, or for an older index the manifest.json beside it whose
    sha the build recorded) - a card member the build itself filed ctlcard in a JCL folder reads 'by its
    folder' (LESSONS 199).
@@ -401,9 +415,10 @@ shipped alone and cost one such night; these still wait for the next one:
    a copybook instead of undoing the re-file (LESSONS 187, 188). tests/test_refiled_copybooks.py
    (TheBuildFilesThemRight, ClassifierShapes, GenuineAssemblerIsNotRefiled, RealAssemblerShapesAreNotRefiled,
    DeclaredKinds, AnIndexBuiltBeforeTheBatch, TheFirstBuildAfterTheBatch, SecondRunBeforeTheBuild,
-   DryRunWithAFolderTypedCopyToo, OkWithAnUnlinkedCopyRow, WrittenCopybookIsFiledRight, TheVerdict),
-   tests/test_library_says.py (TheClassifierReadsTheLibrary, TheBuildsOwnRuleIsNoDeclaration,
-   ADeclaredCopybookOverAShape, DeclaredKindsUsed), LESSONS 186-189, 198, 199.
+   DryRunWithAFolderTypedCopyToo, OkWithAnUnlinkedCopyRow, OneProgramCopyingTwoRefiled, WrittenCopybookIsFiledRight,
+   TheVerdict), tests/test_library_says.py (TheClassifierReadsTheLibrary, TheSecondRoundInABuild,
+   TheBuildsOwnRuleIsNoDeclaration, ADeclaredCopybookOverAShape, TheNoteOutlivesAForcedReparse, DeclaredKindsUsed),
+   LESSONS 186-189, 198, 199, 200.
 23. **reader.py: a copybook member whose every non-blank line keeps its text within columns 1-7 is read as
    code.** Two of his missing copybooks hold a 7-8 digit number in column 1 and nothing else (a stub, or a
    value meant to be copied): fixed-format reading takes columns 1-6 as the sequence area and column 7 as
