@@ -354,10 +354,10 @@ class Ctx:
         self.problems: List[Tuple[str, str, str]] = []   # (kind of problem, path, detail) - listed at the end of the build
         self.problems_file: Optional[str] = None
         # what the compiler listings say (atlas.recover's listing_copy_source, read once): (PROGRAM, COPYBOOK) ->
-        # (the library dataset the listing names, the system of the listing member that names it); and the dataset
-        # each folder holds (the `library` table, else the folder's own name), cached per folder - make_resolver
-        # reads both before its precedence chain
-        self.listing_sources: Dict[Tuple[str, str], Tuple[Tuple[str, Optional[str]], ...]] = {}
+        # (the library dataset the listing names, the system of the listing member that names it, whether the
+        # listing is current); and the dataset each folder holds (the `library` table, else the folder's own name),
+        # cached per folder - make_resolver reads both before its precedence chain
+        self.listing_sources: Dict[Tuple[str, str], Tuple[ListingRow, ...]] = {}
         self.folder_dataset: Dict[str, Optional[str]] = {}
 
     def problem(self, kind: str, path: str, detail: str, line: Optional[str] = None) -> None:
@@ -1264,16 +1264,27 @@ def _proc_facts(ctx: Ctx, name: str, job_mem: Optional[Mem] = None,
 _LIB_DSN = re.compile(r"^[A-Z0-9@#$][A-Z0-9@#$\-]{0,7}(?:\.[A-Z0-9@#$][A-Z0-9@#$\-]{0,7})+$")
 LIB_DSN_MAX = 44
 LISTING_HOW = "the program's compiler listing names "          # the 'how' of a choice the listing decided
+# the 'how' of the chain's pick kept because the copy the listing names has the same text:
+# f"{LISTING_SAME}{DATASET})" - 'confirmed by the program's listing (same text as DATASET)'
+LISTING_SAME = "confirmed by the program's listing (same text as "
 
 
 def _folder_key(folder: str) -> str:
     return os.path.normcase(os.path.normpath(os.path.abspath(folder)))
 
 
-def load_listing_sources(conn: sqlite3.Connection) -> Dict[Tuple[str, str], Tuple[Tuple[str, Optional[str]], ...]]:
-    """{(PROGRAM, COPYBOOK): ((library dataset, system), ...)} - the datasets
-    the program's compiler listings name for that copybook, in stored order,
-    each with the SYSTEM of the listing member that names it: atlas.recover
+# one row of what a compiler listing says: (library dataset, the listing member's system, the listing current?)
+ListingRow = Tuple[str, Optional[str], Optional[bool]]
+
+
+def load_listing_sources(conn: sqlite3.Connection) -> Dict[Tuple[str, str], Tuple[ListingRow, ...]]:
+    """{(PROGRAM, COPYBOOK): ((library dataset, system, current), ...)} - the
+    datasets the program's compiler listings name for that copybook, in
+    stored order, each with the SYSTEM of the listing member that names it
+    and whether that listing is CURRENT (recover's `current` column: its
+    source is the program as indexed; None when not dated, or on a table
+    written before recover dated listings - such a row is never followed,
+    make_resolver follows a current listing only): atlas.recover
     keys the rows by the listing's file stem, so every listing of one program
     NAME shares the key - GC's and GC-TEST's listings of GCPGM1, and one filed
     under estate\\SHARED\\PROD.LISTINGS - and rows_that_count decides which
@@ -1285,16 +1296,18 @@ def load_listing_sources(conn: sqlite3.Connection) -> Dict[Tuple[str, str], Tupl
     table is recover's own: absent on an index recover never ran on, or
     empty - then nothing is known, and the build never creates it. A row with
     no copybook (a listing read with no table) says nothing."""
-    out: Dict[Tuple[str, str], Tuple[Tuple[str, Optional[str]], ...]] = {}
+    out: Dict[Tuple[str, str], Tuple[ListingRow, ...]] = {}
     if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='listing_copy_source'").fetchone() is None:
         return out
-    for program, copybook, dataset, system in conn.execute(
-            "SELECT s.program, s.copybook, s.dataset, m.system FROM listing_copy_source s "
+    cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(listing_copy_source)")}
+    current = "s.current" if "current" in cols else "NULL"             # a table written before recover dated listings
+    for program, copybook, dataset, system, cur in conn.execute(
+            f"SELECT s.program, s.copybook, s.dataset, m.system, {current} FROM listing_copy_source s "
             "LEFT JOIN member m ON m.path = s.listing "
             "WHERE s.copybook IS NOT NULL AND s.copybook <> '' AND s.dataset IS NOT NULL AND s.dataset <> '' "
             "ORDER BY s.rowid"):
         key = (str(program).strip().upper(), str(copybook).strip().upper())
-        row = (str(dataset).strip().upper(), system_key(system))
+        row = (str(dataset).strip().upper(), system_key(system), None if cur is None else bool(cur))
         have = out.get(key, ())
         if row not in have:
             out[key] = have + (row,)
@@ -1313,7 +1326,7 @@ _R = TypeVar("_R")
 def rows_that_count(rows: Sequence[_R], system: Optional[str], twins: AbstractSet[Optional[str]],
                     listing_system: Callable[[_R], Optional[str]]) -> List[_R]:
     """The listing rows that speak for one program - ONE rule, applied by the
-    resolver (listing_rows_for) and by atlas.recover's check
+    resolver (current_datasets) and by atlas.recover's check
     (recover.rows_of_system), so what the build expanded and what recover
     checks it against never differ. Every listing of a program NAME shares
     the rows' key; each row carries the system of the listing member that
@@ -1341,11 +1354,24 @@ def rows_that_count(rows: Sequence[_R], system: Optional[str], twins: AbstractSe
     return [] if twins else list(rows)
 
 
-def listing_rows_for(rows: Sequence[Tuple[str, Optional[str]]], system: Optional[str],
-                     twins: AbstractSet[Optional[str]]) -> List[str]:
-    """The datasets, in stored order, that a program in `system` takes from
-    its listing rows ((dataset, listing system) pairs): rows_that_count."""
-    return [dsn for dsn, _lsys in rows_that_count(rows, system_key(system), twins, lambda r: r[1])]
+def listing_rows_for(rows: Sequence[Tuple], system: Optional[str], twins: AbstractSet[Optional[str]]) -> List[str]:
+    """The datasets, in stored order, of every listing row that speaks for a
+    program in `system` ((dataset, listing system, ...) tuples):
+    rows_that_count, current or not - the resolver itself reads
+    current_datasets, the same rows with only the current listings kept."""
+    return [r[0] for r in rows_that_count(rows, system_key(system), twins, lambda r: r[1])]
+
+
+def current_datasets(rows: Sequence[ListingRow], system: Optional[str], twins: AbstractSet[Optional[str]]) -> List[str]:
+    """The datasets a CURRENT listing that speaks for the program names, in
+    stored order, once each: rows_that_count first (whose listing it is),
+    then only a listing whose source is the program as indexed - an older
+    compile's listing or one not yet dated never decides."""
+    out: List[str] = []
+    for dsn, _lsys, cur in rows_that_count(rows, system_key(system), twins, lambda r: r[1]):
+        if cur and dsn not in out:
+            out.append(dsn)
+    return out
 
 
 def twin_systems(ctx: "Ctx", prog: "Mem") -> Set[Optional[str]]:
@@ -1403,6 +1429,47 @@ def _chain_pick(ctx: Ctx, prog: Mem, cands: List[Mem], lib: Optional[str]) -> Tu
     return (by_lib or same_sys or auth or same_lib or cands)[0], how
 
 
+def listing_pick(ctx: Ctx, prog: Mem, cands: List[Mem], lib: Optional[str], pick: Mem, how: str,
+                 named: Sequence[str]) -> Tuple[Mem, str]:
+    """The chain's (pick, how) after the program's CURRENT listing, which
+    names the library datasets in `named` (current_datasets). The listing
+    changes the pick only where the compiler's record and the chain's guess
+    differ in CONTENT - a name is not a fact about content (LESSONS 193):
+
+    - the listing names the dataset of the chain's pick: that copy, and the
+      how says the listing names it;
+    - it names a dataset whose held copies all differ in text from the
+      chain's pick: the copy in that dataset is expanded (two folders tied to
+      it: the chain breaks the tie) - LISTING_HOW + DATASET;
+    - it names a dataset holding a copy with the SAME text as the chain's
+      pick (his listings name the staging library the compile ran against;
+      the copybook was promoted to production unchanged): the chain's pick
+      stays - production, not the staging copy - and the how says
+      'confirmed by the program's listing (same text as DATASET)';
+    - it names only datasets the index does not hold: the chain decides.
+
+    A different text beats a same text, in the listing's order: the same
+    precedence atlas.recover.check_choices gives its verdicts, so a program
+    this resolver parsed is never called contradicted, and one recover marks
+    is changed by the next parse."""
+    own = folder_dataset(ctx, pick.path)
+    if own is not None and own in named:
+        return pick, LISTING_HOW + own
+    same_as: Optional[str] = None
+    for dsn in named:
+        in_dsn = [c for c in cands if folder_dataset(ctx, c.path) == dsn]
+        if not in_dsn:
+            continue                                                    # a library the index does not hold
+        if any(c.norm_sha == pick.norm_sha for c in in_dsn):
+            same_as = same_as or dsn                                    # promoted unchanged: the chain's copy stays
+            continue
+        chosen, _tie = _chain_pick(ctx, prog, in_dsn, lib)
+        return chosen, LISTING_HOW + dsn
+    if same_as is not None:
+        return pick, f"{LISTING_SAME}{same_as})"
+    return pick, how
+
+
 def make_resolver(ctx: Ctx, prog: Mem, notes: List[Tuple[str, str, int]]):
     def resolve(name: str, lib: Optional[str]):
         cands = [c for c in ctx.by_name.get(name.upper(), [])
@@ -1411,27 +1478,24 @@ def make_resolver(ctx: Ctx, prog: Mem, notes: List[Tuple[str, str, int]]):
             return None
         pick = cands[0]
         if len(cands) > 1:
-            # The program's compiler listing FIRST: it names the library
-            # dataset the compiler read this copybook from (atlas.recover's
-            # listing_copy_source). A candidate in a folder tied to that
-            # dataset is the copy the compiler used - not a guess. Only the
+            # The precedence chain's pick, then the program's compiler
+            # listing: it names the library dataset the compiler read this
+            # copybook from (atlas.recover's listing_copy_source). Only the
             # rows that speak for THIS program count (rows_that_count): its
             # own system's listing; else any listing of its name (a SHARED
             # listings folder) while no other system holds a program of that
-            # name. GC and GC-TEST each hold GCPGM1 with its own listing, and
-            # one's listing must not decide for the other's copy. Only where
-            # no listing says (none read, no table, no row, no candidate in
-            # the dataset it names) does the precedence chain decide.
-            pick, how = None, ""
-            for dsn in listing_rows_for(ctx.listing_sources.get((prog.name.upper(), name.upper()), ()), prog.system,
-                                        twin_systems(ctx, prog)):
-                in_dsn = [c for c in cands if folder_dataset(ctx, c.path) == dsn]
-                if in_dsn:
-                    pick, _tie = _chain_pick(ctx, prog, in_dsn, lib)     # two folders holding one dataset: the chain breaks the tie
-                    how = LISTING_HOW + dsn
-                    break
-            if pick is None:
-                pick, how = _chain_pick(ctx, prog, cands, lib)
+            # name - GC and GC-TEST each hold GCPGM1 with its own listing, and
+            # one's listing must not decide for the other's copy. Only a
+            # CURRENT listing (its source is the program as indexed) decides,
+            # and only where the copy it names is held with a different text
+            # from the chain's pick (listing_pick). Everywhere else - none
+            # read, no table, no row, an older or undated listing, a library
+            # not held - the chain decides as before.
+            pick, how = _chain_pick(ctx, prog, cands, lib)
+            named = current_datasets(ctx.listing_sources.get((prog.name.upper(), name.upper()), ()), prog.system,
+                                     twin_systems(ctx, prog))
+            if named:
+                pick, how = listing_pick(ctx, prog, cands, lib, pick, how, named)
             if len({c.norm_sha for c in cands}) > 1:
                 # A choice, recorded once: the 'ambiguous_copybook' row names the
                 # copy and says how. It is NOT handed back to the expander as a COPY
