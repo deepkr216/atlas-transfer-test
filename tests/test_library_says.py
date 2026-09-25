@@ -423,5 +423,33 @@ class DeclaredKindsUsed(unittest.TestCase):
         self.assertIsNone(self.used(full, ("fp", "0" * 16, None)))               # a manifest changed since: not that one
 
 
+class TheDocsSayIt(unittest.TestCase):
+    """ROADMAP 20 and 22, README, the Field Manual, the synth harness's README and LESSONS 199 say what the library
+    says and how a declared kind is told."""
+
+    def read(self, *path):
+        with open(os.path.join(os.path.dirname(HERE), *path), encoding="utf-8") as fh:
+            return " ".join(fh.read().split())                          # the sentences, not the line breaks
+
+    def test_the_words(self):
+        roadmap = self.read("ROADMAP.md")
+        item20 = roadmap.split(" 20. **")[1].split(" 21. **")[0]
+        item22 = roadmap.split(" 22. **")[1].split(" 23. **")[0]
+        for word in ("classify.library_says", "classify.not_cobol", "LESSONS 199", "tests/test_library_says.py"):
+            self.assertIn(word, item20)
+        for word in ("build_run.declared_kinds", "declared_kind", "recover.declared_kinds_used", "classify._LISTING_BANNER",
+                     "tests/test_library_says.py", "199"):
+            self.assertIn(word, item22)
+        self.assertNotIn("so control cards keep their folder's kind", item20)
+        for text in (self.read("README.md"), self.read("docs", "FieldManual.html")):
+            self.assertIn("The COBOL statements say only as much as the library lets them", text)
+            self.assertIn("an Easytrieve program or a Connect:Direct process", text)
+            self.assertIn("each build records the kinds it was declared", text)
+        synth = self.read("tools", "synth", "README.md")
+        self.assertIn("filed `copybook` by its COBOL statements, before the folder name", synth)
+        self.assertIn("recover re-files all three", synth)
+        self.assertIn("| 199 | ", self.read("LESSONS.md"))
+
+
 if __name__ == "__main__":
     unittest.main()

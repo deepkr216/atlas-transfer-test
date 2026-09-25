@@ -82,7 +82,7 @@ def upd01(estate, sys_: str) -> ProgramBuilder:
                                Item(5, "WS-CHG-COUNT", pic="S9(05)", usage="COMP"),
                                Item(5, "WS-NEW-COUNT", pic="S9(05)", usage="COMP")])
     pb.copy(f"{s3}WORKA")
-    pb.copy("CMNDATEA", expect="not_found_then_ok")               # D4: START-DATE inside
+    pb.copy("CMNDATEA", expect="resolved")               # D4: START-DATE inside
     pb.copy("CMNERRA")
     pb.copy(f"{s3}MSGT")
     pb.wrapper_01("WS-HISTORY-AREA")
@@ -294,7 +294,7 @@ def build_policy_specials(estate) -> None:
     sys_ = "POLICY"
     c = S(estate, sys_)
     pt, pw = c["p"]["trans"], c["p"]["work"]
-    # D3: SECTION then COPY of a procedure copybook that sits in a PROCS folder
+    # D3: SECTION then COPY of a procedure copybook that sits in a PROCS folder - found since ROADMAP re-parse item 20
     pb = new(estate, "POLUPD02", sys_)
     pb.identification()
     pb.environment([{"name": "TRAN-FILE", "dd": "POLTRAN"}])
@@ -320,10 +320,10 @@ def build_policy_specials(estate) -> None:
     pb.section("A-100-BEGIN")
     pb.read("TRAN-FILE", at_end=f"SET {pw}-EOF TO TRUE")
     pb.end_stmt()
-    n = pb.copy("POLPROCB", prefix_text="Z-100-EDITS SECTION.", expect="not_found")
+    n = pb.copy("POLPROCB", prefix_text="Z-100-EDITS SECTION.")
     pb.sections.append({"name": "Z-100-EDITS", "line": n})
     pb.fact("section", n, name="Z-100-EDITS")
-    estate.add_program(pb, status="partial", why="COPY POLPROCB NOT FOUND (filed proc by its folder)", role="D3")
+    estate.add_program(pb, why="copies POLPROCB, a procedure copybook in a PROCS folder (ROADMAP re-parse item 20)", role="D3")
     # D5: two programs copy the missing POLMISSB, one with a REPLACING over two lines
     def body3(pb, c):
         pb.move(f"{pt}-{c['key']}", ["WA-AUDIT-KEY"])
@@ -386,7 +386,7 @@ def ext01(estate, sys_: str) -> ProgramBuilder:
     ws_constants(pb, pb.name, [Item(5, "WS-EXCLUDE-LAPSED", pic="X(01)", value="'Y'")])
     pb.copy(f"{s3}WORKA")
     pb.copy("STDHDR", expect="chosen")
-    pb.copy("CMNDATEA", expect="not_found_then_ok")
+    pb.copy("CMNDATEA", expect="resolved")
     pb.procedure()
     pb.para("0000-MAIN")
     pb.open_([("INPUT", ["MASTER-FILE", "CONTROL-FILE"]), ("OUTPUT", ["EXTRACT-FILE"])])
@@ -521,7 +521,7 @@ def his01(estate, sys_: str) -> ProgramBuilder:
     pb.working_storage()
     ws_constants(pb, pb.name, [Item(5, "WS-PURGE-DATE", pic="9(08)")])
     pb.copy(f"{s3}WORKA")
-    pb.copy("CMNDATEA", expect="not_found_then_ok")
+    pb.copy("CMNDATEA", expect="resolved")
     pb.item(Item(1, "WS-DETAIL", children=[Item(5, "WD-KEY", pic=f"X({c['klen']})"), Item(5, "FILLER", pic="X(02)", value="SPACES"),
                                           Item(5, "WD-TYPE", pic="X(01)"), Item(5, "FILLER", pic="X(02)", value="SPACES"),
                                           Item(5, "WD-USER", pic="X(08)"), Item(5, "FILLER", pic="X(02)", value="SPACES"),
@@ -1043,7 +1043,7 @@ def edit(estate, sys_: str) -> ProgramBuilder:
     ws_constants(pb, pb.name, [Item(5, "WS-MIN-AMT", pic="S9(09)V99", usage="COMP-3", value="+1.00"),
                                Item(5, "WS-MAX-AMT", pic="S9(09)V99", usage="COMP-3", value="+999999.99")])
     pb.copy(f"{s3}MSGT")
-    pb.copy("CMNDATEA", expect="not_found_then_ok")
+    pb.copy("CMNDATEA", expect="resolved")
     pb.item(Item(1, "WS-EDIT-SW", pic="X(01)", value="'N'", conds=[("WS-EDIT-FAILED", ["'Y'"]), ("WS-EDIT-PASSED", ["'N'"])]))
     pb.linkage_section()
     pb.copy(f"{s3}COMMA", replacing=[Replacing("leading", f"{pa}-", "LK-")])
@@ -1208,7 +1208,7 @@ def build_shared(estate) -> None:
     pb.working_storage()
     ws_constants(pb, "CMNDATE", [Item(5, "WS-START-INT", pic="S9(09)", usage="COMP"), Item(5, "WS-END-INT", pic="S9(09)", usage="COMP")])
     pb.linkage_section()
-    pb.copy("CMNDATEA", expect="not_found_then_ok")
+    pb.copy("CMNDATEA", expect="resolved")
     pb.procedure(using=["CMN-DATE-AREA"])
     pb.para("0000-MAIN")
     pb.move_lit("0", ["DATE-RC"], quote=False)
@@ -1294,7 +1294,7 @@ def build_shared(estate) -> None:
     pb.close(["CUSTFILE"])
     pb.end_stmt()
     pb.stmt("GOBACK.")
-    n = pb.copy("CMNCUSTP", prefix_text="A-100-BEGIN SECTION.", expect="not_found_then_ok")
+    n = pb.copy("CMNCUSTP", prefix_text="A-100-BEGIN SECTION.", expect="resolved")
     pb.sections.append({"name": "A-100-BEGIN", "line": n})
     pb.fact("section", n, name="A-100-BEGIN")
     estate.add_program(pb, role="D4 copier (procedure)")
@@ -1391,7 +1391,7 @@ def gen_batch(estate, sys_: str, k: int) -> ProgramBuilder:
     ws_constants(pb, pb.name, [Item(5, "WS-CYCLE", pic="9(02)", value=f"{k:02d}"), Item(5, "WS-SEL-CNT", pic="S9(07)", usage="COMP-3", value="ZERO")])
     pb.copy(f"{s3}WORKA")
     if k % 2:
-        pb.copy("CMNDATEA", expect="not_found_then_ok")
+        pb.copy("CMNDATEA", expect="resolved")
     pb.procedure()
     pb.para("0000-MAIN")
     pb.open_([("INPUT", ["GEN-IN"]), ("OUTPUT", ["GEN-OUT"])])

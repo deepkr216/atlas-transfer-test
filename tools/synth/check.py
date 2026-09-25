@@ -197,8 +197,9 @@ class Checker:
         self.truth = json.load(open(os.path.join(self.out, "truth.json"), encoding="utf-8"))
         self.timing["generate_s"] = round(secs, 2)
 
-    def build(self, label: str, rebuild: bool = False) -> str:
-        cmd = [PY, "-m", "atlas.build", self.truth["root"], "--db", self.db, "--manifest", self.truth["manifest"], "--no-current-file"]
+    def build(self, label: str, rebuild: bool = False, db: Optional[str] = None) -> str:
+        cmd = [PY, "-m", "atlas.build", self.truth["root"], "--db", db or self.db, "--manifest", self.truth["manifest"],
+               "--no-current-file"]
         if rebuild:
             cmd.append("--rebuild")
         rc, outp, secs = run(cmd)
@@ -319,18 +320,19 @@ class Checker:
                           "a different text: " + " / ".join(body_got[:3]), facts=len(body_want))
             else:
                 self.ok("recover: recovered text exact", len(body_want))
-        # re-filed: exactly the two asm-by-content members
+        # re-filed: nothing on an index this toolkit built - D3 and D4 are copybooks by their own lines since ROADMAP
+        # re-parse items 20 and 22 (phase_aged checks the re-file on an index built before them)
         c = self.conn()
         refiled = sorted(r[0] for r in c.execute("SELECT name FROM member WHERE parse_error LIKE 're-filed as copybook by atlas.recover%'"))
         pending = sorted(r[0] for r in c.execute("SELECT name FROM member WHERE parse_status='pending'"))
         c.close()
-        if refiled != ["CMNCUSTP", "CMNDATEA"]:
-            self.find("recover", "recover", "re-filed members", "exactly CMNCUSTP and CMNDATEA (asm by a line of their text)",
-                      ", ".join(refiled) or "none", facts=2)
+        if refiled:
+            self.find("recover", "recover", "re-filed members", "none: D3 and D4 are copybooks by their own lines (ROADMAP re-parse "
+                      "items 20 and 22)", ", ".join(refiled), facts=len(refiled))
         else:
-            self.ok("recover: re-filed exactly the two misfiled-by-content copybooks", 2)
+            self.ok("recover: nothing re-filed on an index this toolkit built")
         want_pending = sorted({p["name"] for p in t["programs"].values()
-                               if any(cp["copybook"] in ("CMNDATEA", "CMNCUSTP") for cp in p["copies"])})
+                               if any(cp["copybook"] in refiled for cp in p["copies"])})
         missing_mark = [p for p in want_pending if p not in pending]
         extra_mark = [p for p in pending if p not in want_pending]
         if missing_mark:
@@ -348,11 +350,12 @@ class Checker:
                 self.ok("recover: sentence present")
             else:
                 self.find("recover", "recover", "console / work\\recover.md", f"the sentence `{w}`", "absent", facts=1, severity="words")
-        for w in ["## Re-filed as copybook", "START-DATE", "START"]:
-            if w in self.recover_report:
-                self.ok("recover: report sentence present")
+        for w in ("re-filed as copybook", "## Re-filed as copybook", "filed as asm", "filed as proc"):
+            if w in self.recover_console + "\n" + self.recover_report:
+                self.find("recover", "recover", "console / work\\recover.md", f"no `{w}` - nothing is misfiled on an index this "
+                          "toolkit built (ROADMAP re-parse items 20 and 22)", "present", facts=1, severity="words")
             else:
-                self.find("recover", "recover", "work\\recover.md", f"`{w}`", "absent", facts=1, severity="words")
+                self.ok("recover: no re-file sentence on an index this toolkit built")
         m = re.search(r"copybook choices checked against the listings: (\d+) confirmed, (\d+) contradicted, (\d+) unknown", outp)
         if m:
             a, b, u = int(m.group(1)), int(m.group(2)), int(m.group(3))
@@ -407,6 +410,110 @@ class Checker:
         render_items(em, root)
         return list(em.lines)
 
+    # ------------------------------------------------------------ phase 5: an index built before the batch
+    def phase_aged(self) -> None:
+        """The stand-in on an index built before ROADMAP re-parse items 20 and 22: a copy of the index with POLPROCB
+        (D3) filed proc and CMNDATEA / CMNCUSTP (D4) filed asm, as the classifier before the batch filed them, their
+        programs parsed again without them (COPY NOT FOUND) and the last build recorded as an older toolkit's (no
+        declared kinds). recover must re-file exactly those three with the promised words and mark their programs;
+        the next build re-parses every member and makes them whole; recover then finds nothing."""
+        t = self.truth
+        d = t["defects"]
+        aged = os.path.join(self.out, "aged.db")
+        shutil.copy(self.db, aged)
+        books = {d["D3"]["copybook"]: d["D3"]["aged_kind"], **{b: d["D4"]["aged_kind"] for b in d["D4"]["copybooks"]}}
+        copiers = sorted({p["name"] for p in t["programs"].values() if any(cp["copybook"] in books for cp in p["copies"])})
+        c = sqlite3.connect(aged)
+        try:
+            tables = [n for (n,) in c.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+            for book, kind in books.items():
+                row = c.execute("SELECT id FROM member WHERE name=? AND kind='copybook'", (book,)).fetchone()
+                if row is None:
+                    self.find("recover", "aged index", book, "a copybook member to age", "none", facts=1, severity="crash")
+                    return
+                for table in tables:
+                    cols = [r[1] for r in c.execute(f"PRAGMA table_info({table})")]
+                    if "member_id" in cols and table not in ("member", "fts_span") and not table.startswith("src_fts"):
+                        c.execute(f"DELETE FROM {table} WHERE member_id=?", (row[0],))
+                c.execute("UPDATE member SET kind=?, parse_status='skipped', parse_error=NULL WHERE id=?", (kind, row[0]))
+            q = ",".join("?" * len(books))
+            c.execute(f"UPDATE member SET parse_status='pending' WHERE kind='cobol' AND id IN "
+                      f"(SELECT member_id FROM copy_use WHERE UPPER(copybook) IN ({q}))", list(books))
+            c.commit()
+        finally:
+            c.close()
+        self.build("aged-incremental", db=aged)
+        c = sqlite3.connect(aged)
+        try:
+            c.execute("UPDATE build_run SET fingerprint='0000prebatch0000', declared_kinds=NULL WHERE id=(SELECT MAX(id) FROM build_run)")
+            c.commit()
+            partial = sorted(r[0] for r in c.execute("SELECT name FROM member WHERE kind='cobol' AND parse_status='partial'"))
+        finally:
+            c.close()
+        not_partial = [p for p in copiers if p not in partial]
+        if not_partial:
+            self.find("recover", "aged index", ", ".join(not_partial[:8]), "parsed only in part on the aged copy (COPY NOT FOUND)",
+                      "whole", facts=len(not_partial), severity="crash")
+            return
+        rc, outp, _secs = run([PY, "-m", "atlas.recover", "--db", aged], cwd=REPO)
+        with open(os.path.join(self.out, "recover-console-aged.txt"), "w", encoding="utf-8") as fh:
+            fh.write(outp)
+        rep_path = os.path.join(REPO, "work", "recover.md")
+        report = read(rep_path) if os.path.exists(rep_path) else ""
+        if report:
+            shutil.copy(rep_path, os.path.join(self.out, "recover-report-aged.md"))
+        c = sqlite3.connect(aged)
+        try:
+            refiled = sorted(r[0] for r in c.execute("SELECT name FROM member WHERE parse_error LIKE 're-filed as copybook by atlas.recover%'"))
+            pending = sorted(r[0] for r in c.execute("SELECT name FROM member WHERE parse_status='pending'"))
+        finally:
+            c.close()
+        if refiled != sorted(books):
+            self.find("recover", "recover (aged index)", "re-filed members", f"exactly {', '.join(sorted(books))} (filed asm / proc by "
+                      "the classifier before the batch)", ", ".join(refiled) or "none", facts=len(books))
+        else:
+            self.ok("aged: re-filed exactly D3 and D4", len(books))
+        unmarked = [p for p in copiers if p not in pending]
+        if unmarked:
+            self.find("recover", "recover (aged index)", ", ".join(unmarked[:10]), "marked pending for the next build (they copy a "
+                      "re-filed copybook)", "not marked", facts=len(unmarked))
+        else:
+            self.ok("aged: the copiers marked", len(copiers))
+        self.must("recover", "recover (aged index)", "console", outp, d["D4"]["aged_recover_words"], "the re-file sentence")
+        self.must("recover", "recover (aged index)", "work\\recover.md", report, d["D4"]["aged_report_words"], "the re-filed section")
+        text = run([PY, "-m", "atlas.query", "--db", aged, "copybook", "CMNDATEA"], cwd=REPO)[1]
+        self.must("recover", "copybook (aged index)", "CMNDATEA", text, d["D4"]["aged_copybook_words"], "the re-filed sentence")
+        self.build("aged-after-recover", db=aged)
+        c = sqlite3.connect(aged)
+        try:
+            kinds = {r[0]: (r[1], r[2]) for r in c.execute(f"SELECT name, kind, parse_status FROM member WHERE name IN ({q})", list(books))}
+            status = {r[0]: r[1] for r in c.execute("SELECT name, parse_status FROM member WHERE kind='cobol'")}
+        finally:
+            c.close()
+        wrong = [f"{b} {kinds.get(b)}" for b in books if kinds.get(b) != ("copybook", "ok")]
+        if wrong:
+            self.find("build", "build (aged index)", ", ".join(wrong), "copybook, ok (the first build after the toolkit changed "
+                      "re-parses every member)", "otherwise", facts=len(wrong))
+        else:
+            self.ok("aged: the build files them copybooks", len(books))
+        c = sqlite3.connect(self.db)
+        try:
+            want = {r[0]: r[1] for r in c.execute("SELECT name, parse_status FROM member WHERE kind='cobol'")}
+        finally:
+            c.close()
+        off = [p for p in copiers if status.get(p) != want.get(p)]
+        if off:
+            self.find("build", "build (aged index)", ", ".join(off[:8]), "the status the index this toolkit built gives them, after "
+                      "recover and the build", ", ".join(f"{p} {status.get(p)} (not {want.get(p)})" for p in off[:8]), facts=len(off))
+        else:
+            self.ok("aged: the programs whole", len(copiers))
+        outp = run([PY, "-m", "atlas.recover", "--db", aged, "--dry-run"], cwd=REPO)[1]
+        if "re-filed" in outp:
+            self.find("recover", "recover (aged index)", "the run after the build", "nothing to re-file", outp[:200], facts=1,
+                      severity="words")
+        else:
+            self.ok("aged: nothing left to re-file")
+
     # ------------------------------------------------------------ phase 3: the fact tables
     def phase_facts(self) -> None:
         t = self.truth
@@ -421,10 +528,6 @@ class Checker:
             self.ok("member indexed")
             exp_kind = m["kind"]
             exp_status = m["status"]
-            if m["role"] in ("D4 asm by content", "D4 asm by content (procedure)"):
-                exp_kind, exp_status = "copybook", "skipped"           # re-filed by recover, own rows wait for the re-parse
-            if m["role"] == "D3 misfiled by folder":
-                exp_kind = "proc"
             if m["role"] == "D6 stub":
                 exp_kind = "empty"
             if r["kind"] != exp_kind:
@@ -1229,10 +1332,13 @@ class Checker:
             else:
                 self.find("recover", "program", name, f"`{w}`", "absent", facts=1, severity="words")
         if name == d["D3"]["program"]:
-            if "NOT FOUND" in section(text, "Copybooks") and "filed as proc" in text:
-                self.ok("program: D3 wording")
+            row = next((r for h, hdr, rows_ in md_tables(section(text, "Copybooks")) for r in rows_ if r and r[0] == d["D3"]["copybook"]), None)
+            bad = [w for w in d["D3"]["not_words"] if w in text]
+            if row and len(row) > 1 and row[1] == d["D3"]["copybook"] and not bad:
+                self.ok("program: D3 resolved")
             else:
-                self.find("recover", "program", name, "COPY POLPROCB NOT FOUND ... filed as proc (folder PROD.POL.PROCS)", "absent", facts=1, severity="words")
+                self.find("classify", "program", name, "COPY POLPROCB resolved to POLPROCB (a copybook by its statements, ROADMAP "
+                          "re-parse item 20)", "; ".join(bad) or (" | ".join(row) if row else "no row"), facts=1)
         if name == d["D6"]["program"]:
             if "columns 1-7" in text:
                 self.ok("program: D6 stub wording")
@@ -1297,10 +1403,14 @@ class Checker:
             jobs = sorted({j["job"] for p in t["programs"].values() if p["name"] in copiers for j in p["jobs"]})
             self.must("jcl", "copybook", name, section(text, "Jobs/steps running those programs"), jobs, "jobs running the including programs")
         d = t["defects"]
-        if name == "POLPROCB":
-            self.must("recover", "copybook", name, text, d["D3"]["copybook_words"], "the D3 sentence")
-        if name in d["D4"]["copybooks"]:
-            self.must("recover", "copybook", name, text, d["D4"]["copybook_words"], "the re-filed sentence")
+        if name == d["D3"]["copybook"] or name in d["D4"]["copybooks"]:
+            key = "D3" if name == d["D3"]["copybook"] else "D4"
+            bad = [w for w in d[key]["not_words"] if w in text]
+            if bad:
+                self.find("classify", "copybook", name, "a copybook with its programs, nothing misfiled (ROADMAP re-parse items 20 and "
+                          "22)", "; ".join(bad), facts=len(bad), severity="words")
+            else:
+                self.ok(f"copybook: {key} filed as a copybook")
         if name == "POLSTUBB":
             self.must("recover", "copybook", name, text, ["columns 1-7"], "the stub verdict")
         if name == "POLMISSB":
@@ -1310,17 +1420,22 @@ class Checker:
                 self.ok("copybook: recovered wording")
         # layout: offsets
         if cb["fields"] and cb["status"] != "skipped":
-            rows = {}
+            rows: Dict[str, List[Tuple[int, int]]] = {}
             for ln in lay.splitlines():
                 m = re.match(r"^\s*(\d+)\s+(\d+)\s+(\d+)\s+([A-Z0-9-]+)", ln)
                 if m:
-                    rows.setdefault(m.group(4), (int(m.group(1)), int(m.group(2))))
+                    rows.setdefault(m.group(4), []).append((int(m.group(1)), int(m.group(2))))
             bad = 0
+            # a name the copybook itself holds twice (DI-YY under DATE-IN and under DATE-OUT) is matched by its offset;
+            # any other name by the first row printed, as before
+            names = [r[1] for r in cb["fields"]]
+            twice = {n for n in names if names.count(n) > 1}
             for r in cb["fields"]:
                 nm, off, ln_ = r[1], r[2], r[3]
                 if not nm or nm == "FILLER":
                     continue
-                g = rows.get(nm)
+                same = rows.get(nm) or []
+                g = (off, ln_) if nm in twice and (off, ln_) in same else (same[0] if same else None)
                 if g is None:
                     bad += 1
                     self.find("copybook", "layout", f"{name} {nm}", f"a row at offset {off}", "no row in the layout", facts=1)
@@ -1508,15 +1623,16 @@ class Checker:
             else:
                 self.ok("coverage partial split adds up")
         nf = {row[0]: int(row[1]) for h, hdr, rows_ in md_tables(section(text, "Copybooks not found")) for row in rows_ if len(row) >= 2 and row[1].isdigit()}
-        want_nf = {"POLPROCB": 1, "POLSTUBB": 1, "DFHAID": 3}
+        want_nf = {"POLSTUBB": 1, "DFHAID": 3}
         for k, v in want_nf.items():
             if nf.get(k) != v:
                 self.find("query", "coverage", f"Copybooks not found {k}", f"{v} use(s)", f"{nf.get(k)}", facts=1)
             else:
                 self.ok("coverage not-found row exact")
-        for k in ("CMNDATEA", "CMNCUSTP", "POLMISSB", "POLARRVB"):
+        for k in ("CMNDATEA", "CMNCUSTP", "POLPROCB", "POLMISSB", "POLARRVB"):
             if k in nf:
-                self.find("recover", "coverage", f"Copybooks not found {k}", "no longer listed after recover and the build", f"listed with {nf[k]} use(s)", facts=nf[k])
+                self.find("recover", "coverage", f"Copybooks not found {k}", "not listed (a copybook in the index, or healed by recover "
+                          "and the build)", f"listed with {nf[k]} use(s)", facts=nf[k])
             else:
                 self.ok("coverage: healed copybook gone from not-found")
         call_rows = {(row[0], row[1]): int(row[2]) for h, hdr, rows_ in md_tables(section(text, "Call resolution")) for row in rows_ if len(row) == 3 and row[2].isdigit()}
@@ -1528,7 +1644,6 @@ class Checker:
         d = self.truth["defects"]
         self.must("recover", "coverage", "D1", text, d["D1"]["coverage_words"], "the chosen-copybook sentences")
         self.must("recover", "coverage", "D2", text, d["D2"]["coverage_words"], "the listing-check sentence")
-        self.must("recover", "coverage", "D3", text, ["filed as proc", "PROD.POL.PROCS", "rename the folder to end in COPYLIB"], "the folder-decided sentence")
         self.must("recover", "coverage", "D6", text, ["POLSTUBB"], "the stub in the not-found table")
         stub_row = next((row for h, hdr, rows_ in md_tables(section(text, "Copybooks not found")) for row in rows_ if row and row[0] == "POLSTUBB"), None)
         if stub_row and "columns 1-7" not in " ".join(stub_row):
@@ -1590,7 +1705,10 @@ class Checker:
             else:
                 self.find("cobol", "conditions", f"POLUPD01 {fld} '{lit}'", "a condition row", "absent", facts=1)
         if "DATE-OK" not in text:
-            self.documented.append(Finding("cobol", "conditions", "POLUPD01 IF NOT DATE-OK", "the 88 DATE-OK expanded to its value", "absent: the re-filed copybook has no 88 rows until the next full re-parse (LESSONS 186)", 1))
+            self.find("cobol", "conditions", "POLUPD01 IF NOT DATE-OK", "the 88 DATE-OK expanded to its value (CMNDATEA, a copybook with "
+                      "its own rows since ROADMAP re-parse item 22)", "absent", facts=1)
+        else:
+            self.ok("conditions: the copybook's 88 expanded")
         # values / pair / literal / messages
         text = self.query("values", "PM-STATUS")
         self.check_names("values", text)
@@ -1624,7 +1742,7 @@ class Checker:
         text = self.query("walk", "POLUPD01", "--no-source")
         self.check_names("walk", text)
         self.must("cobol", "walk", "POLUPD01", text, ["9900-NEVER-REACHED", "1 not reached"], "the paragraph nothing reaches")
-        self.must("cobol", "walk", "POLUPD01", text, ["CMN-DATE-AREA", "START-DATE"], "the re-filed copybook's fields in the data section")
+        self.must("cobol", "walk", "POLUPD01", text, ["CMN-DATE-AREA", "START-DATE"], "the D4 copybook's fields in the data section")
         text = self.query("walk", "CMNCUST1")
         self.must("cobol", "walk", "CMNCUST1", text, ["A-110-POSITION", "A-120-READ", "CMNCUSTP"], "the procedure copybook's paragraphs, cited to the copybook")
         text = self.query("flow", "PT-TRAN-AMT", "--program", "POLUPD01")
@@ -1674,7 +1792,10 @@ class Checker:
             self.find("query", "cite", "POLNIGHT(proc) 3", "the EXEC PGM=POLUPD01 line of the PROC", text[:200], facts=1)
         text = self.query("search", '"START-DATE"')
         if "CMNDATEA" not in text:
-            self.documented.append(Finding("query", "search", "START-DATE", "found in CMNDATEA", "its lines are not in src_fts until the re-parse (re-filed member)", 1))
+            self.find("query", "search", "START-DATE", "found in CMNDATEA (a copybook with its own lines indexed since ROADMAP re-parse "
+                      "item 22)", "absent", facts=1)
+        else:
+            self.ok("search: the D4 copybook's own line found")
         text = self.query("program", "POLZIP01")
         self.must("query", "program", "POLZIP01 (load module only)", text, ["Source not indexed", "POLRERUN"], "the job that runs a program with no source")
         text = self.query("program", "CMNUTIL")
@@ -1869,6 +1990,7 @@ def main(argv=None) -> int:
     ck.phase_recover()
     ck.phase_facts()
     ck.phase_reports()
+    ck.phase_aged()
     ck.write_report()
     return 0
 

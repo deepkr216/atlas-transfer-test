@@ -10,11 +10,15 @@ Deliberate defects - the shapes LESSONS 181-192 were written for:
   D2  a compiler listing whose copybook-source table CONTRADICTS the copy
       the build chose for one program, and confirms it for another.
   D3  POLPROCB, a procedure copybook (no level numbers), in a PROCS folder:
-      filed `proc` by the folder name, never expanded.
+      a copybook by its COBOL statements, before the folder name (ROADMAP
+      re-parse item 20) - expanded at once, POLUPD02 whole.
   D4  CMNDATEA (a data copybook with `05 START-DATE`) and CMNCUSTP (a
       procedure copybook with the COBOL START verb) in COPYLIB folders:
-      the classifier reads a line as Assembler and files them `asm`;
-      atlas.recover must re-file them.
+      copybooks by their own lines, before the Assembler shape (item 22);
+      recover finds nothing to re-file. The checker also ages a copy of the
+      index as the classifier before the batch built it (D3 `proc`, D4
+      `asm`): there atlas.recover must re-file all three, and the next
+      build makes their programs whole.
   D5  POLMISSB is copied by two programs (one with a REPLACING clause over
       two lines, the period inside the pseudo-text) and is nowhere in the
       estate: their listings hold its text, atlas.recover must write it.
@@ -362,7 +366,8 @@ class Estate:
         roots, meta = dom.date_area_with_start_date()
         self.record_meta["CMNDATEA"] = meta
         self.write_copybook("SHARED", "CMNDATEA", roots, comments=[" COMMON DATE WORK AREA (CALL 'CMNDATE' USING CMN-DATE-AREA)"],
-                            status="skipped", why="filed asm by the classifier (START-DATE), re-filed by recover", role="D4 asm by content")
+                            why="a copybook by its level numbers, read before the Assembler shape (ROADMAP re-parse item 22)",
+                            role="D4 START line (data)")
         roots, meta = dom.error_area()
         self.record_meta["CMNERRA"] = meta
         self.write_copybook("SHARED", "CMNERRA", roots, comments=[" COMMON ERROR AREA"])
@@ -377,7 +382,8 @@ class Estate:
         self.write_copybook("SHARED", "CMNSQLW", roots, comments=[" SQL WORK AREA"])
         roots, _m = dom.abend_area()
         self.write_copybook("SHARED", "CMNABNDA", roots, comments=[" ABEND AREA"])
-        # the procedure copybook with the COBOL START verb (LESSONS 189): asm by a line of its text
+        # the procedure copybook with the COBOL START verb (LESSONS 189): a copybook by its statements since ROADMAP
+        # re-parse item 22 (the classifier before it read the START line as Assembler)
         self.write_text_copybook("SHARED", "CMNCUSTP", [
             "      *  CUSTOMER LOOKUP - PARAGRAPHS COPIED INTO THE CALLER'S SECTION",
             "       A-110-POSITION.",
@@ -393,9 +399,10 @@ class Estate:
             "           IF CF-CUST-NO = WS-CUST-NO",
             "               MOVE 'Y' TO WS-CUST-FOUND-SW",
             "           END-IF.",
-        ], paragraphs=["A-110-POSITION", "A-120-READ"], status="skipped",
-            why="filed asm by the classifier (START verb), re-filed by recover", role="D4 asm by content (procedure)")
-        # D3: a procedure copybook in a PROCS folder - filed proc by the folder, no signature of its own
+        ], paragraphs=["A-110-POSITION", "A-120-READ"],
+            why="a copybook by its COBOL statements - the START verb is no Assembler shape (ROADMAP re-parse item 22)",
+            role="D4 START line (procedure)")
+        # D3: a procedure copybook in a PROCS folder - a copybook by its statements, before the folder name (item 20)
         self.write_text_copybook("POLICY", "POLPROCB", [
             "      *  POLICY EDIT PARAGRAPHS - PROCEDURE COPYBOOK",
             "       B-100-EDIT-KEY.",
@@ -408,7 +415,8 @@ class Estate:
             "               MOVE 'E003' TO PW-RETURN-CD",
             "           END-IF.",
         ], kind="procs", paragraphs=["B-100-EDIT-KEY", "B-200-EDIT-DATE"], status="ok",
-            why="filed proc by the folder name (PROCS)", role="D3 misfiled by folder", member_kind="proc")
+            why="a copybook by its COBOL statements, before the folder name (ROADMAP re-parse item 20)",
+            role="D3 procedure copybook in a PROCS folder")
         # D6: a stub - 8-digit numbers in columns 1-8, nothing else
         stub = [f"{k * 100:07d}" for k in range(1, 7)]
         self.write_text_copybook("POLICY", "POLSTUBB", stub, ck="stub", status="skipped",
@@ -1028,16 +1036,21 @@ class Estate:
                    "program_words": {"POLRPT01": "listing says: STDHDR came from PROD.POL.COPYLIB (SYSLIB) - confirms the copy the build used",
                                      "CLMRPT01": "listing says: STDHDR came from PROD.POL.COPYLIB (SYSLIB) - CONTRADICTS the copy the build used"},
                    "coverage_words": ["of these choices is confirmed by the program's listing", "contradicted"]},
-            "D3": {"title": "a procedure copybook filed proc by its folder (LESSONS 183)", "copybook": "POLPROCB", "program": "POLUPD02",
-                   "recover_words": ["copybook name(s) exist in the index only as a member of a kind the build does not expand (proc)"],
-                   "coverage_words": ["filed as proc (folder PROD.POL.PROCS)", "rename the folder to end in COPYLIB"],
-                   "copybook_words": ["**NOT FOUND** as a copybook - a member with this name exists, filed as proc (folder PROD.POL.PROCS)"],
-                   "program_words": ["NOT FOUND"], "final_status": "partial"},
-            "D4": {"title": "copybooks the classifier typed asm by a line of their text, re-filed by recover (LESSONS 186-189)",
-                   "copybooks": ["CMNDATEA", "CMNCUSTP"], "words_before": ["filed as asm by its content"],
-                   "recover_words": ["misfiled copybook(s) re-filed as copybook in the index (the classifier had read them as asm by a line of their text)"],
-                   "report_words": ["## Re-filed as copybook", "START-DATE", "START CUSTFILE"],
-                   "copybook_words": ["Indexed as a copybook (re-filed by atlas.recover; its own layout rows arrive with the next full re-parse)"],
+            "D3": {"title": "a procedure copybook in a PROCS folder, a copybook by its statements (LESSONS 183, 198)",
+                   "copybook": "POLPROCB", "program": "POLUPD02", "recover_words": [],
+                   "not_words": ["filed as proc", "POLPROCB NOT FOUND", "rename the folder"], "final_status": "ok",
+                   "aged_kind": "proc"},
+            "D4": {"title": "copybooks with a START line, typed asm by the classifier before the batch - copybooks now (LESSONS 186-189, 198)",
+                   "copybooks": ["CMNDATEA", "CMNCUSTP"], "recover_words": [],
+                   "not_words": ["re-filed", "filed as asm", "NOT FOUND"],
+                   "aged_kind": "asm",
+                   # an index built before the batch (the checker ages a copy): recover re-files D3 and D4
+                   "aged_recover_words": ["misfiled copybook(s) re-filed as copybook in the index (the classifier this index was "
+                                          "built with had filed them as asm/proc; the classifier of this toolkit reads them as "
+                                          "copybooks - ROADMAP re-parse items 20 and 22)"],
+                   "aged_report_words": ["## Re-filed as copybook", "START-DATE", "START", "PROCS"],
+                   "aged_copybook_words": ["Indexed as a copybook (re-filed by atlas.recover; its own layout rows arrive with "
+                                           "the next full re-parse)"],
                    "programs_whole_after": ["POLUPD01", "CLMUPD01", "BILUPD01", "CMNCUST1"]},
             "D5": {"title": "a missing copybook recovered from the listings, one COPY with a REPLACING over two lines (LESSONS 190)",
                    "copybook": "POLMISSB", "programs": ["POLUPD03", "POLUPD04"],

@@ -471,12 +471,23 @@ say the same beside each such NOT FOUND). A COBOL copybook is typed by its own
 lines first - level numbers, or COBOL statements (MOVE ... TO, PERFORM, a
 paragraph name in area A ...) with no DIVISION header - before the shape of
 an Assembler, listing or MFS member, the kind declared for its library in the
-UI's table and the folder name (ROADMAP re-parse items 20 and 22); a member
-with no signature at all (a literal copied into a VALUE clause) takes the
-declared kind or its folder's kind: rename the folder to end in COPYLIB, or
-declare the library's kind in the UI's table, and build. A declared kind wins
-over a shape, a folder name and an extension - except `cobol`, the table's
-default for a new row, which types only a member nothing else did. A member
+UI's table and the folder name (ROADMAP re-parse items 20 and 22). The COBOL
+statements say only as much as the library lets them (LESSONS 199): an
+Easytrieve program or a Connect:Direct process - read by its job through
+SYSIN - is never typed by them; in a library of documents (a folder named
+DOCS, SPECS or DESIGN, a library declared doc, or a .txt or .md file with a
+line of prose) they count for nothing; in a library of control cards (a
+folder named CNTL, PARMLIB, CARDLIB ..., or a library declared ctlcard) two
+statement lines are needed, one of a form no card language has - a single
+MOVE line, an IDCAMS `IF LASTCC` or an ICETOOL `DISPLAY FROM(` keeps the
+folder's kind. A member with no signature at all (a literal copied into a
+VALUE clause) takes the declared kind or its folder's kind: rename the folder
+to end in COPYLIB, or declare the library's kind in the UI's table, and
+build. A declared kind wins over a shape, a folder name and an extension -
+except `cobol`, the table's default for a new row, which types only a member
+nothing else did; a member the declared kind filed as a copybook over the
+shape of an Assembler, listing or MFS member carries a note that `program`
+(beside the copy), `copybook` and `coverage` print. A member
 typed `unknown` is expanded into its programs but has no parser of its own,
 so its own lines are not indexed or citable until that same folder fix is
 applied - the notes say so beside it. A member with the shape of an
@@ -486,8 +497,9 @@ copybook. On an index built before the batch a line of a copybook's own text
 could type it (a field or paragraph named START-... as Assembler, a comment
 naming MODULE MAP as a listing, a first word MSG as MFS) and a procedure
 copybook took its folder's kind: the same run re-files every such member the
-classifier of this toolkit reads as a copybook, marks the programs copying
-it, and the next build expands it; the report's 'Re-filed as copybook'
+classifier of this toolkit reads as a copybook - or, with the manifest.json the
+index was built with beside it, whose library is declared copybook over a
+shape - marks the programs copying it, and the next build expands it; the report's 'Re-filed as copybook'
 section names each, and the first build after the toolkit changed re-parses
 every member and files them as copybooks itself.
 Every missing copybook is also looked for on disk, the estate root walked
@@ -497,7 +509,10 @@ it), filed `empty` because its text sits in columns 1-7, under a near name
 in the copybook folders, or not there at all - and what to do for each;
 `coverage` and `copybook NAME` say the same.
 A member typed by the kind declared for its library in the UI's table reads
-'by its declared kind' with 'declare it copybook there'. `--from
+'by its declared kind' with 'declare it copybook there' - each build records
+the kinds it was declared (an older index: the manifest.json beside it tells),
+so a card member the build itself filed ctlcard in a JCL folder never reads
+so. `--from
 FOLDER` adds expanded programs the index does not hold; `--dry-run` says
 what would be written. The same run reads the listing of every program whose
 copybook the build chose among several same-named ones (the listing's

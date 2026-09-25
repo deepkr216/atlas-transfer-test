@@ -31,8 +31,8 @@ instead of being copied into the truth.
 |---|---|---|
 | D1 | `STDHDR` in three COPYLIBs with different content | the copying programs are "complete, with a copybook chosen among several", never "parsed only in part" |
 | D2 | a listing whose copybook-source table contradicts the build's choice for one program and confirms it for another | `copybook choices checked against the listings: 1 confirmed, 1 contradicted`; `program` says `listing says: ... CONTRADICTS` |
-| D3 | `POLPROCB`, a procedure copybook in a PROCS folder | filed `proc` by the folder; every note says so and names the folder fix |
-| D4 | `CMNDATEA` (`05 START-DATE`) and `CMNCUSTP` (the COBOL `START` verb) in COPYLIB folders | filed `asm` by a line of their text; recover re-files them, the next build makes the programs whole |
+| D3 | `POLPROCB`, a procedure copybook in a PROCS folder | filed `copybook` by its COBOL statements, before the folder name (ROADMAP re-parse item 20): `POLUPD02` whole at once, no note names a folder fix |
+| D4 | `CMNDATEA` (`05 START-DATE`) and `CMNCUSTP` (the COBOL `START` verb) in COPYLIB folders | filed `copybook` by their own lines, before the Assembler shape (item 22): the programs whole at once, recover re-files nothing. On a copy of the index aged as the classifier before the batch built it (D3 `proc`, D4 `asm`), recover re-files all three, marks their programs, and the next build makes them whole |
 | D5 | `POLMISSB`, copied by two programs (one with a REPLACING over two lines, the period inside the pseudo-text), present only in their listings | recover writes it, exactly |
 | D6 | `POLSTUBB`, a stub of 7-digit numbers in columns 1-7 (and `POLSTUBC`, the 8-digit twin) | filed `empty`; the disk check says its text sits in columns 1-7 |
 | + | `POLARRVB` dropped into the COPYLIB after the first build | recover says it arrived after the last build; the next build resolves it |
@@ -43,6 +43,7 @@ instead of being copied into the truth.
 2. `build --rebuild`, then one copybook changed (`CLMTRANR`) and an incremental build: the programs that copy it are parsed again, nothing else is.
 3. the arrived copybook dropped in; `recover --from listings`; an incremental build; recover again (nothing left to do).
 4. every query command over the samples (40 programs, 20 jobs, 34 copybooks, 34 fields, 12 datasets, 6 tables, every DBD, every transaction, coverage), the gate over a pack and over a wrong answer.
-5. the comparison at two levels - the fact tables (every truth fact a row, every row a truth fact, offsets and lines exact) and the reports (every fact printed, every name real, every cite inside its member, the promised sentences present) - and the report.
+5. an index built before ROADMAP re-parse items 20 and 22: a copy of the index with D3 filed `proc` and D4 `asm`, their programs parsed again without them and the last build recorded as an older toolkit's; `recover` re-files exactly those three, the next build makes the programs whole, a further `recover` finds nothing.
+6. the comparison at two levels - the fact tables (every truth fact a row, every row a truth fact, offsets and lines exact) and the reports (every fact printed, every name real, every cite inside its member, the promised sentences present) - and the report.
 
 The scratch folder is cleared only when it holds a `truth.json` this tool wrote and is not inside the repository.

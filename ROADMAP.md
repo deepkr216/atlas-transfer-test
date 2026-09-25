@@ -296,15 +296,28 @@ shipped alone and cost one such night; these still wait for the next one:
    case, where a COBOL line's code begins (never column 1, a `//` line or a `*` comment). The statements
    an Assembler member uses too - IF, DISPLAY, CALL, COPY, EXEC CICS / SQL / DLI - count only where the
    Assembler shape did not fire (`_SIG_COBOL_SHARED`), and the IDCAMS `IF LASTCC`, ICETOOL `DISPLAY FROM(`
-   / `COPY FROM(`, IEBCOPY `COPY OUTDD=` and TSO `CALL 'LIB(PGM)'` forms never count, so control cards
-   keep their folder's kind. A member with no signature at all (a literal copied into a VALUE clause)
+   / `COPY FROM(`, IEBCOPY `COPY OUTDD=` and TSO `CALL 'LIB(PGM)'` forms never count. The library says how
+   much the statements must say (`classify.library_says`, LESSONS 199), so control cards and documents keep
+   their kind: an Easytrieve program (JOB INPUT, END-PROC, FILE with its field definitions) or a
+   Connect:Direct process (label PROCESS SNODE=, COPY FROM (DSN=, RUN TASK, EIF) is never typed by a COBOL
+   signature (`classify.not_cobol`) - its job reads it through SYSIN, which `build._card_text` does only for
+   a control-card member, never a copybook; in a library of documents (a folder named DOCS / SPECS / DESIGN,
+   a library declared doc, or a document's extension on a text with a line of prose) the statements and the
+   loose level number count for nothing - a run book says PERFORM THE FOLLOWING STEPS, a design note quotes a
+   paragraph - while a data description entry still types a copybook, as before the batch; in a library of
+   control cards (a folder named CNTL / PARMLIB / CARDLIB ..., a library declared ctlcard or sched) two
+   statement lines are needed, one of a form no card language has, and the loose level number counts for
+   nothing. So a procedure copybook - paragraph names and statements - is a copybook in any library but one
+   of documents, and in a library of control cards when it has two statement lines (a single MOVE line keeps
+   the folder's kind). A member with no signature at all (a literal copied into a VALUE clause)
    still takes its folder's kind or the declared one, and `atlas.recover`, `coverage`, `program` and
    `copybook` name it with the fix - rename the folder to end in COPYLIB, or declare the library's kind
    in the UI's table: both are true now, since item 22 lets a declaration win over the folder name. The
    same rename (or declaration) is what puts an 'unknown' member's own lines in the index: the build
    expands it into its programs but has no parser for that kind (LESSONS 184).
    tests/test_refiled_copybooks.py TheBuildFilesThemRight, ClassifierShapes; tests/test_arrived_copybooks.py
-   ArrivedAfterTheParse, FiledAsAnotherKind, NestedCopybookArrivesLater (LESSONS 198).
+   ArrivedAfterTheParse, FiledAsAnotherKind, NestedCopybookArrivesLater; tests/test_library_says.py
+   TheClassifierReadsTheLibrary, JobsReadTheirCards (LESSONS 198, 199).
 21. **build.py: inventory forcing (`changed_names`) covers every kind the resolver accepts.**
    A new or changed member forces the programs that copy it to be parsed again only when its kind
    is copybook or cobol; the resolver also expands sql and unknown members, so a procedure copybook
@@ -347,7 +360,13 @@ shipped alone and cost one such night; these still wait for the next one:
    labelled MFS statement or TYPE= / POS= / LTH= operands. So `05 START-DATE`, `PERFORM START-PARA`, `START
    CUSTFILE` alone on its line, a comment naming MODULE MAP and a line whose first word is MSG no longer
    type a copybook as something else; nor does a signature on a comment line - a remark naming DFHMDF,
-   PROGRAM-ID, CREATE TABLE or the compiler, a REXX header behind a slash in column 7 (`_code_hit`).
+   PROGRAM-ID, CREATE TABLE or the compiler (`_code_hit`). CREATE TABLE counts where a statement begins, so
+   an Assembler remark `CREATE TABLE OF RATES` or a COBOL literal is no DDL; the compiler's banner counts at
+   the start of a line (`1PP 5655-`, `LineID PL SL`), so a program's `DISPLAY 'BUILT WITH IBM ENTERPRISE
+   COBOL'` or a copybook's VALUE literal is no listing (atlas.recover, reading a text known to be a listing,
+   keeps the looser banner, `classify._LISTING_BANNER`); a REXX header six blanks in - the slash in column 7,
+   where a COBOL comment has it - counts after a COBOL copybook's own lines, so the exec is rexx and a
+   copybook with such a banner comment a copybook (LESSONS 199).
    (c) The kind declared for a library in sources.json (the manifest kinds; `build.load_declared_kinds`,
    `_inventory_one` passes it to `classify.classify`) wins over a shape (asm / listing / mfs), the folder
    name and the extension, not only over 'unknown' (`classify.declared_wins`) - 'declare the library's kind'
@@ -355,7 +374,15 @@ shipped alone and cost one such night; these still wait for the next one:
    macro, CSD, stage-1, IDENTIFICATION DIVISION / PROGRAM-ID) and a COBOL copybook's own lines still win
    over it, and 'cobol' - the kind the UI's table gives a new row and every ...SRC name - replaces
    'unknown' only, since a member a shape or a folder typed never carries a PROGRAM-ID (a mixed source
-   library's Assembler members, a listing library left at the default, would be filed as programs).
+   library's Assembler members, a listing library left at the default, would be filed as programs). The
+   build records the kinds each run was declared (`build_run.declared_kinds`), and a member the declared
+   kind filed as a copybook over the shape of an Assembler, listing or MFS member carries a `declared_kind`
+   row that `program` (beside the copy), `copybook` and `coverage` print - fetch.infer_kind declares every
+   COPYLIB copybook, so a real Assembler member there is expanded into its programs, and 'ok' must not be
+   silent about it. atlas.recover and `coverage` say 'by its declared kind' only for a library declared so
+   (`recover.declared_kinds_used`: the run's record, or for an older index the manifest.json beside it whose
+   sha the build recorded) - a card member the build itself filed ctlcard in a JCL folder reads 'by its
+   folder' (LESSONS 199).
    The stand-in stays for an index built before the batch: `atlas.recover` re-files a misfiled member
    whose bytes are the ones indexed and which the classifier of this toolkit reads as a copybook
    (`how_classified` says how the older classifier filed it - its weak signature and the line, the folder,
@@ -365,14 +392,18 @@ shipped alone and cost one such night; these still wait for the next one:
    listing or MFS member with a copybook's name is refused as what it is - the shape is checked before
    the folder now (a real member in a folder with no COPY hint was told to rename the folder to end in
    COPYLIB and run again, and the second run refused it on the shape) - with 'declare its library copybook
-   in the UI's table and run the build' if it IS the copybook. The two windows the stand-in left open are
+   in the UI's table and run the build' if it IS the copybook; on an older index whose library is declared
+   copybook already (its manifest.json beside it) the member is re-filed, since the build of this toolkit
+   files it one, and where that cannot be known the refusal says a library declared copybook already needs
+   only the build. The two windows the stand-in left open are
    closed: a re-filed member whose text changes on disk is classified again and reads as a copybook, and a
    build that re-parses every member (--rebuild, the manifest changed, a parser module changed) files it
    a copybook instead of undoing the re-file (LESSONS 187, 188). tests/test_refiled_copybooks.py
    (TheBuildFilesThemRight, ClassifierShapes, GenuineAssemblerIsNotRefiled, RealAssemblerShapesAreNotRefiled,
    DeclaredKinds, AnIndexBuiltBeforeTheBatch, TheFirstBuildAfterTheBatch, SecondRunBeforeTheBuild,
    DryRunWithAFolderTypedCopyToo, OkWithAnUnlinkedCopyRow, WrittenCopybookIsFiledRight, TheVerdict),
-   LESSONS 186-189, 198.
+   tests/test_library_says.py (TheClassifierReadsTheLibrary, TheBuildsOwnRuleIsNoDeclaration,
+   ADeclaredCopybookOverAShape, DeclaredKindsUsed), LESSONS 186-189, 198, 199.
 23. **reader.py: a copybook member whose every non-blank line keeps its text within columns 1-7 is read as
    code.** Two of his missing copybooks hold a 7-8 digit number in column 1 and nothing else (a stub, or a
    value meant to be copied): fixed-format reading takes columns 1-6 as the sequence area and column 7 as
