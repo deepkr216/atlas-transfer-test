@@ -310,6 +310,15 @@ class ArrivedAfterTheParse(_Estate):
         self.assertNotIn("parsed before it arrived", cov)
         self.assertNotIn("A copybook marked `yes`", cov)
         self.assertNotIn("Not counted above", cov)
+        # the program is whole, but LITBOOK's own lines are not indexed ('unknown' has no parser): `program` and
+        # `copybook` say so with the folder fix - before item 21 only recover's arrived step did (LESSONS 202)
+        self.assertIn("| LITBOOK | LITBOOK - filed `unknown` in PROD.GC.CPYLIB: its own lines are not indexed; rename "
+                      "the folder to end in COPYLIB (or declare the library's kind in the UI's table) so the copybook's "
+                      "own lines are indexed and citable |", prog)
+        self.assertIn("**Filed `unknown`** (`", book)
+        self.assertIn("LITBOOK.txt`): the build expands it into the programs below but has no parser for that kind, so "
+                      "its own lines are not indexed - `paragraph` prints them empty and nothing can cite them; rename the "
+                      "folder to end in COPYLIB", book)
         conn = query.connect(self.db)
         try:
             self.assertEqual(recover.arrived_copybooks(conn), ([], []))
@@ -344,6 +353,21 @@ class ArrivedAfterTheParse(_Estate):
         self.assertIn(("A-199-EXIT", "paragraph", "A-100-BEGIN"), paras)
         stats, said = self.recover()
         self.assertEqual((stats["arrived"], stats["marked"]), (0, 0), said)
+        # the paragraph's lines come from PROCLOW, filed 'unknown': not indexed, so they print empty - `paragraph`
+        # says why under them and offers no cite for them; a paragraph of the program's own lines keeps its cite
+        conn = query.connect(self.db)
+        try:
+            page = query.cmd_paragraph(conn, "LOWPGM", "A-110-DO")
+            own = query.cmd_paragraph(conn, "LOWPGM", "MAIN")
+        finally:
+            conn.close()
+        source = page.split("### Source")[1]
+        self.assertIn("> Filed `unknown`: PROCLOW (PROD.GC.CPYLIB) - the build expands it into its programs but has no "
+                      "parser for that kind, so its own lines are not indexed - `paragraph` prints them empty and nothing "
+                      "can cite them; rename the folder to end in COPYLIB", source)
+        self.assertNotIn("cite as", source)
+        self.assertIn("cite as", own.split("### Source")[1])
+        self.assertNotIn("Filed `unknown`", own)
 
     def test_before_the_batch_the_build_left_the_program_partial_and_recover_marks_it(self):
         self.assert_parsed_without_the_book("VALPGM", "LITBOOK")

@@ -496,14 +496,15 @@ def cmd_program(conn: sqlite3.Connection, name: str) -> str:
 
         # copybooks
         cps = conn.execute("""
-            SELECT c.copybook, c.replacing, c.line, m.name AS resolved,
+            SELECT c.copybook, c.replacing, c.line, m.name AS resolved, m.kind AS rkind, m.library AS rlib,
                    (SELECT u.detail FROM unresolved u WHERE u.member_id = c.resolved_member_id AND u.kind = 'declared_kind'
                     LIMIT 1) AS declared_over
             FROM copy_use c LEFT JOIN member m ON m.id = c.resolved_member_id
             WHERE c.member_id = ? ORDER BY c.line""", (p["member_id"],)).fetchall()
         out.append("\n### Copybooks\n")
         out.append(table(["copybook", "resolved to", "REPLACING", "line"],
-                         [(c["copybook"], (declared_over_cell(c["resolved"], c["declared_over"]) if c["resolved"]
+                         [(c["copybook"], (unknown_cell(c["resolved"], c["rlib"]) if c["rkind"] == "unknown"
+                                           else declared_over_cell(c["resolved"], c["declared_over"]) if c["resolved"]
                                            else _not_found_cell(conn, c["copybook"], p["member_id"])),
                            (c["replacing"] or "")[:40], f"{p['member_name']}:{c['line']}") for c in cps]))
 
@@ -1413,6 +1414,33 @@ def _sentence(s: str) -> str:
 _OVER_SHAPE = re.compile(r"over the shape of [^:]*")
 
 
+def unknown_cell(resolved: str, folder: Optional[str]) -> str:
+    """`program`'s 'resolved to' cell for a copy expanded from a member filed
+    'unknown' (no content signature - a literal, a procedure copybook in
+    lower case - in a dataset-named folder with no hint): the program is
+    whole, but the build has no parser for that kind, so the member's own
+    lines are not indexed - `paragraph` prints them empty and nothing can
+    cite them. Before ROADMAP re-parse item 21 the one moment this was said
+    was recover's arrived step; the build of this toolkit parses such a
+    program again at once, so it is said here (LESSONS 202)."""
+    from . import recover
+    return f"{resolved} - filed `unknown` in {folder or '?'}: its own lines are not indexed; {recover.UNKNOWN_FIX}"
+
+
+def unknown_note(conn: sqlite3.Connection, names: Sequence[str]) -> str:
+    """The note under a report whose lines come from members filed 'unknown'
+    (unknown_cell): '' when none is."""
+    rows = [r for n in dict.fromkeys(names) for r in conn.execute(
+        "SELECT name, library FROM member WHERE UPPER(name)=? AND kind='unknown' ORDER BY library", (n.upper(),))]
+    if not rows:
+        return ""
+    from . import recover
+    where = ", ".join(dict.fromkeys(f"{r[0]} ({r[1] or '?'})" for r in rows))
+    return (f"\n> Filed `unknown`: {where} - the build expands it into its programs but has no parser for that kind, so "
+            f"its own lines are not indexed - `paragraph` prints them empty and nothing can cite them; "
+            f"{recover.UNKNOWN_FIX}.\n")
+
+
 def declared_over_cell(resolved: str, detail: Optional[str]) -> str:
     """`program`'s 'resolved to' cell: the member's name - and, for a member
     the kind declared for its library typed copybook over the shape of an
@@ -1455,6 +1483,11 @@ def cmd_copybook(conn: sqlite3.Connection, name: str) -> str:
                             (c["id"],)).fetchone()
         if over:
             out.append(f"\n**Declared copybook over a shape** (`{c['path']}`): {over[0]}.\n")
+        if c["kind"] == "unknown":
+            # expanded into the programs below, but no parser reads it: its lines are not indexed (unknown_cell)
+            out.append(f"\n**Filed `unknown`** (`{c['path']}`): the build expands it into the programs below but has no "
+                       f"parser for that kind, so its own lines are not indexed - `paragraph` prints them empty and "
+                       f"nothing can cite them; {recover.UNKNOWN_FIX}.\n")
     out.append(_listing_sources_of(conn, name, recovered=all(recover.FOLDER.lower() in (c["path"] or "").lower() for c in copies)))
     progs = conn.execute("""SELECT DISTINCT m.name AS member_name, m.id AS mid, m.parse_status AS mstatus, p.program_id,
                                    p.id AS pid, c.replacing, c.line,
@@ -4437,12 +4470,19 @@ def cmd_paragraph(conn: sqlite3.Connection, name: str, para: str) -> str:
     out.append("\n### Source\n```\n")
     m1, l1, _d, _v = origin(conn, pid, s)
     m2, l2, _d2, _v2 = origin(conn, pid, e)
+    # lines expanded from a member filed 'unknown' are not in the index: say so, not only print them empty - and offer
+    # no cite for them
+    unknown = [r[0] for r in conn.execute(
+        "SELECT m.name FROM expand_run r JOIN member m ON m.id = r.src_member WHERE r.program_id = ? "
+        "AND r.exp_start <= ? AND r.exp_end >= ? AND m.kind = 'unknown' ORDER BY r.exp_start", (pid, e, s))]
     if m1 == m2 and m1:
         for i in range(l1, l2 + 1):
             out.append(f"{i:6d} | {source_line(conn, m1, i)}\n")
-        out.append(f"```\n(cite as `[[{m1} line \"token\"]]`)\n")
+        out.append("```\n" if m1.rpartition("/")[2].upper() in {n.upper() for n in unknown}
+                   else f"```\n(cite as `[[{m1} line \"token\"]]`)\n")
     else:
         out.append("(the paragraph spans an expanded copybook - use `cite --program` with the expanded lines)\n```\n")
+    out.append(unknown_note(conn, unknown))
     return "".join(out)
 
 
