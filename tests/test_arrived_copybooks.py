@@ -653,6 +653,7 @@ class NestedCopybookIsNotArrived(_Estate):
             conn.close()
         # recover, build, recover, build: nothing is ever reported, marked or re-inserted - it settles at once
         for _round in range(2):
+            self.stamp()
             stats, said = self.recover()
             self.assertEqual((stats["arrived"], stats["misfiled"], stats["marked"]), (0, 0, 0), said)
             self.assertNotIn("has arrived since", said)
@@ -661,6 +662,7 @@ class NestedCopybookIsNotArrived(_Estate):
             self.assertFalse(os.path.exists(self.report) and "arrived after" in self.report_text())
             self.build()
             self.assertEqual(self.ids(), before, "no member re-inserted under a new id")
+            self.assertEqual(self.recorded_again(), set(), "no member parsed again, whatever id it would get")
             self.assertIsNotNone(self.copy_use("OUTBOOK", "NESTPGM")[0][0], "the program's link to OUTBOOK kept")
             self.assertIsNotNone(self.copy_use("INBOOK", "NESTPGM")[0][0])
             cov, nf, prog, _book = self.outputs("NESTPGM", "INBOOK")
@@ -791,8 +793,10 @@ class _SkippedCopy(_Estate):
             self.assertNotIn("next:", said)
             self.assertEqual(self.ids(), before, "no member marked pending")
             self.assertFalse(os.path.exists(self.report) and "arrived after" in self.report_text())
+            self.stamp()
             self.build()
             self.assertEqual(self.ids(), before, "no member re-inserted under a new id, no status changed")
+            self.assertEqual(self.recorded_again(), set(), "no member parsed again, whatever id it would get")
 
 
 class RecursiveCopyIsNotArrived(_SkippedCopy):
