@@ -78,8 +78,17 @@ each choice: CONFIRMED, CONTRADICTED (a wrong fact - the report names every
 one with the library the listing says) or UNKNOWN. Since ROADMAP re-parse
 item 19 the build reads the table before its precedence chain: a program
 parsed with its rows in place expands the copy the listing names; one parsed
-before they were stored carries the chain's guess until it is parsed again.
-Nothing in the fact tables changes here.
+before they were stored carries the chain's guess until it is parsed again -
+where the index holds the copy the listing names, this tool marks that
+program for the next build (an index this toolkit built; when the toolkit
+changed since, the next build re-parses every member anyway). A listing
+speaks for the program in its own system; when that system has no listing
+of it, a listing filed where no program of that name lives (a SHARED
+listings folder) speaks for it, and one the index does not hold (a --from
+folder) does only while no other system holds a program of that name - GC
+and GC-TEST each holding GCPGM1 with its own listing keep their own copy
+(build.rows_that_count, the build's rule too). Nothing in the fact tables
+changes here.
 
 The same rows are the FETCH LIST: per library dataset named by the listings
 this tool reads (those of the programs that copy a missing copybook, one the
@@ -109,7 +118,7 @@ import sqlite3
 import sys
 import time
 from collections import Counter, defaultdict
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import AbstractSet, Dict, List, Optional, Sequence, Set, Tuple
 
 from . import classify, copybook, expand, reader
 
@@ -985,6 +994,11 @@ def copy_sources(lines: Sequence[str]) -> List[Tuple[str, str, str, str]]:
 # small table - no fact table changes here; build.make_resolver reads it
 # once (build.load_listing_sources) before its precedence chain (ROADMAP
 # re-parse item 19), so the rows must be there BEFORE the program is parsed.
+# The rows are keyed by the listing's file stem, so two environments holding
+# one program name share the key: the `listing` column (the path read) ties
+# each row to the listing member's SYSTEM, and build.rows_that_count decides
+# which rows speak for a program - here (rows_of_system) and in the build
+# (build.listing_rows_for), by the same function.
 COPY_SOURCE_TABLE = ("CREATE TABLE IF NOT EXISTS listing_copy_source (program TEXT NOT NULL, copybook TEXT NOT NULL, "
                      "ddname TEXT, dataset TEXT, listing TEXT, seen TEXT)")
 _PICK = re.compile(r"(\d+) copies of (\S+) with different content; used (.+?) \(([^()]*)\)\s*$")
@@ -1022,21 +1036,120 @@ def dataset_of(path: str, libs: Dict[str, str]) -> Optional[str]:
     return base if "." in base and len(base) <= DSN_MAX and _DSN_SHAPE.match(base) else None
 
 
-def chosen_picks(conn: sqlite3.Connection) -> List[Tuple[str, str, str, str, int]]:
-    """[(program, copybook, the path the build used, how, member id)] - every
-    'ambiguous_copybook' row in the index, its note read; a note the pattern
-    does not read is skipped (it is still in the index, unchanged)."""
-    out: List[Tuple[str, str, str, str, int]] = []
+def chosen_picks(conn: sqlite3.Connection) -> List[Tuple[str, str, str, str, int, Optional[str]]]:
+    """[(program, copybook, the path the build used, how, member id, the
+    program's system)] - every 'ambiguous_copybook' row in the index, its
+    note read; a note the pattern does not read is skipped (it is still in
+    the index, unchanged)."""
+    out: List[Tuple[str, str, str, str, int, Optional[str]]] = []
     try:
-        rows = conn.execute("SELECT m.name, m.id, u.detail FROM unresolved u JOIN member m ON m.id = u.member_id "
+        rows = conn.execute("SELECT m.name, m.id, u.detail, m.system FROM unresolved u JOIN member m ON m.id = u.member_id "
                             "WHERE u.kind = 'ambiguous_copybook' ORDER BY m.name, u.id").fetchall()
     except sqlite3.OperationalError:
         return out
-    for name, mid, detail in rows:
+    for name, mid, detail, system in rows:
         m = _PICK.search(detail or "")
         if m:
-            out.append((str(name).upper(), m.group(2).upper(), m.group(3), m.group(4), int(mid)))
+            out.append((str(name).upper(), m.group(2).upper(), m.group(3), m.group(4), int(mid),
+                        (str(system).strip().upper() or None) if system else None))
     return out
+
+
+def listing_systems(conn: sqlite3.Connection, sources: Dict[str, List[CopySource]]) -> Dict[str, Optional[str]]:
+    """{listing path: the system of that listing member} for every listing
+    the rows name - the index's own member row (member.path = the path this
+    tool read); a listing the index does not hold (a folder given with
+    --from) is not in it and has no system. Looked up by path, so this run's
+    rows (not stored on a dry run) and the stored ones are tied alike;
+    build.load_listing_sources ties each row the same way."""
+    from . import build as _build                                   # local: build imports nothing from here
+    paths = sorted({r[3] for rows in sources.values() for r in rows if r[3]})
+    out: Dict[str, Optional[str]] = {}
+    for k in range(0, len(paths), 500):
+        chunk = paths[k:k + 500]
+        try:
+            rows = conn.execute(f"SELECT path, system FROM member WHERE path IN ({','.join('?' * len(chunk))})", chunk).fetchall()
+        except sqlite3.OperationalError:
+            return out
+        for path, system in rows:
+            out[str(path)] = _build.system_key(system)
+    return out
+
+
+def program_systems(conn: sqlite3.Connection, names: Optional[Sequence[str]] = None) -> Dict[str, Set[Optional[str]]]:
+    """{PROGRAM NAME: the systems holding a program member (kind cobol) of
+    that name} - None stands for a member with no system; `names` limits
+    the lookup."""
+    from . import build as _build
+    out: Dict[str, Set[Optional[str]]] = {}
+    try:
+        if names is None:
+            rows = conn.execute("SELECT UPPER(name), system FROM member WHERE kind = 'cobol'").fetchall()
+        else:
+            wanted = sorted({str(n).upper() for n in names})
+            rows = []
+            for k in range(0, len(wanted), 500):
+                chunk = wanted[k:k + 500]
+                rows += conn.execute(f"SELECT UPPER(name), system FROM member WHERE kind = 'cobol' AND UPPER(name) IN "
+                                     f"({','.join('?' * len(chunk))})", chunk).fetchall()
+    except sqlite3.OperationalError:
+        return out
+    for name, system in rows:
+        out.setdefault(str(name), set()).add(_build.system_key(system))
+    return out
+
+
+def rows_of_system(rows: Sequence[CopySource], system: Optional[str], systems: Dict[str, Optional[str]],
+                   twins: AbstractSet[Optional[str]]) -> List[CopySource]:
+    """The rows a program in `system` is checked against - build.rows_that_count,
+    the rule the resolver applies when it reads the rows, so what the build
+    expanded and what this tool checks it against never differ: the rows of
+    the program's own system's listing; when it has none, every other
+    listing of that name (a SHARED listings folder, a --from folder: not in
+    `systems`) while no other system holds a program of that name. `twins`:
+    the systems other than the program's holding a program of that name."""
+    from . import build as _build
+    return _build.rows_that_count(rows, _build.system_key(system), twins, lambda r: systems.get(r[3]))
+
+
+# which listing speaks for which program (build.rows_that_count), in the report's words
+LISTING_RULE = ("A listing speaks for the program in its own system. When that system has no listing of it, any other "
+                "listing of that name - a SHARED listings folder, a --from folder - speaks for it only while no other "
+                "system holds a program of that name: two environments holding one program name (GC and GC-TEST) each "
+                "keep their own listing's word, and a listing filed elsewhere cannot say which of them it is.")
+
+
+def not_counted_why(program: str, system: Optional[str], rows: Sequence[CopySource], systems: Dict[str, Optional[str]],
+                    twins: AbstractSet[Optional[str]]) -> str:
+    """Why no row of the listings read speaks for this program, and what to
+    do next - the UNKNOWN reason when the program's own system has no
+    listing of it while another system holds a program of that name: a
+    listing read in that system is that program's own, and one filed
+    anywhere else cannot say which of the two it is."""
+    theirs = sorted({str(systems[r[3]]) for r in rows if systems.get(r[3]) and systems.get(r[3]) in twins})
+    where = []                                                          # the listings read that belong to no twin
+    for r in rows:
+        lsys = systems.get(r[3])
+        if lsys and lsys in twins:
+            continue
+        w = (f"filed under {lsys}" if lsys else "filed outside any system folder" if r[3] in systems
+             else "not in the index (a --from folder)")
+        if w not in where:
+            where.append(w)
+    named = sorted(str(t) if t else "a folder with no system" for t in twins)
+    whose = " and ".join(f"{t}'s" for t in theirs)
+    said = []
+    if theirs:
+        said.append(f"the listing read is {whose}, and {theirs[0]} holds a {program} of its own" if len(theirs) == 1
+                    else f"the listings read are {whose}, and each of those systems holds a {program} of its own")
+    if where:
+        said.append(f"the listing {' / '.join(where)} cannot say which {program} it is while {', '.join(named)} "
+                    f"{'holds' if len(named) == 1 else 'hold'} one too")
+    if system:
+        return ("; ".join(said) + f": no listing of the program in {system} - next: put {system}'s own listing of "
+                f"{program} in a folder under estate\\{system}, run the build, then run recover again")
+    return ("; ".join(said) + ": the program has no system, so no listing is its own - next: move its library under a "
+            "system folder (estate\\SYSTEM\\LIBRARY) with its listing beside it, run the build, then run recover again")
 
 
 def stored_copy_sources(conn: sqlite3.Connection) -> Dict[str, List[CopySource]]:
@@ -1092,29 +1205,39 @@ def check_choices(conn: sqlite3.Connection, sources: Optional[Dict[str, List[Cop
     rows to check against, else the stored table."""
     libs = library_datasets(conn)
     srcs = stored_copy_sources(conn) if sources is None else sources
+    systems = listing_systems(conn, srcs)
+    held_by = program_systems(conn, [p for p, *_rest in chosen_picks(conn)])   # program name -> systems holding one
     holders: Dict[str, str] = {}                                       # dataset -> a folder the index holds for it
     for folder, dsn in libs.items():
         holders.setdefault(dsn, folder)
     out: List[Dict[str, object]] = []
-    for program, copybook, used, how, mid in chosen_picks(conn):
+    for program, copybook, used, how, mid, system in chosen_picks(conn):
         used_dsn = dataset_of(used, libs)
-        rows = [r for r in srcs.get(program, []) if r[0] == copybook]
+        twins = held_by.get(program, set()) - {system}                  # the same name as a program in another system
+        own = rows_of_system(srcs.get(program, []), system, systems, twins)   # the rows that speak for THIS program
+        rows = [r for r in own if r[0] == copybook]
         said = sorted({r[2] for r in rows if r[2]})
         v: Dict[str, object] = {"program": program, "copybook": copybook, "used": used, "used_dataset": used_dsn,
-                                "how": how, "member_id": mid, "listing_datasets": said,
+                                "how": how, "member_id": mid, "system": system, "listing_datasets": said,
                                 "ddnames": sorted({r[1] for r in rows if r[1]}),
-                                "listings": sorted({r[3] for r in rows if r[3]}), "index_has": ""}
+                                "listings": sorted({r[3] for r in rows if r[3]}), "index_has": "",
+                                "holds_copy": False, "marked": ""}
         if program not in srcs:
             v.update(verdict="UNKNOWN", why="no listing of the program was read")
         elif not srcs[program]:
             v.update(verdict="UNKNOWN", why="the program's listing has no copybook-source table")
+        elif not own:
+            v.update(verdict="UNKNOWN", why=not_counted_why(program, system, srcs[program], systems, twins))
         elif not said:
             v.update(verdict="UNKNOWN", why=f"the listing's table has no row for {copybook}")
         elif used_dsn is None:
             v.update(verdict="UNKNOWN", why="the chosen member's library dataset is not known (no `library` row for its "
                                             "folder, and the folder is not named after a dataset)")
-        elif said == [used_dsn]:
-            v.update(verdict="CONFIRMED", why="")
+        elif used_dsn in said:
+            # one library named: the copy came from it; several (the copybook read from two DDs): the copy used is
+            # one the compiler read - the listing does not say which COPY took which, so it is not contradicted
+            v.update(verdict="CONFIRMED", why="" if len(said) == 1 else
+                     f"the listing names {len(said)} libraries for {copybook} ({', '.join(said)}); the copy used is one of them")
         else:
             other = [d for d in said if d != used_dsn]
             have = ""
@@ -1122,6 +1245,7 @@ def check_choices(conn: sqlite3.Connection, sources: Optional[Dict[str, List[Cop
                                         f"({','.join('?' * len(RESOLVER_KINDS))})", (copybook, *RESOLVER_KINDS)):
                 if dataset_of(path, libs) in other:
                     have = f"the index holds that copy at {_tail(path)} - the build chose the other"
+                    v["holds_copy"] = True
                     break
             if not have:
                 have = (f"the index holds that library ({_tail(holders[other[0]])}) but no {copybook} in it"
@@ -1129,6 +1253,68 @@ def check_choices(conn: sqlite3.Connection, sources: Optional[Dict[str, List[Cop
             v.update(verdict="CONTRADICTED", why="the listing names another library", index_has=have)
         out.append(v)
     return out
+
+
+REPARSE_ALL = "the next build re-parses every member (the toolkit changed since the index was built) and reads the listing first"
+
+
+def toolkit_reads_the_listing(conn: sqlite3.Connection) -> bool:
+    """True when the index's last build was made by THIS toolkit
+    (build_run.fingerprint = build.tool_fingerprint()): its resolver reads
+    the listing table, and the next build is incremental, so a program whose
+    guess the listing contradicts is parsed again only if marked. False when
+    the toolkit changed since (an index built before ROADMAP re-parse item
+    19, or any parser change): the next build re-parses every member and
+    reads the listing first - nothing to mark."""
+    from . import build
+    try:
+        row = conn.execute("SELECT fingerprint FROM build_run ORDER BY id DESC LIMIT 1").fetchone()
+    except sqlite3.OperationalError:
+        return False
+    return bool(row and row[0] and row[0] == build.tool_fingerprint())
+
+
+def mark_contradicted(db: str, checks: Sequence[Dict[str, object]], dry_run: bool) -> Tuple[int, bool]:
+    """The programs whose choice the listing CONTRADICTS while the index holds
+    the copy the listing names are parsed again on the next build, which
+    reads the listing first - marked here (by member id, programs only) when
+    that build is incremental, an index this toolkit built; when the toolkit
+    changed since, the next build re-parses every member and nothing is
+    marked (test_copy_sources pins that an index built by another toolkit is
+    left as it is). Not on a dry run. Each such check's 'marked' says what
+    happened. Returns (programs marked, whether the toolkit changed)."""
+    todo = [v for v in checks if v["verdict"] == "CONTRADICTED" and v["holds_copy"]]
+    if not todo:
+        return 0, False
+    conn = sqlite3.connect(db)
+    try:
+        same = toolkit_reads_the_listing(conn)
+    finally:
+        conn.close()
+    if not same:
+        for v in todo:
+            v["marked"] = "re-parsed by the next build (toolkit changed)"
+        return 0, True
+    ids = sorted({int(v["member_id"]) for v in todo})                  # type: ignore[call-overload]
+    n = 0 if dry_run else _mark_members(db, ids)
+    for v in todo:
+        v["marked"] = "would be marked for the next build (dry run)" if dry_run else "marked for the next build"
+    return n, False
+
+
+def contradicted_line(checks: Sequence[Dict[str, object]], dry_run: bool, toolkit_changed: bool) -> str:
+    """The console line under the choice line: what happens to the programs
+    whose listing names a copy the index holds; '' when there is none."""
+    progs = {v["member_id"] for v in checks if v["verdict"] == "CONTRADICTED" and v["holds_copy"]}
+    if not progs:
+        return ""
+    n = len(progs)
+    head = f"  {n:,} program{'s' if n != 1 else ''} whose listing names a copy the index holds"
+    if toolkit_changed:
+        return head + f": {REPARSE_ALL}"
+    if dry_run:
+        return head + f" would be marked for the next build (dry run: nothing changed)"
+    return head + f" {'are' if n != 1 else 'is'} marked for the next build - it reads the listing first"
 
 
 def choice_counts(checks: Sequence[Dict[str, object]]) -> Tuple[int, int, int]:
@@ -1154,11 +1340,23 @@ def choice_report(checks: Sequence[Dict[str, object]], root: Optional[str]) -> L
              "re-parse item 19 the build reads this table first: a program parsed with its rows in place expands the "
              "listing's copy (its note says 'the program's compiler listing names DATASET'); a program parsed before "
              "its rows were stored, or by an earlier toolkit, carries the chain's guess - a contradicted choice is a "
-             "wrong fact until that program is parsed again, and `program NAME` shows the listing's library under "
-             "its notes.\n\n"
+             "wrong fact until that program is parsed again: where the index holds the copy the listing names, this "
+             "tool marks the program for the next build (an index this toolkit built) or the next build re-parses "
+             "every member anyway (the toolkit changed since), and `program NAME` shows the listing's library under "
+             f"its notes. {LISTING_RULE}\n\n"
              f"- {len(checks)} choice{'s' if len(checks) != 1 else ''} checked: {a} confirmed, {b} contradicted, {u} unknown"
              + ("" if not whys else " (" + "; ".join(f"{n}: {w}" for w, n in sorted(whys.items(), key=lambda kv: (-kv[1], kv[0])))
                                            + ")") + "\n"]
+    held = [v for v in checks if v["verdict"] == "CONTRADICTED" and v["holds_copy"]]
+    if held:
+        n = len({v["member_id"] for v in held})
+        what = str(held[0]["marked"])
+        lines.append(f"- {len(held)} of the contradicted: the index holds the copy the listing names - "
+                     + (f"the {n} program{'s' if n != 1 else ''} {'are' if n != 1 else 'is'} marked for the next build, which reads "
+                        "the listing first: run your usual build command" if what == "marked for the next build" else
+                        f"the {n} program{'s' if n != 1 else ''} would be marked for the next build (dry run: nothing changed)"
+                        if what.startswith("would be") else REPARSE_ALL if what else
+                        "parsed again on the next build, which reads the listing first") + "\n")
     if not b:
         lines.append("\n_no contradicted choice_\n")
         return lines
@@ -1169,7 +1367,8 @@ def choice_report(checks: Sequence[Dict[str, object]], root: Optional[str]) -> L
         used = f"{v['used_dataset']} ({_tail(str(v['used']))}; {v['how']})"
         says = (", ".join(str(d) for d in v["listing_datasets"]) + (f" ({', '.join(str(d) for d in v['ddnames'])})" if v["ddnames"] else "")
                 + f" - {v['index_has']}")
-        lines.append(f"| {v['program']} | {v['copybook']} | {used} | {says} | CONTRADICTED |\n")
+        lines.append(f"| {v['program']} | {v['copybook']} | {used} | {says} | CONTRADICTED"
+                     + (f" - {v['marked']}" if v["marked"] else "") + " |\n")
     return lines
 
 
@@ -2983,6 +3182,7 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
     then_run_names = {str(e["copybook"]) for e in content_folder}
     settle_first = folder_names | then_run_names | {str(e["copybook"]) for e in refiled}
     only_misfiled = bool(missing) and set(missing) <= settle_first
+    marked_contra = 0                                                   # programs marked because the listing contradicts their choice
 
     def early(stats: Dict[str, object], nothing: str) -> Dict[str, object]:
         """A run that ends before the listings are read still reports the
@@ -3000,14 +3200,14 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
             elif os.path.exists(report):
                 _write_report(report, head + [f"\nNothing to report on this run: {nothing}.\n"])
                 log(f"{report} - nothing to report on this run (the earlier run's report is replaced)")
-        if marked or marked_removed or marked_refiled or waiting:
+        if marked or marked_removed or marked_refiled or waiting or marked_contra:
             log("next: run your usual build command - the programs marked re-expand by themselves")
         if folder_fix:
             log(MISFILED_NEXT)
         if content_folder:
             log(NEXT_FOLDER_REFILE)
         stats.update({"arrived": len(arrived), "misfiled": len(misfiled), "refiled": 0 if dry_run else len(refiled),
-                      "waiting": len(waiting), "marked": marked + marked_removed + marked_refiled,
+                      "waiting": len(waiting), "marked": marked + marked_removed + marked_refiled + marked_contra,
                       "on_disk": disk_stats["on_disk"], "arrived_late": disk_stats["arrived_late"],
                       "no_file": disk_stats["no_file"]})
         return stats
@@ -3051,7 +3251,10 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
         checked = None
         if chosen:
             checks, _fetch, _unnamed = _check_after(db, {}, True, to_fetch_for, True, recovered)
+            marked_contra, toolkit_changed = mark_contradicted(db, checks, dry_run)
             log(choice_line(checks) + " - the listings would say which copy of a copybook chosen among several was right")
+            if contradicted_line(checks, dry_run, toolkit_changed):
+                log(contradicted_line(checks, dry_run, toolkit_changed))
             checked = choice_counts(checks)
         return early({"missing": len(missing), "sources": 0, "written": 0, "rejected": 0, "not_found": len(missing),
                       "removed": 0, "kept": 0, "formats": {}, "out": out_dir, "unconfirmed": 0, "checked": checked},
@@ -3226,6 +3429,9 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
     # the listings' copybook-source rows, stored per program read, and every choice the build made checked against them
     # ... and, from the same rows, the libraries the listings name: the fetch list
     checks, fetch, unnamed = _check_after(db, copy_src, dry_run, to_fetch_for, bool(chosen), recovered)
+    # a choice the listing contradicts while the index holds the listing's copy: the program is parsed again on the
+    # next build, which reads the listing first - marked here when that build is incremental (this toolkit's index)
+    marked_contra, toolkit_changed = mark_contradicted(db, checks, dry_run)
     list_file = os.path.join(os.path.dirname(report) or ".", FETCH_LIST) if report else None
     seen_names = set(by_name) | have_now
     unread = sorted(n for n in missing if n not in seen_names and n in unprovable)   # in a listing, column unproven
@@ -3335,6 +3541,8 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
         n_contra = choice_counts(checks)[1]
         log(choice_line(checks) + (" - every contradicted choice is a wrong fact in the index: the report names each "
                                    "one with the library the listing says" if n_contra else ""))
+        if contradicted_line(checks, dry_run, toolkit_changed):
+            log(contradicted_line(checks, dry_run, toolkit_changed))
     if fetch:
         log(f"libraries the listings name: {len(fetch):,} datasets, {to_fetch:,} not fetched yet - the report's fetch list "
             "names them" + (f"; {list_file} holds the {to_fetch:,} to fetch, one dataset per line, for the UI's Bulk add"
@@ -3356,8 +3564,8 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
         log(f"every name: {report}")
     if written and not dry_run:
         log("next: run your usual build command - the programs that copy them re-expand by themselves"
-            + (" (and the programs marked above)" if marked or marked_removed or marked_refiled or waiting else ""))
-    elif marked or marked_removed or marked_refiled or waiting:
+            + (" (and the programs marked above)" if marked or marked_removed or marked_refiled or waiting or marked_contra else ""))
+    elif marked or marked_removed or marked_refiled or waiting or marked_contra:
         log("next: run your usual build command - the programs marked re-expand by themselves")
     if folder_fix:
         log(MISFILED_NEXT)
@@ -3369,7 +3577,7 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
             "checked": choice_counts(checks) if checks else None,
             "fetch": (len(fetch), to_fetch), "unnamed": len(unnamed), "misread": len(misread_written),
             "arrived": len(arrived), "misfiled": len(misfiled), "refiled": 0 if dry_run else len(refiled),
-            "waiting": len(waiting), "marked": marked + marked_removed + marked_refiled,
+            "waiting": len(waiting), "marked": marked + marked_removed + marked_refiled + marked_contra,
             "on_disk": disk_stats["on_disk"], "arrived_late": disk_stats["arrived_late"], "no_file": disk_stats["no_file"]}
 
 

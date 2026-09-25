@@ -309,7 +309,8 @@ class TheTableAbsentOrEmpty(unittest.TestCase):
 
 
 class LoadedOnce(unittest.TestCase):
-    """The table is read once into a dict keyed (PROGRAM, COPYBOOK); the
+    """The table is read once into a dict keyed (PROGRAM, COPYBOOK), each row
+    tied to the system of the listing member that names it; the
     folder-to-dataset tie is cached per folder."""
 
     def test_absent_table_gives_nothing_and_is_not_created(self):
@@ -320,6 +321,8 @@ class LoadedOnce(unittest.TestCase):
     def test_rows_keyed_upper_deduped_and_empty_rows_skipped(self):
         conn = sqlite3.connect(":memory:")
         conn.execute(recover.COPY_SOURCE_TABLE)
+        conn.execute("CREATE TABLE member (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE, system TEXT)")
+        conn.executemany("INSERT INTO member(path, system) VALUES(?,?)", [("a.lst", "CLAIMS"), ("c.lst", None), ("d.lst", "")])
         conn.executemany("INSERT INTO listing_copy_source(program, copybook, ddname, dataset, listing, seen) VALUES(?,?,?,?,?,?)", [
             ("pgma", "dupreC", "SYSLIB", "prod.policy.copylib", "a.lst", "x"),
             ("PGMA", "DUPREC", "SYSLIB", "PROD.POLICY.COPYLIB", "a.lst", "x"),         # the same row twice: once
@@ -327,10 +330,19 @@ class LoadedOnce(unittest.TestCase):
             ("PGMA", "OTHER", "SYSLIB", "PROD.CLAIMS.COPYLIB", "a.lst", "x"),
             ("NOTABLE", "", None, None, None, "x"),                                    # a listing read with no table
             ("NODSN", "DUPREC", "SYSLIB", "", "b.lst", "x"),
+            ("PGMB", "DUPREC", "SYSLIB", "PROD.X.COPYLIB", "b.lst", "x"),              # a listing the index does not hold: no system
+            ("PGMC", "DUPREC", "SYSLIB", "PROD.X.COPYLIB", "c.lst", "x"),              # held, no system assigned
+            ("PGMD", "DUPREC", "SYSLIB", "PROD.X.COPYLIB", "d.lst", "x"),              # held, an empty system: none
+            ("PGME", "DUPREC", "SYSLIB", "PROD.X.COPYLIB", "a.lst", "x"),              # the same dataset from two listings: both
+            ("PGME", "DUPREC", "SYSLIB", "PROD.X.COPYLIB", "b.lst", "x"),
         ])
         self.assertEqual(build.load_listing_sources(conn), {
-            ("PGMA", "DUPREC"): ("PROD.POLICY.COPYLIB", "PROD.OTHER.COPYLIB"),
-            ("PGMA", "OTHER"): ("PROD.CLAIMS.COPYLIB",),
+            ("PGMA", "DUPREC"): (("PROD.POLICY.COPYLIB", "CLAIMS"), ("PROD.OTHER.COPYLIB", "CLAIMS")),
+            ("PGMA", "OTHER"): (("PROD.CLAIMS.COPYLIB", "CLAIMS"),),
+            ("PGMB", "DUPREC"): (("PROD.X.COPYLIB", None),),
+            ("PGMC", "DUPREC"): (("PROD.X.COPYLIB", None),),
+            ("PGMD", "DUPREC"): (("PROD.X.COPYLIB", None),),
+            ("PGME", "DUPREC"): (("PROD.X.COPYLIB", "CLAIMS"), ("PROD.X.COPYLIB", None)),
         })
 
     def test_folder_dataset_by_the_library_table_then_by_the_folder_name(self):

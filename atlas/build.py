@@ -32,7 +32,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass, replace
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import AbstractSet, Callable, Dict, List, Optional, Sequence, Set, Tuple, TypeVar
 
 from . import classify, cobol, copybook, docs, expand, ims, jcl, reader, screens, txn
 from .reader import Line
@@ -354,9 +354,10 @@ class Ctx:
         self.problems: List[Tuple[str, str, str]] = []   # (kind of problem, path, detail) - listed at the end of the build
         self.problems_file: Optional[str] = None
         # what the compiler listings say (atlas.recover's listing_copy_source, read once): (PROGRAM, COPYBOOK) ->
-        # the library datasets the listing names; and the dataset each folder holds (the `library` table, else the
-        # folder's own name), cached per folder - make_resolver reads both before its precedence chain
-        self.listing_sources: Dict[Tuple[str, str], Tuple[str, ...]] = {}
+        # (the library dataset the listing names, the system of the listing member that names it); and the dataset
+        # each folder holds (the `library` table, else the folder's own name), cached per folder - make_resolver
+        # reads both before its precedence chain
+        self.listing_sources: Dict[Tuple[str, str], Tuple[Tuple[str, Optional[str]], ...]] = {}
         self.folder_dataset: Dict[str, Optional[str]] = {}
 
     def problem(self, kind: str, path: str, detail: str, line: Optional[str] = None) -> None:
@@ -1269,36 +1270,104 @@ def _folder_key(folder: str) -> str:
     return os.path.normcase(os.path.normpath(os.path.abspath(folder)))
 
 
-def load_listing_sources(conn: sqlite3.Connection) -> Dict[Tuple[str, str], Tuple[str, ...]]:
-    """{(PROGRAM, COPYBOOK): the library datasets the program's compiler
-    listing names for that copybook, in stored order} - atlas.recover's
-    `listing_copy_source`, read ONCE for the whole build (one dict lookup per
-    COPY afterwards). The table is recover's own: absent on an index recover
-    never ran on, or empty - then nothing is known, and the build never
-    creates it. A row with no copybook (a listing read with no table) says
-    nothing."""
-    out: Dict[Tuple[str, str], Tuple[str, ...]] = {}
+def load_listing_sources(conn: sqlite3.Connection) -> Dict[Tuple[str, str], Tuple[Tuple[str, Optional[str]], ...]]:
+    """{(PROGRAM, COPYBOOK): ((library dataset, system), ...)} - the datasets
+    the program's compiler listings name for that copybook, in stored order,
+    each with the SYSTEM of the listing member that names it: atlas.recover
+    keys the rows by the listing's file stem, so every listing of one program
+    NAME shares the key - GC's and GC-TEST's listings of GCPGM1, and one filed
+    under estate\\SHARED\\PROD.LISTINGS - and rows_that_count decides which
+    of them speak for the program being parsed. The system is the listing
+    member's own (member.path = the stored listing path, member.system as
+    derive_systems set it); a listing the index does not hold (a folder given
+    to recover with --from) has none. atlas.recover's `listing_copy_source`,
+    read ONCE for the whole build (one dict lookup per COPY afterwards). The
+    table is recover's own: absent on an index recover never ran on, or
+    empty - then nothing is known, and the build never creates it. A row with
+    no copybook (a listing read with no table) says nothing."""
+    out: Dict[Tuple[str, str], Tuple[Tuple[str, Optional[str]], ...]] = {}
     if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='listing_copy_source'").fetchone() is None:
         return out
-    for program, copybook, dataset in conn.execute("SELECT program, copybook, dataset FROM listing_copy_source "
-                                                   "WHERE copybook IS NOT NULL AND copybook <> '' "
-                                                   "AND dataset IS NOT NULL AND dataset <> '' ORDER BY rowid"):
+    for program, copybook, dataset, system in conn.execute(
+            "SELECT s.program, s.copybook, s.dataset, m.system FROM listing_copy_source s "
+            "LEFT JOIN member m ON m.path = s.listing "
+            "WHERE s.copybook IS NOT NULL AND s.copybook <> '' AND s.dataset IS NOT NULL AND s.dataset <> '' "
+            "ORDER BY s.rowid"):
         key = (str(program).strip().upper(), str(copybook).strip().upper())
-        dsn = str(dataset).strip().upper()
+        row = (str(dataset).strip().upper(), system_key(system))
         have = out.get(key, ())
-        if dsn not in have:
-            out[key] = have + (dsn,)
+        if row not in have:
+            out[key] = have + (row,)
     return out
+
+
+def system_key(system: Optional[str]) -> Optional[str]:
+    """A member's system as the listing rule compares it: upper case, None
+    for none (an empty string included)."""
+    return (str(system).strip().upper() or None) if system else None
+
+
+_R = TypeVar("_R")
+
+
+def rows_that_count(rows: Sequence[_R], system: Optional[str], twins: AbstractSet[Optional[str]],
+                    listing_system: Callable[[_R], Optional[str]]) -> List[_R]:
+    """The listing rows that speak for one program - ONE rule, applied by the
+    resolver (listing_rows_for) and by atlas.recover's check
+    (recover.rows_of_system), so what the build expanded and what recover
+    checks it against never differ. Every listing of a program NAME shares
+    the rows' key; each row carries the system of the listing member that
+    names it (derive_systems: the top-level folder under the estate root).
+
+    1. The rows from listings in the program's own system, when it has any.
+    2. When it has none, every other listing of that name - one filed under
+       a system that holds no program of that name (SHARED holds no WRONGPK,
+       so estate\\SHARED\\PROD.LISTINGS\\WRONGPK.lst speaks for the CLAIMS
+       program WRONGPK), one held outside any system folder, one the index
+       does not hold (a --from folder) - but only while no other system
+       holds a program of that name (a twin). GC-TEST holds a GCPGM2, so
+       GC-TEST's listing is its own GCPGM2's and says nothing for GC's; and a
+       listing filed elsewhere cannot say which of the two it is - recover
+       dates it against one program of the name only, and a test compile's
+       SYSLIB must never decide the production program's copy.
+
+    `system`: the program's (system_key); `twins`: the systems (None for a
+    member with none) of the program members of that name in systems OTHER
+    than the program's; `listing_system(row)`: the row's listing system (None
+    for none). A program with no system has no own rows: 2 decides."""
+    own = [r for r in rows if system and listing_system(r) == system]
+    if own:
+        return own
+    return [] if twins else list(rows)
+
+
+def listing_rows_for(rows: Sequence[Tuple[str, Optional[str]]], system: Optional[str],
+                     twins: AbstractSet[Optional[str]]) -> List[str]:
+    """The datasets, in stored order, that a program in `system` takes from
+    its listing rows ((dataset, listing system) pairs): rows_that_count."""
+    return [dsn for dsn, _lsys in rows_that_count(rows, system_key(system), twins, lambda r: r[1])]
+
+
+def twin_systems(ctx: "Ctx", prog: "Mem") -> Set[Optional[str]]:
+    """The systems, other than the program's own, that hold a program member
+    (kind cobol) of the same name - GC-TEST for GC's GCPGM2 when GC-TEST holds
+    one too. None stands for a member with no system."""
+    mine = system_key(prog.system)
+    return {system_key(m.system) for m in ctx.by_name.get(prog.name.upper(), ())
+            if m.kind == "cobol" and m.id != prog.id} - {mine}
 
 
 def load_folder_datasets(conn: sqlite3.Connection) -> Dict[str, Optional[str]]:
     """{folder (normalised): dataset} from the `library` table - the fetcher's
     `.atlas-library.json` ties each fetched folder to the dataset it holds.
     The seed of ctx.folder_dataset; a folder not in it is judged by its own
-    name (folder_dataset)."""
+    name (folder_dataset) - a row whose dataset is empty is left out, so the
+    folder's name decides exactly as atlas.recover.dataset_of judges it."""
     out: Dict[str, Optional[str]] = {}
     for folder, dataset in conn.execute("SELECT folder, dataset FROM library WHERE folder IS NOT NULL AND dataset IS NOT NULL"):
-        out[_folder_key(str(folder))] = str(dataset).strip().upper() or None
+        dsn = str(dataset).strip().upper()
+        if dsn:
+            out[_folder_key(str(folder))] = dsn
     return out
 
 
@@ -1345,11 +1414,17 @@ def make_resolver(ctx: Ctx, prog: Mem, notes: List[Tuple[str, str, int]]):
             # The program's compiler listing FIRST: it names the library
             # dataset the compiler read this copybook from (atlas.recover's
             # listing_copy_source). A candidate in a folder tied to that
-            # dataset is the copy the compiler used - not a guess. Only where
+            # dataset is the copy the compiler used - not a guess. Only the
+            # rows that speak for THIS program count (rows_that_count): its
+            # own system's listing; else any listing of its name (a SHARED
+            # listings folder) while no other system holds a program of that
+            # name. GC and GC-TEST each hold GCPGM1 with its own listing, and
+            # one's listing must not decide for the other's copy. Only where
             # no listing says (none read, no table, no row, no candidate in
             # the dataset it names) does the precedence chain decide.
             pick, how = None, ""
-            for dsn in ctx.listing_sources.get((prog.name.upper(), name.upper()), ()):
+            for dsn in listing_rows_for(ctx.listing_sources.get((prog.name.upper(), name.upper()), ()), prog.system,
+                                        twin_systems(ctx, prog)):
                 in_dsn = [c for c in cands if folder_dataset(ctx, c.path) == dsn]
                 if in_dsn:
                     pick, _tie = _chain_pick(ctx, prog, in_dsn, lib)     # two folders holding one dataset: the chain breaks the tie

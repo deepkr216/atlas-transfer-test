@@ -11,7 +11,9 @@ LIBRARY DATASET the compiler read it from - the truth. atlas.recover reads
 that table from every such program's listing, stores it
 (listing_copy_source) and gives each choice a verdict: CONFIRMED,
 CONTRADICTED (a wrong fact: the report names it), UNKNOWN. The fact tables
-do not change; the build's use of the rows is ROADMAP re-parse item 19.
+do not change; the build reads the rows before its chain since ROADMAP
+re-parse item 19 (tests/test_listing_resolver.py), and this file pins the
+check on an index built before that - the stand-in must keep working there.
 """
 
 import contextlib
@@ -114,7 +116,11 @@ class CopySourcesParser(unittest.TestCase):
 class ChoicesCheckedAgainstTheListings(unittest.TestCase):
     """estate\\SYSTEM\\LIBRARY\\member. DUPREC exists in CLAIMS, POLICY and a
     third library with different content; every CLAIMS program takes the
-    CLAIMS copy (same system). The listings say which copy was right."""
+    CLAIMS copy (same system). The listings say which copy was right. The
+    index is one ANOTHER toolkit built (its last build carries another
+    fingerprint - what an index built before ROADMAP re-parse item 19 looks
+    like to this tool): the next build re-parses every member and reads the
+    listing first, so recover marks nothing and changes no parse_status."""
 
     @classmethod
     def setUpClass(cls):
@@ -149,6 +155,12 @@ class ChoicesCheckedAgainstTheListings(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             rc = build._main([cls.root, "--db", cls.db, "--rebuild", "--quiet"])
         assert rc == 0
+        conn = sqlite3.connect(cls.db)
+        try:
+            conn.execute("UPDATE build_run SET fingerprint='0000000000000000'")     # built by another toolkit
+            conn.commit()
+        finally:
+            conn.close()
 
     @classmethod
     def tearDownClass(cls):
@@ -202,8 +214,12 @@ class ChoicesCheckedAgainstTheListings(unittest.TestCase):
         self.assertIn("the 6 with a copybook chosen among several (to check the choice against the listing)", text)
         self.assertIn("copybook choices checked against the listings: 1 confirmed, 3 contradicted, 2 unknown - every contradicted "
                       "choice is a wrong fact in the index", text)
+        self.assertIn("  2 programs whose listing names a copy the index holds: the next build re-parses every member (the toolkit "
+                      "changed since the index was built) and reads the listing first", text)
+        self.assertNotIn("marked for the next build", text)
+        self.assertNotIn("next: run your usual build command", text)
         self.assertNotIn("recovered: 0 of 0", text)
-        self.assertEqual(stats["checked"], (1, 3, 2))
+        self.assertEqual((stats["checked"], stats["marked"]), ((1, 3, 2), 0))
         conn = query.connect(self.db)
         try:
             by = {v["program"]: v for v in recover.check_choices(conn)}
@@ -222,9 +238,11 @@ class ChoicesCheckedAgainstTheListings(unittest.TestCase):
         self.assertIn("- 6 choices checked: 1 confirmed, 3 contradicted, 2 unknown (1: no listing of the program was read; "
                       "1: the program's listing has no copybook-source table)", sec)
         self.assertIn("| program | copybook | the index used | the listing says | verdict |", sec)
+        self.assertIn("- 2 of the contradicted: the index holds the copy the listing names - the next build re-parses every member "
+                      "(the toolkit changed since the index was built) and reads the listing first", sec)
         self.assertIn("| WRONGPK | DUPREC | PROD.CLAIMS.COPYLIB (CLAIMS/PROD.CLAIMS.COPYLIB/DUPREC.cpy; same system) | "
                       "PROD.POLICY.COPYLIB (SYSLIB) - the index holds that copy at POLICY/PROD.POLICY.COPYLIB/DUPREC.cpy - "
-                      "the build chose the other | CONTRADICTED |", sec)
+                      "the build chose the other | CONTRADICTED - re-parsed by the next build (toolkit changed) |", sec)
         self.assertIn("| LIBTBL | DUPREC | ", sec)
         self.assertIn("| FETCHIT | DUPREC | PROD.CLAIMS.COPYLIB (CLAIMS/PROD.CLAIMS.COPYLIB/DUPREC.cpy; same system) | "
                       "PROD.SHARED.COPYLIB (COPYLIB) - not a library the index holds - fetch it | CONTRADICTED |", sec)
@@ -238,7 +256,8 @@ class ChoicesCheckedAgainstTheListings(unittest.TestCase):
                                                      ("LIBTBL", "DUPREC", "SYSLIB", "PROD.POLICY.COPYLIB2"),
                                                      ("WRONGPK", "DUPREC", "SYSLIB", "PROD.POLICY.COPYLIB")])
         self.assertEqual([r for r in rows if not r[1]], [("NOTABLE", "", None, None)])
-        # the build's facts are untouched: no parse_status changed, every 'ambiguous_copybook' row still there
+        # the build's facts are untouched: no parse_status changed (nothing marked on an index another toolkit built),
+        # every 'ambiguous_copybook' row still there
         conn = sqlite3.connect(self.db)
         try:
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM unresolved WHERE kind='ambiguous_copybook'").fetchone()[0], 6)
@@ -294,7 +313,9 @@ class ChoicesCheckedAgainstTheListings(unittest.TestCase):
 class CheckedWhileRecovering(unittest.TestCase):
     """A program that copies a missing copybook AND took a chosen one: its
     listing is read for the missing copybook, and the choice is checked on
-    the same read - the recovery path, not the check-only one."""
+    the same read - the recovery path, not the check-only one. The index is
+    this toolkit's own build, so the contradicted program (the index holds
+    the listing's copy) is marked for the next build."""
 
     def setUp(self):
         self.td = tempfile.mkdtemp()
@@ -332,11 +353,16 @@ class CheckedWhileRecovering(unittest.TestCase):
         self.assertIn("| NOPE | 1 |", rep)
         self.assertIn("| MISSPGM | DUPREC | PROD.CLAIMS.COPYLIB (CLAIMS/PROD.CLAIMS.COPYLIB/DUPREC.cpy; same system) | "
                       "PROD.POLICY.COPYLIB (SYSLIB) - the index holds that copy at POLICY/PROD.POLICY.COPYLIB/DUPREC.cpy - "
-                      "the build chose the other | CONTRADICTED |", rep)
+                      "the build chose the other | CONTRADICTED - marked for the next build |", rep)
+        self.assertIn("  1 program whose listing names a copy the index holds is marked for the next build - it reads the listing first", text)
+        self.assertIn("next: run your usual build command - the programs that copy them re-expand by themselves (and the programs "
+                      "marked above)", text)
+        self.assertEqual(stats["marked"], 1)
         # the recovered copybook is not in the listing's table for anything the index chose: NOPE's row is stored all the same
         conn = sqlite3.connect(self.db)
         try:
             rows = conn.execute("SELECT copybook, dataset FROM listing_copy_source WHERE program='MISSPGM' ORDER BY 1").fetchall()
+            self.assertEqual(conn.execute("SELECT parse_status FROM member WHERE name='MISSPGM' AND kind='cobol'").fetchone()[0], "pending")
         finally:
             conn.close()
         self.assertEqual(rows, [("DUPREC", "PROD.POLICY.COPYLIB"), ("NOPE", "PROD.X.COPYLIB")])

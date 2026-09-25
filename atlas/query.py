@@ -1636,8 +1636,17 @@ UNRESOLVED_MEANING = {
         "nothing to fetch; an index built before ROADMAP re-parse item 18 repeats the choice as a COPY warning, and "
         "the next full re-parse stops it - check the manifest's system / copybook order if the copy named is the "
         "wrong one"),
+    "expand (copybook chosen among several - by the listing)": (
+        "the resolver's choice repeated as a COPY warning: the program expanded completely with the copy its compiler "
+        "listing names (its 'ambiguous_copybook' row) - not a missing copybook",
+        "nothing: the compiler's own record decided, not a guess; an index built before ROADMAP re-parse item 18 repeats "
+        "the choice as a COPY warning, and the next full re-parse stops it"),
     "ambiguous_copybook": ("two copies of one copybook with different content; one was chosen",
                            "declare the department's copybook order (manifest `copylib_order`) or remove the stale copy"),
+    "ambiguous_copybook (decided by the listing)": (
+        "two copies of one copybook with different content; the program's compiler listing names the library the "
+        "compiler read it from, and that copy was expanded",
+        "nothing - the compiler's own record, not a guess; nothing to declare"),
     "include_member": ("a JCL `INCLUDE MEMBER=` whose member is not in the index",
                        "fetch the JCLLIB / PARMLIB holding it: its DDs, symbols and steps are missing from the job"),
     "card_member": ("a SYSIN DD naming a control-card member that is not in the index",
@@ -1865,22 +1874,31 @@ def _listing_says(conn: sqlite3.Connection, member_id: int) -> str:
     from . import recover
     if not recover.has_copy_sources(conn):
         return ""
-    row = conn.execute("SELECT name FROM member WHERE id=?", (member_id,)).fetchone()
+    row = conn.execute("SELECT name, system FROM member WHERE id=?", (member_id,)).fetchone()
     if not row:
         return ""
-    rows = conn.execute("SELECT DISTINCT copybook, ddname, dataset FROM listing_copy_source WHERE program=? AND copybook<>'' "
-                        "ORDER BY copybook, dataset", (row[0].upper(),)).fetchall()
+    program = str(row[0]).upper()
+    system = (str(row[1]).strip().upper() or None) if row[1] else None
+    stored = [(str(r[0]).upper(), str(r[1] or ""), str(r[2] or "").upper(), str(r[3] or "")) for r in conn.execute(
+        "SELECT copybook, ddname, dataset, listing FROM listing_copy_source WHERE program=? AND copybook<>'' ORDER BY rowid",
+        (program,))]
+    # the rows that speak for THIS program (build.rows_that_count, the resolver's rule): its own system's listing, else
+    # one filed where no program of its name lives; GC-TEST's listing of its own GCPGM2 says nothing for GC's
+    twins = recover.program_systems(conn, [program]).get(program, set()) - {system}
+    own = recover.rows_of_system(stored, system, recover.listing_systems(conn, {program: stored}), twins)
+    rows = sorted({(cb, dd, dsn) for cb, dd, dsn, _lst in own})
     if not rows:
         return ""
     verdicts = {v["copybook"]: v for v in recover.check_choices(conn) if v["member_id"] == member_id}
     out = ["\n### Listing says\n"]
-    for r in rows:
-        line = f"- listing says: {r['copybook']} came from {r['dataset']} ({r['ddname'] or 'no DD name'})"
-        v = verdicts.get(r["copybook"])
+    for cb, dd, dsn in rows:
+        line = f"- listing says: {cb} came from {dsn} ({dd or 'no DD name'})"
+        v = verdicts.get(cb)
         if v is not None and v["verdict"] == "CONTRADICTED":
             line += f" - CONTRADICTS the copy the build used ({v['used_dataset']}; {v['index_has']}) - see work/recover.md"
         elif v is not None and v["verdict"] == "CONFIRMED":
-            line += " - confirms the copy the build used"
+            line += (" - confirms the copy the build used" if dsn == v["used_dataset"] else
+                     f" - a second library the listing names for this copybook; the build used {v['used_dataset']}")
         out.append(line + "\n")
     return "".join(out)
 
@@ -2021,7 +2039,10 @@ def _chosen_members(conn: sqlite3.Connection, limit: int = COVERAGE_ROWS) -> str
     build of the batch), or `partial` only by the resolver's repeated note
     (an index built before ROADMAP re-parse item 18). Their own table, so
     that `coverage` does not count them with the members whose copybook is
-    missing (his 701 'partial' with ~60 copybooks missing)."""
+    missing (his 701 'partial' with ~60 copybooks missing). A
+    choice the program's compiler listing decided (ROADMAP re-parse item 19)
+    is the compiler's own record and is said apart from the chain's guesses."""
+    from .build import LISTING_HOW
     rows = conn.execute(f"""
         SELECT m.kind, m.name, m.library, m.parse_status,
                (SELECT COUNT(*) FROM unresolved u WHERE u.member_id = m.id AND u.kind = 'ambiguous_copybook') AS picks,
@@ -2052,13 +2073,22 @@ def _chosen_members(conn: sqlite3.Connection, limit: int = COVERAGE_ROWS) -> str
         m = _PICK_RE.search((r["notes"] or "").split("\n")[0])
         if m:
             tail = "/".join(m.group(3).replace("\\", "/").split("/")[-3:])     # SYSTEM/LIBRARY/member
-            first = f"{m.group(2)}: {m.group(1)} copies, used {tail} ({m.group(4)})"
+            how = m.group(4)
+            if how.startswith(LISTING_HOW):                                   # 'listing: DATASET' - the word that matters, whole
+                how = "listing: " + how[len(LISTING_HOW):]
+            first = f"{m.group(2)}: {m.group(1)} copies, used {tail} ({how})"
         else:
-            first = (r["notes"] or "")[:110]
-        return first[:110] + (f" - and {r['picks'] - 1} more copybook(s)" if r["picks"] > 1 else "")
+            first = (r["notes"] or "")[:140]
+        return first[:140] + (f" - and {r['picks'] - 1} more copybook(s)" if r["picks"] > 1 else "")
 
+    # who decided: the program's compiler listing (build.LISTING_HOW in the note - the compiler's own record) or
+    # the precedence chain (system and library order - a guess the manifest's order can correct)
+    n_listing = sum(1 for r in rows for n in (r["notes"] or "").split("\n") if LISTING_HOW in n)
+    n_chain = sum(int(r["picks"]) for r in rows) - n_listing
+    who = (f"{n_listing} choice{'s' if n_listing != 1 else ''} decided by the program's compiler listing, {n_chain} picked "
+           "by system and library order" if n_listing else "the build picked by system and library order")
     out = [f"\n### Complete, with a copybook chosen among several: {len(rows)} member{'s' if len(rows) != 1 else ''} - "
-           "the build picked by system and library order; the 'ambiguous_copybook' rows name the copy used\n"]
+           f"{who}; the 'ambiguous_copybook' rows name the copy used\n"]
     out.append(table(["kind", "members", "most often chosen"],
                      [(k, len(v), top_names(v)) for k, v in sorted(by_kind.items(), key=lambda kv: -len(kv[1]))]))
     out.append("\n" + table(["kind", "member", "library", "copy used"],
@@ -2067,11 +2097,22 @@ def _chosen_members(conn: sqlite3.Connection, limit: int = COVERAGE_ROWS) -> str
         out.append(f"_... {len(rows) - limit} more; every one of them: `coverage --all`; `program NAME` shows each "
                    "member's choice under Unresolved in scope_\n")
     out.append(_choices_checked(conn))
+    names = f"{len(pick_names(rows))} copybook name(s) are involved - `ambiguous` lists them per department"
+    if not n_listing:
+        rule = ("The choice follows `COPY ... OF`, then the member's own system in its declared copybook order, then the "
+                f"manifest's authoritative copy; {names}, and a choice is wrong only where the manifest's system or "
+                "copybook order is.")
+    elif not n_chain:
+        rule = ("Every choice is the compiler's own: the program's listing names the library the copybook was read from, "
+                f"and that copy was expanded (`listing: DATASET` in the table) - nothing to declare; {names}.")
+    else:
+        rule = (f"{n_listing} of the choices {'are' if n_listing != 1 else 'is'} the compiler's own: the program's listing "
+                "names the library the copybook was read from, and that copy was expanded (`listing: DATASET` in the "
+                f"table) - nothing to declare for those. The other {n_chain} follow{'s' if n_chain == 1 else ''} `COPY ... OF`, "
+                "then the member's own system in its declared copybook order, then the manifest's authoritative copy, and "
+                f"one of those is wrong only where the manifest's system or copybook order is; {names}.")
     n_old = sum(1 for r in rows if r["parse_status"] == "partial")
     marked = _chosen_marked(n_old, len(rows) - n_old)
-    rule = ("The choice follows `COPY ... OF`, then the member's own system in its declared copybook order, then the "
-            f"manifest's authoritative copy; {len(pick_names(rows))} copybook name(s) are involved - `ambiguous` lists "
-            "them per department, and a choice is wrong only where the manifest's system or copybook order is.")
     out.append(f"\n> {'This member is' if len(rows) == 1 else f'These {len(rows)} members are'} NOT parsed only in "
                f"part: every COPY expanded, and their facts are complete for the copy named. {marked} {rule}\n")
     return "".join(out)
@@ -2244,9 +2285,17 @@ def cmd_coverage(conn: sqlite3.Connection, everything: bool = False) -> str:
                    "looked at: no folder change helps - `python -m atlas.recover --db atlas.db` re-files it as a copybook in "
                    f"the index ({recover.REFILED_ITEM}), then build; the cell says why when it cannot.\n")
     out.append("\n### Unresolved by kind - what the index could NOT work out, and what closes each one\n")
+    # a chosen copybook's rows apart from the rest; the ones the program's compiler listing decided apart again
+    # (build.LISTING_HOW in the note): those have nothing to declare
+    from .build import LISTING_HOW
     rows = conn.execute("""SELECT CASE WHEN kind = 'expand' AND instr(COALESCE(detail, ''), ?) > 0
-                                       THEN 'expand (copybook chosen among several)' ELSE kind END AS k, COUNT(*)
-                           FROM unresolved GROUP BY 1 ORDER BY 2 DESC""", (AMBIGUOUS_PICK,)).fetchall()
+                                       THEN CASE WHEN instr(COALESCE(detail, ''), ?) > 0
+                                                 THEN 'expand (copybook chosen among several - by the listing)'
+                                                 ELSE 'expand (copybook chosen among several)' END
+                                       WHEN kind = 'ambiguous_copybook' AND instr(COALESCE(detail, ''), ?) > 0
+                                       THEN 'ambiguous_copybook (decided by the listing)'
+                                       ELSE kind END AS k, COUNT(*)
+                           FROM unresolved GROUP BY 1 ORDER BY 2 DESC""", (AMBIGUOUS_PICK, LISTING_HOW, LISTING_HOW)).fetchall()
     out.append(table(["kind", "count", "what it means", "what closes it"],
                      [(k, n, *UNRESOLVED_MEANING.get(k, ("(see the members below)", "send this kind's name for a fix")))
                       for k, n in rows]))
