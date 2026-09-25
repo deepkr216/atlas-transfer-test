@@ -1084,24 +1084,35 @@ class EndToEnd(unittest.TestCase):
         stats = recover.run(self.db, log=said.append, report=self.report)
         self.assertEqual(stats["missing"], 0, said)
         self.assertTrue(any("nothing to recover: every copybook" in s for s in said), said)
-        # the real copybook arrives: the recovered one goes, its programs are parsed again, the real one is the only one
+        # the real copybook arrives: the build expands it at once - a recovered copy ranks after every other candidate
+        # (ROADMAP re-parse item 11) - with no choice among several; recover then removes the recovered copy and
+        # marks nothing, for no program expands it; the next build drops it and the real one is the only one
         shutil.copy(os.path.join(FIX, "PMASTREC.cpy"), os.path.join(self.root, "SHARED", "COPYLIB"))
         self.build()
         conn = query.connect(self.db)
-        before = conn.execute("SELECT id FROM member WHERE name='SAMPPGM' AND kind='cobol'").fetchone()[0]
-        conn.close()
+        try:
+            resolved = conn.execute("SELECT m.path FROM copy_use c JOIN member m ON m.id=c.resolved_member_id "
+                                    "WHERE c.copybook='PMASTREC'").fetchone()[0]
+            self.assertIn("COPYLIB", resolved)
+            self.assertNotIn(recover.FOLDER, resolved)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM unresolved WHERE kind='ambiguous_copybook'").fetchone()[0], 0)
+        finally:
+            conn.close()
         said = []
         stats = recover.run(self.db, log=said.append, report=self.report)
-        self.assertEqual(stats["removed"], 1, said)
+        self.assertEqual((stats["removed"], stats["marked"]), (1, 0), said)
         self.assertEqual(sorted(os.listdir(out)), [recover.MARKER, "POLDCL.cpy"])
         self.assertTrue(any("removed - the estate now holds the real member: PMASTREC" in s for s in said), said)
-        self.assertTrue(any("1 program(s) that had expanded them are marked for the next build" in s for s in said), said)
+        self.assertIn("  " + recover.REMOVED_NONE_EXPANDS, said)
+        self.assertFalse(any("that had expanded them" in s for s in said), said)
+        self.assertIn(recover.REMOVED_NEXT, said)
+        with open(self.report, encoding="utf-8") as fh:
+            self.assertIn("Removed: PMASTREC. No program expands them, so none is marked; the next build drops them from "
+                          "the index.", fh.read())
         self.build()
         conn = query.connect(self.db)
         try:
             self.assertEqual(self.status("SAMPPGM"), "ok")
-            self.assertNotEqual(conn.execute("SELECT id FROM member WHERE name='SAMPPGM' AND kind='cobol'").fetchone()[0],
-                                before, "parsed again against the real copybook")
             paths = [r[0] for r in conn.execute("SELECT path FROM member WHERE name='PMASTREC'")]
             self.assertEqual(len(paths), 1, paths)
             self.assertIn("COPYLIB", paths[0])
@@ -1111,37 +1122,90 @@ class EndToEnd(unittest.TestCase):
         finally:
             conn.close()
 
-    def test_coverage_warns_while_a_recovered_copy_shadows_the_real_member(self):
+    def resolved_path(self, book):
+        conn = query.connect(self.db)
+        try:
+            return conn.execute("SELECT m.path FROM copy_use c JOIN member m ON m.id=c.resolved_member_id "
+                                "WHERE c.copybook=?", (book,)).fetchone()[0]
+        finally:
+            conn.close()
+
+    def coverage(self):
+        conn = query.connect(self.db)
+        try:
+            return query.cmd_coverage(conn), query._recovered_shadowing(conn)
+        finally:
+            conn.close()
+
+    def real_member_arrives_late(self):
+        """PMASTREC recovered and expanded, then the real member arrives in a library that sorts after
+        RECOVERED-COPYBOOKS - the chain's 'first found' would keep the recovered copy."""
         recover.run(self.db, log=lambda s: None, report=self.report)
         self.build()
-        conn = query.connect(self.db)
-        try:
-            self.assertNotIn("still expand a recovered copybook", query.cmd_coverage(conn))
-            # the real member arrives in a library that sorts after RECOVERED-COPYBOOKS: the build keeps the
-            # recovered copy until atlas.recover runs - and coverage says so
-            late = os.path.join(self.root, "SHARED", "ZCOPYLIB")
-            os.makedirs(late)
-            shutil.copy(os.path.join(FIX, "PMASTREC.cpy"), late)
-        finally:
-            conn.close()
+        self.assertIn(recover.FOLDER, self.resolved_path("PMASTREC"))
+        self.assertNotIn("still expand a recovered copybook", self.coverage()[0])
+        late = os.path.join(self.root, "SHARED", "ZCOPYLIB")
+        os.makedirs(late)
+        shutil.copy(os.path.join(FIX, "PMASTREC.cpy"), late)
         self.build()
+
+    def test_the_real_member_beats_a_recovered_copy_the_moment_it_arrives(self):
+        # ROADMAP re-parse item 11: the build ranks a recovered copy after every other candidate, so the real member
+        # is expanded at the build it arrives in, with no choice among several; coverage has nothing to warn of
+        self.real_member_arrives_late()
+        self.assertIn("ZCOPYLIB", self.resolved_path("PMASTREC"))
+        self.assertEqual((self.status("SAMPPGM"), self.status("ERRPGM")), ("ok", "ok"))
+        cov, shadow = self.coverage()
+        self.assertEqual(shadow, "")
+        self.assertNotIn("still expand a recovered copybook", cov)
         conn = query.connect(self.db)
         try:
-            cov = query.cmd_coverage(conn)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM unresolved WHERE kind='ambiguous_copybook'").fetchone()[0], 0)
+            self.assertNotIn("chosen among several", query.cmd_program(conn, "SAMPPGM"))
         finally:
             conn.close()
+        # recover removes the stand-in and marks nothing - no program expands it; the next build drops it
+        said = []
+        stats = recover.run(self.db, log=said.append, report=self.report)
+        self.assertEqual((stats["removed"], stats["marked"]), (1, 0), said)
+        self.assertIn("  " + recover.REMOVED_NONE_EXPANDS, said)
+        self.assertIn(recover.REMOVED_NEXT, said)
+        self.assertNotIn("next: run your usual build command - the programs marked re-expand by themselves", said)
+        self.build()
+        self.assertIn("ZCOPYLIB", self.resolved_path("PMASTREC"))
+        self.assertEqual(self.coverage()[1], "")
+
+    def test_coverage_warns_while_a_recovered_copy_shadows_the_real_member_on_an_older_index(self):
+        # an index built before ROADMAP re-parse item 11: the build kept the recovered copy after the real member
+        # arrived (the chain's 'first found'). Written by hand - the program's COPY row pointed back at the recovered
+        # member - since no build of this toolkit leaves it. Coverage warns, and recover marks that program
+        self.real_member_arrives_late()
+        conn = sqlite3.connect(self.db)
+        try:
+            rec = conn.execute("SELECT id FROM member WHERE name='PMASTREC' AND UPPER(library)=?",
+                               (recover.FOLDER,)).fetchone()[0]
+            conn.execute("UPDATE copy_use SET resolved_member_id=? WHERE copybook='PMASTREC'", (rec,))
+            conn.commit()
+        finally:
+            conn.close()
+        cov, shadow = self.coverage()
         self.assertIn("still expand a recovered copybook although the estate now holds the real member", cov)
-        self.assertIn("PMASTREC", cov)
-        recover.run(self.db, log=lambda s: None, report=self.report)
+        self.assertIn("PMASTREC", shadow)
+        said = []
+        stats = recover.run(self.db, log=said.append, report=self.report)
+        self.assertEqual((stats["removed"], stats["marked"]), (1, 1), said)
+        self.assertIn("  1 program(s) that had expanded them are marked for the next build", said)
+        self.assertIn("next: run your usual build command - the programs marked re-expand by themselves", said)
+        self.assertNotIn("  " + recover.REMOVED_NONE_EXPANDS, said)
+        self.assertNotIn(recover.REMOVED_NEXT, said)
+        with open(self.report, encoding="utf-8") as fh:
+            self.assertIn("Removed: PMASTREC. 1 program(s) that had expanded them are marked for the next build: run your "
+                          "usual build command.", fh.read())
+        self.assertEqual(self.status("SAMPPGM"), "pending")
         self.build()
-        conn = query.connect(self.db)
-        try:
-            self.assertNotIn("still expand a recovered copybook", query.cmd_coverage(conn))
-            resolved = conn.execute("SELECT m.path FROM copy_use c JOIN member m ON m.id=c.resolved_member_id "
-                                    "WHERE c.copybook='PMASTREC'").fetchone()[0]
-            self.assertIn("ZCOPYLIB", resolved)
-        finally:
-            conn.close()
+        self.assertNotIn("still expand a recovered copybook", self.coverage()[0])
+        self.assertIn("ZCOPYLIB", self.resolved_path("PMASTREC"))
+        self.assertEqual(self.status("SAMPPGM"), "ok")
 
     def test_a_copybook_copied_only_from_inside_another_copybook_is_named_as_such(self):
         # his z=71 (2026-09-21): after the re-parse, 71 of 80 missing copybooks were 'not in any expanded text'.

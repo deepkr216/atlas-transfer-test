@@ -2520,9 +2520,13 @@ def _top_reason(rows: List[sqlite3.Row]) -> str:
 
 def _recovered_shadowing(conn: sqlite3.Connection) -> str:
     """COPY statements that expand a recovered copybook (atlas.recover) while
-    the estate now holds the real member: the build picks whichever it met
-    first, so until the recovered one is removed a program may carry the
-    recovered layout."""
+    the estate now holds the real member. A build before ROADMAP re-parse
+    item 11 ranked the recovered copy like any library (the same folder,
+    first found), so until the recovered one is removed a program may carry
+    the recovered layout. The build of this toolkit takes a recovered copy
+    only while no other member of the name is a candidate, and parses the
+    copying programs again when the real member arrives: on an index it
+    built this finds nothing."""
     rows = conn.execute("""
         SELECT r.name, COUNT(*) FROM copy_use c
         JOIN member r ON r.id = c.resolved_member_id

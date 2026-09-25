@@ -919,24 +919,19 @@ class RemovedCopiesAreNotNothingToReport(_Estate):
         with open(self.report, "w", encoding="utf-8") as fh:
             fh.write("# Recovered copybooks - an earlier run\n\n## Written\n\n| DATABOOK | 1 | ... |\n")
 
-    def test_the_report_and_the_next_line_say_what_the_console_said(self):
+    def real_member_arrives(self):
         self.assertEqual(self.status("DATAPGM"), "ok")
         self.assertIn(recover.FOLDER, self.q("SELECT path FROM member WHERE name='DATABOOK'")[0][0])
         self.write("GC/PROD.GC.COPYLIB/DATABOOK.cpy", DATABOOK)
         self.build()
         self.assertEqual(len(self.book("DATABOOK")), 2)
-        stats, said = self.recover()
-        self.assertEqual((stats["removed"], stats["arrived"], stats["misfiled"], stats["marked"]), (1, 0, 0, 1), said)
-        self.assertIn("1 recovered copybook(s) removed - the estate now holds the real member: DATABOOK", said)
-        self.assertIn("1 program(s) that had expanded them are marked for the next build", said)
-        self.assertIn("next: run your usual build command", said)
-        self.assertEqual(self.status("DATAPGM"), "pending")
+
+    def removed_and_built(self):
         rep = self.report_text()
         self.assertNotIn("Nothing to report on this run", rep)
         self.assertNotIn("an earlier run", rep)
         self.assertIn("## Recovered copies removed - the real member arrived", rep)
         self.assertIn("DATABOOK", rep)
-        self.assertIn("1 program(s) that had expanded them are marked for the next build: run your usual build command", rep)
         self.assertFalse(os.path.exists(os.path.join(self.root, "SHARED", recover.FOLDER, "DATABOOK.cpy")))
         self.build()
         self.assertEqual(self.status("DATAPGM"), "ok")
@@ -946,6 +941,43 @@ class RemovedCopiesAreNotNothingToReport(_Estate):
         self.assertEqual((stats["removed"], stats["marked"]), (0, 0), said)
         self.assertNotIn("next:", said)
         self.assertIn("Nothing to report on this run", self.report_text())
+
+    def test_the_report_and_the_next_line_say_what_the_console_said(self):
+        # the build of this toolkit expands the real member the moment it arrives (ROADMAP re-parse item 11): the
+        # run removes the recovered copy, marks nothing - no program expands it - and still says what comes next
+        self.real_member_arrives()
+        stats, said = self.recover()
+        self.assertEqual((stats["removed"], stats["arrived"], stats["misfiled"], stats["marked"]), (1, 0, 0, 0), said)
+        self.assertIn("1 recovered copybook(s) removed - the estate now holds the real member: DATABOOK", said)
+        self.assertIn(recover.REMOVED_NONE_EXPANDS, said)
+        self.assertNotIn("that had expanded them", said)
+        self.assertIn(recover.REMOVED_NEXT, said)
+        self.assertEqual(self.status("DATAPGM"), "ok")
+        self.assertIn("Removed: DATABOOK. No program expands them, so none is marked; the next build drops them from "
+                      "the index.", self.report_text())
+        self.removed_and_built()
+
+    def test_on_an_index_built_before_the_item_the_program_that_expanded_it_is_marked(self):
+        # before ROADMAP re-parse item 11 a build could keep the recovered copy after the real member arrived:
+        # DATAPGM's COPY row still points at it (written by hand). The run marks that program and says so
+        self.real_member_arrives()
+        conn = sqlite3.connect(self.db)
+        try:
+            rec = conn.execute("SELECT id FROM member WHERE name='DATABOOK' AND library=?", (recover.FOLDER,)).fetchone()[0]
+            conn.execute("UPDATE copy_use SET resolved_member_id=? WHERE copybook='DATABOOK'", (rec,))
+            conn.commit()
+        finally:
+            conn.close()
+        stats, said = self.recover()
+        self.assertEqual((stats["removed"], stats["arrived"], stats["misfiled"], stats["marked"]), (1, 0, 0, 1), said)
+        self.assertIn("1 recovered copybook(s) removed - the estate now holds the real member: DATABOOK", said)
+        self.assertIn("1 program(s) that had expanded them are marked for the next build", said)
+        self.assertIn("next: run your usual build command - the programs marked re-expand by themselves", said)
+        self.assertNotIn(recover.REMOVED_NEXT, said)
+        self.assertEqual(self.status("DATAPGM"), "pending")
+        self.assertIn("1 program(s) that had expanded them are marked for the next build: run your usual build command",
+                      self.report_text())
+        self.removed_and_built()
 
 
 if __name__ == "__main__":

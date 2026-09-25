@@ -158,12 +158,42 @@ shipped alone and cost one such night; these still wait for the next one:
 10. A file name ending with a space or a dot before its extension gives a
     member name that keeps it (`PLAN `): strip it at inventory (the OCR folder,
     the lookups and the gate tolerate it meanwhile - LESSONS 156).
-11. `make_resolver` should rank a member under `RECOVERED-COPYBOOKS` after
-    every other candidate of the same name, so a recovered copybook never
-    beats the real one once it arrives (coverage warns meanwhile - LESSONS 168).
-12. An expression index on `UPPER(TRIM(name))` next to the one on
-    `UPPER(name)` (QUERY_INDEXES): the trimmed-name lookups the gate, `doc`
-    and `diff` fall back to scan the member table on a miss (LESSONS 158).
+11. **Delivered in the batch - a recovered copybook ranks after every other candidate of its name.**
+    `atlas.recover` writes a copybook it rebuilt from the listings under a `RECOVERED-COPYBOOKS` folder
+    (SHARED's, or a system's own when the systems' texts differ): a stand-in for a missing member. The
+    resolver's chain ranked it like any library - in the program's own system it beat a real copy under
+    SHARED ('same system'), in a folder that sorts first it beat one that sorts after ('first found') - and
+    a recovered copy with a different text made the choice 'among several', an 'ambiguous_copybook' row for
+    a stand-in; coverage warned until recover removed it (LESSONS 168). Now `make_resolver` takes a member
+    whose folder is `RECOVERED-COPYBOOKS` (`build.RECOVERED_FOLDER`, `build.is_recovered`) only while no
+    other member of the name is a candidate: the real copybook is expanded at the build it arrives in (item
+    21 parses its copiers again), and the chain, the listing's pick and the 'N copies of X with different
+    content' count read the real members alone, so no 'ambiguous_copybook' row is written when the only
+    other candidates are recovered copies. Among recovered copies alone the chain decides as before (a
+    program takes its own system's). On an index this toolkit built, coverage's 'still expand a recovered
+    copybook' (`query._recovered_shadowing`) finds nothing, and `atlas.recover`, removing a recovered copy
+    whose real member arrived, marks only the programs whose COPY row resolves to it
+    (`recover.expanding_programs`) - none there: it says 'no program expands them, so none is marked' and
+    'next: run your usual build command - it drops the removed copies from the index'. On an index built
+    before the item both still work: the warning names the copybooks, and the programs that expanded the
+    recovered copy are marked (before, every program copying the name was, and said to have expanded it).
+    A copy written with `--out` into a folder of another name is not known to the build as recovered.
+    tests/test_recovered_rank_last.py (TheResolverRanksARecoveredCopyLast, AnIndexBuiltBeforeTheItem,
+    ExpandingPrograms), tests/test_recover.py EndToEnd (test_the_real_member_beats_a_recovered_copy_the_moment_it_arrives,
+    test_coverage_warns_while_a_recovered_copy_shadows_the_real_member_on_an_older_index,
+    test_missing_copybooks_are_recovered_and_the_programs_become_whole), tests/test_arrived_copybooks.py
+    RemovedCopiesAreNotNothingToReport, LESSONS 207.
+12. **Delivered in the batch - the trimmed-name lookups use an index.** A file named `PLAN .docx` is member
+    `PLAN `, and nobody types the space: the gate (for every cited name no document carries), `doc`,
+    `images` and `diff` look a name up again with `UPPER(TRIM(name))` (LESSONS 156, 158), and QUERY_INDEXES
+    held an index on `UPPER(name)` only, so each such lookup scanned the member table. Now
+    `ix_q_member_utname` on `UPPER(TRIM(name))` sits beside `ix_q_member_uname`, and every one of those
+    lookups searches it (their query plans are pinned). `ensure_query_indexes` checked that a table has the
+    columns an expression reads by taking `UPPER(` off, which read `TRIM(name` for the new expression and
+    would have skipped it without a word; `build.index_columns` takes every call off. An index built before
+    the item opens and answers as before, by a scan, and its next build adds the index, once. The OCR pass's
+    `--member` lookup reads the kind index instead - once per run, over the documents only.
+    tests/test_query_indexes.py (IndexColumns, TheLookupsUseTheIndex, AnIndexBuiltBeforeTheItem), LESSONS 208.
 13. Parser reach (from his coverage tables): dynamic CALL targets across
     members, `sql_cursor` declared in another member, INTRDR-submitted JCL
     through a card member, the MFS macros in his estate.

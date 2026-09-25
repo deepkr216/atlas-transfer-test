@@ -38,9 +38,11 @@ and GC-TEST) hold different texts, each system gets its own copy under its
 own folder, so no program expands the other system's layout. A block is
 written only when the copybook parser reads it as data items, procedure
 code, or comments, and the build would file it as a copybook. When the
-real copybook later arrives in the estate, the recovered one is removed on
-the next run and the programs that had expanded it are marked for the next
-build.
+real copybook later arrives in the estate, the build expands it at once (a
+recovered copy ranks after every other member of its name - ROADMAP
+re-parse item 11), and the next run removes the recovered one; a program
+whose COPY row still names it (an index built before the item) is marked
+for the next build.
 
 Every recovered copybook says in its first lines where it came from; it is
 the copybook's text as one program saw it, not the library copy, and the
@@ -139,7 +141,11 @@ from typing import AbstractSet, Callable, Dict, List, Optional, Sequence, Set, T
 
 from . import classify, copybook, expand, reader
 
-FOLDER = "RECOVERED-COPYBOOKS"
+FOLDER = "RECOVERED-COPYBOOKS"                                      # build.RECOVERED_FOLDER: the build ranks such a copy last
+# the removal line when no program's COPY row resolves to a removed copy - on an index built by the toolkit of ROADMAP
+# re-parse item 11 always so: the build expands the real member the moment it arrives
+REMOVED_NONE_EXPANDS = "no program expands them, so none is marked"
+REMOVED_NEXT = "next: run your usual build command - it drops the removed copies from the index"
 MARKER = ".atlas-recovered.json"
 REPORT = os.path.join("work", "recover.md")
 FETCH_LIST = "fetch-list.txt"                                       # next to the report: the datasets to fetch, one per line
@@ -3777,10 +3783,11 @@ def _on_disk(out_dir: str) -> Dict[str, int]:
 
 
 def _mark_programs(db: str, names: Sequence[str]) -> int:
-    """Programs that copied a removed copybook are parsed again on the next
-    build (before ROADMAP re-parse item 21 a vanished member forced nothing
-    by itself; the build of this toolkit parses them again anyway, and the
-    mark changes nothing it would not do). Programs only: a
+    """Every program that copies one of `names` is parsed again on the next
+    build - by the copybook's NAME. The removal of a recovered copy marked
+    this way until ROADMAP re-parse item 11; it marks by the COPY row now
+    (expanding_programs), and the tests use this to stand for a night that
+    parses every copier again. Programs only: a
     copybook that copies the removed one gains nothing from a re-parse (its
     own COPY rows are never resolved), and a copybook marked pending is
     re-inserted under a new id, which nulls the links of every program
@@ -3834,6 +3841,36 @@ def _mark_members(db: str, ids: Sequence[int]) -> int:
         return n
     finally:
         conn.close()
+
+
+def expanding_programs(conn: sqlite3.Connection, files: Sequence[str]) -> List[int]:
+    """The programs (kind cobol) whose COPY row resolves to a member at one
+    of `files` - the recovered copies this run removes. Those are the
+    programs that had expanded them. By the row, not by the copybook's name:
+    a build before ROADMAP re-parse item 11 could keep a recovered copy after
+    the real member arrived, and its programs are marked; the build of this
+    toolkit expands the real member the moment it arrives, so on an index it
+    built the programs copying the name expand the real one already and
+    nothing is marked (a mark by name said they 'had expanded them')."""
+    wanted = {os.path.normcase(os.path.abspath(f)) for f in files}
+    names = sorted({os.path.splitext(os.path.basename(f))[0].upper() for f in files})
+    if not wanted:
+        return []
+    ids: Set[int] = set()
+    for k in range(0, len(names), 500):
+        chunk = names[k:k + 500]
+        for mid, path in conn.execute(f"SELECT id, path FROM member WHERE UPPER(name) IN ({','.join('?' * len(chunk))})",
+                                      tuple(chunk)):
+            if os.path.normcase(os.path.abspath(path)) in wanted:
+                ids.add(int(mid))
+    found = sorted(ids)
+    out: Set[int] = set()
+    for k in range(0, len(found), 500):
+        chunk = found[k:k + 500]
+        out.update(int(r[0]) for r in conn.execute(
+            f"SELECT DISTINCT c.member_id FROM copy_use c JOIN member m ON m.id = c.member_id "
+            f"WHERE m.kind = 'cobol' AND c.resolved_member_id IN ({','.join('?' * len(chunk))})", tuple(chunk)))
+    return sorted(out)
 
 
 def _write_report(report: str, lines: Sequence[str]) -> None:
@@ -4050,6 +4087,7 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
     # the recovered folders first: what is there, and what the estate now holds for real
     entries: Dict[str, Dict[str, dict]] = {d: _load_marker(d) for d in roots_out}
     removed: List[str] = []
+    removed_files: List[str] = []                                       # where each was: its programs are found by the row
     for d, ents in entries.items():
         disk = _on_disk(d)
         for name in sorted(set(ents) | set(disk)):
@@ -4060,6 +4098,7 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
                     except OSError:
                         pass
                 removed.append(name)
+                removed_files.append(os.path.join(d, name + ".cpy"))
                 ents.pop(name, None)
             elif name in ents and disk.get(name, 0) == 0:
                 ents.pop(name, None)                                    # a file that never got written whole
@@ -4069,18 +4108,31 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
         names = sorted(set(removed))
         log(f"  {len(removed)} recovered copybook(s) {'would be removed' if dry_run else 'removed'} - the estate now holds "
             "the real member: " + ", ".join(names[:8]) + (" ..." if len(names) > 8 else ""))
+        marked_what = ""
         if not dry_run:
-            marked_removed = _mark_programs(db, names)
-            log(f"  {marked_removed} program(s) that had expanded them are marked for the next build")
+            # the programs whose COPY row resolves to a removed copy: on an index built before ROADMAP re-parse item 11
+            # a recovered copy could outlast the real member's arrival; the build of this toolkit takes the real member
+            # at once, so there the programs copying the name expand it already and none is marked
+            conn = sqlite3.connect(db)
+            try:
+                expanding = expanding_programs(conn, removed_files)
+            finally:
+                conn.close()
+            marked_removed = _mark_members(db, expanding)
+            if marked_removed:
+                marked_what = f"{marked_removed} program(s) that had expanded them are marked for the next build"
+                log(f"  {marked_what}")
+                marked_what = f". {marked_what}: run your usual build command"
+            else:
+                log(f"  {REMOVED_NONE_EXPANDS}")
+                marked_what = f". {REMOVED_NONE_EXPANDS[0].upper()}{REMOVED_NONE_EXPANDS[1:]}; the next build drops them from the index"
             for d, ents in entries.items():
                 if os.path.isdir(d):
                     _save_marker(d, ents)
         # said in the report too: a run whose only work this was must not end as 'nothing to report'
         removed_lines.append("\n## Recovered copies removed - the real member arrived\n\n"
                              + ("Would be removed (dry run: nothing removed, nothing marked): " if dry_run else "Removed: ")
-                             + ", ".join(names)
-                             + ("" if dry_run else f". {marked_removed} program(s) that had expanded them are marked for the "
-                                                   "next build: run your usual build command") + ".\n")
+                             + ", ".join(names) + marked_what + ".\n")
     marked = 0
     if arrived:
         ids = sorted({i for e in arrived for i in e["ids"]})                    # type: ignore[union-attr]
@@ -4192,6 +4244,8 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
                 log(f"{report} - nothing to report on this run (the earlier run's report is replaced)")
         if marked or marked_removed or marked_refiled or waiting or marked_contra:
             log("next: run your usual build command - the programs marked re-expand by themselves")
+        elif removed and not dry_run:
+            log(REMOVED_NEXT)
         if folder_fix:
             log(MISFILED_NEXT)
         if content_folder:
@@ -4247,7 +4301,7 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
                 log(line)
             checked = choice_counts(checks)
         return early({"missing": len(missing), "sources": 0, "written": 0, "rejected": 0, "not_found": len(missing),
-                      "removed": 0, "kept": 0, "formats": {}, "out": out_dir, "unconfirmed": 0, "checked": checked},
+                      "removed": len(removed), "kept": 0, "formats": {}, "out": out_dir, "unconfirmed": 0, "checked": checked},
                      f"{len(missing)} copybook(s) missing in the index and no expanded text to read them from - run again "
                      "with --from FOLDER")
     found_all = len(sources)
@@ -4567,6 +4621,8 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
             + (" (and the programs marked above)" if marked or marked_removed or marked_refiled or waiting or marked_contra else ""))
     elif marked or marked_removed or marked_refiled or waiting or marked_contra:
         log("next: run your usual build command - the programs marked re-expand by themselves")
+    elif removed and not dry_run:
+        log(REMOVED_NEXT)
     if folder_fix:
         log(MISFILED_NEXT)
     if content_folder:

@@ -300,6 +300,10 @@ RESOLVER_KINDS = ("copybook", "cobol", "sql", "unknown")
 # note, so the programs copying its name are parsed again too: COPY_KINDS is what moved_names reads for them
 STUB_KIND = "stub"
 COPY_KINDS = RESOLVER_KINDS + (STUB_KIND,)
+# the folder atlas.recover writes a copybook it rebuilt from the compiler listings into (recover.FOLDER: under SHARED,
+# or under a system when the systems' texts differ). Such a copy stands in for a missing member: make_resolver takes it
+# only while no other member of the name is a candidate (ROADMAP re-parse item 11)
+RECOVERED_FOLDER = "RECOVERED-COPYBOOKS"
 # the kinds a job's expansion reads a member from: a cataloged PROC (_proc_facts), an `// INCLUDE MEMBER=` member
 # (_include_text) and a control-card member, `DSN=LIB(MEMBER)` or a sequential dataset's last qualifier (_card_text).
 # A member of one of these kinds that arrives, changes, goes or is re-typed into or out of them changes the facts of
@@ -665,9 +669,16 @@ def ensure_fk_indexes(conn: sqlite3.Connection, say=None) -> int:
 
 # Lookups the builder and the reports make in loops: an index on the exact
 # expression each one tests (UPPER(name) cannot use an index on name).
+# UPPER(TRIM(name)) is the lookup of a member whose file name ends with a
+# space before its extension (`PLAN .docx` is member `PLAN `): the gate (for
+# every cited name no document carries), `doc`, `images` and `diff` look a
+# name up again with it (LESSONS 156, 158; ROADMAP re-parse item 12). An
+# index built before an entry was added gains it on its next build; until
+# then the lookup scans, as it always did.
 QUERY_INDEXES = [
     ("io_op", "ix_q_ioop_prog_target", "program_id, target"),
     ("member", "ix_q_member_uname", "UPPER(name)"),
+    ("member", "ix_q_member_utname", "UPPER(TRIM(name))"),
     ("program", "ix_q_program_upid", "UPPER(program_id)"),
     ("program_alias", "ix_q_alias_ualias", "UPPER(alias)"),
     ("call_edge", "ix_q_call_utarget", "UPPER(target)"),
@@ -681,6 +692,24 @@ QUERY_INDEXES = [
 ]
 
 
+_INDEX_CALL = re.compile(r"^[A-Z]+\((.*)\)$")
+
+
+def index_columns(expr: str) -> Set[str]:
+    """The columns a QUERY_INDEXES expression reads: each comma-separated
+    term with its function calls taken off - `UPPER(TRIM(name))` reads
+    `name`, `program_id, target` reads both."""
+    out: Set[str] = set()
+    for term in expr.split(","):
+        term = term.strip()
+        m = _INDEX_CALL.match(term)
+        while m:
+            term = m.group(1).strip()
+            m = _INDEX_CALL.match(term)
+        out.add(term)
+    return out
+
+
 def ensure_query_indexes(conn: sqlite3.Connection, say=None) -> int:
     made = 0
     existing = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")}
@@ -688,7 +717,8 @@ def ensure_query_indexes(conn: sqlite3.Connection, say=None) -> int:
         if name in existing:
             continue
         cols = {r[1] for r in conn.execute(f"PRAGMA table_info('{table}')")}
-        needed = {c.strip().replace("UPPER(", "").rstrip(")") for c in expr.split(",")}
+        # a table without a column the expression reads (an older schema) gets no index, and no error
+        needed = index_columns(expr)
         if not cols or not needed <= cols:
             continue
         if say and made == 0 and conn.execute("SELECT COUNT(*) FROM member").fetchone()[0] > 5000:
@@ -1737,6 +1767,13 @@ def _stub_lines(ctx: Ctx, mem: Mem) -> Optional[int]:
     return cache[mem.id]
 
 
+def is_recovered(mem: Mem) -> bool:
+    """A copy atlas.recover wrote: its folder (the member's library) is
+    RECOVERED-COPYBOOKS - the test query._recovered_shadowing makes of an
+    index."""
+    return (mem.library or "").upper() == RECOVERED_FOLDER
+
+
 def make_resolver(ctx: Ctx, prog: Mem, notes: List[Tuple[str, str, int]]):
     def resolve(name: str, lib: Optional[str]):
         cands = [c for c in ctx.by_name.get(name.upper(), [])
@@ -1749,6 +1786,15 @@ def make_resolver(ctx: Ctx, prog: Mem, notes: List[Tuple[str, str, int]]):
             if stubs:
                 return None, [], expand.stub_note([(c.library, _stub_lines(ctx, c)) for c in stubs])
             return None
+        # A copy atlas.recover rebuilt from the listings stands in for a missing member: it ranks after every other
+        # candidate of the name, so the real copybook is expanded the moment it arrives - whatever the chain below
+        # would say (the same folder, first found) - and a stand-in never counts as a second library in a choice
+        # among several. Before, the chain could keep the recovered copy until atlas.recover removed it, and
+        # coverage warned meanwhile (ROADMAP re-parse item 11, LESSONS 168). Among recovered copies alone (one per
+        # system when the systems' texts differ) the chain decides as before.
+        real = [c for c in cands if not is_recovered(c)]
+        if real:
+            cands = real
         pick = cands[0]
         if len(cands) > 1:
             # The precedence chain's pick, then the program's compiler
