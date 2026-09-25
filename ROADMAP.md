@@ -218,37 +218,55 @@ shipped alone and cost one such night; these still wait for the next one:
    complete (copybook chosen among several - see notes)" on both, so a program's header does not
    change with the re-parse. tests/test_chosen_copybook.py (the build of this batch, and the earlier
    shape written by hand).
-19. **Delivered in the batch - the resolver reads `listing_copy_source` first: the listing's library
-   beats every guess.** His compiler listings end with a table naming, per copybook, the DD name and
-   the LIBRARY DATASET the compiler read it from. `atlas.recover` reads that table from every
-   program's listing into `listing_copy_source(program, copybook, ddname, dataset, listing, seen)`
-   and checks each 'ambiguous_copybook' choice against it (confirmed / contradicted / unknown -
-   `work\recover.md` names every contradicted one; LESSONS 182). Now `make_resolver` reads that
-   table once for the whole build (`load_listing_sources`: a dict keyed (program, copybook), so
-   121k members cost one lookup per COPY) and looks the pair up before its precedence chain
-   (COPY..OF > same system in declared order > authoritative > same folder > first): where the
-   listing names a dataset and the index holds a candidate in a folder tied to it (the `library`
-   table from the fetcher's `.atlas-library.json`, else the folder named after the dataset -
-   `folder_dataset`, cached per folder), that copy is expanded and the 'ambiguous_copybook' row
-   says 'the program's compiler listing names DATASET' as its how - the compiler's fact, not a
-   guess; a nested COPY is looked up by the program's name, as the listing lists it; only where no
-   listing says (none read, no table, no row, no candidate in the dataset it names) does the chain
-   decide as before. The rows are keyed by the listing's file stem, so every listing of one program
-   NAME shares the key; which of them speak for a program is one rule, one function for the build
-   and for recover's check (`build.rows_that_count`): the listings in the program's own system
-   (the member's top-level folder); when that system has none, every other listing of the name -
-   one filed under SHARED or a LISTINGS folder, one read from a `--from` folder - but only while no
-   other system holds a program of that name. GC and GC-TEST each keep their own listing's word; a
-   listing filed elsewhere for a name both hold decides for neither, and recover says UNKNOWN with
-   the next step (put the program's own listing under its system's folder, build, run recover
-   again). The table absent (recover never ran on that index) or empty changes nothing, and the
-   build never creates it. Two things follow for the re-parse night: run `python -m atlas.recover
-   --db atlas.db` BEFORE the build so the rows are stored (a `--rebuild` deletes the index and the
-   table with it - the toolkit change re-parses every member without it), and a program parsed
-   before its rows were stored keeps the chain's guess until it is parsed again: where the index
-   holds the copy the listing names, `recover` marks that program for the next build (on an index
-   this toolkit built; after a toolkit change the next build re-parses every member anyway).
-   tests/test_listing_resolver.py, tests/test_listing_systems.py (LESSONS 194).
+19. **Delivered in the batch - the resolver reads `listing_copy_source`: a current listing that names
+   a held copy with a different text decides.** His compiler listings end with a table naming, per
+   copybook, the DD name and the LIBRARY DATASET the compiler read it from. `atlas.recover` reads
+   that table from every program's listing into `listing_copy_source(program, copybook, ddname,
+   dataset, listing, seen, current, matched)` - each row dated: `current` is 1 when the listing's
+   own program lines are the member as indexed, 0 for an older compile's (`matched` in percent),
+   NULL when not dated - and checks each 'ambiguous_copybook' choice against it in five verdicts
+   (confirmed, promoted included / contradicted / named by an older listing / a library the index
+   does not hold / unknown - `work\recover.md` names each with why; LESSONS 182, 193). Now
+   `make_resolver` reads that table once for the whole build (`load_listing_sources`: a dict keyed
+   (program, copybook), so 121k members cost one lookup per COPY). The chain picks as before
+   (COPY..OF > same system in declared order > authoritative > same folder > first); then the
+   listing changes the pick only where the compiler's record and the chain's guess differ in
+   CONTENT (`current_datasets`, `listing_pick`):
+   - the row must speak for the program. The rows are keyed by the listing's file stem, so every
+     listing of one program NAME shares the key; one rule, one function for the build and for
+     recover's check (`build.rows_that_count`): the listings in the program's own system (the
+     member's top-level folder); when that system has none, every other listing of the name - one
+     filed under SHARED or a LISTINGS folder, one read from a `--from` folder - but only while no
+     other system holds a program of that name. GC and GC-TEST each keep their own listing's word;
+     a listing filed elsewhere for a name both hold decides for neither (recover dates a listing
+     against one program of the name only), and recover says UNKNOWN with the next step (put the
+     program's own listing under its system's folder, build, run recover again);
+   - the listing must be current (`current` = 1): an older compile's listing or one not yet dated
+     never decides, and a table written before recover dated listings decides nothing;
+   - the index must hold a copy in the dataset it names (the `library` table from the fetcher's
+     `.atlas-library.json`, else the folder named after the dataset - `folder_dataset`, cached per
+     folder) whose text DIFFERS from the chain's pick: that copy is expanded and the how says 'the
+     program's compiler listing names DATASET'. Where the copy it names has the same text - his
+     listings name the staging library the compile ran against, the copybook promoted unchanged -
+     the chain's pick stays (production, not the staging copy) and the how says 'confirmed by the
+     program's listing (same text as DATASET)'. Where it names the chain's own dataset, that copy
+     with 'the program's compiler listing names DATASET'. A different text beats a same text; a
+     library the index does not hold changes nothing.
+
+   A nested COPY is looked up by the program's name, as the listing lists it. recover's verdicts
+   take the same order (a current listing's findings decide over older or undated ones; then a
+   different text, a same text, a library not held; a dataset is 'same' when any held copy in it has
+   the text of the copy used), so a program the resolver parsed is never called contradicted, and
+   `recover` marks for the next build exactly the programs whose choice a CURRENT listing
+   contradicts (on an index this toolkit built; after a toolkit change the next build re-parses
+   every member anyway) - never one contradicted by a listing not yet dated, which the build would
+   not follow: the console says to run recover again with `--from` so it dates it. The table absent
+   (recover never ran on that index) or empty changes nothing, and the build never creates it. For
+   the re-parse night, his sequence: pull, `python -m atlas.recover --db atlas.db` (with `--from
+   FOLDER` for listings outside the estate), which stores and dates the rows, then the build (a
+   `--rebuild` deletes the index and the table with it - the toolkit change re-parses every member
+   without it). tests/test_listing_resolver.py, tests/test_listing_systems.py,
+   tests/test_copy_sources.py TheReparseNightOnTheStagingEstate (LESSONS 193, 194, 195).
 20. **classify.py: a procedure copybook is a copybook by its CONTENT, before the folder hint.**
    His `A-100-BEGIN SECTION.  COPY PROCBOOK.` copies a member of paragraph names and statements -
    no level numbers, no DIVISION header - which has no content signature today, so the FOLDER NAME
