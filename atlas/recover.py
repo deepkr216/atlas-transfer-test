@@ -84,12 +84,16 @@ does not hold, or holds without that member: the copy used stands), OLDER
 (the texts differ but the listing is an older compile's: not a wrong fact),
 CONTRADICTED (a listing names a held copy with different text and is current,
 or not yet dated - the wrong fact, named in the report with the library the
-listing says) or UNKNOWN. While no other system holds a program of its name,
-every listing of that name speaks for the program wherever it is filed (its
-own system, a SHARED listings folder, a --from folder), and a current one
-decides over an older one; when another system holds a program of the same
-name, only the listings in the program's own system speak for it
-(build.rows_that_count - the build's rule too). Since ROADMAP re-parse item
+listing says) or UNKNOWN. Per copybook: when another system holds a
+program of the same name (GC and GC-TEST), only the listings in the program's
+own system speak for it; while no other system holds one, a current listing
+in its own system decides every copybook it names, and for a copybook no
+current listing of its own names, every listing of that name speaks wherever
+it is filed (a SHARED listings folder, a --from folder) and a current one
+decides over an older one (build.rows_that_count - the build's rule too).
+A listing read with no copybook-source table is stored as one row with no
+copybook, its path tying it to its system, so the check can say whose
+listing had no table. Since ROADMAP re-parse item
 19 the build reads the table before its precedence chain and follows a
 CURRENT listing that names a held
 copy whose text differs from the chain's pick; a program parsed before its
@@ -999,6 +1003,9 @@ def copy_sources(lines: Sequence[str]) -> List[Tuple[str, str, str, str]]:
 
 
 # The table the rows go to: one row per (program, copybook) the listing named,
+# and one row with an empty copybook per listing read with no table (its
+# `listing` column ties it to its system: 'GC's own listing has no table' is
+# then known even when GC-TEST's listing of the same name has one),
 # replaced per program each time that program's listing is read. Its own
 # small table - no fact table changes here; build.make_resolver reads it
 # once (build.load_listing_sources) before its precedence chain (ROADMAP
@@ -1166,40 +1173,44 @@ def rows_of_system(rows: Sequence[CopySource], system: Optional[str], systems: D
                    twins: AbstractSet[Optional[str]]) -> List[CopySource]:
     """The rows a program in `system` is checked against - build.rows_that_count,
     the rule the resolver applies when it reads the rows, so what the build
-    expanded and what this tool checks it against never differ: every
-    listing of the program's name, wherever it is filed (its own system, a
-    SHARED listings folder, a --from folder: not in `systems`), while no
-    other system holds a program of that name; else only the rows of the
-    listings in the program's own system. A row counts by itself, so the
-    rule gives the same rows over all of a program's rows as over one
-    copybook's (the build's key). `twins`: the systems other than the
-    program's holding a program of that name."""
+    expanded and what this tool checks it against never differ. Per
+    copybook: when another system holds a program of that name, only the
+    rows of the listings in the program's own system; else its own system's
+    rows when one of them is current, and every listing of the program's
+    name, wherever it is filed (its own system, a SHARED listings folder, a
+    --from folder: not in `systems`), when none is. The rows are grouped by
+    copybook first, so the rule gives the same rows over all of a program's
+    rows as over one copybook's (the build's key). `twins`: the systems
+    other than the program's holding a program of that name."""
     from . import build as _build
-    return _build.rows_that_count(rows, _build.system_key(system), twins, lambda r: systems.get(r[3]))
+    return _build.rows_that_count(rows, _build.system_key(system), twins, lambda r: systems.get(r[3]), lambda r: r[4],
+                                  lambda r: r[0])
 
 
 # which listing speaks for which program (build.rows_that_count), in the report's words
-LISTING_RULE = ("While no other system holds a program of its name, every listing of that name speaks for the program, "
-                "wherever it is filed - its own system's listing folder, a SHARED listings folder, a --from folder - and "
-                "where two of them disagree the current one (its source is the program as indexed) decides. When another "
-                "system holds a program of the same name (GC and GC-TEST), only the listings in the program's own system "
-                "speak for it: each environment keeps its own listing's word, and a listing filed anywhere else cannot say "
-                "which of them it is.")
+LISTING_RULE = ("A program's own system's listings speak for it. When another system holds a program of the same name "
+                "(GC and GC-TEST), only those do: each environment keeps its own listing's word, and a listing filed anywhere "
+                "else cannot say which of them it is. While no other system holds one, the program's own current listing "
+                "decides every copybook it names, and a listing filed elsewhere never overrides it; for a copybook no current "
+                "listing of its own names (it has none, only an older compile's, or one not yet dated), every listing of the "
+                "program's name speaks, wherever it is filed - a SHARED listings folder, a --from folder - and where two of "
+                "them disagree the current one (its source is the program as indexed) decides.")
 
 
-def not_counted_why(program: str, system: Optional[str], rows: Sequence[CopySource], systems: Dict[str, Optional[str]],
-                    twins: AbstractSet[Optional[str]], copybook: str = "", has_own: bool = False) -> str:
-    """Why no row of the listings read for this copybook speaks for the
-    program, and what to do next - the UNKNOWN reason when another system
-    holds a program of that name and the rows naming the copybook are all in
-    listings outside the program's own system: a listing read in that other
-    system is that program's own, and one filed anywhere else cannot say
-    which of the two it is. `rows`: the rows naming the copybook;
-    `has_own`: the program's own system has a listing of it (with no row
-    for this copybook - an older compile's, say)."""
-    theirs = sorted({str(systems[r[3]]) for r in rows if systems.get(r[3]) and systems.get(r[3]) in twins})
+def not_counted_why(program: str, system: Optional[str], others: Sequence[CopySource], systems: Dict[str, Optional[str]],
+                    twins: AbstractSet[Optional[str]], copybook: str = "", own: Sequence[CopySource] = ()) -> str:
+    """Why no row speaks for this copybook of a program another system holds
+    a program of the same name of (a twin), and what to do next - the
+    UNKNOWN reason. Only the listings in the program's own system speak for
+    a twin: a listing read in the other system is that program's own, and
+    one filed anywhere else cannot say which of the two it is. `others`: the
+    rows read from listings outside the program's own system; `own`: the
+    rows read from its own system's listings. A row with no copybook is a
+    listing read with no copybook-source table. The next step is one that
+    changes the answer: never 'put the listing there' when it is there."""
+    theirs = sorted({str(systems[r[3]]) for r in others if systems.get(r[3]) and systems.get(r[3]) in twins})
     where = []                                                          # the listings read that belong to no twin
-    for r in rows:
+    for r in others:
         lsys = systems.get(r[3])
         if lsys and lsys in twins:
             continue
@@ -1216,44 +1227,68 @@ def not_counted_why(program: str, system: Optional[str], rows: Sequence[CopySour
     if where:
         said.append(f"the listing {' / '.join(where)} cannot say which {program} it is while {', '.join(named)} "
                     f"{'holds' if len(named) == 1 else 'hold'} one too")
-    if system and has_own:
-        return ("; ".join(said) + f": {system}'s own listing of the program has no row for {copybook} - next: put "
-                f"{system}'s current listing of {program} in a folder under estate\\{system}, run the build, then run "
-                "recover again")
-    if system:
-        return ("; ".join(said) + f": no listing of the program in {system} - next: put {system}'s own listing of "
-                f"{program} in a folder under estate\\{system}, run the build, then run recover again")
-    return ("; ".join(said) + ": the program has no system, so no listing is its own - next: move its library under a "
-            "system folder (estate\\SYSTEM\\LIBRARY) with its listing beside it, run the build, then run recover again")
+    head = "; ".join(said) + ": " if said else ""
+    if not system:
+        return head + ("the program has no system, so no listing is its own - next: move its library under a system "
+                       "folder (estate\\SYSTEM\\LIBRARY) with its listing beside it, run the build, then run recover again")
+    folder = f"a folder under estate\\{system}"
+    tabled = [r for r in own if r[0]]
+    if tabled and any(r[4] for r in tabled):
+        return head + (f"{system}'s own listing of {program} is current and its table has no row for {copybook}, so no "
+                       f"listing of this {program} names the library {copybook} came from - the copy the build chose "
+                       "stands; nothing to do")
+    if tabled and all(r[4] is False for r in tabled):
+        return head + (f"{system}'s own listing of {program} is an older compile's and its table has no row for {copybook} "
+                       f"- next: put {system}'s current listing of {program} in {folder}, run the build, then run recover "
+                       "again")
+    if tabled:
+        return head + (f"{system}'s own listing of {program} has no row for {copybook} in its table and is not yet dated "
+                       "- next: run recover again: it dates the listing, and says whether a current one has the row")
+    if own:
+        return head + (f"{system}'s own listing of {program} has no copybook-source table (an older compiler's listing "
+                       f"prints none), so it cannot say which library {copybook} came from - the copy the build chose "
+                       f"stands; next: only a listing of {program} from a compiler that prints the table can decide - if "
+                       f"there is one, put it in {folder}, run the build, then run recover again")
+    return head + (f"no listing of the program in {system} - next: put {system}'s own listing of {program} in {folder}, "
+                   "run the build, then run recover again")
 
 
-def stored_copy_sources(conn: sqlite3.Connection) -> Dict[str, List[CopySource]]:
+def stored_copy_sources(conn: sqlite3.Connection, program: Optional[str] = None) -> Dict[str, List[CopySource]]:
     """{program: [(copybook, ddname, dataset, listing, current, matched)]} as
-    stored; a program whose listing was read and had no table is there with
-    an empty list. A table written before the two dating columns reads with
-    both None (the query side never alters the table)."""
+    stored (`program`: that program's rows only). A listing read with no
+    table is a row with an empty copybook and its path, so its system is
+    known ('GC's own listing has no table' while GC-TEST's has one); a
+    marker stored before such rows carried a path (no listing) leaves the
+    program with an empty list, as then. A table written before the two
+    dating columns reads with both None (the query side never alters the
+    table)."""
     out: Dict[str, List[CopySource]] = {}
+    where, args = ("WHERE program = ? ", (program.upper(),)) if program else ("", ())
     try:
         rows = conn.execute("SELECT program, copybook, ddname, dataset, listing, current, matched FROM listing_copy_source "
-                            "ORDER BY program, rowid").fetchall()
+                            f"{where}ORDER BY program, rowid", args).fetchall()
     except sqlite3.OperationalError:
         try:
             rows = [(*r, None, None) for r in conn.execute("SELECT program, copybook, ddname, dataset, listing FROM "
-                                                           "listing_copy_source ORDER BY program, rowid").fetchall()]
+                                                           f"listing_copy_source {where}ORDER BY program, rowid", args).fetchall()]
         except sqlite3.OperationalError:
             return out
-    for program, copybook, dd, dsn, listing, current, matched in rows:
-        lst = out.setdefault(str(program).upper(), [])
+    for prog, copybook, dd, dsn, listing, current, matched in rows:
+        lst = out.setdefault(str(prog).upper(), [])
         if copybook:
             lst.append((str(copybook).upper(), str(dd or ""), str(dsn or "").upper(), str(listing or ""),
                         None if current is None else bool(current), None if matched is None else int(matched)))
+        elif listing:
+            lst.append(("", "", "", str(listing), None, None))           # a listing read with no table
     return out
 
 
 def store_copy_sources(conn: sqlite3.Connection, per_program: Dict[str, List[CopySource]]) -> None:
-    """Replace each named program's rows. A program read with no table keeps
-    one row with an empty copybook, so the next check says 'no table' rather
-    than 'no listing read'; nothing of any other program is touched."""
+    """Replace each named program's rows. A listing read with no table is
+    one row with an empty copybook and the listing's path (so the next check
+    says 'no table' rather than 'no listing read', and knows whose listing
+    it is); an empty list stores one such row with no path. Nothing of any
+    other program is touched."""
     ensure_copy_source_columns(conn)
     now = time.strftime("%Y-%m-%d %H:%M:%S")
     for program, rows in per_program.items():
@@ -1261,7 +1296,8 @@ def store_copy_sources(conn: sqlite3.Connection, per_program: Dict[str, List[Cop
         if rows:
             conn.executemany("INSERT INTO listing_copy_source(program, copybook, ddname, dataset, listing, seen, current, matched) "
                              "VALUES(?,?,?,?,?,?,?,?)",
-                             [(program, c, d, ds, lst, now, None if cur is None else int(cur), matched)
+                             [(program, c, d, ds, lst, now, None if cur is None else int(cur), matched) if c else
+                              (program, "", None, None, lst or None, now, None, None)
                               for c, d, ds, lst, cur, matched in rows])
         else:
             conn.execute("INSERT INTO listing_copy_source(program, copybook, ddname, dataset, listing, seen, current, matched) "
@@ -1331,8 +1367,9 @@ def check_choices(conn: sqlite3.Connection, sources: Optional[Dict[str, List[Cop
       real wrong fact;
     UNKNOWN - no listing read for the program, no table in it, no row for
       that copybook, no row that speaks for this program (another system
-      holds a program of that name and the rows are all in listings outside
-      its own system: not_counted_why), or the chosen member's dataset is
+      holds a program of that name, and its own system's listing is not
+      read, has no table, or has no row for the copybook: not_counted_why
+      says which, with the next step), or the chosen member's dataset is
       not known.
 
     The rows checked are the copybook's rows that speak for the program
@@ -1376,15 +1413,18 @@ def check_choices(conn: sqlite3.Connection, sources: Optional[Dict[str, List[Cop
                                 "current": None, "matched": None, "dated": "", "named": "", "marked": ""}
         if program not in srcs:
             v.update(verdict="UNKNOWN", why="no listing of the program was read")
-        elif not srcs[program]:
+        elif twins and not rows:
+            # a twin: only its own system's listings speak for it - say whose listings were read and what its own
+            # (not read, no table, no row) lacks, with a next step that changes the answer
+            own = [r for r in read if system and systems.get(r[3]) == system]
+            others = [r for r in read if not (system and systems.get(r[3]) == system)]
+            v.update(verdict="UNKNOWN", why=not_counted_why(program, system, others, systems, twins, copybook, own))
+        elif not any(r[0] for r in read):
             v.update(verdict="UNKNOWN", why="the program's listing has no copybook-source table")
         elif not naming:
-            n_read = len({r[3] for r in read})
+            n_read = len({r[3] for r in read if r[0]})                     # the listings read with a table
             v.update(verdict="UNKNOWN", why=f"the listing's table has no row for {copybook}" if n_read <= 1 else
                      f"none of the {n_read} listings read has a row for {copybook} in its table")
-        elif not rows:
-            has_own = bool(rows_of_system(read, system, systems, twins))   # a twin: the own system's rows, any copybook
-            v.update(verdict="UNKNOWN", why=not_counted_why(program, system, naming, systems, twins, copybook, has_own))
         elif not said:
             v.update(verdict="UNKNOWN", why=f"the listing's table names no library for {copybook}")
         elif used_dsn is None:
@@ -3588,8 +3628,9 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
         how = reading(lines_)
         fmt, regions, stats = extract(text, path, wanted or set(), original, system, lines=lines_, how=how)
         if how["kind"] in ("current", "older"):
-            # a listing: its copybook-source table says which library each copybook came from (no table: an empty list,
-            # stored as such, so the check says 'no table' rather than 'no listing read'); each row carries whether the
+            # a listing: its copybook-source table says which library each copybook came from (no table: one row with
+            # no copybook and the listing's path, so the check says 'no table' rather than 'no listing read' and knows
+            # whose listing it is - GC's own listing of TWF with none, GC-TEST's with one); each row carries whether the
             # listing is the compile of the program as indexed - its own program lines against the member's - so what
             # an older compile's listing names is never counted as a wrong fact (LESSONS 193)
             table = copy_sources(lines_)
@@ -3598,7 +3639,8 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
             if table and original is not None:
                 recs, _off = listing_records(lines_, how["old"] if how["kind"] == "older" else None)   # type: ignore[arg-type]
                 cur, matched = listing_is_current(recs, original)
-            copy_src.setdefault(stem.upper(), []).extend((c, d, ds, path, cur, matched) for c, d, ds, _n in table)
+            copy_src.setdefault(stem.upper(), []).extend([(c, d, ds, path, cur, matched) for c, d, ds, _n in table]
+                                                         or [("", "", "", path, None, None)])   # no table: its marker
         del lines_
         formats[fmt] += 1
         unattached += stats.get("flagged lines with no COPY before them", 0)

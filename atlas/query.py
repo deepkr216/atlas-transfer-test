@@ -1885,15 +1885,14 @@ def _listing_says(conn: sqlite3.Connection, member_id: int) -> str:
         return ""
     program = str(row[0]).upper()
     system = (str(row[1]).strip().upper() or None) if row[1] else None
-    stored = [(str(r[0]).upper(), str(r[1] or ""), str(r[2] or "").upper(), str(r[3] or "")) for r in conn.execute(
-        "SELECT copybook, ddname, dataset, listing FROM listing_copy_source WHERE program=? AND copybook<>'' ORDER BY rowid",
-        (program,))]
-    # the rows that speak for THIS program (build.rows_that_count, the resolver's rule, row by row - the same rows per
-    # copybook as the resolver read): every listing of its name while no other system holds a program of that name,
-    # else its own system's listings only; GC-TEST's listing of its own GCPGM2 says nothing for GC's
+    stored = recover.stored_copy_sources(conn, program).get(program, [])     # with each listing's `current`, when dated
+    # the rows that speak for THIS program (build.rows_that_count, the resolver's rule, per copybook - the same rows as
+    # the resolver read for each (program, copybook)): a twin in another system - its own system's listings only
+    # (GC-TEST's listing of its own GCPGM2 says nothing for GC's); else its own system's when one of them is current for
+    # that copybook, every listing of its name when none is
     twins = recover.program_systems(conn, [program]).get(program, set()) - {system}
     own = recover.rows_of_system(stored, system, recover.listing_systems(conn, {program: stored}), twins)
-    rows = sorted({(cb, dd, dsn) for cb, dd, dsn, _lst in own})
+    rows = sorted({(r[0], r[1], r[2]) for r in own if r[0]})                  # a listing read with no table names nothing
     if not rows:
         return ""
     verdicts = {v["copybook"]: v for v in recover.check_choices(conn) if v["member_id"] == member_id}

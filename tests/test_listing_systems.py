@@ -9,18 +9,23 @@ compiler listing), a listing filed under a system of its own (SHARED, a
 LISTINGS folder), a listing read from a --from folder the index does not
 hold. The build (build.current_datasets, per (program, copybook)), the check
 (recover.rows_of_system, per copybook) and `program`'s 'listing says' lines
-(recover.rows_of_system, per program) apply ONE rule, build.rows_that_count,
-row by row: while no other system holds a program of that name, every
-listing of the name speaks for the program wherever it is filed, and where
-two disagree the current one decides; when another system holds one, only
-the listings in the program's own system do. One environment's listing
-never decides for the other's copy, a listing filed elsewhere never decides
-for either of two same-named programs, a SHARED listing decides for the one
-CLAIMS program of its name - the verifier's case, where derive_systems made
-the listing SHARED and the rule of the earlier round threw it away - and an
-older compile's listing in the program's own folder hides neither a current
-one filed under SHARED nor one read from --from, for any copybook (the next
-round's cases: EveryListingOfAOneOfAKindProgram).
+(recover.rows_of_system, per program, grouped by copybook) apply ONE rule,
+build.rows_that_count, per copybook: when another system holds a program of
+that name, only the listings in the program's own system speak for it;
+while no other system holds one, a current listing in its own system
+decides every copybook it names, and for a copybook no current listing of
+its own names, every listing of the name speaks wherever it is filed and
+the current one decides. One environment's listing never decides for the
+other's copy, a listing filed elsewhere never decides for either of two
+same-named programs, a SHARED listing decides for the one CLAIMS program of
+its name - the verifier's case, where derive_systems made the listing SHARED
+and the rule of the earlier round threw it away - an older compile's
+listing in the program's own folder hides neither a current one filed under
+SHARED nor one read from --from (EveryListingOfAOneOfAKindProgram), and a
+listing filed elsewhere never overrides the program's own current listing
+(ItsOwnCurrentListingDecides). A twin's UNKNOWN reason says what its own
+listing lacks - not read, no table, no row in a current or an older
+compile's table - with a next step that changes the answer (ATwinsOwnListing).
 A current listing naming two libraries for one copybook confirms the copy
 used when it is one of them; a `library` row with an empty dataset leaves
 the folder name to decide, in the build as in recover; and a choice a
@@ -49,6 +54,7 @@ sys.path.insert(0, HERE)
 
 from atlas import build, query, recover  # noqa: E402
 from test_copy_sources import DUPREC_CLAIMS, DUPREC_POLICY, listing, listing2, older_listing, program  # noqa: E402
+from test_recover import ibm_listing  # noqa: E402
 from test_listing_resolver import build_it, expanded_from, pick_of, write_estate  # noqa: E402
 
 LISTING = "the program's compiler listing names "
@@ -197,11 +203,14 @@ class TwoEnvironmentsOneProgramName(unittest.TestCase):
         self.assertIn("_no choice contradicted by a current listing_", sec)
         self.assertIn(f"(1: {why})", sec)
         self.assertIn(recover.LISTING_RULE, sec)
-        self.assertIn("While no other system holds a program of its name, every listing of that name speaks for the program, "
-                      "wherever it is filed - its own system's listing folder, a SHARED listings folder, a --from folder - and "
-                      "where two of them disagree the current one (its source is the program as indexed) decides. When another "
-                      "system holds a program of the same name (GC and GC-TEST), only the listings in the program's own system "
-                      "speak for it", sec)
+        self.assertIn("A program's own system's listings speak for it. When another system holds a program of the same name "
+                      "(GC and GC-TEST), only those do: each environment keeps its own listing's word, and a listing filed "
+                      "anywhere else cannot say which of them it is. While no other system holds one, the program's own current "
+                      "listing decides every copybook it names, and a listing filed elsewhere never overrides it; for a "
+                      "copybook no current listing of its own names (it has none, only an older compile's, or one not yet "
+                      "dated), every listing of the program's name speaks, wherever it is filed - a SHARED listings folder, a "
+                      "--from folder - and where two of them disagree the current one (its source is the program as indexed) "
+                      "decides.", sec)
         self.assertEqual(set(statuses(self.db).values()), {"ok"})
 
     def test_6_program_shows_its_own_listing_only(self):
@@ -215,8 +224,10 @@ class TwoEnvironmentsOneProgramName(unittest.TestCase):
         self.assertEqual(query._listing_says(self.conn, member_id(self.conn, "GC", "GCPGM2")), "")
 
     def test_7_the_same_rule_in_both_readers(self):
-        rows = [("DUPREC", "SYSLIB", "PROD.GC.COPYLIB", "gc.lst"), ("DUPREC", "SYSLIB", "TEST.GC.COPYLIB", "gt.lst"),
-                ("DUPREC", "SYSLIB", "PROD.SHR.COPYLIB", "shared.lst"), ("DUPREC", "SYSLIB", "PROD.X.COPYLIB", "nowhere.lst")]
+        rows = [("DUPREC", "SYSLIB", "PROD.GC.COPYLIB", "gc.lst", True, 100),
+                ("DUPREC", "SYSLIB", "TEST.GC.COPYLIB", "gt.lst", True, 100),
+                ("DUPREC", "SYSLIB", "PROD.SHR.COPYLIB", "shared.lst", True, 100),
+                ("DUPREC", "SYSLIB", "PROD.X.COPYLIB", "nowhere.lst", True, 100)]
         systems = {"gc.lst": "GC", "gt.lst": "GC-TEST", "shared.lst": "SHARED"}   # nowhere.lst: not indexed
         loaded = [("PROD.GC.COPYLIB", "GC", True), ("TEST.GC.COPYLIB", "GC-TEST", True), ("PROD.SHR.COPYLIB", "SHARED", True),
                   ("PROD.X.COPYLIB", None, True)]                           # as load_listing_sources gives them: all current
@@ -224,20 +235,43 @@ class TwoEnvironmentsOneProgramName(unittest.TestCase):
         for system, twins, want in (
                 ("GC", {"GC-TEST"}, ["PROD.GC.COPYLIB"]),                   # a twin: its own system's listing, and only that
                 ("GC-TEST", {"GC"}, ["TEST.GC.COPYLIB"]),
-                ("GC", set(), every),                                       # no twin: every listing of the name is its own
-                ("CLAIMS", set(), every),
+                ("GC", set(), ["PROD.GC.COPYLIB"]),                         # no twin, a current listing of its own: that one
+                ("SHARED", set(), ["PROD.SHR.COPYLIB"]),
+                ("CLAIMS", set(), every),                                   # no twin, none of its own: every listing of the name
                 ("CLAIMS", {"GC"}, []),                                     # none of its own, a twin: none of them
-                ("SHARED", set(), every),
                 (None, set(), every),                                       # no system, no twin: every one
                 (None, {"GC"}, [])):                                        # no system, a twin: none is its own
             with self.subTest(system=system, twins=twins):
                 self.assertEqual([r[2] for r in recover.rows_of_system(rows, system, systems, twins)], want)
                 self.assertEqual(build.current_datasets(loaded, system, twins), want)
         self.assertEqual(build.current_datasets(loaded, "gc", {"GC-TEST"}), ["PROD.GC.COPYLIB"])   # the system in any case
-        # only a current listing's rows reach the resolver; recover checks every row that counts and dates them itself
+        # only a current listing's rows reach the resolver; recover checks every row that counts and dates them itself.
+        # An own listing that is not current (older, not dated) hides no current one filed elsewhere
         dated = [("PROD.GC.COPYLIB", "GC", False), ("TEST.GC.COPYLIB", "GC-TEST", None), ("PROD.SHR.COPYLIB", "SHARED", True)]
         self.assertEqual(build.current_datasets(dated, "GC", set()), ["PROD.SHR.COPYLIB"])
+        self.assertEqual(build.current_datasets(dated, "GC-TEST", set()), ["PROD.SHR.COPYLIB"])
         self.assertEqual(build.current_datasets(dated, "GC", {"GC-TEST"}), [])
+        # the verifier's VNHDIFF: its own current listing names a staging library the index does not hold, a current one
+        # filed under SHARED names POLICY's - its own listing's word stands, both ways round
+        both = [("STG.NOTHELD.COPYLIB", "CLAIMS", True), ("PROD.POLICY.COPYLIB", "SHARED", True)]
+        self.assertEqual(build.current_datasets(both, "CLAIMS", set()), ["STG.NOTHELD.COPYLIB"])
+        self.assertEqual(build.current_datasets(both[::-1], "CLAIMS", set()), ["STG.NOTHELD.COPYLIB"])
+        self.assertEqual(build.current_datasets([("PROD.POLICY.COPYLIB", "CLAIMS", True), ("PROD.CLAIMS.COPYLIB", "SHARED", True)],
+                                                "CLAIMS", set()), ["PROD.POLICY.COPYLIB"])
+        # per copybook: its own current listing names DUPREC only; FEEREC is named only by the one filed under SHARED
+        prog = [("DUPREC", "SYSLIB", "STG.NOTHELD.COPYLIB", "own.lst", True, 100),
+                ("DUPREC", "SYSLIB", "PROD.POLICY.COPYLIB", "shared.lst", True, 100),
+                ("FEEREC", "SYSLIB", "PROD.POLICY.COPYLIB", "shared.lst", True, 100)]
+        where = {"own.lst": "CLAIMS", "shared.lst": "SHARED"}
+        self.assertEqual([(r[0], r[2]) for r in recover.rows_of_system(prog, "CLAIMS", where, set())],
+                         [("DUPREC", "STG.NOTHELD.COPYLIB"), ("FEEREC", "PROD.POLICY.COPYLIB")])
+        for copybook in ("DUPREC", "FEEREC"):                               # the same rows per copybook as per program
+            with self.subTest(copybook=copybook):
+                one = [r for r in prog if r[0] == copybook]
+                self.assertEqual(recover.rows_of_system(one, "CLAIMS", where, set()),
+                                 [r for r in recover.rows_of_system(prog, "CLAIMS", where, set()) if r[0] == copybook])
+                self.assertEqual(build.current_datasets([(r[2], where[r[3]], r[4]) for r in one], "CLAIMS", set()),
+                                 [r[2] for r in recover.rows_of_system(one, "CLAIMS", where, set())])
 
 
 class AListingNamingTwoLibraries(unittest.TestCase):
@@ -523,9 +557,11 @@ FEEREC_POLICY = ["           05  FEE-AMT-B     PIC X(8)."]
 class EveryListingOfAOneOfAKindProgram(unittest.TestCase):
     """The verifier's next round (LESSONS 196). While no other system holds a
     program of its name, every listing of that name is the program's own,
-    wherever it is filed, and a current one decides over an older one - the
-    rule applied row by row, so the build (per copybook) and recover and
-    `program` (per program) read the same rows.
+    wherever it is filed, and a current one decides over an older one - for
+    every copybook no current listing in the program's own system names
+    (LESSONS 197: ItsOwnCurrentListingDecides); the rule is decided per
+    copybook, so the build (per copybook) and recover and `program` (per
+    program, grouped by copybook) read the same rows.
 
     - MIXPGM copies DUPREC and FEEREC. Its listing in CLAIMS's own listing
       folder is an older compile, from before COPY FEEREC was added, so it
@@ -735,11 +771,40 @@ class EveryListingOfAOneOfAKindProgram(unittest.TestCase):
         self.assertEqual([r[2] for r in recover.rows_of_system(rows, "CLAIMS", where, {"POLICY"}) if r[0] == "FEEREC"], [])
 
     def test_6_a_twins_own_listing_without_the_copybooks_row(self):
-        why = recover.not_counted_why("TWINFEE", "GC", [("FEEREC", "SYSLIB", "TEST.GC.COPYLIB", "gt.lst", True, 100)],
-                                      {"gt.lst": "GC-TEST", "gc.lst": "GC"}, {"GC-TEST"}, "FEEREC", True)
-        self.assertEqual(why, "the listing read is GC-TEST's, and GC-TEST holds a TWINFEE of its own: GC's own listing of the "
-                              r"program has no row for FEEREC - next: put GC's current listing of TWINFEE in a folder under "
-                              r"estate\GC, run the build, then run recover again")
+        # not_counted_why: what GC's own listing lacks decides the next step - never 'put the listing there' when it is
+        # there (the verifier's E2: a current own listing, asked for again)
+        theirs = [("FEEREC", "SYSLIB", "TEST.GC.COPYLIB", "gt.lst", True, 100)]
+        where = {"gt.lst": "GC-TEST", "gc.lst": "GC"}
+        head = "the listing read is GC-TEST's, and GC-TEST holds a TWINFEE of its own: "
+
+        def why(own):
+            return recover.not_counted_why("TWINFEE", "GC", theirs, where, {"GC-TEST"}, "FEEREC", own)
+
+        self.assertEqual(why([("RATEREC", "SYSLIB", "PROD.GC.COPYLIB", "gc.lst", True, 100)]),
+                         head + "GC's own listing of TWINFEE is current and its table has no row for FEEREC, so no listing "
+                                "of this TWINFEE names the library FEEREC came from - the copy the build chose stands; "
+                                "nothing to do")
+        self.assertEqual(why([("RATEREC", "SYSLIB", "PROD.GC.COPYLIB", "gc.lst", False, 90)]),
+                         head + "GC's own listing of TWINFEE is an older compile's and its table has no row for FEEREC - "
+                                r"next: put GC's current listing of TWINFEE in a folder under estate\GC, run the build, then "
+                                "run recover again")
+        self.assertEqual(why([("RATEREC", "SYSLIB", "PROD.GC.COPYLIB", "gc.lst", None, None)]),
+                         head + "GC's own listing of TWINFEE has no row for FEEREC in its table and is not yet dated - next: "
+                                "run recover again: it dates the listing, and says whether a current one has the row")
+        self.assertEqual(why([("", "", "", "gc.lst", None, None)]),
+                         head + "GC's own listing of TWINFEE has no copybook-source table (an older compiler's listing prints "
+                                "none), so it cannot say which library FEEREC came from - the copy the build chose stands; "
+                                "next: only a listing of TWINFEE from a compiler that prints the table can decide - if there "
+                                r"is one, put it in a folder under estate\GC, run the build, then run recover again")
+        self.assertEqual(why([]), head + r"no listing of the program in GC - next: put GC's own listing of TWINFEE in a folder "
+                                         r"under estate\GC, run the build, then run recover again")
+        # one current own listing is enough: an older one beside it does not make the step 'put the current one there'
+        self.assertIn("is current and its table has no row for FEEREC",
+                      why([("RATEREC", "SYSLIB", "PROD.GC.COPYLIB", "gc.lst", True, 100),
+                           ("RATEREC", "SYSLIB", "PROD.GC.COPYLIB", "gc2.lst", False, 80)]))
+        # nothing else read: the reason starts with what its own listing lacks
+        self.assertTrue(recover.not_counted_why("TWINFEE", "GC", [], where, {"GC-TEST"}, "FEEREC", [])
+                        .startswith("no listing of the program in GC - next:"))
 
 
 class ContradictedChoicesMarkedForTheNextBuild(unittest.TestCase):
@@ -997,6 +1062,331 @@ class ContradictedChoicesMarkedForTheNextBuild(unittest.TestCase):
         self.assertIn("| ambiguous_copybook | 2 | two copies of one copybook with different content; one was chosen | declare the "
                       "department's copybook order (manifest `copylib_order`) or remove the stale copy |", kinds)
         self.assertNotIn("| expand (copybook chosen among several", kinds)     # no COPY warning repeats the choice (item 18)
+
+
+class ItsOwnCurrentListingDecides(unittest.TestCase):
+    """The verifier's next round (LESSONS 197): the per-row rule of row 196
+    let a listing filed outside the program's system override the program's
+    own CURRENT listing. The rule, per copybook: a current listing in the
+    program's own system decides every copybook it names; a listing filed
+    elsewhere counts only for a copybook no current listing of its own names.
+
+    - VNHDIFF (CLAIMS, no twin): its own current listing names
+      STG.NOTHELD.COPYLIB, a staging library the index does not hold - the
+      owner's usual case; a second current listing under SHARED names
+      PROD.POLICY.COPYLIB, held with a different text. It read CONTRADICTED,
+      was marked, and the next build expanded POLICY's copy; now NOT HELD,
+      and CLAIMS's copy stays, parsed again or not. VFROMNH: the same with
+      the other listing in a --from folder.
+    - VREVERSE: its own current listing names POLICY's copy, the one under
+      SHARED names CLAIMS's. It read CONFIRMED against its own listing; now
+      CONTRADICTED, marked, and the next build expands POLICY's copy.
+    - VSPLIT: its own current listing names DUPREC only (-> the staging
+      library); the one under SHARED names DUPREC and FEEREC -> POLICY's.
+      DUPREC is its own listing's word (NOT HELD), FEEREC the SHARED one's
+      (contradicted, then POLICY's FEEREC) - in the build, in recover and in
+      `program` alike.
+    - VOWNSHO: its own current listing names CLAIMS's copy, an older one
+      under SHARED names POLICY's: CONFIRMED, nothing marked."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.td = tempfile.mkdtemp()
+        cls.root = os.path.join(cls.td, "estate")
+        cls.from_dir = os.path.join(cls.td, "listings-pulled")
+        texts = {"DUPREC": DUPREC_CLAIMS, "FEEREC": FEEREC_POLICY}
+        one = lambda dsn: [("DUPREC", "SYSLIB", dsn)]                       # noqa: E731
+        own, shared = "CLAIMS/PROD.CLAIMS.LISTING", "SHARED/PROD.LISTINGS"
+        write_estate(cls.root, {
+            "CLAIMS/PROD.CLAIMS.SRC/VNHDIFF.cbl": program("VNHDIFF", "DUPREC"),
+            "CLAIMS/PROD.CLAIMS.SRC/VFROMNH.cbl": program("VFROMNH", "DUPREC"),
+            "CLAIMS/PROD.CLAIMS.SRC/VREVERSE.cbl": program("VREVERSE", "DUPREC"),
+            "CLAIMS/PROD.CLAIMS.SRC/VSPLIT.cbl": program("VSPLIT", "DUPREC", "FEEREC"),
+            "CLAIMS/PROD.CLAIMS.SRC/VOWNSHO.cbl": program("VOWNSHO", "DUPREC"),
+            "CLAIMS/PROD.CLAIMS.COPYLIB/DUPREC.cpy": DUPREC_CLAIMS[0] + "\n",
+            "POLICY/PROD.POLICY.COPYLIB/DUPREC.cpy": DUPREC_POLICY[0] + "\n",
+            "CLAIMS/PROD.CLAIMS.COPYLIB/FEEREC.cpy": FEEREC_CLAIMS[0] + "\n",
+            "POLICY/PROD.POLICY.COPYLIB/FEEREC.cpy": FEEREC_POLICY[0] + "\n",
+            f"{own}/VNHDIFF.lst": listing("VNHDIFF", ["DUPREC"], one("STG.NOTHELD.COPYLIB")),
+            f"{shared}/VNHDIFF.lst": listing("VNHDIFF", ["DUPREC"], one("PROD.POLICY.COPYLIB")),
+            f"{own}/VFROMNH.lst": listing("VFROMNH", ["DUPREC"], one("STG.NOTHELD.COPYLIB")),
+            f"{own}/VREVERSE.lst": listing("VREVERSE", ["DUPREC"], one("PROD.POLICY.COPYLIB")),
+            f"{shared}/VREVERSE.lst": listing("VREVERSE", ["DUPREC"], one("PROD.CLAIMS.COPYLIB")),
+            f"{own}/VSPLIT.lst": listing2("VSPLIT", ["DUPREC", "FEEREC"], texts, one("STG.NOTHELD.COPYLIB")),
+            f"{shared}/VSPLIT.lst": listing2("VSPLIT", ["DUPREC", "FEEREC"], texts,
+                                             [("DUPREC", "SYSLIB", "PROD.POLICY.COPYLIB"),
+                                              ("FEEREC", "SYSLIB", "PROD.POLICY.COPYLIB")]),
+            f"{own}/VOWNSHO.lst": listing("VOWNSHO", ["DUPREC"], one("PROD.CLAIMS.COPYLIB")),
+            f"{shared}/VOWNSHO.lst": older_listing("VOWNSHO", ["DUPREC"], one("PROD.POLICY.COPYLIB")),
+        })
+        write_estate(cls.from_dir, {"VFROMNH.lst": listing("VFROMNH", ["DUPREC"], one("PROD.POLICY.COPYLIB"))})
+        cls.claims = os.path.join(cls.root, "CLAIMS", "PROD.CLAIMS.COPYLIB", "DUPREC.cpy")
+        cls.policy = os.path.join(cls.root, "POLICY", "PROD.POLICY.COPYLIB", "DUPREC.cpy")
+        cls.fee_claims = os.path.join(cls.root, "CLAIMS", "PROD.CLAIMS.COPYLIB", "FEEREC.cpy")
+        cls.fee_policy = os.path.join(cls.root, "POLICY", "PROD.POLICY.COPYLIB", "FEEREC.cpy")
+        cls.db = os.path.join(cls.td, "t.db")
+        cls.report = os.path.join(cls.td, "work", "recover.md")
+        build_it(cls.root, cls.db, rebuild=True)
+        cls.first_said = []
+        cls.first_stats = recover.run(cls.db, [cls.from_dir], log=cls.first_said.append, report=cls.report)
+        cls.after_first = statuses(cls.db)
+        with open(cls.report, encoding="utf-8") as fh:
+            cls.first_report = fh.read()
+        conn = query.connect(cls.db)
+        try:
+            cls.first_checks = recover.check_choices(conn)
+        finally:
+            conn.close()
+        recover._mark_programs(cls.db, ["DUPREC"])                       # the re-parse night: every program, the rows in place
+        build_it(cls.root, cls.db)
+        cls.said = []
+        cls.stats = recover.run(cls.db, [cls.from_dir], log=cls.said.append, report=cls.report)
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.td, ignore_errors=True)
+
+    def setUp(self):
+        self.conn = query.connect(self.db)
+
+    def tearDown(self):
+        self.conn.close()
+
+    def copy_of(self, name, copybook):
+        mid = member_id(self.conn, "CLAIMS", name)
+        note = next(d for (d,) in self.conn.execute("SELECT detail FROM unresolved WHERE member_id=? AND "
+                                                    "kind='ambiguous_copybook'", (mid,)) if f" of {copybook} " in d)
+        row = self.conn.execute("SELECT r.path FROM copy_use u JOIN member r ON r.id = u.resolved_member_id "
+                                "WHERE u.member_id=? AND UPPER(u.copybook)=?", (mid, copybook)).fetchone()
+        return note, row[0]
+
+    def test_1_recover_takes_its_own_current_listings_word(self):
+        text = "\n".join(self.first_said)
+        self.assertEqual((self.first_stats["checked"], self.first_stats["marked"]), ((1, 2, 0, 3, 0), 2), text)
+        self.assertIn("  2 programs whose current listing names a held copy with different text are marked for the next build - "
+                      "it follows the listing", text)
+        self.assertEqual(self.after_first, {("CLAIMS", "VNHDIFF"): "ok", ("CLAIMS", "VFROMNH"): "ok",
+                                            ("CLAIMS", "VREVERSE"): "pending", ("CLAIMS", "VSPLIT"): "pending",
+                                            ("CLAIMS", "VOWNSHO"): "ok"})
+        by = {(v["program"], v["copybook"]): v for v in self.first_checks}
+        for name in ("VNHDIFF", "VFROMNH"):                               # it read CONTRADICTED and was marked
+            with self.subTest(program=name):
+                v = by[(name, "DUPREC")]
+                self.assertEqual((v["verdict"], v["named"], v["listing_datasets"], v["marked"]),
+                                 ("NOT HELD", "STG.NOTHELD.COPYLIB", ["STG.NOTHELD.COPYLIB"], ""))
+                self.assertEqual(v["why"], recover.NOT_HELD_WHY)
+        v = by[("VREVERSE", "DUPREC")]                                    # it read CONFIRMED against its own listing
+        self.assertEqual((v["verdict"], v["named"], v["current"], v["listing_datasets"]),
+                         ("CONTRADICTED", "PROD.POLICY.COPYLIB", True, ["PROD.POLICY.COPYLIB"]))
+        self.assertEqual((by[("VSPLIT", "DUPREC")]["verdict"], by[("VSPLIT", "DUPREC")]["named"]),
+                         ("NOT HELD", "STG.NOTHELD.COPYLIB"))
+        self.assertEqual((by[("VSPLIT", "FEEREC")]["verdict"], by[("VSPLIT", "FEEREC")]["named"]),
+                         ("CONTRADICTED", "PROD.POLICY.COPYLIB"))
+        self.assertEqual((by[("VOWNSHO", "DUPREC")]["verdict"], by[("VOWNSHO", "DUPREC")]["listing_datasets"]),
+                         ("CONFIRMED", ["PROD.CLAIMS.COPYLIB"]))
+        self.assertIn("| VNHDIFF | DUPREC | PROD.CLAIMS.COPYLIB (CLAIMS/PROD.CLAIMS.COPYLIB/DUPREC.cpy; same system) | "
+                      "STG.NOTHELD.COPYLIB (SYSLIB) - not a library the index holds | yes | NOT HELD | "
+                      f"{recover.NOT_HELD_WHY} |", self.first_report)
+        self.assertNotIn("| VNHDIFF | DUPREC | PROD.CLAIMS.COPYLIB (CLAIMS/PROD.CLAIMS.COPYLIB/DUPREC.cpy; same system) | "
+                         "PROD.POLICY.COPYLIB", self.first_report)
+
+    def test_2_the_build_reads_the_same_rows(self):
+        rows = build.load_listing_sources(self.conn)
+        self.assertEqual(rows[("VNHDIFF", "DUPREC")], (("STG.NOTHELD.COPYLIB", "CLAIMS", True),
+                                                      ("PROD.POLICY.COPYLIB", "SHARED", True)))
+        self.assertEqual(build.current_datasets(rows[("VNHDIFF", "DUPREC")], "CLAIMS", set()), ["STG.NOTHELD.COPYLIB"])
+        self.assertEqual(build.current_datasets(rows[("VFROMNH", "DUPREC")], "CLAIMS", set()), ["STG.NOTHELD.COPYLIB"])
+        self.assertEqual(build.current_datasets(rows[("VREVERSE", "DUPREC")], "CLAIMS", set()), ["PROD.POLICY.COPYLIB"])
+        self.assertEqual(build.current_datasets(rows[("VSPLIT", "DUPREC")], "CLAIMS", set()), ["STG.NOTHELD.COPYLIB"])
+        self.assertEqual(build.current_datasets(rows[("VSPLIT", "FEEREC")], "CLAIMS", set()), ["PROD.POLICY.COPYLIB"])
+        # every key of the index: what the build reads per (program, copybook) is what recover reads per program
+        stored = recover.stored_copy_sources(self.conn)
+        systems = recover.listing_systems(self.conn, stored)
+        for (program_, copybook), rows_ in rows.items():
+            with self.subTest(program=program_, copybook=copybook):
+                per_program = recover.rows_of_system(stored[program_], "CLAIMS", systems, set())
+                self.assertEqual(build.current_datasets(rows_, "CLAIMS", set()),
+                                 list(dict.fromkeys(r[2] for r in per_program if r[0] == copybook and r[4])))
+
+    def test_3_parsed_again_its_own_listing_decides(self):
+        for name in ("VNHDIFF", "VFROMNH"):                               # it expanded POLICY's copy
+            with self.subTest(program=name):
+                note, used = self.copy_of(name, "DUPREC")
+                self.assertEqual(used, self.claims)
+                self.assertEqual(note, f"2 copies of DUPREC with different content; used {self.claims} (same system)")
+                self.assertEqual(expanded_from(self.conn, name), {self.claims})
+        note, used = self.copy_of("VREVERSE", "DUPREC")
+        self.assertEqual(used, self.policy)
+        self.assertEqual(note, f"2 copies of DUPREC with different content; used {self.policy} ({LISTING}PROD.POLICY.COPYLIB)")
+        note, used = self.copy_of("VSPLIT", "DUPREC")
+        self.assertEqual((used, note.endswith("(same system)")), (self.claims, True))
+        note, used = self.copy_of("VSPLIT", "FEEREC")
+        self.assertEqual(used, self.fee_policy)
+        self.assertTrue(note.endswith(f"({LISTING}PROD.POLICY.COPYLIB)"), note)
+        note, used = self.copy_of("VOWNSHO", "DUPREC")
+        self.assertEqual(used, self.claims)
+        self.assertTrue(note.endswith(f"({LISTING}PROD.CLAIMS.COPYLIB)"), note)
+
+    def test_4_recover_agrees_and_marks_nothing(self):
+        text = "\n".join(self.said)
+        self.assertEqual((self.stats["checked"], self.stats["marked"]), ((3, 0, 0, 3, 0), 0), text)
+        self.assertNotIn("marked for the next build", text)
+        self.assertEqual(set(statuses(self.db).values()), {"ok"})
+        by = {(v["program"], v["copybook"]): v["verdict"] for v in recover.check_choices(self.conn)}
+        self.assertEqual(by, {("VNHDIFF", "DUPREC"): "NOT HELD", ("VFROMNH", "DUPREC"): "NOT HELD",
+                              ("VREVERSE", "DUPREC"): "CONFIRMED", ("VSPLIT", "DUPREC"): "NOT HELD",
+                              ("VSPLIT", "FEEREC"): "CONFIRMED", ("VOWNSHO", "DUPREC"): "CONFIRMED"})
+        self.assertIn("3 of these choices are confirmed by the program's listing, 0 contradicted by a current listing (see "
+                      "work/recover.md), 0 named by an older listing, 3 name a library the index does not hold, 0 unknown",
+                      query.cmd_coverage(self.conn))
+
+    def test_5_program_shows_the_rows_that_speak_for_it(self):
+        out = query.cmd_program(self.conn, "VNHDIFF").split("### Listing says")[1]
+        self.assertIn("- listing says: DUPREC came from STG.NOTHELD.COPYLIB (SYSLIB) - names STG.NOTHELD.COPYLIB, a library "
+                      "the index does not hold - the copy the build used stands\n", out)
+        self.assertNotIn("PROD.POLICY.COPYLIB", out)
+        out = query.cmd_program(self.conn, "VREVERSE").split("### Listing says")[1]
+        self.assertIn("- listing says: DUPREC came from PROD.POLICY.COPYLIB (SYSLIB) - confirms the copy the build used\n", out)
+        self.assertNotIn("PROD.CLAIMS.COPYLIB", out)
+        out = query.cmd_program(self.conn, "VSPLIT").split("### Listing says")[1]
+        self.assertIn("- listing says: DUPREC came from STG.NOTHELD.COPYLIB (SYSLIB) - names STG.NOTHELD.COPYLIB", out)
+        self.assertIn("- listing says: FEEREC came from PROD.POLICY.COPYLIB (SYSLIB) - confirms the copy the build used\n", out)
+        self.assertNotIn("DUPREC came from PROD.POLICY.COPYLIB", out)
+
+
+class ATwinsOwnListing(unittest.TestCase):
+    """The verifier's next round (LESSONS 197), a twin's UNKNOWN reason.
+    GC and GC-TEST each hold TWF, TWC and TWO.
+
+    - TWF: GC's own listing has no copybook-source table (an older
+      compiler's), GC-TEST's has one. The rows were gathered per program
+      stem and the 'no table' marker was written only when no listing of
+      the name had a table, so nothing showed GC's listing was read: the
+      reason said 'no listing of the program in GC - next: put GC's own
+      listing of TWF in a folder under estate\\GC', where it already was.
+      Now each listing read with no table is a row with no copybook and its
+      path: 'GC's own listing of TWF has no copybook-source table'.
+    - TWC: GC's own CURRENT listing names DUPREC only; one under SHARED names
+      FEEREC -> GC-TEST's library. The reason asked for 'GC's current
+      listing of TWC', which is there; now it says the current listing's
+      table has no row for FEEREC and the chain's pick stands.
+    - TWO: the same with GC's own listing an older compile's: then the next
+      step is GC's current listing."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.td = tempfile.mkdtemp()
+        cls.root = os.path.join(cls.td, "estate")
+        texts = {"DUPREC": DUPREC_CLAIMS, "FEEREC": FEEREC_CLAIMS}
+        files = {
+            "GC/PROD.GC.COPYLIB/DUPREC.cpy": DUPREC_CLAIMS[0] + "\n",
+            "GC-TEST/TEST.GC.COPYLIB/DUPREC.cpy": DUPREC_POLICY[0] + "\n",
+            "GC/PROD.GC.COPYLIB/FEEREC.cpy": FEEREC_CLAIMS[0] + "\n",
+            "GC-TEST/TEST.GC.COPYLIB/FEEREC.cpy": FEEREC_POLICY[0] + "\n",
+            "GC/PROD.GC.LISTING/TWF.lst": listing("TWF", ["DUPREC"], None),
+            "GC-TEST/TEST.GC.LISTING/TWF.lst": listing("TWF", ["DUPREC"], [("DUPREC", "SYSLIB", "TEST.GC.COPYLIB")]),
+            "GC/PROD.GC.LISTING/TWC.lst": listing2("TWC", ["DUPREC", "FEEREC"], texts, [("DUPREC", "SYSLIB", "PROD.GC.COPYLIB")]),
+            "SHARED/PROD.LISTINGS/TWC.lst": listing2("TWC", ["DUPREC", "FEEREC"], texts,
+                                                     [("DUPREC", "SYSLIB", "PROD.GC.COPYLIB"),
+                                                      ("FEEREC", "SYSLIB", "TEST.GC.COPYLIB")]),
+            "GC/PROD.GC.LISTING/TWO.lst": ibm_listing(program("TWO", "DUPREC", "FEEREC").replace("PIC X(5).", "PIC X(6).", 1)
+                                                      .splitlines(), texts, copy_table=[("DUPREC", "SYSLIB", "PROD.GC.COPYLIB")]),
+            "SHARED/PROD.LISTINGS/TWO.lst": listing2("TWO", ["DUPREC", "FEEREC"], texts,
+                                                     [("FEEREC", "SYSLIB", "TEST.GC.COPYLIB")]),
+        }
+        for name, copybooks in (("TWF", ("DUPREC",)), ("TWC", ("DUPREC", "FEEREC")), ("TWO", ("DUPREC", "FEEREC"))):
+            files[f"GC/PROD.GC.SRC/{name}.cbl"] = program(name, *copybooks)
+            files[f"GC-TEST/TEST.GC.SRC/{name}.cbl"] = program(name, *copybooks)
+        write_estate(cls.root, files)
+        cls.gc_twf = os.path.join(cls.root, "GC", "PROD.GC.LISTING", "TWF.lst")
+        cls.db = os.path.join(cls.td, "t.db")
+        cls.report = os.path.join(cls.td, "work", "recover.md")
+        build_it(cls.root, cls.db, rebuild=True)
+        cls.dry_said = []
+        cls.dry_stats = recover.run(cls.db, dry_run=True, log=cls.dry_said.append, report=cls.report)
+        with open(cls.report, encoding="utf-8") as fh:
+            cls.dry_report = fh.read()
+        conn = query.connect(cls.db)
+        try:
+            cls.before_stored = recover.has_copy_sources(conn)
+        finally:
+            conn.close()
+        cls.said = []
+        cls.stats = recover.run(cls.db, log=cls.said.append, report=cls.report)
+        with open(cls.report, encoding="utf-8") as fh:
+            cls.section = fh.read().split("## Copybook choices, checked against the listings")[1]
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.td, ignore_errors=True)
+
+    def setUp(self):
+        self.conn = query.connect(self.db)
+
+    def tearDown(self):
+        self.conn.close()
+
+    TWF_WHY = ("the listing read is GC-TEST's, and GC-TEST holds a TWF of its own: GC's own listing of TWF has no "
+               "copybook-source table (an older compiler's listing prints none), so it cannot say which library DUPREC "
+               "came from - the copy the build chose stands; next: only a listing of TWF from a compiler that prints the "
+               r"table can decide - if there is one, put it in a folder under estate\GC, run the build, then run recover "
+               "again")
+    TWC_WHY = ("the listing filed under SHARED cannot say which TWC it is while GC-TEST holds one too: GC's own listing of "
+               "TWC is current and its table has no row for FEEREC, so no listing of this TWC names the library FEEREC came "
+               "from - the copy the build chose stands; nothing to do")
+    TWO_WHY = ("the listing filed under SHARED cannot say which TWO it is while GC-TEST holds one too: GC's own listing of "
+               "TWO is an older compile's and its table has no row for FEEREC - next: put GC's current listing of TWO in a "
+               r"folder under estate\GC, run the build, then run recover again")
+
+    def test_1_a_listing_read_with_no_table_is_stored_with_its_path(self):
+        rows = [tuple(r) for r in self.conn.execute("SELECT copybook, dataset, listing FROM listing_copy_source "
+                                                    "WHERE program='TWF' ORDER BY listing")]
+        self.assertEqual(sorted(rows, key=lambda r: r[0]),
+                         [("", None, self.gc_twf),
+                          ("DUPREC", "TEST.GC.COPYLIB", os.path.join(self.root, "GC-TEST", "TEST.GC.LISTING", "TWF.lst"))])
+        stored = recover.stored_copy_sources(self.conn, "twf")
+        self.assertEqual(sorted(stored), ["TWF"])
+        self.assertIn(("", "", "", self.gc_twf, None, None), stored["TWF"])
+        self.assertEqual(recover.listing_systems(self.conn, stored)[self.gc_twf], "GC")
+        self.assertNotIn(("TWF", ""), build.load_listing_sources(self.conn))       # the build reads no marker
+
+    def test_2_the_twins_reasons_say_what_its_own_listing_lacks(self):
+        by = {(v["system"], v["program"], v["copybook"]): v for v in recover.check_choices(self.conn)}
+        self.assertEqual((by[("GC", "TWF", "DUPREC")]["verdict"], by[("GC", "TWF", "DUPREC")]["why"]), ("UNKNOWN", self.TWF_WHY))
+        self.assertEqual(by[("GC-TEST", "TWF", "DUPREC")]["verdict"], "CONFIRMED")
+        self.assertEqual((by[("GC", "TWC", "FEEREC")]["verdict"], by[("GC", "TWC", "FEEREC")]["why"]), ("UNKNOWN", self.TWC_WHY))
+        self.assertEqual(by[("GC", "TWC", "DUPREC")]["verdict"], "CONFIRMED")
+        self.assertEqual((by[("GC", "TWO", "FEEREC")]["verdict"], by[("GC", "TWO", "FEEREC")]["why"]), ("UNKNOWN", self.TWO_WHY))
+        self.assertEqual((by[("GC", "TWO", "DUPREC")]["verdict"], by[("GC", "TWO", "DUPREC")]["current"]), ("CONFIRMED", False))
+        self.assertEqual(by[("GC-TEST", "TWC", "FEEREC")]["why"],
+                         "the listing read is GC's, and GC holds a TWC of its own; the listing filed under SHARED cannot say "
+                         "which TWC it is while GC holds one too: no listing of the program in GC-TEST - next: put GC-TEST's "
+                         r"own listing of TWC in a folder under estate\GC-TEST, run the build, then run recover again")
+        self.assertEqual((self.stats["checked"], self.stats["marked"]), ((3, 0, 0, 0, 7), 0), "\n".join(self.said))
+        self.assertIn(self.TWF_WHY, self.section)
+        self.assertIn(self.TWC_WHY, self.section)
+        self.assertEqual(set(statuses(self.db).values()), {"ok"})
+
+    def test_3_a_dry_run_gives_the_same_reasons_from_the_rows_it_read(self):
+        self.assertFalse(self.before_stored)                               # nothing stored on the dry run
+        self.assertEqual(self.dry_stats["checked"], self.stats["checked"], "\n".join(self.dry_said))
+        self.assertIn(self.TWF_WHY, self.dry_report)
+        self.assertIn(self.TWC_WHY, self.dry_report)
+        self.assertNotIn(r"no listing of the program in GC - next: put GC's own listing of TWF", self.dry_report)
+
+    def test_4_markers_written_before_they_carried_a_path_still_read_as_no_table(self):
+        conn = sqlite3.connect(":memory:")
+        try:
+            recover.store_copy_sources(conn, {"OLDMARK": [], "NEWMARK": [("", "", "", "x.lst", None, None)]})
+            conn.execute("INSERT INTO listing_copy_source(program, copybook, ddname, dataset, listing, seen) "
+                         "VALUES('PRE', '', NULL, NULL, NULL, '2026-09-01 08:00:00')")    # an older toolkit's marker
+            self.assertEqual([tuple(r) for r in conn.execute("SELECT program, copybook, dataset, listing FROM "
+                                                             "listing_copy_source ORDER BY program")],
+                             [("NEWMARK", "", None, "x.lst"), ("OLDMARK", "", None, None), ("PRE", "", None, None)])
+            self.assertEqual(recover.stored_copy_sources(conn),
+                             {"NEWMARK": [("", "", "", "x.lst", None, None)], "OLDMARK": [], "PRE": []})
+        finally:
+            conn.close()
 
 
 if __name__ == "__main__":
