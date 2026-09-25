@@ -291,5 +291,30 @@ class AnIndexBuiltBeforeTheBatch(_Estate):
         self.check_program_pack_and_flow()
 
 
+class TheMarkedSentence(unittest.TestCase):
+    """coverage's closing note says which word the index uses for the members
+    complete with a chosen copybook: `ok` (the build of the batch), `partial`
+    (an index built before item 18), or both - a re-parse interrupted and
+    resumed holds members of both shapes in one index until it ends."""
+
+    def test_ok_only(self):
+        self.assertEqual(query._chosen_marked(0, 3), "They are marked `ok`: the build records the choice once, as the "
+                                                     "'ambiguous_copybook' row (ROADMAP re-parse item 18).")
+
+    def test_partial_only(self):
+        self.assertEqual(query._chosen_marked(2, 0), "The index marks them `partial` only because the build that made it "
+                                                     "repeated the resolver's choice as a COPY warning - an index built "
+                                                     "before ROADMAP re-parse item 18; the next full re-parse marks them `ok`.")
+
+    def test_both_shapes_in_one_index(self):
+        self.assertEqual(query._chosen_marked(2, 1), "1 of them is marked `ok` (the build records the choice once, as the "
+                                                     "'ambiguous_copybook' row - ROADMAP re-parse item 18); the other 2 are "
+                                                     "marked `partial` only because the build that parsed them repeated the "
+                                                     "resolver's choice as a COPY warning (parsed before the item); the next "
+                                                     "full re-parse marks them `ok`.")
+        self.assertTrue(query._chosen_marked(1, 2).startswith("2 of them are marked `ok`"), query._chosen_marked(1, 2))
+        self.assertIn("the other 1 is marked `partial`", query._chosen_marked(1, 2))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
