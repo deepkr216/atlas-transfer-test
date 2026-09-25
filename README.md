@@ -662,8 +662,9 @@ also keeps a program whose copybook was **chosen among several** same-named
 ones with different content (the build picks by system and declared library
 order, and the `ambiguous_copybook` row names the copy used) in its own row,
 "Complete, with a copybook chosen among several", apart from the members
-parsed only in part - the index still marks it `partial` until the next
-re-parse, but every COPY expanded and `program` says so. The fetch
+parsed only in part - every COPY expanded, the program is `ok` (an index
+built before the re-parse batch still marks it `partial`, and `coverage`
+says so), and `program` says so. The fetch
 reconciles each PDS folder with the host's member list (`zowe zos-files
 list all-members`): a download that stopped part-way is reported
 `INCOMPLETE n/m`, the listed-but-missing members are named, local members

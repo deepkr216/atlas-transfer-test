@@ -202,15 +202,22 @@ shipped alone and cost one such night; these still wait for the next one:
    echo, and the statement is gathered from the COPY keyword, so the prefix's period no longer cuts
    off a REPLACING continued on the next line. The OS/VS `01 X COPY Y.` rename (item 16) is decided
    first and is unchanged; a COPY that starts its line is unchanged (LESSONS 178).
-18. **An ambiguous-copybook pick is not a partial parse**: build.py must not turn the resolver's
-   note ("N copies of X with different content; used PATH (how)") into an 'expand' note (keep the
-   'ambiguous_copybook' row), so parse_status stays ok. Today `make_resolver` returns the note,
-   expand.py repeats it as a COPY warning, `index_cobol` stores every expander warning as
-   `("expand", w)` and sets `partial` when any exists - so a program that expanded completely with
-   a chosen copy counts as "parsed only in part", the same as one whose copybook is missing (his 701
-   "partial" COBOL programs with ~60 copybooks missing). Until the re-parse, query.py tells the two
-   apart (`partial_kind` / `is_truly_partial`: every 'expand' note is the resolver's wording) and
-   `coverage` prints them as "Complete, with a copybook chosen among several" (LESSONS 181).
+18. **Delivered in the batch - an ambiguous-copybook pick is not a partial parse.** `make_resolver`
+   records the choice once, as the 'ambiguous_copybook' row ("N copies of X with different content;
+   used PATH (how)"), and hands the expander no note, so no 'expand' note repeats it and the
+   program's parse_status is `ok`; a copybook NOT FOUND, a COPY skipped (recursive, nested too deep)
+   and an unrecognised map still make a member `partial`. Before, the resolver returned the note,
+   expand.py repeated it as a COPY warning, and `index_cobol` stored every expander warning as
+   `("expand", w)` and set `partial` when any existed - so a program that expanded completely with
+   a chosen copy counted as "parsed only in part", the same as one whose copybook is missing (his
+   701 "partial" COBOL programs with ~60 copybooks missing; LESSONS 181). The query side keeps both
+   shapes apart: on an index built before the batch `partial_kind` / `is_truly_partial` read the
+   resolver's wording in the 'expand' notes, on one built by it the program is `ok` with the row
+   alone (`chose_a_copybook`); `coverage` lists such members under "Complete, with a copybook chosen
+   among several" on both and says which word the index uses, and `program` / `pack` print "parse:
+   complete (copybook chosen among several - see notes)" on both, so a program's header does not
+   change with the re-parse. tests/test_chosen_copybook.py (the build of this batch, and the earlier
+   shape written by hand).
 19. **Delivered in the batch - the resolver reads `listing_copy_source` first: the listing's library
    beats every guess.** His compiler listings end with a table naming, per copybook, the DD name and
    the LIBRARY DATASET the compiler read it from. `atlas.recover` reads that table from every
