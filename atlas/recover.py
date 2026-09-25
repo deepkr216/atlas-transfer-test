@@ -1247,6 +1247,14 @@ def check_choices(conn: sqlite3.Connection, sources: Optional[Dict[str, List[Cop
         elif next((s for p, s in copies_of(copybook) if _fkey(p) == _fkey(used)), None) is None:
             v.update(verdict="UNKNOWN", why="the copy the build used is no longer a member of the index (its path is gone), "
                                             "so its text cannot be compared with the listing's copy")
+        elif used_dsn in said and _dating([r for r in rows if r[2] == used_dsn])[0] is True:
+            # two listings of the program: a CURRENT one names the dataset the build used, another (older, or
+            # elsewhere) names something else - the current one decides (the verifier's scenario A2)
+            cur, matched = _dating([r for r in rows if r[2] == used_dsn])
+            others = ", ".join(d for d in said if d != used_dsn)
+            v.update(verdict="CONFIRMED", current=cur, matched=matched, named=used_dsn,
+                     why=f"a current listing names the dataset the build used; another listing names {others} and is not "
+                         "the current compile's")
         else:
             held = copies_of(copybook)
             used_sha = next(s for p, s in held if _fkey(p) == _fkey(used))

@@ -329,6 +329,49 @@ class ChoicesCheckedAgainstTheListings(unittest.TestCase):
             conn.close()
 
 
+class TwoListingsOfOneProgram(unittest.TestCase):
+    """A program with two listings - one current naming the dataset the build used, one older naming
+    another library the index holds with different text: the current listing decides (CONFIRMED); the
+    other way round (the older one confirms, the current one names the other copy) is CONTRADICTED."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.td = tempfile.mkdtemp()
+        cls.root = os.path.join(cls.td, "estate")
+        for rel, text in {"CLAIMS/PROD.CLAIMS.SRC/CHOSEN.cbl": program("CHOSEN", "DUPREC"),
+                          "CLAIMS/PROD.CLAIMS.COPYLIB/DUPREC.cpy": DUPREC_CLAIMS[0] + "\n",
+                          "POLICY/PROD.POLICY.COPYLIB/DUPREC.cpy": DUPREC_POLICY[0] + "\n"}.items():
+            p = os.path.join(cls.root, *rel.split("/"))
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "w", encoding="utf-8") as fh:
+                fh.write(text)
+        cls.db = os.path.join(cls.td, "t.db")
+        with contextlib.redirect_stdout(io.StringIO()):
+            assert build._main([cls.root, "--db", cls.db, "--rebuild", "--quiet"]) == 0
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.td, ignore_errors=True)
+
+    def verdict(self, rows):
+        conn = query.connect(self.db)
+        try:
+            checks = recover.check_choices(conn, {"CHOSEN": rows})
+        finally:
+            conn.close()
+        self.assertEqual([c["copybook"] for c in checks], ["DUPREC"])
+        return checks[0]
+
+    def test_the_current_listing_decides(self):
+        v = self.verdict([("DUPREC", "SYSLIB", "PROD.CLAIMS.COPYLIB", "cur.lst", 1, 100),
+                          ("DUPREC", "SYSLIB", "PROD.POLICY.COPYLIB", "old.lst", 0, 90)])
+        self.assertEqual((v["verdict"], v["current"], v["named"]), ("CONFIRMED", True, "PROD.CLAIMS.COPYLIB"))
+        self.assertIn("a current listing names the dataset the build used; another listing names PROD.POLICY.COPYLIB", v["why"])
+        v = self.verdict([("DUPREC", "SYSLIB", "PROD.CLAIMS.COPYLIB", "old.lst", 0, 90),
+                          ("DUPREC", "SYSLIB", "PROD.POLICY.COPYLIB", "cur.lst", 1, 100)])
+        self.assertEqual((v["verdict"], v["named"]), ("CONTRADICTED", "PROD.POLICY.COPYLIB"))
+
+
 class CheckedWhileRecovering(unittest.TestCase):
     """A program that copies a missing copybook AND took a chosen one: its
     listing is read for the missing copybook, and the choice is checked on
