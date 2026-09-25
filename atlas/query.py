@@ -1483,8 +1483,12 @@ def cmd_copybook(conn: sqlite3.Connection, name: str) -> str:
                             (c["id"],)).fetchone()
         if over:
             out.append(f"\n**Declared copybook over a shape** (`{c['path']}`): {over[0]}.\n")
-        if c["kind"] == "unknown":
-            # expanded into the programs below, but no parser reads it: its lines are not indexed (unknown_cell)
+        if c["kind"] == "unknown" and conn.execute("SELECT 1 FROM copy_use WHERE resolved_member_id=? LIMIT 1",
+                                                   (c["id"],)).fetchone():
+            # expanded into the programs below, but no parser reads it: its lines are not indexed (unknown_cell). Said
+            # only when a program expands it, as `program` says it: a card member filed 'unknown' that a job reads and
+            # no program copies is no copybook, and the folder fix would file its cards as one, which no card lookup
+            # reads (build.CARD_KINDS) - the job would lose them (LESSONS 203)
             out.append(f"\n**Filed `unknown`** (`{c['path']}`): the build expands it into the programs below but has no "
                        f"parser for that kind, so its own lines are not indexed - `paragraph` prints them empty and "
                        f"nothing can cite them; {recover.UNKNOWN_FIX}.\n")
@@ -1506,14 +1510,22 @@ def cmd_copybook(conn: sqlite3.Connection, name: str) -> str:
     # program had expanded a copy that left the index after the parse (recover.not_found_copies, LESSONS 202)
     noted = recover.not_found_copies(conn, [p["mid"] for p in progs if p["resolved_member_id"] is None])
 
+    def supplied(p: sqlite3.Row) -> bool:
+        # `EXEC SQL INCLUDE SQLCA`: the precompiler's area, never this member - no copy of it left (LESSONS 203)
+        return p["resolved_member_id"] is None and not skip_why(p) and precompiler_row(name, (p["mid"], name.upper()) in noted)
+
     def left_since(p: sqlite3.Row) -> bool:
-        return p["resolved_member_id"] is None and not skip_why(p) and (p["mid"], name.upper()) not in noted
+        return (p["resolved_member_id"] is None and not skip_why(p) and (p["mid"], name.upper()) not in noted
+                and not supplied(p))
 
     out.append(f"\n### Programs including it ({len(progs)})\n")
-    if len({p["resolved_member_id"] for p in progs}) > 1:
+    expanded = {p["resolved_member_id"] for p in progs}
+    if len(expanded) > 1:
         # Two copies of the copybook: say which programs compile against which
-        # layout - that IS the version-skew answer.
-        out.append("Grouped by the copy each program actually expanded (version skew):\n")
+        # layout - that IS the version-skew answer. One copy beside rows with no
+        # member (NOT FOUND, skipped, the precompiler's SQLCA) is no skew.
+        out.append("Grouped by the copy each program actually expanded"
+                   + (" (version skew)" if len(expanded - {None}) > 1 else "") + ":\n")
         by_copy: Dict[Optional[int], List[sqlite3.Row]] = defaultdict(list)
         for p in progs:
             by_copy[p["resolved_member_id"]].append(p)
@@ -1525,11 +1537,13 @@ def cmd_copybook(conn: sqlite3.Connection, name: str) -> str:
             else:
                 by_why: Dict[Optional[str], List[sqlite3.Row]] = defaultdict(list)
                 for p in ps:
-                    by_why["" if left_since(p) else skip_why(p)].append(p)
+                    # the key: '' a copy that left, PRECOMPILED the precompiler's area, a skip's reason, None NOT FOUND
+                    by_why["" if left_since(p) else PRECOMPILED if supplied(p) else skip_why(p)].append(p)
                 for why, qs in by_why.items():
                     out.append(("- copy NOT FOUND: " if why is None
                                 else "- no longer linked (the copy it had expanded left the index after the parse): "
-                                if why == "" else f"- {skipped_cell(why)}: ")
+                                if why == "" else f"- supplied by the DB2 precompiler (`EXEC SQL INCLUDE {name.upper()}`), "
+                                                  "not this member: " if why == PRECOMPILED else f"- {skipped_cell(why)}: ")
                                + ", ".join(f"{p['program_id']} @{p['member_name']}:{p['line']}" for p in qs) + "\n")
     out.append(table(["program", "member", "REPLACING", "cite"],
                      [(p["program_id"], p["member_name"], (p["replacing"] or "")[:40], f"{p['member_name']}:{p['line']}")
@@ -1542,7 +1556,7 @@ def cmd_copybook(conn: sqlite3.Connection, name: str) -> str:
     if skips:
         out.append("\n> " + "; ".join(f"{skipped_cell(w)}: {', '.join(ps)}" for w, ps in skips.items()) + ".\n")
     stale = {p["program_id"] for p in progs if p["resolved_member_id"] is None and not skip_why(p)
-             and not left_since(p)}                                                     # programs, not COPY sites
+             and not left_since(p) and not supplied(p)}                                 # programs, not COPY sites
     gone = {p["program_id"] for p in progs if left_since(p)}
     if stale and refiled and len(refiled) == len(copies):
         # re-filed by atlas.recover: the programs were parsed while it was filed as the other kind, and the same run
@@ -2194,16 +2208,46 @@ def skipped_cell(why: str) -> str:
             "there (the notes below say so)")
 
 
+# cmd_copybook's group key for the rows precompiler_row() accounts for (a skip's reason is never this word)
+PRECOMPILED = "precompiled"
+
+
+def precompiler_cell(copybook: str) -> str:
+    """`program`'s 'resolved to' cell for `EXEC SQL INCLUDE SQLCA` / `SQLDA`
+    (expand._SYSTEM_INCLUDES): the DB2 precompiler writes the area into the
+    program, so expand.py records the row with no member and no note, on
+    purpose - nothing is missing and there is nothing to run. Read by its
+    note alone, the row looked like a copy that had left the index, and
+    `program` and `pack` told him to run recover, then the build, on every
+    DB2 program - on an index this toolkit built too, where neither run
+    changes the row (LESSONS 203)."""
+    return (f"**supplied by the DB2 precompiler** - `EXEC SQL INCLUDE {copybook.upper()}` is written into the program by "
+            "the precompiler, not copied from a library: no member is expanded for it and none is missing")
+
+
+def precompiler_row(copybook: str, noted: bool) -> bool:
+    """A COPY row with no member that the precompiler accounts for: SQLCA or
+    SQLDA with no 'COPY X NOT FOUND' note of the program's own (a COBOL
+    `COPY SQLCA` the resolver found no member for carries that note, and
+    stays NOT FOUND). The same names coverage, recover and the un-linked
+    note leave out."""
+    return (copybook or "").upper() in expand._SYSTEM_INCLUDES and not noted
+
+
 def _not_found_cell(conn: sqlite3.Connection, copybook: str, member_id: int) -> str:
     """`program`'s 'resolved to' cell for an unresolved COPY: the skip reason
-    when the expander skipped it; else NOT FOUND, and where a member with
-    that name exists now, why the build did not use it."""
+    when the expander skipped it; the precompiler's for SQLCA / SQLDA; else
+    NOT FOUND, and where a member with that name exists now, why the build
+    did not use it."""
     from . import recover
     why = recover.skipped_copies(conn, member_id).get((member_id, copybook.upper()))
     if why:
         return skipped_cell(why)
+    noted = (member_id, copybook.upper()) in recover.not_found_copies(conn, [member_id])
+    if precompiler_row(copybook, noted):
+        return precompiler_cell(copybook)
     note = same_named_note(conn, copybook, (member_id,))
-    if (member_id, copybook.upper()) not in recover.not_found_copies(conn, [member_id]):
+    if not noted:
         # no NOT FOUND note: the program had expanded a copy that left the index after the parse, and the build that
         # made the index did not parse it again (LESSONS 188, 202) - its fields are of that copy, not missing
         return ("**no longer linked** - " + (f"a member with this name exists: {note}" if note else

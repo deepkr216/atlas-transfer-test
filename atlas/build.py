@@ -851,6 +851,63 @@ def copiers_to_parse(conn: sqlite3.Connection, names: AbstractSet[str]) -> Set[s
     return forced
 
 
+def program_names_moved(existing: Dict[str, tuple], found: Sequence[tuple]) -> Set[str]:
+    """The names whose PROGRAM members changed: a member filed cobol that
+    arrived or went, or that was re-typed into or out of cobol. Which
+    systems hold a program of a name decides which compiler listings speak
+    for each of them (twin_systems, rows_that_count - ROADMAP re-parse item
+    19): while one system holds the name, every current listing of it
+    speaks, wherever it is filed; once another holds one too, only the
+    listings in the program's own system do. So such a change may change
+    what a COPY expands in the OTHER programs of the name, which copy
+    nothing that moved - twins_to_parse finds them. A program member whose
+    bytes changed, or that is recorded again, leaves every system holding
+    what it held: not counted. `existing` / `found` as for moved_names."""
+    names: Set[str] = set()
+    here: Set[str] = set()
+    for f in found:
+        path, name, kind = f[0], f[1], f[2]
+        here.add(path)
+        ex = existing.get(path)
+        if (kind == "cobol") != (ex is not None and ex[4] == "cobol"):
+            names.add(str(ex[-1] if ex is not None and ex[-1] else name).upper())
+    for path, ex in existing.items():
+        if path not in here and ex[4] == "cobol":
+            names.add(str(ex[-1] or os.path.splitext(os.path.basename(path))[0]).upper())    # gone from disk
+    return names
+
+
+def twins_to_parse(conn: sqlite3.Connection, names: AbstractSet[str]) -> Set[str]:
+    """The paths of the program members (kind cobol) named one of `names`
+    (program_names_moved) that a CURRENT compiler listing speaks of - a row
+    of atlas.recover's listing_copy_source for the name that names a
+    copybook and a dataset and is dated current, the only rows
+    current_datasets follows. Without such a row, which systems hold the
+    name decides nothing and nothing is parsed again. Before this, a
+    program of the name arriving in GC-TEST, or going from it, left GC's
+    program with the copy a listing filed outside GC had named (or without
+    it) until a full re-parse (LESSONS 203). One query per 500 names; a
+    program copied by other members is parsed again with the rest of them,
+    since its name is one moved_names takes too."""
+    if not names or conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='listing_copy_source'"
+                                 ).fetchone() is None:
+        return set()
+    if "current" not in {str(r[1]) for r in conn.execute("PRAGMA table_info(listing_copy_source)")}:
+        return set()                                                    # written before recover dated listings
+    forced: Set[str] = set()
+    batch = sorted({n.upper() for n in names})
+    for k in range(0, len(batch), 500):
+        chunk = tuple(batch[k:k + 500])
+        q = ",".join("?" * len(chunk))
+        for (path,) in conn.execute(
+                f"SELECT m.path FROM member m WHERE m.kind = 'cobol' AND UPPER(m.name) IN ({q}) "
+                f"AND UPPER(m.name) IN (SELECT UPPER(TRIM(s.program)) FROM listing_copy_source s "
+                f"WHERE UPPER(TRIM(s.program)) IN ({q}) AND s.copybook IS NOT NULL AND s.copybook <> '' "
+                f"AND s.dataset IS NOT NULL AND s.dataset <> '' AND s.current)", chunk + chunk):
+            forced.add(path)
+    return forced
+
+
 def _inventory_one(ctx: Ctx, path: str, fn: str, dirpath: str, data: bytes) -> tuple:
     """Classify and fingerprint one file. Pure: no database, so it can run
     on a worker thread under a time limit."""
@@ -895,7 +952,10 @@ def inventory(ctx: Ctx, roots, limit: Optional[int] = None, force_all: bool = Fa
     A member of a kind the resolver expands (copybook, cobol, sql, unknown)
     that arrives, changes, goes or is re-typed forces every program that
     copies its name (and every copybook that copies it) to be re-parsed
-    (moved_names, copiers_to_parse); a member of a kind a job reads (a PROC,
+    (moved_names, copiers_to_parse); a program member that arrives, goes or
+    is re-typed changes which compiler listings speak for the other programs
+    of its name, and forces those a current listing speaks of
+    (program_names_moved, twins_to_parse); a member of a kind a job reads (a PROC,
     an INCLUDE, a card member: JOB_READ_KINDS) that arrives, changes, goes
     or is re-typed forces every job and PROC. `force_all` (parser or manifest
     changed) re-parses everything. Members that vanished are pruned.
@@ -1041,6 +1101,12 @@ def inventory(ctx: Ctx, roots, limit: Optional[int] = None, force_all: bool = Fa
             progress.now(f"finding the programs to parse again: {len(moved):,} name(s) of members that arrived, changed, "
                          f"went or were re-typed since the last build")
             forced |= copiers_to_parse(conn, moved)
+        twins = program_names_moved(existing, found) if existing and not force_all else set()
+        if twins:
+            # a program of a name arriving in another system, going from it or re-typed changes which listings speak
+            # for the other programs of the name (item 19's twin rule): those a current listing speaks of are parsed
+            # again too - they copy nothing that moved (LESSONS 203)
+            forced |= twins_to_parse(conn, twins)
         if existing and not force_all and moved_names(existing, found, JOB_READ_KINDS, again=False):
             # a PROC, INCLUDE or card member arrived, changed, went or was re-typed (a card member may be filed
             # unknown or sql): every job that expands it carries its facts, and a job keeps only the names it looked

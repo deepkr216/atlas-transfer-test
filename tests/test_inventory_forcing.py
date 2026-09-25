@@ -785,6 +785,270 @@ class JobsFollowWhatTheyRead(_Forcing):
         self.assertEqual(self.recorded_again(), {"NEWBK", "RUNBOOK", "GCPROC"})
         self.assert_as_full()
 
+    def test_copybook_gives_no_folder_fix_for_a_card_member(self):
+        # a card member filed 'unknown' that the job reads and no program copies: `copybook` has no copy of it to
+        # speak of - the folder fix it printed ('rename the folder to end in COPYLIB') would file the cards as a
+        # copybook, which no card lookup reads (build.CARD_KINDS), and the job would lose them (LESSONS 203)
+        self.write("GC/PROD.GC.PARMS/GCRUN1.txt", GCRUN1)
+        self.build()
+        self.assertEqual(self.member("GCRUN1")[0], "unknown")
+        self.assertIn(("SYSTSIN", "PROD.GC.PARMS(GCRUN1)", "GCRUN1", 1), self.dds())
+        conn = query.connect(self.db)
+        try:
+            book = query.cmd_copybook(conn, "GCRUN1")
+        finally:
+            conn.close()
+        self.assertIn("### Programs including it (0)", book)
+        self.assertNotIn("Filed `unknown`", book)
+        self.assertNotIn("COPYLIB", book)
+        # a program that copies it: the note is said, as for any copy expanded from a member filed 'unknown'
+        self.write("GC/PROD.GC.SRC/VALPGM.cbl", value_program("VALPGM", "GCRUN1"))
+        self.build()
+        conn = query.connect(self.db)
+        try:
+            self.assertIn("**Filed `unknown`** (`", query.cmd_copybook(conn, "GCRUN1"))
+        finally:
+            conn.close()
+
+
+# a DB2 program whose SQLCA the precompiler supplies (`EXEC SQL INCLUDE SQLCA` on one line: expand.py writes a
+# copy_use row with no member and no note, on purpose) - and a SQLCA copybook in a library, which a program COPYs
+DB2PGM = HEAD.format(name="DB2PGM", data="           EXEC SQL INCLUDE SQLCA END-EXEC.\n"
+                                         "           EXEC SQL INCLUDE SQLDA END-EXEC.\n", main="") + PLAIN_SECTION + TAIL
+SQLCABK = "           05  SQLCAID             PIC X(8).\n           05  SQLCODE             PIC S9(9) COMP.\n"
+PRECOMPILER = ("**supplied by the DB2 precompiler** - `EXEC SQL INCLUDE {0}` is written into the program by the "
+               "precompiler, not copied from a library: no member is expanded for it and none is missing")
+
+
+class PrecompilerIncludes(_Forcing):
+    """`EXEC SQL INCLUDE SQLCA` / `SQLDA`: the row carries no member and no NOT FOUND note because the DB2 precompiler
+    supplies the area - not because a copy left the index. coverage, recover and the un-linked note leave the two
+    names out (expand._SYSTEM_INCLUDES); `program`, `pack` and `copybook` read the row by its note alone and told him
+    to run recover, then the build, on every DB2 program - on an index this toolkit built too, where no run of either
+    changes the row (LESSONS 203)."""
+
+    files = (("GC/PROD.GC.SRC/DB2PGM.cbl", DB2PGM),)
+
+    def assert_precompiler_cells(self, text):
+        for book in ("SQLCA", "SQLDA"):
+            self.assertIn(f"| {book} | {PRECOMPILER.format(book)} |", text)
+        for words in ("no longer linked", "run recover", "left the index", "NOT FOUND", "a member with this name"):
+            self.assertNotIn(words, text)
+
+    def test_program_and_pack_say_the_precompiler_supplies_it(self):
+        self.assertEqual(self.status("DB2PGM"), "ok")
+        self.assertEqual(self.copy_use("DB2PGM", "SQLCA"), [(None,)])
+        self.assertEqual(self.not_found_note("DB2PGM", "SQLCA"), [])
+        conn = query.connect(self.db)
+        try:
+            self.assert_precompiler_cells(query.cmd_program(conn, "DB2PGM"))
+            self.assert_precompiler_cells(query.cmd_pack(conn, "DB2PGM"))
+            self.assertEqual(recover.unlinked_ok_programs(conn), {})
+        finally:
+            conn.close()
+        stats, said = self.recover()
+        self.assertEqual((stats["arrived"], stats["marked"]), (0, 0), said)
+
+    def test_with_a_sqlca_copybook_in_the_estate(self):
+        # the verifier's second estate: a SQLCA member in a COPYLIB, COPYed by another program - the DB2 program's
+        # row is still the precompiler's, and `copybook SQLCA` groups it apart, with no word of a copy that left
+        self.write("GC/PROD.GC.COPYLIB/SQLCA.cpy", SQLCABK)
+        self.write("GC/PROD.GC.SRC/CPYPGM.cbl", data_program("CPYPGM", "SQLCA", "SQLCODE"))
+        self.build()
+        self.assert_ok_and_linked("CPYPGM", "SQLCA")
+        self.assertEqual((self.status("DB2PGM"), self.copy_use("DB2PGM", "SQLCA")), ("ok", [(None,)]))
+        conn = query.connect(self.db)
+        try:
+            self.assert_precompiler_cells(query.cmd_program(conn, "DB2PGM"))
+            book = query.cmd_copybook(conn, "SQLCA")
+        finally:
+            conn.close()
+        self.assertIn("- supplied by the DB2 precompiler (`EXEC SQL INCLUDE SQLCA`), not this member: "
+                      "DB2PGM @DB2PGM:", book)
+        self.assertIn("CPYPGM @CPYPGM:", book)
+        self.assertIn("Grouped by the copy each program actually expanded:\n", book)       # one copy: no skew
+        for words in ("left the index", "no longer linked", "still say", "recover", "NOT FOUND", "version skew"):
+            self.assertNotIn(words, book)
+        stats, said = self.recover()
+        self.assertEqual((stats["arrived"], stats["marked"]), (0, 0), said)
+        # on an index the build before ROADMAP re-parse item 21 left, the same words: the row is the precompiler's
+        self.stamp()
+        with build_before_item_21():
+            self.build()
+        conn = query.connect(self.db)
+        try:
+            self.assert_precompiler_cells(query.cmd_program(conn, "DB2PGM"))
+            self.assertNotIn("left the index", query.cmd_copybook(conn, "SQLCA"))
+        finally:
+            conn.close()
+
+    def test_a_copy_of_sqlca_not_found_is_still_not_found(self):
+        # `COPY SQLCA` is a COBOL COPY the resolver looks up: with no member of the name it says NOT FOUND, as before
+        self.write("GC/PROD.GC.SRC/CPYPGM.cbl", data_program("CPYPGM", "SQLCA"))
+        self.build()
+        self.assert_not_found("CPYPGM", "SQLCA")
+        conn = query.connect(self.db)
+        try:
+            self.assertIn("| SQLCA | **NOT FOUND** |", query.cmd_program(conn, "CPYPGM"))
+        finally:
+            conn.close()
+
+
+class ASameNamedProgramArrivesOrGoes(_Forcing):
+    """ROADMAP re-parse item 19's rule reads which systems hold a program of the name (build.twin_systems): while
+    only GC holds TWPGM, every current listing of the name speaks for it, wherever it is filed; once GC-TEST holds a
+    TWPGM too, only the listings in GC's own system do. So a program of that name arriving in another system, or
+    going from it, changes which copy of STARTBK GC's TWPGM expands - and moved_names forced only the members that
+    COPY the name, never the members that carry it: GC's TWPGM kept the copy the listing had named, with its fields
+    and offsets, until a full re-parse (LESSONS 203). A --rebuild deletes the listing rows, so each case is compared
+    with the programs parsed again instead."""
+
+    files = (("GC/PROD.GC.SRC/TWPGM.cbl", data_program("TWPGM", "STARTBK", "START-DATE")),
+             ("GC/PROD.GC.COPYLIB/STARTBK.cpy", STARTBK),
+             ("GC-TEST/TEST.GC.COPYLIB/STARTBK.cpy", STARTBK_SHARED))
+    TWIN = "GC-TEST/TEST.GC.SRC/TWPGM.cbl"
+
+    def listing_row(self, current=1):
+        """A listing of TWPGM read from a --from folder the index does not hold - filed outside both systems - naming
+        TEST.GC.COPYLIB for STARTBK, stored as atlas.recover stores it; the programs of the name marked, as recover
+        marks a contradicted choice."""
+        conn = sqlite3.connect(self.db)
+        try:
+            conn.execute(recover.COPY_SOURCE_TABLE)
+            conn.execute("INSERT INTO listing_copy_source VALUES('TWPGM','STARTBK','SYSLIB','TEST.GC.COPYLIB',?,"
+                         "'2026-09-25',?,100)", (os.path.join(self.td, "listings", "TWPGM.lst"), current))
+            conn.execute("UPDATE member SET parse_status='pending' WHERE name='TWPGM'")
+            conn.commit()
+        finally:
+            conn.close()
+
+    def pick(self, system="GC"):
+        """(the library the system's TWPGM expanded STARTBK from, START-DATE's offset, how the copy was chosen)"""
+        rows = self.q("SELECT r.library, (SELECT f.offset FROM pfield f JOIN program p ON p.id=f.program_id "
+                      "WHERE p.member_id=m.id AND f.name='START-DATE'), (SELECT u.detail FROM unresolved u "
+                      "WHERE u.member_id=m.id AND u.kind='ambiguous_copybook') FROM member m "
+                      "JOIN copy_use c ON c.member_id=m.id LEFT JOIN member r ON r.id=c.resolved_member_id "
+                      "WHERE m.name='TWPGM' AND m.kind='cobol' AND m.system=?", system)
+        self.assertEqual(len(rows), 1, rows)
+        lib, offset, how = rows[0]
+        return lib, offset, (how or "").rsplit(" (", 1)[-1].rstrip(")")
+
+    def kept(self, system="GC"):
+        """Whether the system's TWPGM was kept by the last build (not parsed again) - see stamp()."""
+        return self.q("SELECT scanned_at FROM member WHERE name='TWPGM' AND kind='cobol' AND system=?",
+                      system)[0][0] == "kept by the last build"
+
+    def as_parsed_again(self):
+        """The index holds what parsing every program of the name again gives."""
+        before = facts(self.db)
+        conn = sqlite3.connect(self.db)
+        try:
+            conn.execute("UPDATE member SET parse_status='pending' WHERE name='TWPGM'")
+            conn.commit()
+        finally:
+            conn.close()
+        self.build()
+        self.assertEqual(facts_differ(before, facts(self.db)), {})
+
+    def test_a_program_of_the_name_arrives_in_another_system(self):
+        self.listing_row()
+        self.build()
+        # the one TWPGM: the listing filed elsewhere speaks for it and names GC-TEST's copy, held with another text
+        self.assertEqual(self.pick(), ("TEST.GC.COPYLIB", 15, build.LISTING_HOW + "TEST.GC.COPYLIB"))
+        self.stamp()
+        self.write(self.TWIN, data_program("TWPGM", "STARTBK", "START-DATE"))
+        self.build()
+        # GC-TEST holds one too: only GC's own listings speak for GC's, and it has none - its own system's copy
+        self.assertFalse(self.kept("GC"), "GC's TWPGM is parsed again")
+        self.assertEqual(self.pick(), ("PROD.GC.COPYLIB", 5, "same system"))
+        self.assertEqual(self.pick("GC-TEST"), ("TEST.GC.COPYLIB", 15, "same system"))
+        self.as_parsed_again()
+
+    def test_a_program_of_the_name_goes_from_another_system(self):
+        self.write(self.TWIN, data_program("TWPGM", "STARTBK", "START-DATE"))
+        self.build()
+        self.listing_row()
+        self.build()
+        self.assertEqual(self.pick(), ("PROD.GC.COPYLIB", 5, "same system"))
+        self.stamp()
+        self.remove(self.TWIN)
+        self.build()
+        # the one TWPGM again: the listing filed elsewhere speaks for it
+        self.assertFalse(self.kept("GC"), "GC's TWPGM is parsed again")
+        self.assertEqual(self.pick(), ("TEST.GC.COPYLIB", 15, build.LISTING_HOW + "TEST.GC.COPYLIB"))
+        self.as_parsed_again()
+
+    def test_without_the_rule_the_program_kept_the_listings_copy(self):
+        # the verifier's case: 'to parse: programs 1' - the new member only; GC's TWPGM kept GC-TEST's copy
+        self.listing_row()
+        self.build()
+        self.write(self.TWIN, data_program("TWPGM", "STARTBK", "START-DATE"))
+        with mock.patch.object(build, "twins_to_parse", lambda conn, names: set()):
+            self.build()
+        self.assertEqual(self.pick(), ("TEST.GC.COPYLIB", 15, build.LISTING_HOW + "TEST.GC.COPYLIB"))
+
+    def test_no_current_listing_of_the_name_nothing_else_is_parsed_again(self):
+        # with no listing row, or an older compile's only, which systems hold the name decides nothing: the program
+        # that arrived or went is the only one parsed
+        for current in (None, 0):
+            with self.subTest(current=current):
+                if current is not None:
+                    self.listing_row(current)
+                    self.build()
+                self.stamp()
+                self.write(self.TWIN, data_program("TWPGM", "STARTBK", "START-DATE"))
+                self.build()
+                self.assertTrue(self.kept("GC"))
+                self.assertFalse(self.kept("GC-TEST"))
+                self.assertEqual(self.pick(), ("PROD.GC.COPYLIB", 5, "same system"))
+                self.stamp()
+                self.remove(self.TWIN)
+                self.build()
+                self.assertTrue(self.kept("GC"))
+
+
+class TwinsToParse(_Estate):
+    """build.program_names_moved and build.twins_to_parse: the names whose program members changed, and the program
+    members of those names a current listing speaks for - one query per 500 names."""
+
+    files = (("GC/PROD.GC.SRC/TWPGM.cbl", data_program("TWPGM", "STARTBK")),
+             ("GC-TEST/TEST.GC.SRC/TWPGM.cbl", data_program("TWPGM", "STARTBK")),
+             ("GC/PROD.GC.SRC/LONEPGM.cbl", data_program("LONEPGM", "STARTBK")))
+
+    def test_the_names_whose_program_members_changed(self):
+        moved = build.program_names_moved
+        self.assertEqual(moved({}, [seen("p", "cobol")]), {"BOOK"})                                  # arrived
+        self.assertEqual(moved({r"x\book.cbl": stored("cobol", name="BOOK")}, []), {"BOOK"})         # went
+        self.assertEqual(moved({"p": stored("cobol")}, [seen("p", "asm", sha="s2")]), {"BOOK"})      # re-typed out
+        self.assertEqual(moved({"p": stored("unknown")}, [seen("p", "cobol", sha="s2")]), {"BOOK"})  # re-typed in
+        # the same program member: new bytes, or recorded again - no system gains or loses one
+        self.assertEqual(moved({"p": stored("cobol")}, [seen("p", "cobol", sha="s2")]), set())
+        self.assertEqual(moved({"p": stored("cobol", status="pending")}, [seen("p", "cobol")]), set())
+        for kind in ("copybook", "unknown", "sql", "proc", "jcl", "asm"):
+            self.assertEqual(moved({}, [seen("p", kind)]), set(), kind)
+            self.assertEqual(moved({r"x\book.cbl": stored(kind)}, []), set(), kind)
+
+    def test_only_the_names_a_current_listing_speaks_for_one_query_per_500(self):
+        conn = sqlite3.connect(self.db)
+        try:
+            names = {"TWPGM", "LONEPGM"} | {f"NOBODY{i:04d}" for i in range(1200)}
+            self.assertEqual(build.twins_to_parse(conn, names), set(), "no listing table: nothing")
+            conn.execute(recover.COPY_SOURCE_TABLE)
+            conn.executemany("INSERT INTO listing_copy_source VALUES(?,?,'SYSLIB',?,'x.lst','2026-09-25',?,100)",
+                             [("twpgm ", "STARTBK", "TEST.GC.COPYLIB", 1), ("LONEPGM", "STARTBK", "TEST.GC.COPYLIB", 0),
+                              ("LONEPGM", "STARTBK", "TEST.GC.COPYLIB", None), ("LONEPGM", "", "TEST.GC.COPYLIB", 1),
+                              ("LONEPGM", "STARTBK", "", 1)])
+            asked = []
+            conn.set_trace_callback(lambda sql: asked.append(sql) if "FROM member m" in sql else None)
+            forced = build.twins_to_parse(conn, names)
+        finally:
+            conn.close()
+        # both TWPGM members (the row's program name read as load_listing_sources reads it); LONEPGM's rows are an
+        # older compile's, undated, or name no copybook or no dataset: none of them decides
+        self.assertEqual({os.path.relpath(p, self.root) for p in forced},
+                         {os.path.join("GC", "PROD.GC.SRC", "TWPGM.cbl"), os.path.join("GC-TEST", "TEST.GC.SRC", "TWPGM.cbl")})
+        self.assertEqual(len(asked), 3, asked)
+
 
 if __name__ == "__main__":
     unittest.main()
