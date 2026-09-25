@@ -186,11 +186,11 @@ class Resume(unittest.TestCase):
         import time as _t
         real = build.classify.classify
 
-        def slow(path, head, ext_hint=None):
+        def slow(path, head, ext_hint=None, **kw):             # kw: the declared kind the build passes
             if path.endswith("STUCK.txt"):
                 while True:
                     _t.sleep(0.01)
-            return real(path, head, ext_hint)
+            return real(path, head, ext_hint, **kw)
 
         with open(os.path.join(self.root, "STUCK.txt"), "w") as fh:
             fh.write("just text\n")
@@ -232,10 +232,10 @@ class Resume(unittest.TestCase):
         import time as _t
         real = build.classify.classify
 
-        def stuck(path, head, ext_hint=None):
+        def stuck(path, head, ext_hint=None, **kw):             # kw: the declared kind the build passes
             if path.endswith("STUCK.txt"):
                 _t.sleep(3)
-            return real(path, head, ext_hint)
+            return real(path, head, ext_hint, **kw)
 
         with open(os.path.join(self.root, "STUCK.txt"), "w") as fh:
             fh.write("just text\n")

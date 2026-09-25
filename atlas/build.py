@@ -773,11 +773,12 @@ def _inventory_one(ctx: Ctx, path: str, fn: str, dirpath: str, data: bytes) -> t
         norm, nlines, fixed = sha(data), data.count(b"\n"), 0
     else:
         text, enc = reader.decode_bytes(data)
-        kind, _why = classify.classify(path, text[:8192])
-        if kind == "unknown":
-            # neither the content nor the folder name said: the kind the
-            # user declared for that library in sources.json does
-            kind = ctx.kind_of.get(os.path.basename(dirpath).upper(), kind)
+        # the kind the user declared for that library in sources.json (the
+        # manifest kinds) replaces 'unknown', and - unless it is 'cobol' - a
+        # shape (asm / listing / mfs), the folder name and the extension;
+        # a strong signature and a COBOL copybook's own lines win over it
+        # (classify.declared_wins, ROADMAP re-parse item 22)
+        kind, _why = classify.classify(path, text[:8192], declared=ctx.kind_of.get(os.path.basename(dirpath).upper()))
         norm, nlines, fixed = norm_hash(kind, text, data, enc)
         if kind in CODE_KINDS and code_line_count(kind, text, data, enc) == 0:
             kind = "empty"           # a stub or a retired member: never a program row
@@ -1083,7 +1084,9 @@ def load_sched(ctx: Ctx, csv_path: str) -> None:
 def load_declared_kinds(ctx: Ctx, manifest_path: Optional[str]) -> None:
     """`kinds` from the manifest (written from the sources table): library
     folder name -> kind. Read BEFORE the inventory, because that is where a
-    member without a content signature gets typed."""
+    member gets typed: the declared kind replaces 'unknown' and - unless it
+    is 'cobol' - an Assembler / listing / MFS shape, the folder name and the
+    extension (classify.declared_wins)."""
     ctx.kind_of = {}
     if not manifest_path or not os.path.isfile(manifest_path):
         return
@@ -1093,8 +1096,7 @@ def load_declared_kinds(ctx: Ctx, manifest_path: Optional[str]) -> None:
     except (OSError, ValueError):
         return
     ctx.kind_of = {str(k).upper(): str(v).lower() for k, v in (man.get("kinds") or {}).items()
-                   if str(v).lower() in ("cobol", "copybook", "jcl", "proc", "ctlcard", "dbd", "psb", "bms", "mfs",
-                                         "csd", "imsgen", "sql", "listing", "doc", "sched")}
+                   if str(v).lower() in classify.DECLARABLE}
 
 
 def apply_manifest(ctx: Ctx, manifest_path: str) -> None:

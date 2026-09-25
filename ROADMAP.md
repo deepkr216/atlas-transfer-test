@@ -281,21 +281,30 @@ shipped alone and cost one such night; these still wait for the next one:
    `--rebuild` deletes the index and the table with it - the toolkit change re-parses every member
    without it). tests/test_listing_resolver.py, tests/test_listing_systems.py,
    tests/test_copy_sources.py TheReparseNightOnTheStagingEstate (LESSONS 193, 194, 195, 196, 197).
-20. **classify.py: a procedure copybook is a copybook by its CONTENT, before the folder hint.**
-   His `A-100-BEGIN SECTION.  COPY PROCBOOK.` copies a member of paragraph names and statements -
-   no level numbers, no DIVISION header - which has no content signature today, so the FOLDER NAME
-   types it: PROCLIB / PROCS make it a proc (a JCL PROC), CNTL / CARDLIB a control card, a plain
-   folder a document, a dataset-named folder with no hint 'unknown'. Only copybook / cobol / sql /
-   unknown reach the resolver, so a procedure copybook fetched into a PROCS or CNTL folder is never
-   expanded ('COPY PROCBOOK NOT FOUND' with the member on disk - LESSONS 183). A member with COBOL
-   procedure statements (PERFORM / MOVE / IF / EVALUATE / EXEC CICS / GOBACK / paragraph names in
-   area A) and no level numbers and no DIVISION is a copybook before the folder hint is consulted.
-   Until then `atlas.recover` names each such member with the fix (rename the folder to end in
-   COPYLIB, or declare the library's kind in the UI's table) and `coverage` / `program` /
-   `copybook` say 'filed as proc' instead of a bare NOT FOUND. The same rename is what puts an
-   'unknown' member's own lines in the index: the build expands it into its programs but has no
-   parser for that kind (HANDLERS), so `paragraph` shows its lines empty and nothing can cite them
-   (LESSONS 184) - until this item, the folder fix is the one thing to do in both cases.
+20. **Delivered in the batch - a procedure copybook is a copybook by its CONTENT, before the folder hint.**
+   His `A-100-BEGIN SECTION.  COPY PROCBOOK.` copies a member of paragraph names and statements - no
+   level numbers, no DIVISION header - which had no content signature, so the FOLDER NAME typed it:
+   PROCLIB / PROCS made it a proc (a JCL PROC), CNTL / CARDLIB a control card, a plain folder a document,
+   a dataset-named folder with no hint 'unknown'. Only copybook / cobol / sql / unknown reach the
+   resolver, so a procedure copybook fetched into a PROCS or CNTL folder was never expanded ('COPY
+   PROCBOOK NOT FOUND' with the member on disk - LESSONS 183). Now classify.py types a member with COBOL
+   procedure statements and no DIVISION header as a copybook before the Assembler and MFS shapes and
+   before the folder hint (`_SIG_COBOL_PROC`): MOVE ... TO, the arithmetic verbs with their preposition,
+   SET ... TO, PERFORM, GOBACK, GO TO, EVALUATE, STOP RUN, EXIT., CONTINUE, COMPUTE, INITIALIZE, ACCEPT ...
+   FROM, STRING / UNSTRING ... DELIMITED, INSPECT, OPEN INPUT and the COBOL forms of CLOSE / READ / WRITE,
+   a scope terminator, a paragraph or section name in area A (columns 8-11) ended by a period - in upper
+   case, where a COBOL line's code begins (never column 1, a `//` line or a `*` comment). The statements
+   an Assembler member uses too - IF, DISPLAY, CALL, COPY, EXEC CICS / SQL / DLI - count only where the
+   Assembler shape did not fire (`_SIG_COBOL_SHARED`), and the IDCAMS `IF LASTCC`, ICETOOL `DISPLAY FROM(`
+   / `COPY FROM(`, IEBCOPY `COPY OUTDD=` and TSO `CALL 'LIB(PGM)'` forms never count, so control cards
+   keep their folder's kind. A member with no signature at all (a literal copied into a VALUE clause)
+   still takes its folder's kind or the declared one, and `atlas.recover`, `coverage`, `program` and
+   `copybook` name it with the fix - rename the folder to end in COPYLIB, or declare the library's kind
+   in the UI's table: both are true now, since item 22 lets a declaration win over the folder name. The
+   same rename (or declaration) is what puts an 'unknown' member's own lines in the index: the build
+   expands it into its programs but has no parser for that kind (LESSONS 184).
+   tests/test_refiled_copybooks.py TheBuildFilesThemRight, ClassifierShapes; tests/test_arrived_copybooks.py
+   ArrivedAfterTheParse, FiledAsAnotherKind, NestedCopybookArrivesLater (LESSONS 198).
 21. **build.py: inventory forcing (`changed_names`) covers every kind the resolver accepts.**
    A new or changed member forces the programs that copy it to be parsed again only when its kind
    is copybook or cobol; the resolver also expands sql and unknown members, so a procedure copybook
@@ -307,49 +316,63 @@ shipped alone and cost one such night; these still wait for the next one:
    step marks those programs pending for the next build - the query-side stand-in (item 1 of
    LESSONS 183's fix), not the fix. Marking alone is not the whole fix either: an 'unknown'
    member's own lines stay outside the index until item 20 files it as a copybook, so every note
-   that says 'run recover, then the build' adds the folder rename (LESSONS 184). The stand-in marks
+   that says 'run recover, then the build' adds the folder rename - since item 20 only for a member with
+   no signature at all, a procedure copybook being a copybook by its statements (LESSONS 184). The stand-in marks
    PROGRAMS only: a copybook member's own COPY rows are never resolved by the build (index_copybook
    parses for copies, never resolves), so they say nothing, and a copybook marked pending is
    re-inserted under a new id, which nulls the links of every program copying it. And it leaves
    alone a COPY the expander SKIPPED (a copybook copying itself; nesting deeper than 12): that
    program row is NULL too, but the member was found and the program parsed after it - the
    program's own 'expand' note tells the two apart (recover.skipped_copies, LESSONS 185).
-22. **classify.py: the level-number signature and a COBOL-statement signature are checked BEFORE the
-   Assembler, listing and MFS signatures, and `_SIG_ASM` requires the Assembler shape.** His copybook
-   in a `.COPYLIB` folder was filed `asm`: `_SIG_ASM` (`^(?:[ \t]*\w+)?[ \t]+(CSECT|DSECT|START|DFHEIENT)\b`)
-   fires on any line whose first or second word BEGINS with START - `05 START-DATE PIC X(8).`,
-   `PERFORM START-PARA.`, `MOVE START-DATE TO WS-DATE` - and runs before `_SIG_DATA_LEVEL` and before the
-   folder hint; `_SIG_LISTING` fires on a comment saying MODULE MAP or CROSS REFERENCE TABLE, `_SIG_MFS`
-   on a line whose first word is MSG / FMT / DEV / DFLD / MFLD. The resolver never looks at asm / listing /
-   mfs, so every program copying such a member says COPY X NOT FOUND while the file is in the estate, and
-   the folder fix of item 20 changes nothing - the content decided (LESSONS 186); data copybooks with a
-   START-DATE field are common in insurance code. At the re-parse: (a) the level-number signature and a
-   COBOL-statement signature (PERFORM / MOVE / IF / EVALUATE / EXEC / GOBACK / paragraph names in area A,
-   no DIVISION header) are checked before the Assembler, listing and MFS signatures; (b) `_SIG_ASM`
-   requires the Assembler shape - a label in column 1 followed by CSECT / DSECT, or START with a numeric
-   operand or alone - so START-DATE, START-PARA, a comment naming MODULE MAP and a line starting with MSG
-   no longer type a copybook as something else; (c) the declared kind in sources.json (the manifest
-   kinds) wins over a weak content signature, not only over 'unknown' (`_inventory_one` applies it to
-   'unknown' alone today, so 'declare the library's kind' never helped a member a signature had typed).
-   Until then `atlas.recover` re-files such a member as a copybook in the index (`kind='copybook'`,
-   `parse_status='skipped'`, the reason in `parse_error`; `refile_misfiled()`) and marks its programs:
-   the build keeps the stored kind of an unchanged, settled member and the expander reads the copybook's
-   text from disk, so the next incremental build makes the programs whole; the member's own field rows
-   stay absent, a `--rebuild` files it as before and recover re-files it again (so does any build that
-   re-parses every member: the manifest changed - the UI rewrites manifest.json from the sources table on
-   every build, so every library he adds or re-kinds in its table changes it - or a parser module changed;
-   run recover after such a build, and it re-files them again - LESSONS 188); a real Assembler, listing
-   or MFS member with a copybook's name is never re-filed (its shape is checked) and the report says so.
-   This item makes the stand-in unnecessary: once the classifier files these as copybooks the re-parse
-   gives them their own rows and `refile_misfiled()` finds nothing to do. Two windows the stand-in leaves
-   open, closed by this item as well (LESSONS 187): a re-filed member whose text changes on disk before
-   the re-parse is filed as before again by the next build, under a new member id, which un-links the
-   programs copying it without parsing them again - they read 'ok' with the old text's fields until
-   recover has run again and the build after it (the report's 'Re-filed as copybook' section says so);
-   and the stand-in's shape guard (`recover._ASM_SHAPE`) first erred towards refusing, so a COBOL `START
-   CUSTFILE` alone on its line (the KEY clause on the next line) read as an Assembler START - his procedure
-   copybook, LESSONS 189; the guard now takes START as Assembler only with a label in column 1 or a numeric
-   or quoted operand, and a strong signature found only in comment lines refuses nothing.
+22. **Delivered in the batch - the level-number and COBOL-statement signatures are checked BEFORE the
+   Assembler, listing and MFS signatures, `_SIG_ASM` requires the Assembler shape, and a declared kind wins
+   over a shape.** His copybook in a `.COPYLIB` folder was filed `asm`: `_SIG_ASM`
+   (`^(?:[ \t]*\w+)?[ \t]+(CSECT|DSECT|START|DFHEIENT)\b`) fired on any line whose first or second word BEGAN
+   with START - `05 START-DATE PIC X(8).`, `PERFORM START-PARA.`, `MOVE START-DATE TO WS-DATE` - and ran
+   before `_SIG_DATA_LEVEL` and before the folder hint; `_SIG_LISTING` fired on a comment saying MODULE MAP
+   or CROSS REFERENCE TABLE, `_SIG_MFS` on a line whose first word is MSG / FMT / DEV / DFLD / MFLD. The
+   resolver never looks at asm / listing / mfs, so every program copying such a member said COPY X NOT FOUND
+   while the file was in the estate, and no folder change helped - the content decided (LESSONS 186). Now,
+   in classify.py: (a) a data description entry (a level number where a COBOL line's code begins, then a
+   data-name ended by a period, the end of the line or a clause - `_SIG_DATA_LEVEL`) and the COBOL-statement
+   signature of item 20 are checked before the Assembler and MFS shapes; the looser level-number signature
+   (`_SIG_LEVEL_NUMBER`), which an Assembler register equate `R12 EQU 12` trips, stays after them as before.
+   A compiler listing is still looked for before every COBOL signature - it echoes the program's level
+   numbers and PROGRAM-ID - but by its shape alone: the compiler's banner on a line that is not a comment,
+   a map heading at the start of a line, or three numbered source lines (`listing_hit`). (b) The Assembler,
+   listing and MFS signatures are the shapes the stand-in proved on his estate - `recover._ASM_SHAPE`,
+   `_MFS_SHAPE`, `_LISTING_SHAPE` / `_LISTING_HEAD` moved into classify.py and recover imports them (LESSONS
+   187-189): CSECT / DSECT as the operation after a label of any length or none, START with a label in
+   column 1 or a numeric or quoted operand, DFHEIENT, DS / DC with a type, `USING *`, `EQU *`, `BR 14`; a
+   labelled MFS statement or TYPE= / POS= / LTH= operands. So `05 START-DATE`, `PERFORM START-PARA`, `START
+   CUSTFILE` alone on its line, a comment naming MODULE MAP and a line whose first word is MSG no longer
+   type a copybook as something else; nor does a signature on a comment line - a remark naming DFHMDF,
+   PROGRAM-ID, CREATE TABLE or the compiler, a REXX header behind a slash in column 7 (`_code_hit`).
+   (c) The kind declared for a library in sources.json (the manifest kinds; `build.load_declared_kinds`,
+   `_inventory_one` passes it to `classify.classify`) wins over a shape (asm / listing / mfs), the folder
+   name and the extension, not only over 'unknown' (`classify.declared_wins`) - 'declare the library's kind'
+   is true advice now for a member any of those typed; a strong signature (JOB card, PROC, DBD, PSB, BMS
+   macro, CSD, stage-1, IDENTIFICATION DIVISION / PROGRAM-ID) and a COBOL copybook's own lines still win
+   over it, and 'cobol' - the kind the UI's table gives a new row and every ...SRC name - replaces
+   'unknown' only, since a member a shape or a folder typed never carries a PROGRAM-ID (a mixed source
+   library's Assembler members, a listing library left at the default, would be filed as programs).
+   The stand-in stays for an index built before the batch: `atlas.recover` re-files a misfiled member
+   whose bytes are the ones indexed and which the classifier of this toolkit reads as a copybook
+   (`how_classified` says how the older classifier filed it - its weak signature and the line, the folder,
+   the extension or the declared kind: `earlier`), marks its programs, and the next build expands it; the
+   first build after the toolkit changed re-parses every member and files it a copybook itself, with its
+   own rows, and on an index this toolkit built `refile_misfiled()` finds nothing to do. A real Assembler,
+   listing or MFS member with a copybook's name is refused as what it is - the shape is checked before
+   the folder now (a real member in a folder with no COPY hint was told to rename the folder to end in
+   COPYLIB and run again, and the second run refused it on the shape) - with 'declare its library copybook
+   in the UI's table and run the build' if it IS the copybook. The two windows the stand-in left open are
+   closed: a re-filed member whose text changes on disk is classified again and reads as a copybook, and a
+   build that re-parses every member (--rebuild, the manifest changed, a parser module changed) files it
+   a copybook instead of undoing the re-file (LESSONS 187, 188). tests/test_refiled_copybooks.py
+   (TheBuildFilesThemRight, ClassifierShapes, GenuineAssemblerIsNotRefiled, RealAssemblerShapesAreNotRefiled,
+   DeclaredKinds, AnIndexBuiltBeforeTheBatch, TheFirstBuildAfterTheBatch, SecondRunBeforeTheBuild,
+   DryRunWithAFolderTypedCopyToo, OkWithAnUnlinkedCopyRow, WrittenCopybookIsFiledRight, TheVerdict),
+   LESSONS 186-189, 198.
 23. **reader.py: a copybook member whose every non-blank line keeps its text within columns 1-7 is read as
    code.** Two of his missing copybooks hold a 7-8 digit number in column 1 and nothing else (a stub, or a
    value meant to be copied): fixed-format reading takes columns 1-6 as the sequence area and column 7 as

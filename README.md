@@ -466,39 +466,38 @@ run marks for the next build every program that still says `COPY X NOT
 FOUND` although a member named X has arrived since it was parsed (a member
 typed `unknown` by its folder name forces no re-parse by itself), and names
 in `work\recover.md` every copybook whose only member is filed as a kind the
-build never expands - a procedure copybook, paragraphs and statements with
-no level numbers, in a PROCS or CNTL folder - with what to do: rename the
-folder to end in COPYLIB, or declare the library's kind in the UI's table,
-and build (`coverage`, `program` and `copybook` say the same beside each
-such NOT FOUND). A member typed `unknown` is expanded into its programs
-but has no parser of its own, so its own lines are not indexed or citable
-until that same folder fix is applied - the notes say so beside it. A member the
-classifier typed `asm`, `listing` or `mfs` by a LINE OF ITS TEXT - a field
-or paragraph named START-..., a comment naming MODULE MAP, a line whose
-first word is MSG: weak signatures checked before the level numbers and
-the folder name (ROADMAP re-parse item 22) - gets no folder advice, because
-none helps: the same run re-files it as a copybook in the index when its
-text is COBOL (never a real Assembler, listing or MFS member, a JCL line or
-a program), marks the programs copying it, and the next build expands it;
-its own field rows wait for the next full re-parse, the report's 'Re-filed
-as copybook' section names each, and `coverage`, `program` and `copybook`
-say 'filed as asm by its content' with the recover instruction instead of
-the rename. A build that re-parses every member - `--rebuild`, the
-manifest changed (every library added or re-kinded in the UI's table
-rewrites it), a parser module changed - files such a member as before
-and parses its programs again without it, so they read partial with
-COPY NOT FOUND: run recover after such a build and it re-files them.
+build never expands, with what to do (`coverage`, `program` and `copybook`
+say the same beside each such NOT FOUND). A COBOL copybook is typed by its own
+lines first - level numbers, or COBOL statements (MOVE ... TO, PERFORM, a
+paragraph name in area A ...) with no DIVISION header - before the shape of
+an Assembler, listing or MFS member, the kind declared for its library in the
+UI's table and the folder name (ROADMAP re-parse items 20 and 22); a member
+with no signature at all (a literal copied into a VALUE clause) takes the
+declared kind or its folder's kind: rename the folder to end in COPYLIB, or
+declare the library's kind in the UI's table, and build. A declared kind wins
+over a shape, a folder name and an extension - except `cobol`, the table's
+default for a new row, which types only a member nothing else did. A member
+typed `unknown` is expanded into its programs but has no parser of its own,
+so its own lines are not indexed or citable until that same folder fix is
+applied - the notes say so beside it. A member with the shape of an
+Assembler, listing or MFS member gets no folder advice, because none helps:
+the notes say what it is, and to declare its library copybook if it IS the
+copybook. On an index built before the batch a line of a copybook's own text
+could type it (a field or paragraph named START-... as Assembler, a comment
+naming MODULE MAP as a listing, a first word MSG as MFS) and a procedure
+copybook took its folder's kind: the same run re-files every such member the
+classifier of this toolkit reads as a copybook, marks the programs copying
+it, and the next build expands it; the report's 'Re-filed as copybook'
+section names each, and the first build after the toolkit changed re-parses
+every member and files them as copybooks itself.
 Every missing copybook is also looked for on disk, the estate root walked
 once: the report's first table says per name whether a file with that name
 is there and not in the index (arrived after the last build, or skipped by
 it), filed `empty` because its text sits in columns 1-7, under a near name
 in the copybook folders, or not there at all - and what to do for each;
 `coverage` and `copybook NAME` say the same.
-Such a member in a folder with no COPY hint and with no level
-numbers to go by is not re-filed - nothing says copybook - and every note
-says the folder fix first, then a second run; a member typed by the kind
-declared for its library in the UI's table reads 'by its declared kind'
-with 'declare it copybook there'. `--from
+A member typed by the kind declared for its library in the UI's table reads
+'by its declared kind' with 'declare it copybook there'. `--from
 FOLDER` adds expanded programs the index does not hold; `--dry-run` says
 what would be written. The same run reads the listing of every program whose
 copybook the build chose among several same-named ones (the listing's
