@@ -94,11 +94,15 @@ forces every program that copies it to be re-parsed; a member a job reads -
 a PROC, an INCLUDE member, a control-card member (filed proc, jcl, ctlcard,
 unknown or sql) - that arrives, changes, disappears or is filed as another
 kind forces every job to be re-parsed; and members that disappeared are
-pruned. An incremental build gives the facts a full one would, save one
-list: a dataset name no DD names any more stays in the index's list of
-dataset names until a `--rebuild` (the list is read only for an IDCAMS
-DEFINE's attributes; ROADMAP re-parse item 24). A full estate re-run after
-a small change takes seconds, not minutes.
+pruned. For what a COPY and a job expand, an incremental build gives the
+facts a full one would (the tests compare the two indexes row for row),
+save one list: a dataset name no DD names any more stays in the index's
+list of dataset names until a `--rebuild` (the list is read only for an
+IDCAMS DEFINE's attributes). One fact outside that also outlives its
+source: a DD direction a program's OPEN verb set stays after the program
+stops opening the file, until the job is parsed again or a `--rebuild`
+(ROADMAP re-parse item 24 has both). A full estate re-run after a small
+change takes seconds, not minutes.
 
 ### When zowe asks for a host, a user or a password
 

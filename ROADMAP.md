@@ -350,10 +350,11 @@ shipped alone and cost one such night; these still wait for the next one:
    name `moved_names(..., JOB_READ_KINDS, again=False)` finds parses every job and PROC again - every one, because a
    card looked up by its sequential dataset's last qualifier leaves no name behind when nothing is found; a member
    recorded again with the same bytes does not count there, since a job keeps the names of what it read, never a
-   member id. An incremental build gives the facts a --rebuild of the same estate gives, checked row for row
-   (tests/test_inventory_forcing.py `facts`): a copybook removed from disk leaves its programs 'partial - COPY X NOT
-   FOUND', or resolved to the other copy of the name, never 'ok' with a NULL row; a PROC removed leaves its job with
-   'missing_proc'. The one list left out is the dataset names (item 24). The price: a copybook the parser fails on
+   member id. For what a COPY and a job expand, an incremental build gives the facts a --rebuild of the same estate
+   gives, checked row for row (tests/test_inventory_forcing.py `facts`): a copybook removed from disk leaves its
+   programs 'partial - COPY X NOT FOUND', or resolved to the other copy of the name, never 'ok' with a NULL row; a
+   PROC removed leaves its job with 'missing_proc'. The one list left out is the dataset names (item 24, with a DD
+   direction an OPEN verb set, which outlives its OPEN the same way). The price: a copybook the parser fails on
    with an exception (not a time limit, which settles) is recorded again on every build until the parser is fixed,
    and its programs are parsed again with it - the problem list names the member each time; and a member of an
    'unknown' or 'sql' kind arriving parses every job again (JCL is cheap next to COBOL). The stand-ins stay for an
@@ -458,7 +459,9 @@ shipped alone and cost one such night; these still wait for the next one:
    text is the code) and counted; the reader says so in the member's note. Until then `atlas.recover`,
    `coverage` and `copybook NAME` say where the text sits ('the file holds N line(s) whose text sits in
    columns 1-7 ...') instead of the bare word `empty`, and the disk check names the file.
-24. **The list of dataset names keeps a name no DD names any more.** The build adds a row to `dataset` for every
+24. **Two facts an incremental build keeps after their source is gone: the list of dataset names keeps a name no DD
+   names any more, and a DD keeps the direction an OPEN verb gave it after the program stops opening the file.**
+   The build adds a row to `dataset` for every
    DSN a DD, an IDCAMS DEFINE or a CICS / IMS definition names (`INSERT OR IGNORE`), and no incremental build
    removes one: after a job stops naming a dataset - a PROC or INCLUDE gone, a DD deleted, a DEFINE dropped - the
    name, and a DEFINE's attributes, stay until a `--rebuild`. The list is read only by `dataset NAME` for an IDCAMS
@@ -466,7 +469,12 @@ shipped alone and cost one such night; these still wait for the next one:
    that defined it went. Found while checking item 21 row for row against a --rebuild
    (tests/test_inventory_forcing.py JobsFollowWhatTheyRead leaves the table out and says why). At the re-parse:
    record the member that wrote each row (or each DEFINE's attributes) so `_forget_member` takes it with the rest,
-   or delete after the parse the rows nothing names; then compare the table too.
+   or delete after the parse the rows nothing names; then compare the table too. The second: `post_open_modes`
+   sets `dd.mode` from each program's OPEN verb (mode_source 'open_verb') on every build and never sets it back,
+   so after GCOPN1's `OPEN OUTPUT OUT-FILE` is removed, the kept job's DD OUTF still reads 'output' from
+   'open_verb', while a --rebuild gives 'unknown' from 'undetermined' (checked on a scratch estate while writing
+   item 21's tests). At the re-parse: keep the JCL's own direction in a column of its own and let the pass start
+   from it on every build.
 25. **A COPY NOT FOUND inside a VALUE clause loses the PROCEDURE DIVISION.** `05 WS-STATES PIC X(10) VALUE`
    followed by `COPY LITBK.` with LITBK missing: the expander turns the COPY line into a comment, period
    included, so the data entry runs on into `PROCEDURE DIVISION.` - the member is 'partial' with no paragraphs,
