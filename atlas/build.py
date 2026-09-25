@@ -293,6 +293,17 @@ CODE_KINDS = {"cobol", "copybook", "jcl", "proc", "ctlcard", "dbd", "psb", "bms"
 # re-typed into or out of them - so an incremental build parses again every program that copies such a name
 # (moved_names, copiers_to_parse; ROADMAP re-parse item 21). atlas.recover keeps the same tuple (recover.RESOLVER_KINDS).
 RESOLVER_KINDS = ("copybook", "cobol", "sql", "unknown")
+# the kinds a job's expansion reads a member from: a cataloged PROC (_proc_facts), an `// INCLUDE MEMBER=` member
+# (_include_text) and a control-card member, `DSN=LIB(MEMBER)` or a sequential dataset's last qualifier (_card_text).
+# A member of one of these kinds that arrives, changes, goes or is re-typed into or out of them changes the facts of
+# every job that reads it, and a job records only the NAME it looked for (a card taken by its last qualifier not even
+# that, when nothing was found) - so an incremental build parses every job and PROC again (moved_names with
+# again=False: a job holds no member id of what it read, so a member recorded again with the same bytes changes
+# nothing in it; ROADMAP re-parse item 21)
+PROC_KINDS = ("proc", "jcl")
+INCLUDE_KINDS = ("jcl", "proc", "ctlcard", "unknown")
+CARD_KINDS = ("ctlcard", "unknown", "sql", "jcl", "proc")
+JOB_READ_KINDS = tuple(dict.fromkeys(PROC_KINDS + INCLUDE_KINDS + CARD_KINDS))
 SKIP_DIRS = {".git", "__pycache__", "node_modules", ".svn", "$RECYCLE.BIN"}
 
 EXTRA_SCHEMA = """
@@ -763,7 +774,8 @@ def _settled(status: Optional[str], error: Optional[str]) -> bool:
         status == "failed" and (error or "").startswith(("MemberTimeout", "ParserStuck", "InventoryTimeout")))
 
 
-def moved_names(existing: Dict[str, tuple], found: Sequence[tuple]) -> Set[str]:
+def moved_names(existing: Dict[str, tuple], found: Sequence[tuple], kinds: Sequence[str] = RESOLVER_KINDS,
+                again: bool = True) -> Set[str]:
     """The names whose COPY statements may resolve differently after this
     inventory: every member of a kind the resolver expands (RESOLVER_KINDS)
     that is new, whose bytes changed, that is recorded again under a new id
@@ -771,6 +783,16 @@ def moved_names(existing: Dict[str, tuple], found: Sequence[tuple]) -> Set[str]:
     build stopped before it was parsed, a parser exception), or that went
     from disk - taken under its kind in the last build AND in this one, so a
     member re-typed into or out of those kinds counts too.
+
+    With `kinds` = JOB_READ_KINDS and `again` False: the names of the members
+    a job's expansion reads (a PROC, an INCLUDE, a card member) that arrived,
+    changed, went or were re-typed - one of them makes inventory() parse
+    every job and PROC again. A member recorded again with the same bytes is
+    left out there: a job keeps the names of what it read, never its id, so
+    its facts do not change. Before this, only a new or changed member filed
+    proc, jcl or ctlcard forced the jobs: a PROC that went from disk left its
+    jobs with the steps and datasets of the PROC it no longer has, and a card
+    member arriving 'unknown' or 'sql' left them without its cards.
 
     Before ROADMAP re-parse item 21 only a new or changed member filed
     copybook or cobol counted: a copybook arriving 'unknown' (a dataset-named
@@ -789,14 +811,14 @@ def moved_names(existing: Dict[str, tuple], found: Sequence[tuple]) -> Set[str]:
         path, name, kind, sha_ = f[0], f[1], f[2], f[5]
         here.add(path)
         ex = existing.get(path)
-        if ex is not None and ex[1] == sha_ and _settled(ex[2], ex[3]):
+        if ex is not None and ex[1] == sha_ and (not again or _settled(ex[2], ex[3])):
             continue                          # kept: the same bytes, the same kind, the same id
-        if kind in RESOLVER_KINDS:
+        if kind in kinds:
             names.add(str(name).upper())
-        if ex is not None and ex[4] in RESOLVER_KINDS:
+        if ex is not None and ex[4] in kinds:
             names.add(str(ex[-1] or name).upper())
     for path, ex in existing.items():
-        if path not in here and ex[4] in RESOLVER_KINDS:
+        if path not in here and ex[4] in kinds:
             names.add(str(ex[-1] or os.path.splitext(os.path.basename(path))[0]).upper())    # gone from disk
     return names
 
@@ -873,8 +895,9 @@ def inventory(ctx: Ctx, roots, limit: Optional[int] = None, force_all: bool = Fa
     A member of a kind the resolver expands (copybook, cobol, sql, unknown)
     that arrives, changes, goes or is re-typed forces every program that
     copies its name (and every copybook that copies it) to be re-parsed
-    (moved_names, copiers_to_parse); a changed PROC / INCLUDE /
-    control-card member forces every job. `force_all` (parser or manifest
+    (moved_names, copiers_to_parse); a member of a kind a job reads (a PROC,
+    an INCLUDE, a card member: JOB_READ_KINDS) that arrives, changes, goes
+    or is re-typed forces every job and PROC. `force_all` (parser or manifest
     changed) re-parses everything. Members that vanished are pruned.
     `--rebuild` starts from an empty db.
 
@@ -1009,7 +1032,6 @@ def inventory(ctx: Ctx, roots, limit: Optional[int] = None, force_all: bool = Fa
         found_by = {f[0]: f for f in found}
         _load_library_markers(ctx, roots)
 
-        changed = [f for f in found if f[0] not in existing or existing[f[0]][1] != f[5]]
         forced: set = set()
         moved = moved_names(existing, found) if existing and not force_all else set()
         if moved:
@@ -1019,9 +1041,11 @@ def inventory(ctx: Ctx, roots, limit: Optional[int] = None, force_all: bool = Fa
             progress.now(f"finding the programs to parse again: {len(moved):,} name(s) of members that arrived, changed, "
                          f"went or were re-typed since the last build")
             forced |= copiers_to_parse(conn, moved)
-        if any(f[2] in ("proc", "jcl", "ctlcard") for f in changed) and existing and not force_all:
-            # a PROC, INCLUDE or card member changed: every job that expands it
-            # carries its facts - re-parse all JCL (cheap next to COBOL)
+        if existing and not force_all and moved_names(existing, found, JOB_READ_KINDS, again=False):
+            # a PROC, INCLUDE or card member arrived, changed, went or was re-typed (a card member may be filed
+            # unknown or sql): every job that expands it carries its facts, and a job keeps only the names it looked
+            # for - re-parse all JCL (cheap next to COBOL). Before ROADMAP re-parse item 21 only a new or changed
+            # member filed proc, jcl or ctlcard did: a PROC gone from disk left its jobs with its steps and datasets
             forced |= {r[0] for r in conn.execute("SELECT path FROM member WHERE kind IN ('jcl','proc')")}
         if force_all:
             forced |= set(existing)
@@ -1325,14 +1349,14 @@ def _member_text(ctx: Ctx, name: str, kinds: Tuple[str, ...], job_mem: Optional[
 
 def _include_text(ctx: Ctx, name: str, job_mem: Optional[Mem] = None) -> Optional[str]:
     """`// INCLUDE MEMBER=X`: the member's records, spliced in by parse_jcl."""
-    return _member_text(ctx, name, ("jcl", "proc", "ctlcard", "unknown"), job_mem)
+    return _member_text(ctx, name, INCLUDE_KINDS, job_mem)
 
 
 def _card_text(ctx: Ctx, name: str, job_mem: Optional[Mem] = None) -> Optional[str]:
     """`//SYSIN DD DSN=PROD.PARMLIB(SRTCLM)`: the card member's text. Never a
     COBOL/copybook member of the same name - PARMLIB(CLMRPT2) is cards for
     CLMRPT2, not the program."""
-    return _member_text(ctx, name, ("ctlcard", "unknown", "sql", "jcl", "proc"), job_mem)
+    return _member_text(ctx, name, CARD_KINDS, job_mem)
 
 
 def _parsed_proc(ctx: Ctx, m: Mem) -> Optional[jcl.JclFacts]:
@@ -1350,7 +1374,7 @@ def _proc_facts(ctx: Ctx, name: str, job_mem: Optional[Mem] = None,
     """Cataloged PROC by name for expand_job, chosen by the calling job's
     JCLLIB ORDER and department; an undecidable choice is recorded on the
     job as `ambiguous_proc`."""
-    cands = [m for m in ctx.by_name.get(name.upper(), []) if m.kind in ("proc", "jcl")
+    cands = [m for m in ctx.by_name.get(name.upper(), []) if m.kind in PROC_KINDS
              and _parsed_proc(ctx, m) is not None]
     m, note = _pick_member(ctx, cands, name, job_mem, job.jcllib if job else ())
     if m is None:

@@ -26,12 +26,23 @@ copying one of the names - one query per 500 names, each name asked once.
 Each case is also built by the earlier rule (build_before_item_21), which
 leaves the state the stand-ins are written for, and on an index this
 toolkit built the stand-ins have nothing to say.
+
+The jobs follow the same rule for what THEY read (build.JOB_READ_KINDS: a
+cataloged PROC, an INCLUDE member, a card member - which may be filed
+unknown or sql): a member of those kinds that arrives, changes, goes or is
+re-typed makes the build parse every job and PROC again. Before, only a new
+or changed member filed proc, jcl or ctlcard did: a PROC that went from disk
+left its job with the PROC's steps and datasets, and a card member arriving
+'unknown' left the job without its cards (JobsFollowWhatTheyRead). Each
+case is checked against a --rebuild of the same estate, fact for fact.
 """
 
 import os
+import shutil
 import sqlite3
 import sys
 import unittest
+from collections import Counter
 from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -56,6 +67,88 @@ DDLBK = "  CREATE TABLE PROD.POLICY_TAB\n  ( POL_ID CHAR(10) NOT NULL\n  , POL_A
 STARTBK_SHARED = ("           05  ST-ID               PIC X(5).\n           05  ST-REGION           PIC X(10).\n"
                   "           05  START-DATE          PIC X(8).\n           05  ST-AMT              PIC 9(3).\n")
 UNLINKED = "but 1 COPY row is unresolved (STARTBK)"
+
+
+# a job that reads a cataloged PROC, a card member by DSN=LIB(MEMBER), a card taken by its sequential dataset's last
+# qualifier, and an INCLUDE member
+GCJOB1 = ("//GCJOB1   JOB (ACCT),'NIGHT',CLASS=A\n"
+          "//STEP1    EXEC GCPROC\n"
+          "//STEP2    EXEC PGM=IKJEFT01\n"
+          "//SYSTSIN  DD DSN=PROD.GC.PARMS(GCRUN1),DISP=SHR\n"
+          "//STEP3    EXEC PGM=SORT\n"
+          "//SORTIN   DD DSN=PROD.GC.IN,DISP=SHR\n"
+          "//SORTOUT  DD DSN=PROD.GC.SORTED,DISP=(NEW,CATLG)\n"
+          "//SYSIN    DD DSN=PROD.GC.SRTCARD,DISP=SHR\n"
+          "//STEP4    EXEC PGM=GCPGM2\n"
+          "//         INCLUDE MEMBER=GCINC1\n")
+GCPROC = "//GCPROC   PROC\n//RUN      EXEC PGM=GCPGM1\n//OUT      DD DSN=PROD.GC.OUT,DISP=SHR\n//         PEND\n"
+GCINC1 = "//EXTRA    DD DSN=PROD.GC.EXTRA,DISP=SHR\n"
+# card members with no signature in a dataset-named folder with no hint: filed 'unknown'
+GCRUN1 = " DSN SYSTEM(DB2P)\n RUN PROGRAM(GCPGM3) PLAN(GCPLAN3)\n END\n"
+SRTCARD = "  SORT FIELDS=(1,5,CH,A)\n"
+
+# build bookkeeping and the search index: not facts about the estate
+_NOT_FACTS = {"atlas_meta", "build_run", "src_fts", "src_fts_config", "src_fts_content", "src_fts_data",
+              "src_fts_docsize", "src_fts_idx", "fts_span", "expand_run", "sqlite_sequence", "library"}
+_WHEN = {"id", "scanned_at", "generated_at", "fetched_at", "started_at", "finished_at"}
+
+
+def facts(db, skip=()):
+    """Every row of the index with each id replaced by what it points at (the member's path under the estate root,
+    the program, the field, the step), so an incremental build and a --rebuild of the same estate compare row for
+    row: {table: Counter(rows)}."""
+    c = sqlite3.connect(db)
+    try:
+        root = os.path.commonpath([r[0] for r in c.execute("SELECT path FROM member")] or [os.sep])
+        mem = {i: os.path.relpath(p, root) for i, p in c.execute("SELECT id, path FROM member")}
+        prog = {i: mem.get(m) for i, m in c.execute("SELECT id, member_id FROM program")}
+        pf = {i: f"{prog.get(p)}:{n}@{o}" for i, p, n, o in c.execute("SELECT id, program_id, name, offset FROM pfield")}
+        fld = {i: f"{mem.get(m)}:{n}" for i, m, n in c.execute("SELECT id, member_id, name FROM field")}
+        step = {i: f"{j}/{n}/{o}/{pp}" for i, j, n, o, pp in c.execute(
+            "SELECT s.id, COALESCE(j.job_name, pd.proc_name), s.step_name, s.ordinal, s.parent_step FROM step s "
+            "LEFT JOIN job j ON j.id=s.job_id LEFT JOIN proc_def pd ON pd.id=s.proc_id")}
+        maps = {"member_id": mem, "resolved_member_id": mem, "src_member": mem, "include_member": mem,
+                "card_member": mem, "pfield": pf, "pfield_id": pf, "src_pfield": pf, "dst_pfield": pf, "root_id": pf,
+                "copy_field_id": fld, "field_id": fld, "step_id": step,
+                "job_id": dict(c.execute("SELECT id, job_name FROM job").fetchall()),
+                "proc_id": dict(c.execute("SELECT id, proc_name FROM proc_def").fetchall())}
+        out = {}
+        for (t,) in c.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").fetchall():
+            if t in _NOT_FACTS or t in skip:
+                continue
+            cols = [r[1] for r in c.execute(f'PRAGMA table_info("{t}")')]
+            rows = Counter()
+            for r in c.execute(f'SELECT * FROM "{t}"'):
+                vals = []
+                for col, v in zip(cols, r):
+                    if col in _WHEN:
+                        continue
+                    if col == "program_id" and t != "program":
+                        v = prog.get(v, f"?prog{v}")
+                    elif col == "parent_id":
+                        v = (pf if t == "pfield" else fld).get(v, v)
+                    elif col in maps and v is not None and isinstance(v, int):
+                        v = maps[col].get(v, f"?{col}{v}")
+                    elif col.endswith("_id") and isinstance(v, int):
+                        v = "*"
+                    if isinstance(v, str):
+                        v = v.replace(root, "<ROOT>")
+                    vals.append(f"{col}={v}")
+                rows[tuple(vals)] += 1
+            out[t] = rows
+        return out
+    finally:
+        c.close()
+
+
+def facts_differ(a, b):
+    """The rows each index holds that the other does not, table by table ({} when they hold the same facts)."""
+    diff = {}
+    for t in sorted(set(a) | set(b)):
+        ra, rb = a.get(t, Counter()), b.get(t, Counter())
+        if ra != rb:
+            diff[t] = (sorted(ra - rb)[:4], sorted(rb - ra)[:4])
+    return diff
 
 
 def stored(kind, sha="s1", status="ok", error=None, name="BOOK"):
@@ -112,6 +205,34 @@ class TheRule(unittest.TestCase):
         self.assertEqual(build.moved_names({}, [seen("p", "copybook", name="Book")]), {"BOOK"})
         self.assertEqual(build.moved_names({"q": stored("unknown", name="Gone")}, []), {"GONE"})
 
+    def test_the_jobs_read_the_kinds_their_lookups_read(self):
+        # _proc_facts, _include_text and _card_text read these kinds; the job forcing reads the same tuple
+        self.assertEqual(build.PROC_KINDS, ("proc", "jcl"))
+        self.assertEqual(build.INCLUDE_KINDS, ("jcl", "proc", "ctlcard", "unknown"))
+        self.assertEqual(build.CARD_KINDS, ("ctlcard", "unknown", "sql", "jcl", "proc"))
+        self.assertEqual(build.JOB_READ_KINDS, ("proc", "jcl", "ctlcard", "unknown", "sql"))
+
+    def test_for_the_jobs_a_member_arriving_changing_going_or_re_typed_counts(self):
+        J = build.JOB_READ_KINDS
+
+        def moved(existing, found):
+            return build.moved_names(existing, found, J, again=False)
+
+        for kind in J:
+            self.assertEqual(moved({}, [seen("p", kind)]), {"BOOK"}, kind)
+            self.assertEqual(moved({"p": stored(kind)}, [seen("p", kind, sha="s2")]), {"BOOK"}, kind)
+            self.assertEqual(moved({r"x\book.txt": stored(kind, name="BOOK")}, []), {"BOOK"}, kind)
+        for kind in ("copybook", "cobol", "doc", "listing", "asm", "mfs", "bms", "dbd", "psb", "empty", "rexx"):
+            self.assertEqual(moved({}, [seen("p", kind)]), set(), kind)
+            self.assertEqual(moved({r"x\book.txt": stored(kind)}, []), set(), kind)
+        # re-typed out of the kinds a job reads, and into them
+        self.assertEqual(moved({"p": stored("proc")}, [seen("p", "doc", sha="s2")]), {"BOOK"})
+        self.assertEqual(moved({"p": stored("doc")}, [seen("p", "unknown", sha="s2")]), {"BOOK"})
+        self.assertEqual(moved({"p": stored("asm")}, [seen("p", "copybook", sha="s2")]), set())
+        # recorded again with the same bytes: a job keeps the names of what it read, never an id - nothing changes
+        for status, error in (("ok", None), ("pending", None), ("failed", "RuntimeError: boom")):
+            self.assertEqual(moved({"p": stored("proc", status=status, error=error)}, [seen("p", "proc")]), set(), status)
+
 
 class CopiersToParse(_Estate):
     """build.copiers_to_parse: every member copying a name, then every member copying one of THEIRS, each name
@@ -162,6 +283,18 @@ class _Forcing(_Estate):
             conn.commit()
         finally:
             conn.close()
+
+    def full(self):
+        """The same estate built from nothing (--rebuild) into another index: what an incremental build must give."""
+        db = os.path.join(self.td, "full.db")
+        if os.path.exists(db):
+            os.remove(db)
+        self.build(["--rebuild", "--db", db])
+        return db
+
+    def assert_as_full(self, skip=()):
+        """The incremental index holds the facts a --rebuild of the same estate holds, row for row."""
+        self.assertEqual(facts_differ(facts(self.db, skip), facts(self.full(), skip)), {})
 
     def stamp(self):
         """Mark every member row as it stands: a member the next build records again - parsed again - loses the
@@ -226,6 +359,7 @@ class ArrivingUnderEveryKind(_Forcing):
         self.assert_ok_and_linked("VALPGM", "VALBK")
         self.assert_ok_and_linked("SQLPGM", "POLTAB")
         self.stand_ins_say_nothing("VALPGM", "VALBK")
+        self.assert_as_full()
         self.stamp()
         self.build()
         self.assertEqual(self.recorded_again(), set(), "settled: the next build parses nothing again")
@@ -260,6 +394,7 @@ class RemovedFromDisk(_Forcing):
         self.assertIn("| STARTBK | **NOT FOUND** |", prog)
         self.assertIn("| STARTBK | 1 | - |", cov.split("### Copybooks not found")[1].split("\n###")[0])
         self.assertIn("| cobol | STPGM |", cov.split("### Members parsed only in part")[1].split("\n###")[0])
+        self.assert_as_full()
 
     def test_before_the_batch_the_program_kept_ok_with_a_null_row(self):
         self.remove("GC/PROD.GC.COPYLIB/STARTBK.cpy")
@@ -297,6 +432,7 @@ class RemovedFromDisk(_Forcing):
         self.assertEqual(self.q("SELECT COUNT(*) FROM unresolved WHERE kind='ambiguous_copybook'"), [(0,)],
                          "one copy left: no choice to record")
         self.stand_ins_say_nothing("STPGM", "STARTBK")
+        self.assert_as_full()
 
     def test_an_unknown_member_going_forces_its_programs_too(self):
         self.write("GC/PROD.GC.SRC/VALPGM.cbl", value_program("VALPGM", "VALBK"))
@@ -307,6 +443,7 @@ class RemovedFromDisk(_Forcing):
         self.build()
         self.assert_not_found("VALPGM", "VALBK")
         self.stand_ins_say_nothing("VALPGM", "VALBK")
+        self.assert_as_full()
 
 
 class ReTyped(_Forcing):
@@ -331,6 +468,7 @@ class ReTyped(_Forcing):
         self.stand_ins_say_nothing("STPGM", "STARTBK")
         nf = self.outputs("STPGM", "STARTBK")[1]
         self.assertIn("filed as asm", nf)
+        self.assert_as_full()
 
     def test_before_the_batch_it_left_the_program_ok_with_the_old_fields(self):
         self.write("GC/PROD.GC.COPYLIB/STARTBK.cpy", ASMBK.replace("ASMBK ", "STARTBK", 1))
@@ -352,6 +490,7 @@ class ReTyped(_Forcing):
         self.assertIn("A-120-NEW", self.paras())
         self.assertNotIn("A-110-DO", self.paras())
         self.stand_ins_say_nothing("SECPGM", "PROCBK")
+        self.assert_as_full()
 
     def test_before_the_batch_the_old_paragraphs_stayed(self):
         self.write("SHARED/PROD.GC.CPYLIB/PROCBK.txt", PROCBK_LOWER)
@@ -374,6 +513,7 @@ class RecordedAgain(_Forcing):
         self.assertEqual(self.member("STARTBK")[2], "ok")
         self.assert_ok_and_linked()
         self.stand_ins_say_nothing("STPGM", "STARTBK")
+        self.assert_as_full()
 
     def test_before_the_batch_a_copybook_marked_pending_un_linked_its_programs(self):
         self.q_write("UPDATE member SET parse_status='pending' WHERE name='STARTBK'")
@@ -428,6 +568,109 @@ class NothingElseIsParsedAgain(_Forcing):
         self.build()
         self.assertEqual(self.recorded_again(), set())
         self.assertEqual(self.q("SELECT COUNT(*) FROM member WHERE name='NOBODY'"), [(0,)])
+
+
+class JobsFollowWhatTheyRead(_Forcing):
+    """A member a job's expansion reads - a cataloged PROC, an INCLUDE member, a card member (filed ctlcard, or
+    unknown / sql when its folder has no hint) - that arrives, goes or is re-typed: the build parses every job and
+    PROC again, and the job holds what a --rebuild of the same estate gives it. Before ROADMAP re-parse item 21 only a
+    new or changed member filed proc, jcl or ctlcard forced the jobs.
+
+    The one table left out of the comparison is `dataset`, the registry of dataset names: a name stays in it after
+    the last DD naming it is gone, until a --rebuild - on every incremental build, whatever changed the job (it is
+    read only for an IDCAMS DEFINE's attributes)."""
+
+    files = _Forcing.files + (("GC/PROD.GC.JCL/GCJOB1.jcl", GCJOB1),
+                              ("GC/PROD.GC.PROCLIB/GCPROC.prc", GCPROC),
+                              ("GC/PROD.GC.PROCLIB/GCINC1.prc", GCINC1))
+
+    def steps(self):
+        return self.q("SELECT s.step_name, s.effective_pgm, s.from_proc FROM step s JOIN job j ON j.id=s.job_id "
+                      "WHERE j.job_name='GCJOB1' ORDER BY s.ordinal, s.id")
+
+    def dds(self):
+        return self.q("SELECT d.dd_name, d.dsn_resolved, d.card_member, d.sysin_text IS NOT NULL FROM dd d "
+                      "JOIN step s ON s.id=d.step_id JOIN job j ON j.id=s.job_id WHERE j.job_name='GCJOB1' "
+                      "ORDER BY s.ordinal, d.id")
+
+    def job_notes(self):
+        return self.q("SELECT u.kind, u.detail FROM unresolved u JOIN member m ON m.id=u.member_id "
+                      "WHERE m.name='GCJOB1' ORDER BY u.kind, u.detail")
+
+    def assert_as_full(self, skip=("dataset",)):
+        super().assert_as_full(skip)
+
+    def test_as_built_from_nothing(self):
+        self.assertIn(("STEP1.RUN", "GCPGM1", "GCPROC"), self.steps())
+        self.assertIn(("EXTRA", "PROD.GC.EXTRA", None, 0), self.dds())
+        self.assert_as_full()
+
+    def test_a_proc_gone_from_disk(self):
+        self.stamp()
+        self.remove("GC/PROD.GC.PROCLIB/GCPROC.prc")
+        self.build()
+        self.assertIn("GCJOB1", self.recorded_again())
+        # the job no longer runs the PROC's step nor writes its dataset, and says the PROC is missing
+        self.assertNotIn("STEP1.RUN", [s[0] for s in self.steps()])
+        self.assertNotIn("PROD.GC.OUT", [d[1] for d in self.dds()])
+        self.assertIn(("missing_proc", "STEP1: PROC GCPROC not found"), self.job_notes())
+        self.assert_as_full()
+
+    def test_before_the_batch_a_proc_gone_left_its_steps(self):
+        self.remove("GC/PROD.GC.PROCLIB/GCPROC.prc")
+        with build_before_item_21():
+            self.build()
+        # the verifier's case: 'to parse: nothing' - the job kept the step and the DD of a PROC no longer on disk
+        self.assertIn(("STEP1.RUN", "GCPGM1", "GCPROC"), self.steps())
+        self.assertIn("PROD.GC.OUT", [d[1] for d in self.dds()])
+        self.assertNotIn(("missing_proc", "STEP1: PROC GCPROC not found"), self.job_notes())
+        self.assertIn("step", facts_differ(facts(self.db, ("dataset",)), facts(self.full(), ("dataset",))))
+
+    def test_an_include_member_gone_from_disk(self):
+        self.remove("GC/PROD.GC.PROCLIB/GCINC1.prc")
+        self.build()
+        self.assertNotIn("EXTRA", [d[0] for d in self.dds()])
+        self.assert_as_full()
+
+    def test_card_members_arriving_unknown(self):
+        # SYSTSIN names its card member; SORT's SYSIN is a sequential dataset, whose cards are looked up by its last
+        # qualifier - a lookup the job records nothing of when it finds nothing, so only 'every job' can follow it
+        self.assertIn(("STEP2", None, None), self.steps())
+        self.write("GC/PROD.GC.PARMS/GCRUN1.txt", GCRUN1)
+        self.write("GC/PROD.GC.PARMS/SRTCARD.txt", SRTCARD)
+        self.build()
+        self.assertEqual((self.member("GCRUN1")[0], self.member("SRTCARD")[0]), ("unknown", "unknown"))
+        self.assertIn(("STEP2", "GCPGM3", None), self.steps())
+        self.assertIn(("SYSTSIN", "PROD.GC.PARMS(GCRUN1)", "GCRUN1", 1), self.dds())
+        self.assertIn(("SYSIN", "PROD.GC.SRTCARD", "SRTCARD", 1), self.dds())
+        self.assert_as_full()
+        # and when they go again, the job loses them again
+        self.remove("GC/PROD.GC.PARMS/GCRUN1.txt")
+        self.remove("GC/PROD.GC.PARMS/SRTCARD.txt")
+        self.build()
+        self.assertIn(("STEP2", None, None), self.steps())
+        self.assert_as_full()
+
+    def test_before_the_batch_cards_arriving_unknown_were_not_read(self):
+        self.write("GC/PROD.GC.PARMS/GCRUN1.txt", GCRUN1)
+        with build_before_item_21():
+            self.build()
+        self.assertIn(("STEP2", None, None), self.steps())
+
+    def test_what_a_job_does_not_read_forces_no_job(self):
+        self.stamp()
+        # a data copybook and a document arrive; a PROC is recorded again with its bytes unchanged (marked pending)
+        self.write("GC/PROD.GC.COPYLIB/NEWBK.cpy", STARTBK)
+        self.write("SHARED/DOCS/RUNBOOK.txt", "Please run the job after the close.\n")
+        conn = sqlite3.connect(self.db)
+        try:
+            conn.execute("UPDATE member SET parse_status='pending' WHERE name='GCPROC'")
+            conn.commit()
+        finally:
+            conn.close()
+        self.build()
+        self.assertEqual(self.recorded_again(), {"NEWBK", "RUNBOOK", "GCPROC"})
+        self.assert_as_full()
 
 
 if __name__ == "__main__":

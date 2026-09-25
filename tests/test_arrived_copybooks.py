@@ -65,11 +65,14 @@ sys.path.insert(0, os.path.dirname(HERE))
 from atlas import build, query, recover  # noqa: E402
 
 
-def earlier_rule(existing, found):
-    """build.py's forcing before ROADMAP re-parse item 21 (`changed_names`): the names of the members new or with
-    changed bytes that are filed copybook or cobol - nothing for one filed sql or unknown, one that went from disk,
-    or one re-typed out of those kinds."""
-    return {f[1] for f in found if (f[0] not in existing or existing[f[0]][1] != f[5]) and f[2] in ("copybook", "cobol")}
+def earlier_rule(existing, found, kinds=build.RESOLVER_KINDS, again=True):
+    """build.py's forcing before ROADMAP re-parse item 21: for the programs (`changed_names`) the names of the members
+    new or with changed bytes that are filed copybook or cobol - nothing for one filed sql or unknown, one that went
+    from disk, or one re-typed out of those kinds; for the jobs (asked with build.JOB_READ_KINDS) a new or changed
+    member filed proc, jcl or ctlcard - nothing for a PROC or INCLUDE that went, or a card member filed unknown or
+    sql."""
+    old = ("copybook", "cobol") if tuple(kinds) == build.RESOLVER_KINDS else ("proc", "jcl", "ctlcard")
+    return {f[1] for f in found if (f[0] not in existing or existing[f[0]][1] != f[5]) and f[2] in old}
 
 
 @contextlib.contextmanager
