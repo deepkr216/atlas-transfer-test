@@ -7,11 +7,19 @@ the build's resolver GUESSES which copy to expand (COPY..OF, then the
 program's own system in its declared order, then authoritative, then the
 same folder, then the first) and records an 'ambiguous_copybook' row. His
 compiler listings end with a table naming, per copybook, the DD name and the
-LIBRARY DATASET the compiler read it from - the truth. atlas.recover reads
-that table from every such program's listing, stores it
-(listing_copy_source) and gives each choice a verdict: CONFIRMED,
-CONTRADICTED (a wrong fact: the report names it), UNKNOWN. The fact tables
-do not change; the build's use of the rows is ROADMAP re-parse item 19.
+LIBRARY DATASET the compiler read it from - the compiler's record.
+atlas.recover reads that table from every such program's listing, stores it
+(listing_copy_source, each row dated: is the listing the compile of the
+program as indexed?) and gives each choice a verdict. A name is not a fact
+about content (LESSONS 193: his listings' SYSLIB is the staging library the
+compile ran against, the copybooks promoted to production unchanged), so
+the listing's library is looked up in the index and its copy's text
+compared before anything is called wrong: CONFIRMED (the same dataset, or a
+held copy with the same text - promoted), NOT HELD (a library the index
+does not hold: the copy used stands), OLDER (different text, but an older
+compile's listing), CONTRADICTED (a current listing, a held copy, different
+text: the wrong fact), UNKNOWN. The fact tables do not change; the build's
+use of the rows is ROADMAP re-parse item 19.
 """
 
 import contextlib
@@ -187,11 +195,14 @@ class ChoicesCheckedAgainstTheListings(unittest.TestCase):
         finally:
             conn.close()
 
+    LINE = ("copybook choices checked against the listings: 1 confirmed, 2 contradicted by a current listing, 0 named by an "
+            "older listing, 1 name a library the index does not hold, 2 unknown")
+
     def test_2_dry_run_checks_and_stores_nothing(self):
         stats, said = self.run_it(dry_run=True)
-        self.assertEqual(stats["checked"], (1, 3, 2), said)
+        self.assertEqual(stats["checked"], (1, 2, 0, 1, 2), said)
         self.assertIsNone(self.rows(), "a dry run writes nothing")
-        self.assertIn("copybook choices checked against the listings: 1 confirmed, 3 contradicted, 2 unknown", "\n".join(said))
+        self.assertIn(self.LINE, "\n".join(said))
 
     def test_3_the_verdicts_the_line_and_the_report(self):
         stats, said = self.run_it()
@@ -200,44 +211,66 @@ class ChoicesCheckedAgainstTheListings(unittest.TestCase):
         self.assertIn("nothing to recover: every copybook the programs copy is in the index", text)
         self.assertIn("expanded texts to read: 5 of 5 found", text)
         self.assertIn("the 6 with a copybook chosen among several (to check the choice against the listing)", text)
-        self.assertIn("copybook choices checked against the listings: 1 confirmed, 3 contradicted, 2 unknown - every contradicted "
-                      "choice is a wrong fact in the index", text)
+        self.assertIn(self.LINE + " - every choice contradicted by a current listing is a wrong fact in the index: the report "
+                      "names each one with the library the listing says", text)
         self.assertNotIn("recovered: 0 of 0", text)
-        self.assertEqual(stats["checked"], (1, 3, 2))
+        self.assertEqual(stats["checked"], (1, 2, 0, 1, 2))
         conn = query.connect(self.db)
         try:
             by = {v["program"]: v for v in recover.check_choices(conn)}
         finally:
             conn.close()
-        self.assertEqual(by["CHOSEN"]["verdict"], "CONFIRMED")
+        self.assertEqual((by["CHOSEN"]["verdict"], by["CHOSEN"]["why"], by["CHOSEN"]["current"]), ("CONFIRMED", "", True))
         self.assertEqual((by["WRONGPK"]["verdict"], by["WRONGPK"]["listing_datasets"], by["WRONGPK"]["used_dataset"]),
                          ("CONTRADICTED", ["PROD.POLICY.COPYLIB"], "PROD.CLAIMS.COPYLIB"))
+        # the listing is current (the source it echoes is the program as indexed), the index holds POLICY's copy and its
+        # text differs from the CLAIMS copy the build used: the real wrong fact
+        self.assertEqual((by["WRONGPK"]["current"], by["WRONGPK"]["matched"], by["WRONGPK"]["why"]),
+                         (True, 100, "a current listing names PROD.POLICY.COPYLIB, whose text differs from the copy the build used"))
         self.assertIn("the index holds that copy at POLICY/PROD.POLICY.COPYLIB/DUPREC.cpy - the build chose the other", by["WRONGPK"]["index_has"])
+        self.assertEqual(by["LIBTBL"]["verdict"], "CONTRADICTED")
         self.assertIn("the index holds that copy at POLICY/POLCOPY2/DUPREC.cpy", by["LIBTBL"]["index_has"])     # known through `library`
-        self.assertEqual(by["FETCHIT"]["index_has"], "not a library the index holds - fetch it")
+        # a library the index does not hold says nothing against the copy used: the build could only choose among its own
+        self.assertEqual((by["FETCHIT"]["verdict"], by["FETCHIT"]["index_has"], by["FETCHIT"]["why"]),
+                         ("NOT HELD", "not a library the index holds", recover.NOT_HELD_WHY))
+        self.assertIn("the copy it used stands", recover.NOT_HELD_WHY)
+        self.assertIn("a staging library, or one gone from the host", recover.NOT_HELD_WHY)
         self.assertEqual((by["NOTABLE"]["verdict"], by["NOTABLE"]["why"]), ("UNKNOWN", "the program's listing has no copybook-source table"))
         self.assertEqual((by["NOLIST"]["verdict"], by["NOLIST"]["why"]), ("UNKNOWN", "no listing of the program was read"))
         rep = self.report_text()
         sec = rep.split("## Copybook choices, checked against the listings")[1]
-        self.assertIn("- 6 choices checked: 1 confirmed, 3 contradicted, 2 unknown (1: no listing of the program was read; "
+        self.assertIn("- 6 choices checked: 1 confirmed, 2 contradicted by a current listing, 0 named by an older listing, 1 name a "
+                      "library the index does not hold, 2 unknown (1: no listing of the program was read; "
                       "1: the program's listing has no copybook-source table)", sec)
-        self.assertIn("| program | copybook | the index used | the listing says | verdict |", sec)
+        self.assertIn("A name is not a fact about content", sec)
+        self.assertIn("| program | copybook | the index used | the listing says | listing current? | verdict | why |", sec)
         self.assertIn("| WRONGPK | DUPREC | PROD.CLAIMS.COPYLIB (CLAIMS/PROD.CLAIMS.COPYLIB/DUPREC.cpy; same system) | "
                       "PROD.POLICY.COPYLIB (SYSLIB) - the index holds that copy at POLICY/PROD.POLICY.COPYLIB/DUPREC.cpy - "
-                      "the build chose the other | CONTRADICTED |", sec)
+                      "the build chose the other | yes | CONTRADICTED | a current listing names PROD.POLICY.COPYLIB, whose text "
+                      "differs from the copy the build used |", sec)
         self.assertIn("| LIBTBL | DUPREC | ", sec)
         self.assertIn("| FETCHIT | DUPREC | PROD.CLAIMS.COPYLIB (CLAIMS/PROD.CLAIMS.COPYLIB/DUPREC.cpy; same system) | "
-                      "PROD.SHARED.COPYLIB (COPYLIB) - not a library the index holds - fetch it | CONTRADICTED |", sec)
+                      f"PROD.SHARED.COPYLIB (COPYLIB) - not a library the index holds | yes | NOT HELD | {recover.NOT_HELD_WHY} |", sec)
+        self.assertLess(sec.index("| WRONGPK |"), sec.index("| FETCHIT |"), "contradicted first, then not held")
         self.assertNotIn("| CHOSEN |", sec)
         self.assertNotIn("| NOTABLE |", sec)
+        self.assertNotIn("_no choice contradicted", sec)
         self.assertIn("ROADMAP re-parse item 19", sec)
-        # the stored rows: one per (program, copybook) named; a listing without a table leaves an empty row
+        # the stored rows: one per (program, copybook) named; a listing without a table leaves an empty row; every listing
+        # here echoes the program as indexed, so every row is dated current
         rows = self.rows()
         self.assertEqual([r for r in rows if r[1]], [("CHOSEN", "DUPREC", "SYSLIB", "PROD.CLAIMS.COPYLIB"),
                                                      ("FETCHIT", "DUPREC", "COPYLIB", "PROD.SHARED.COPYLIB"),
                                                      ("LIBTBL", "DUPREC", "SYSLIB", "PROD.POLICY.COPYLIB2"),
                                                      ("WRONGPK", "DUPREC", "SYSLIB", "PROD.POLICY.COPYLIB")])
         self.assertEqual([r for r in rows if not r[1]], [("NOTABLE", "", None, None)])
+        conn = sqlite3.connect(self.db)
+        try:
+            self.assertEqual(conn.execute("SELECT program, current, matched FROM listing_copy_source WHERE copybook<>'' "
+                                          "ORDER BY program").fetchall(),
+                             [("CHOSEN", 1, 100), ("FETCHIT", 1, 100), ("LIBTBL", 1, 100), ("WRONGPK", 1, 100)])
+        finally:
+            conn.close()
         # the build's facts are untouched: no parse_status changed, every 'ambiguous_copybook' row still there
         conn = sqlite3.connect(self.db)
         try:
@@ -259,15 +292,22 @@ class ChoicesCheckedAgainstTheListings(unittest.TestCase):
         try:
             cov = query.cmd_coverage(conn)
             chosen = cov.split("### Complete, with a copybook chosen among several")[1].split("\n###")[0]
-            self.assertIn("1 of these choices is confirmed by the program's listing, 3 contradicted (see work/recover.md), "
-                          "2 unknown", chosen)
+            self.assertIn("1 of these choices is confirmed by the program's listing, 2 contradicted by a current listing (see "
+                          "work/recover.md), 0 named by an older listing, 1 name a library the index does not hold, 2 unknown - "
+                          "the listing names the library the compiler read the copybook from; a name is not a fact about "
+                          "content, so the listing's copy is compared by text with the copy used before a choice is called "
+                          "wrong.", chosen)
             out = query.cmd_program(conn, "CHOSEN")
-            self.assertIn("- listing says: DUPREC came from PROD.CLAIMS.COPYLIB (SYSLIB) - confirms the copy the build used", out)
+            self.assertIn("- listing says: DUPREC came from PROD.CLAIMS.COPYLIB (SYSLIB) - confirms the copy the build used\n", out)
             out = query.cmd_program(conn, "WRONGPK")
             self.assertIn("- listing says: DUPREC came from PROD.POLICY.COPYLIB (SYSLIB) - CONTRADICTS the copy the build used "
                           "(PROD.CLAIMS.COPYLIB; the index holds that copy at POLICY/PROD.POLICY.COPYLIB/DUPREC.cpy - the build "
-                          "chose the other) - see work/recover.md", out)
+                          "chose the other; a current listing: its source matches this program as indexed) - see work/recover.md", out)
             self.assertIn("parse: complete (copybook chosen among several - see notes)", out)      # unchanged
+            out = query.cmd_program(conn, "FETCHIT")
+            self.assertIn("- listing says: DUPREC came from PROD.SHARED.COPYLIB (COPYLIB) - names PROD.SHARED.COPYLIB, a library "
+                          "the index does not hold - the copy the build used stands", out)
+            self.assertNotIn("CONTRADICTS", out)
             self.assertNotIn("listing says", query.cmd_program(conn, "NOLIST"))
             self.assertNotIn("listing says", query.cmd_program(conn, "NOTABLE"))
             out = query.cmd_copybook(conn, "DUPREC")
@@ -321,16 +361,18 @@ class CheckedWhileRecovering(unittest.TestCase):
         said = []
         stats = recover.run(self.db, log=said.append, report=self.report)
         text = "\n".join(said)
-        self.assertEqual((stats["written"], stats["missing"], stats["checked"]), (1, 1, (0, 1, 0)), text)
+        self.assertEqual((stats["written"], stats["missing"], stats["checked"]), (1, 1, (0, 1, 0, 0, 0)), text)
         self.assertIn("recovered: 1 of 1 missing copybooks", text)
-        self.assertIn("copybook choices checked against the listings: 0 confirmed, 1 contradicted, 0 unknown", text)
+        self.assertIn("copybook choices checked against the listings: 0 confirmed, 1 contradicted by a current listing, 0 named "
+                      "by an older listing, 0 name a library the index does not hold, 0 unknown", text)
         self.assertIn("expanded texts to read: 1 of 1 found", text)
         with open(self.report, encoding="utf-8") as fh:
             rep = fh.read()
         self.assertIn("| NOPE | 1 |", rep)
         self.assertIn("| MISSPGM | DUPREC | PROD.CLAIMS.COPYLIB (CLAIMS/PROD.CLAIMS.COPYLIB/DUPREC.cpy; same system) | "
                       "PROD.POLICY.COPYLIB (SYSLIB) - the index holds that copy at POLICY/PROD.POLICY.COPYLIB/DUPREC.cpy - "
-                      "the build chose the other | CONTRADICTED |", rep)
+                      "the build chose the other | yes | CONTRADICTED | a current listing names PROD.POLICY.COPYLIB, whose text "
+                      "differs from the copy the build used |", rep)
         # the recovered copybook is not in the listing's table for anything the index chose: NOPE's row is stored all the same
         conn = sqlite3.connect(self.db)
         try:
@@ -338,6 +380,364 @@ class CheckedWhileRecovering(unittest.TestCase):
         finally:
             conn.close()
         self.assertEqual(rows, [("DUPREC", "PROD.POLICY.COPYLIB"), ("NOPE", "PROD.X.COPYLIB")])
+
+
+STG_COMMENT = "      * promoted to production unchanged: the same code as the CLAIMS copy\n"
+
+
+def older_listing(name, copybooks, table, change=("PIC X(5).", "PIC X(6).")):
+    """A listing from an older compile: the program's source as it was then,
+    one line different from the member as indexed."""
+    src = program(name, *copybooks).replace(change[0], change[1], 1)
+    return ibm_listing(src.splitlines(), {"DUPREC": DUPREC_CLAIMS, "NOPE": NOPE}, copy_table=table)
+
+
+class TheListingIsDated(unittest.TestCase):
+    """listing_is_current: the listing's own program lines (the unflagged
+    records - a copied line carries a mark) against the member's, both read
+    the way the parser reads a member. Equal: current. Else older, with how
+    much of the source still matches."""
+
+    PROG = program("DATED", "DUPREC").splitlines()
+    TABLE = [("DUPREC", "SYSLIB", "PROD.CLAIMS.COPYLIB")]
+
+    def records(self, text):
+        return recover.listing_records(text.splitlines())[0]
+
+    def test_the_same_source_is_current(self):
+        recs = self.records(listing("DATED", ["DUPREC"], self.TABLE))
+        self.assertTrue(any(f == "C" for f, _r, _n in recs), "the copied lines are there, flagged")
+        self.assertEqual(recover.listing_is_current(recs, self.PROG), (True, 100))
+
+    def test_one_changed_line_is_older_with_the_match(self):
+        recs = self.records(older_listing("DATED", ["DUPREC"], self.TABLE))
+        self.assertEqual(recover.listing_is_current(recs, self.PROG), (False, 90))      # 9 of 10 code lines the same
+
+    def test_comments_blank_lines_and_the_columns_outside_8_72_do_not_date(self):
+        # the member as indexed gained sequence numbers, change stamps, a comment and a blank line: the same program
+        member = ["000100" + ln[6:].ljust(66) + "CHG00001" for ln in self.PROG]
+        member.insert(2, "000150* a comment the listing does not show")
+        member.insert(5, "")
+        recs = self.records(listing("DATED", ["DUPREC"], self.TABLE))
+        self.assertEqual(recover.listing_is_current(recs, member), (True, 100))
+
+    def test_nothing_to_date_against(self):
+        recs = self.records(listing("DATED", ["DUPREC"], self.TABLE))
+        self.assertEqual(recover.listing_is_current(recs, None), (None, None))          # the program is not in the index
+        self.assertEqual(recover.listing_is_current([], self.PROG), (None, None))       # no source column read
+        self.assertEqual(recover.listing_is_current([("C", "       01  X PIC X.", 1)], self.PROG), (None, None))
+
+    def test_the_dating_cell(self):
+        self.assertEqual(recover.dated_cell(True, 100), "yes")
+        self.assertEqual(recover.dated_cell(False, 97), "older (97%)")
+        self.assertEqual(recover.dated_cell(None, None), "not dated")
+
+
+def staging_estate(td):
+    """The owner's estate (LESSONS 193), written under td/estate, with one
+    listing outside it under td/from. DUPREC exists in CLAIMS (the copy the
+    build uses: same system), in PROD.STG.COPYLIB - the staging library the
+    compiles ran against, promoted to production unchanged (a comment
+    differs, the code does not) - and in POLICY with different code."""
+    table = lambda dsn: [("DUPREC", "SYSLIB", dsn)]   # noqa: E731
+    files = {
+        "estate/CLAIMS/PROD.CLAIMS.SRC/PROMOTED.cbl": program("PROMOTED", "DUPREC"),   # the listing names staging: same text
+        "estate/CLAIMS/PROD.CLAIMS.SRC/STGGONE.cbl": program("STGGONE", "DUPREC"),     # ... a staging library the index does not hold
+        "estate/CLAIMS/PROD.CLAIMS.SRC/OLDLIST.cbl": program("OLDLIST", "DUPREC"),     # an older compile's listing names POLICY's
+        "estate/CLAIMS/PROD.CLAIMS.SRC/CURLIST.cbl": program("CURLIST", "DUPREC"),     # a current listing names POLICY's
+        "estate/CLAIMS/PROD.CLAIMS.COPYLIB/DUPREC.cpy": DUPREC_CLAIMS[0] + "\n",
+        "estate/STAGING/PROD.STG.COPYLIB/DUPREC.cpy": STG_COMMENT + DUPREC_CLAIMS[0] + "\n",
+        "estate/POLICY/PROD.POLICY.COPYLIB/DUPREC.cpy": DUPREC_POLICY[0] + "\n",
+        "estate/CLAIMS/PROD.CLAIMS.LISTING/PROMOTED.lst": listing("PROMOTED", ["DUPREC"], table("PROD.STG.COPYLIB")),
+        "estate/CLAIMS/PROD.CLAIMS.LISTING/STGGONE.lst": listing("STGGONE", ["DUPREC"], table("PROD.STG2.COPYLIB")),
+        "estate/CLAIMS/PROD.CLAIMS.LISTING/OLDLIST.lst": older_listing("OLDLIST", ["DUPREC"], table("PROD.POLICY.COPYLIB")),
+        "estate/CLAIMS/PROD.CLAIMS.LISTING/CURLIST.lst": listing("CURLIST", ["DUPREC"], table("PROD.POLICY.COPYLIB")),
+        "from/LISTONLY.lst": listing("LISTONLY", ["DUPREC"], table("PROD.POLICY.COPYLIB")),   # a program the index lacks
+    }
+    for rel, text in files.items():
+        p = os.path.join(td, *rel.split("/"))
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w", encoding="utf-8") as fh:
+            fh.write(text)
+    return os.path.join(td, "estate"), os.path.join(td, "from")
+
+
+USED = "PROD.CLAIMS.COPYLIB (CLAIMS/PROD.CLAIMS.COPYLIB/DUPREC.cpy; same system)"
+POLICY_HELD = "the index holds that copy at POLICY/PROD.POLICY.COPYLIB/DUPREC.cpy - the build chose the other"
+
+
+class StagingOlderAndUndatedListings(unittest.TestCase):
+    """His correction: the listing's SYSLIB is the staging library the compile
+    ran against, the copybooks were promoted to production unchanged, and
+    the build's own choice was right - a name is not a fact about content.
+    His listings may also be a mix of older and current compiles. The five
+    verdicts on the estate of staging_estate()."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.td = tempfile.mkdtemp()
+        cls.root, cls.from_dir = staging_estate(cls.td)
+        cls.db = os.path.join(cls.td, "t.db")
+        cls.report = os.path.join(cls.td, "work", "recover.md")
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = build._main([cls.root, "--db", cls.db, "--rebuild", "--quiet"])
+        assert rc == 0
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.td, ignore_errors=True)
+
+    def run_it(self, **kw):
+        said = []
+        stats = recover.run(self.db, folders=[self.from_dir], log=said.append, report=self.report, **kw)
+        return stats, "\n".join(said)
+
+    def verdicts(self):
+        conn = query.connect(self.db)
+        try:
+            return {v["program"]: v for v in recover.check_choices(conn)}
+        finally:
+            conn.close()
+
+    def test_1_the_premise(self):
+        conn = sqlite3.connect(self.db)
+        try:
+            picks = recover.chosen_picks(conn)
+            self.assertEqual(sorted(p[0] for p in picks), ["CURLIST", "OLDLIST", "PROMOTED", "STGGONE"])
+            self.assertTrue(all("PROD.CLAIMS.COPYLIB" in p[2] and p[3] == "same system" for p in picks), picks)
+            shas = dict(conn.execute("SELECT path, norm_sha FROM member WHERE name='DUPREC'").fetchall())
+            by = {os.path.basename(os.path.dirname(p)): s for p, s in shas.items()}
+            self.assertEqual(by["PROD.CLAIMS.COPYLIB"], by["PROD.STG.COPYLIB"], "the same code: the comment does not count")
+            self.assertNotEqual(by["PROD.CLAIMS.COPYLIB"], by["PROD.POLICY.COPYLIB"])
+        finally:
+            conn.close()
+
+    def test_2_the_verdicts_the_console_and_the_report(self):
+        stats, text = self.run_it()
+        self.assertEqual(stats["checked"], (1, 1, 1, 1, 0), text)
+        self.assertIn("expanded texts to read: 5 of 5 found (listings + the folders given)", text)
+        self.assertIn("copybook choices checked against the listings: 1 confirmed, 1 contradicted by a current listing, 1 named "
+                      "by an older listing, 1 name a library the index does not hold, 0 unknown - every choice contradicted by a "
+                      "current listing is a wrong fact in the index: the report names each one with the library the listing "
+                      "says", text)
+        by = self.verdicts()
+        # staging, promoted unchanged: the listing names PROD.STG.COPYLIB, the index holds that copy, same text as the copy used
+        v = by["PROMOTED"]
+        self.assertEqual((v["verdict"], v["why"], v["index_has"], v["current"], v["named"]),
+                         ("CONFIRMED", "same text as the copy the listing names in PROD.STG.COPYLIB - promoted",
+                          "the index holds that copy at STAGING/PROD.STG.COPYLIB/DUPREC.cpy", True, "PROD.STG.COPYLIB"))
+        # the staging library is not in the estate at all: the copy the build used stands
+        v = by["STGGONE"]
+        self.assertEqual((v["verdict"], v["why"], v["index_has"], v["current"]),
+                         ("NOT HELD", recover.NOT_HELD_WHY, "not a library the index holds", True))
+        # an older compile's listing (one source line differs from the member): what it names is not a wrong fact
+        v = by["OLDLIST"]
+        self.assertEqual((v["verdict"], v["current"], v["matched"], v["index_has"]), ("OLDER", False, 90, POLICY_HELD))
+        self.assertEqual(v["why"], "an older listing names PROD.POLICY.COPYLIB, whose text differs from the copy the build used; "
+                                   "the program as indexed may use another copy now; not counted as a wrong fact")
+        # the real wrong fact: current listing, held copy, different text
+        v = by["CURLIST"]
+        self.assertEqual((v["verdict"], v["current"], v["matched"], v["dated"]), ("CONTRADICTED", True, 100, ""))
+        self.assertEqual(v["why"], "a current listing names PROD.POLICY.COPYLIB, whose text differs from the copy the build used")
+        self.assertNotIn("LISTONLY", by, "no choice to check for a program the index does not hold")
+        # the report: the counts, then contradicted first, then older, not held, promoted - each dated, each with its why
+        with open(self.report, encoding="utf-8") as fh:
+            sec = fh.read().split("## Copybook choices, checked against the listings")[1]
+        self.assertIn("- 4 choices checked: 1 confirmed, 1 contradicted by a current listing, 1 named by an older listing, 1 name a "
+                      "library the index does not hold, 0 unknown\n", sec)
+        rows = [ln for ln in sec.splitlines() if ln.startswith("| ") and not ln.startswith("| program")]
+        self.assertEqual(rows, [
+            f"| CURLIST | DUPREC | {USED} | PROD.POLICY.COPYLIB (SYSLIB) - {POLICY_HELD} | yes | CONTRADICTED | "
+            "a current listing names PROD.POLICY.COPYLIB, whose text differs from the copy the build used |",
+            f"| OLDLIST | DUPREC | {USED} | PROD.POLICY.COPYLIB (SYSLIB) - {POLICY_HELD} | older (90%) | OLDER | "
+            "an older listing names PROD.POLICY.COPYLIB, whose text differs from the copy the build used; the program as "
+            "indexed may use another copy now; not counted as a wrong fact |",
+            f"| STGGONE | DUPREC | {USED} | PROD.STG2.COPYLIB (SYSLIB) - not a library the index holds | yes | NOT HELD | "
+            f"{recover.NOT_HELD_WHY} |",
+            f"| PROMOTED | DUPREC | {USED} | PROD.STG.COPYLIB (SYSLIB) - the index holds that copy at "
+            "STAGING/PROD.STG.COPYLIB/DUPREC.cpy | yes | CONFIRMED | same text as the copy the listing names in "
+            "PROD.STG.COPYLIB - promoted |",
+        ])
+        # the stored rows carry the dating; the listing-only program's row is undated
+        conn = sqlite3.connect(self.db)
+        try:
+            self.assertEqual(conn.execute("SELECT program, dataset, current, matched FROM listing_copy_source ORDER BY program").fetchall(),
+                             [("CURLIST", "PROD.POLICY.COPYLIB", 1, 100), ("LISTONLY", "PROD.POLICY.COPYLIB", None, None),
+                              ("OLDLIST", "PROD.POLICY.COPYLIB", 0, 90), ("PROMOTED", "PROD.STG.COPYLIB", 1, 100),
+                              ("STGGONE", "PROD.STG2.COPYLIB", 1, 100)])
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM unresolved WHERE kind='ambiguous_copybook'").fetchone()[0], 4)
+        finally:
+            conn.close()
+
+    def test_3_no_wrong_fact_no_trailing_clause(self):
+        # only the promoted, the not-held and the older programs: the line ends at the counts
+        self.run_it()
+        conn = sqlite3.connect(self.db)
+        try:
+            checks = [v for v in recover.check_choices(conn) if v["program"] != "CURLIST"]
+        finally:
+            conn.close()
+        self.assertEqual(recover.choice_counts(checks), (1, 0, 1, 1, 0))
+        self.assertEqual(recover.choice_line(checks), "copybook choices checked against the listings: 1 confirmed, 0 contradicted "
+                                                      "by a current listing, 1 named by an older listing, 1 name a library the "
+                                                      "index does not hold, 0 unknown")
+        rep = "".join(recover.choice_report(checks, self.root))
+        self.assertIn("_no choice contradicted by a current listing_", rep)
+        self.assertIn("| OLDLIST | DUPREC |", rep)                      # the table follows all the same
+        self.assertIn("| PROMOTED | DUPREC |", rep)
+
+    def test_4_coverage_program_and_copybook(self):
+        self.run_it()
+        conn = query.connect(self.db)
+        try:
+            cov = query.cmd_coverage(conn)
+            self.assertIn("1 of these choices is confirmed by the program's listing, 1 contradicted by a current listing (see "
+                          "work/recover.md), 1 named by an older listing, 1 name a library the index does not hold, 0 unknown", cov)
+            out = query.cmd_program(conn, "PROMOTED")
+            self.assertIn("- listing says: DUPREC came from PROD.STG.COPYLIB (SYSLIB) - confirms the copy the build used (same text, "
+                          "promoted from PROD.STG.COPYLIB)", out)
+            out = query.cmd_program(conn, "STGGONE")
+            self.assertIn("- listing says: DUPREC came from PROD.STG2.COPYLIB (SYSLIB) - names PROD.STG2.COPYLIB, a library the index "
+                          "does not hold - the copy the build used stands", out)
+            out = query.cmd_program(conn, "OLDLIST")
+            self.assertIn("- listing says: DUPREC came from PROD.POLICY.COPYLIB (SYSLIB) - an older listing names PROD.POLICY.COPYLIB "
+                          "(its source differs from this program as indexed; the text differs from the copy used)", out)
+            self.assertNotIn("CONTRADICTS", out)
+            out = query.cmd_program(conn, "CURLIST")
+            self.assertIn(f"- listing says: DUPREC came from PROD.POLICY.COPYLIB (SYSLIB) - CONTRADICTS the copy the build used "
+                          f"(PROD.CLAIMS.COPYLIB; {POLICY_HELD}; a current listing: its source matches this program as indexed) - "
+                          "see work/recover.md", out)
+            out = query.cmd_copybook(conn, "DUPREC")
+            self.assertIn("The programs' compiler listings say this copybook came from: PROD.POLICY.COPYLIB (3 programs; 1 by an "
+                          "older listing; 1 whose program is not in the index to date the listing against), PROD.STG.COPYLIB "
+                          "(1 program), PROD.STG2.COPYLIB (1 program)", out)
+        finally:
+            conn.close()
+
+    def test_5_a_choice_on_a_program_the_index_holds_only_as_a_listing(self):
+        # the branch for a program that cannot be dated because no COBOL member of its name is in the index: the check
+        # says so rather than 'not yet dated' (a hand-made row on a copybook member stands in for it)
+        db2 = os.path.join(self.td, "branch.db")
+        shutil.copyfile(self.db, db2)
+        conn = query.connect(db2)
+        try:
+            used = conn.execute("SELECT path FROM member WHERE name='DUPREC' AND path LIKE '%CLAIMS%'").fetchone()[0]
+            mid = conn.execute("SELECT id FROM member WHERE name='DUPREC' AND path LIKE '%STAGING%'").fetchone()[0]
+            conn.execute("INSERT INTO unresolved(member_id, kind, detail, line) VALUES(?,?,?,0)",
+                         (mid, "ambiguous_copybook", f"3 copies of DUPREC with different content; used {used} (same system)"))
+            conn.commit()
+            srcs = {"DUPREC": [("DUPREC", "SYSLIB", "PROD.POLICY.COPYLIB", "x.lst", None, None)]}
+            v = {c["program"]: c for c in recover.check_choices(conn, srcs)}["DUPREC"]
+            self.assertEqual((v["verdict"], v["dated"]), ("CONTRADICTED", recover.NOT_IN_INDEX_TO_DATE))
+            self.assertTrue(v["why"].endswith("; the program itself is not in the index to date the listing against"), v["why"])
+            self.assertEqual(recover.dated_cell(v["current"], v["matched"]), "not dated")
+        finally:
+            conn.close()
+
+    def test_6_the_copy_used_gone_from_the_index_is_unknown_not_contradicted(self):
+        # no text to compare: the verdict says so rather than call the listing's copy different
+        db2 = os.path.join(self.td, "gone.db")
+        shutil.copyfile(self.db, db2)
+        conn = query.connect(db2)
+        try:
+            conn.execute("DELETE FROM member WHERE name='DUPREC' AND path LIKE '%CLAIMS%'")
+            conn.commit()
+            srcs = {"CURLIST": [("DUPREC", "SYSLIB", "PROD.POLICY.COPYLIB", "CURLIST.lst", True, 100)]}
+            v = {c["program"]: c for c in recover.check_choices(conn, srcs)}["CURLIST"]
+            self.assertEqual(v["verdict"], "UNKNOWN")
+            self.assertIn("the copy the build used is no longer a member of the index", v["why"])
+        finally:
+            conn.close()
+
+
+class RowsFromBeforeTheToolDatedListings(unittest.TestCase):
+    """A listing_copy_source table the tool wrote before the two dating
+    columns existed: read as undated (the query side never alters it), a
+    would-be contradiction says 'not yet dated', and the next recover run
+    adds the columns and dates the rows."""
+
+    def setUp(self):
+        self.td = tempfile.mkdtemp()
+        self.root, self.from_dir = staging_estate(self.td)
+        self.db = os.path.join(self.td, "t.db")
+        self.report = os.path.join(self.td, "work", "recover.md")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(build._main([self.root, "--db", self.db, "--rebuild", "--quiet"]), 0)
+        conn = sqlite3.connect(self.db)
+        try:                                                           # the table as the tool created it before this change
+            conn.execute("CREATE TABLE listing_copy_source (program TEXT NOT NULL, copybook TEXT NOT NULL, ddname TEXT, "
+                         "dataset TEXT, listing TEXT, seen TEXT)")
+            conn.executemany("INSERT INTO listing_copy_source VALUES(?,?,?,?,?,?)",
+                             [("CURLIST", "DUPREC", "SYSLIB", "PROD.POLICY.COPYLIB", "CURLIST.lst", "2026-09-01 08:00:00"),
+                              ("PROMOTED", "DUPREC", "SYSLIB", "PROD.STG.COPYLIB", "PROMOTED.lst", "2026-09-01 08:00:00")])
+            conn.commit()
+        finally:
+            conn.close()
+
+    def tearDown(self):
+        shutil.rmtree(self.td, ignore_errors=True)
+
+    def columns(self):
+        conn = sqlite3.connect(self.db)
+        try:
+            return [r[1] for r in conn.execute("PRAGMA table_info(listing_copy_source)")]
+        finally:
+            conn.close()
+
+    def test_1_read_as_undated(self):
+        conn = query.connect(self.db)
+        try:
+            self.assertEqual(recover.stored_copy_sources(conn),
+                             {"CURLIST": [("DUPREC", "SYSLIB", "PROD.POLICY.COPYLIB", "CURLIST.lst", None, None)],
+                              "PROMOTED": [("DUPREC", "SYSLIB", "PROD.STG.COPYLIB", "PROMOTED.lst", None, None)]})
+            by = {v["program"]: v for v in recover.check_choices(conn)}
+            v = by["CURLIST"]
+            self.assertEqual((v["verdict"], v["current"], v["dated"]), ("CONTRADICTED", None, recover.NOT_YET_DATED))
+            self.assertTrue(v["why"].endswith("; " + recover.NOT_YET_DATED), v["why"])
+            self.assertIn("not yet dated: run recover again with --from", v["why"])
+            self.assertEqual((by["PROMOTED"]["verdict"], by["PROMOTED"]["current"]), ("CONFIRMED", None))   # the same text needs no date
+            rep = "".join(recover.choice_report(recover.check_choices(conn), self.root))
+            self.assertIn(f"| CURLIST | DUPREC | {USED} | PROD.POLICY.COPYLIB (SYSLIB) - {POLICY_HELD} | not dated | CONTRADICTED | "
+                          "the listing names PROD.POLICY.COPYLIB, whose text differs from the copy the build used; "
+                          f"{recover.NOT_YET_DATED} |", rep)
+            out = query.cmd_program(conn, "CURLIST")
+            self.assertIn(f"CONTRADICTS the copy the build used (PROD.CLAIMS.COPYLIB; {POLICY_HELD}; {recover.NOT_YET_DATED}) - "
+                          "see work/recover.md", out)
+            self.assertIn("PROD.POLICY.COPYLIB (1 program; 1 not yet dated)", query.cmd_copybook(conn, "DUPREC"))
+            self.assertIn("1 contradicted by a current listing (see work/recover.md)", query.cmd_coverage(conn))
+            self.assertEqual(self.columns(), ["program", "copybook", "ddname", "dataset", "listing", "seen"], "nothing altered")
+        finally:
+            conn.close()
+
+    def test_2_the_next_run_adds_the_columns_and_dates_the_rows(self):
+        conn = sqlite3.connect(self.db)
+        try:
+            self.assertEqual(recover.ensure_copy_source_columns(conn), ["current", "matched"])
+            self.assertEqual(recover.ensure_copy_source_columns(conn), [])
+            conn.commit()
+        finally:
+            conn.close()
+        self.assertEqual(self.columns(), ["program", "copybook", "ddname", "dataset", "listing", "seen", "current", "matched"])
+        said = []
+        stats = recover.run(self.db, folders=[self.from_dir], log=said.append, report=self.report)
+        self.assertEqual(stats["checked"], (1, 1, 1, 1, 0), "\n".join(said))
+        conn = sqlite3.connect(self.db)
+        try:
+            self.assertEqual(conn.execute("SELECT program, current, matched FROM listing_copy_source WHERE program IN "
+                                          "('CURLIST', 'PROMOTED') ORDER BY program").fetchall(), [("CURLIST", 1, 100), ("PROMOTED", 1, 100)])
+        finally:
+            conn.close()
+
+    def test_3_the_run_alone_alters_the_table(self):
+        said = []
+        recover.run(self.db, folders=[self.from_dir], log=said.append, report=self.report)
+        self.assertEqual(self.columns(), ["program", "copybook", "ddname", "dataset", "listing", "seen", "current", "matched"])
+        conn = query.connect(self.db)
+        try:
+            v = {c["program"]: c for c in recover.check_choices(conn)}["CURLIST"]
+            self.assertEqual((v["verdict"], v["current"], v["dated"]), ("CONTRADICTED", True, ""))
+        finally:
+            conn.close()
 
 
 MISSING1 = ["           05  MISS1-FIELD   PIC X(4)."]

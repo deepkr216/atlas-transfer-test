@@ -73,10 +73,19 @@ COBOL prints one row per copybook: the member, the DD name and the LIBRARY
 DATASET the compiler read it from. Where a copybook's name exists in several
 libraries with different content the build could only choose one copy (its
 'ambiguous_copybook' row says which and how); this tool reads the listing of
-every such program too, stores the rows (listing_copy_source) and checks
-each choice: CONFIRMED, CONTRADICTED (a wrong fact - the report names every
-one with the library the listing says) or UNKNOWN. The build does not read
-the table yet (ROADMAP re-parse item 19); nothing in the fact tables changes.
+every such program too, stores the rows (listing_copy_source, each row with
+whether the listing is the compile of the program as indexed) and checks
+each choice. A name is not a fact about content, so the listing's library
+is looked up in the index and its copy's text compared before anything is
+called wrong: CONFIRMED (the listing names the library the build's copy came
+from, or a held library whose copy has the same text - compiled against
+staging, promoted to production unchanged), NOT HELD (a library the index
+does not hold, or holds without that member: the copy used stands), OLDER
+(the texts differ but the listing is an older compile's: not a wrong fact),
+CONTRADICTED (a current listing names a held copy with different text - the
+wrong fact, named in the report with the library the listing says) or
+UNKNOWN. The build does not read the table yet (ROADMAP re-parse item 19);
+nothing in the fact tables changes.
 
 The same rows are the FETCH LIST: per library dataset named by the listings
 this tool reads (those of the programs that copy a missing copybook, one the
@@ -980,11 +989,63 @@ def copy_sources(lines: Sequence[str]) -> List[Tuple[str, str, str, str]]:
 # The table the rows go to: one row per (program, copybook) the listing named,
 # replaced per program each time that program's listing is read. Its own
 # small table - no fact table changes (the build's use of it is ROADMAP
-# re-parse item 19).
+# re-parse item 19). `current`: 1 when the listing's source is the program
+# as indexed, 0 when it is an older compile's (`matched`: how much of the
+# source still matches, in percent), NULL when nothing dated it - the program
+# is not in the index, or the row was stored before this tool dated
+# listings; the two columns are added to a table written before them.
 COPY_SOURCE_TABLE = ("CREATE TABLE IF NOT EXISTS listing_copy_source (program TEXT NOT NULL, copybook TEXT NOT NULL, "
-                     "ddname TEXT, dataset TEXT, listing TEXT, seen TEXT)")
+                     "ddname TEXT, dataset TEXT, listing TEXT, seen TEXT, current INTEGER, matched INTEGER)")
+COPY_SOURCE_ADDED = ("current INTEGER", "matched INTEGER")            # the columns a table written before them lacks
 _PICK = re.compile(r"(\d+) copies of (\S+) with different content; used (.+?) \(([^()]*)\)\s*$")
-CopySource = Tuple[str, str, str, str]                                # (copybook, ddname, dataset, listing path)
+CopySource = Tuple[str, str, str, str, Optional[bool], Optional[int]]   # (copybook, ddname, dataset, listing path,
+                                                                        #  listing current?, its source match in percent)
+
+
+def listing_is_current(records: Sequence[Tuple[str, str, int]], original: Optional[Sequence[str]]
+                       ) -> Tuple[Optional[bool], Optional[int]]:
+    """(current?, match in percent): whether a listing is the compile of the
+    program as the index holds it. The listing's own program lines (the
+    unflagged records - a copied line carries a mark) against the member's,
+    both read the way the parser reads a member (reader.read_cobol_lines:
+    comment lines and blank lines dropped, columns 8-72 with trailing blanks
+    stripped, the member's own code margin when its records are not 80
+    columns). Equal sequences: current. Otherwise older, with how much of
+    the source still matches (difflib's ratio, never shown as 100). No
+    original member (`original` None): (None, None) - nothing to date the
+    listing against; the same when the listing shows no program line."""
+    if original is None:
+        return None, None
+    plain = [rec for flag, rec, _n in records if not flag.replace("*", "")]
+    if not plain:
+        return None, None
+    orig_text = "\n".join(original)
+    orig_recs = reader._split_records(orig_text, b"", "")
+    cut = (reader.detect_code_end(orig_recs) if reader.looks_fixed_format(orig_recs) else 72) - 7
+
+    def code_lines(text: str) -> List[str]:
+        lines, _fixed = reader.read_cobol_lines(text)
+        return [ln.code[:cut].rstrip() for ln in lines if not ln.is_comment and ln.code.strip()]
+
+    a = code_lines(orig_text)
+    b = code_lines("\n".join(plain))
+    if a == b:
+        return True, 100
+    ratio = difflib.SequenceMatcher(None, a, b, autojunk=False).ratio()
+    return False, min(99, int(ratio * 100))
+
+
+def ensure_copy_source_columns(conn: sqlite3.Connection) -> List[str]:
+    """Create the table when it is not there; add the columns a table
+    written before them lacks. Returns the columns added."""
+    conn.execute(COPY_SOURCE_TABLE)
+    have = {str(r[1]) for r in conn.execute("PRAGMA table_info(listing_copy_source)")}
+    added = []
+    for col in COPY_SOURCE_ADDED:
+        if col.split()[0] not in have:
+            conn.execute(f"ALTER TABLE listing_copy_source ADD COLUMN {col}")
+            added.append(col.split()[0])
+    return added
 
 
 def _fkey(folder: str) -> str:
@@ -1036,18 +1097,25 @@ def chosen_picks(conn: sqlite3.Connection) -> List[Tuple[str, str, str, str, int
 
 
 def stored_copy_sources(conn: sqlite3.Connection) -> Dict[str, List[CopySource]]:
-    """{program: [(copybook, ddname, dataset, listing)]} as stored; a program
-    whose listing was read and had no table is there with an empty list."""
+    """{program: [(copybook, ddname, dataset, listing, current, matched)]} as
+    stored; a program whose listing was read and had no table is there with
+    an empty list. A table written before the two dating columns reads with
+    both None (the query side never alters the table)."""
     out: Dict[str, List[CopySource]] = {}
     try:
-        rows = conn.execute("SELECT program, copybook, ddname, dataset, listing FROM listing_copy_source "
+        rows = conn.execute("SELECT program, copybook, ddname, dataset, listing, current, matched FROM listing_copy_source "
                             "ORDER BY program, rowid").fetchall()
     except sqlite3.OperationalError:
-        return out
-    for program, copybook, dd, dsn, listing in rows:
+        try:
+            rows = [(*r, None, None) for r in conn.execute("SELECT program, copybook, ddname, dataset, listing FROM "
+                                                           "listing_copy_source ORDER BY program, rowid").fetchall()]
+        except sqlite3.OperationalError:
+            return out
+    for program, copybook, dd, dsn, listing, current, matched in rows:
         lst = out.setdefault(str(program).upper(), [])
         if copybook:
-            lst.append((str(copybook).upper(), str(dd or ""), str(dsn or "").upper(), str(listing or "")))
+            lst.append((str(copybook).upper(), str(dd or ""), str(dsn or "").upper(), str(listing or ""),
+                        None if current is None else bool(current), None if matched is None else int(matched)))
     return out
 
 
@@ -1055,16 +1123,18 @@ def store_copy_sources(conn: sqlite3.Connection, per_program: Dict[str, List[Cop
     """Replace each named program's rows. A program read with no table keeps
     one row with an empty copybook, so the next check says 'no table' rather
     than 'no listing read'; nothing of any other program is touched."""
-    conn.execute(COPY_SOURCE_TABLE)
+    ensure_copy_source_columns(conn)
     now = time.strftime("%Y-%m-%d %H:%M:%S")
     for program, rows in per_program.items():
         conn.execute("DELETE FROM listing_copy_source WHERE program = ?", (program,))
         if rows:
-            conn.executemany("INSERT INTO listing_copy_source(program, copybook, ddname, dataset, listing, seen) "
-                             "VALUES(?,?,?,?,?,?)", [(program, c, d, ds, lst, now) for c, d, ds, lst in rows])
+            conn.executemany("INSERT INTO listing_copy_source(program, copybook, ddname, dataset, listing, seen, current, matched) "
+                             "VALUES(?,?,?,?,?,?,?,?)",
+                             [(program, c, d, ds, lst, now, None if cur is None else int(cur), matched)
+                              for c, d, ds, lst, cur, matched in rows])
         else:
-            conn.execute("INSERT INTO listing_copy_source(program, copybook, ddname, dataset, listing, seen) "
-                         "VALUES(?,?,?,?,?,?)", (program, "", None, None, None, now))
+            conn.execute("INSERT INTO listing_copy_source(program, copybook, ddname, dataset, listing, seen, current, matched) "
+                         "VALUES(?,?,?,?,?,?,?,?)", (program, "", None, None, None, now, None, None))
     conn.commit()
 
 
@@ -1079,18 +1149,79 @@ def _tail(path: str, n: int = 3) -> str:
     return "/".join(path.replace("\\", "/").split("/")[-n:])
 
 
+VERDICTS = ("CONFIRMED", "CONTRADICTED", "OLDER", "NOT HELD", "UNKNOWN")   # the order the counts are given in
+NOT_YET_DATED = ("not yet dated: run recover again with --from FOLDER (the rows were stored before this tool dated "
+                 "listings, or the listing's source could not be read)")
+NOT_IN_INDEX_TO_DATE = "the program itself is not in the index to date the listing against"
+NOT_HELD_WHY = ("the build could only choose among the copies it has: the copy it used stands; the listing names the "
+                "library the program was compiled against (a staging library, or one gone from the host) - if it still "
+                "exists and matters, the fetch list names it")
+
+
+def _dating(rows: Sequence[CopySource]) -> Tuple[Optional[bool], Optional[int]]:
+    """(current?, matched) over the rows naming one dataset: current when any
+    listing naming it is, else older with the best match, else not dated."""
+    if any(r[4] for r in rows):
+        return True, 100
+    older = [int(r[5] or 0) for r in rows if r[4] is not None and not r[4]]
+    if older:
+        return False, max(older)
+    return None, None
+
+
+def dated_cell(current: Optional[bool], matched: Optional[int]) -> str:
+    """The report's 'listing current?' cell."""
+    if current is True:
+        return "yes"
+    if current is False:
+        return f"older ({matched or 0}%)"
+    return "not dated"
+
+
 def check_choices(conn: sqlite3.Connection, sources: Optional[Dict[str, List[CopySource]]] = None) -> List[Dict[str, object]]:
     """One verdict per copybook choice the build made, against the program's
-    listing: CONFIRMED (the listing names the dataset the chosen member came
-    from), CONTRADICTED (it names another - a wrong fact in the index),
-    UNKNOWN (no listing read for the program, no table in it, no row for that
-    copybook, or the chosen member's dataset is not known). `sources`: the
-    rows to check against, else the stored table."""
+    listing - a name is not a fact about content, so the listing's library
+    is looked up in the index and its copy's TEXT compared (member.norm_sha:
+    columns 8-72, comments dropped) before anything is called wrong:
+
+    CONFIRMED - the listing names the dataset the chosen member came from;
+      or the index holds the listing's copy and its text is the same as the
+      chosen member's (a copybook compiled against a staging library and
+      promoted to production unchanged: 'promoted');
+    NOT HELD - the listing names a dataset the index does not hold at all,
+      or holds without that member: the build could only choose among the
+      copies it has, and the copy it used stands;
+    OLDER - the index holds the listing's copy, the texts differ, and the
+      listing is an older compile's (its source is not the program as
+      indexed): the program may use another copy now - not a wrong fact;
+    CONTRADICTED - the index holds the listing's copy, the texts differ, and
+      the listing is current (or cannot be dated: the program is not in the
+      index, or the row was stored before this tool dated listings): the
+      real wrong fact;
+    UNKNOWN - no listing read for the program, no table in it, no row for
+      that copybook, or the chosen member's dataset is not known.
+
+    Where listings name several other datasets the most serious finding
+    decides (contradicted, then older, then not held, then promoted).
+    `sources`: the rows to check against, else the stored table."""
     libs = library_datasets(conn)
     srcs = stored_copy_sources(conn) if sources is None else sources
     holders: Dict[str, str] = {}                                       # dataset -> a folder the index holds for it
     for folder, dsn in libs.items():
         holders.setdefault(dsn, folder)
+    try:
+        indexed = {str(n).upper() for (n,) in conn.execute("SELECT name FROM member WHERE kind = 'cobol'")}
+    except sqlite3.OperationalError:
+        indexed = set()
+    copies: Dict[str, List[Tuple[str, Optional[str]]]] = {}           # copybook -> [(path, norm_sha)] the index holds
+
+    def copies_of(name: str) -> List[Tuple[str, Optional[str]]]:
+        if name not in copies:
+            copies[name] = [(str(p), s) for p, s in conn.execute(
+                f"SELECT path, norm_sha FROM member WHERE UPPER(name) = ? AND kind IN ({','.join('?' * len(RESOLVER_KINDS))}) "
+                "ORDER BY id", (name, *RESOLVER_KINDS))]
+        return copies[name]
+
     out: List[Dict[str, object]] = []
     for program, copybook, used, how, mid in chosen_picks(conn):
         used_dsn = dataset_of(used, libs)
@@ -1099,7 +1230,8 @@ def check_choices(conn: sqlite3.Connection, sources: Optional[Dict[str, List[Cop
         v: Dict[str, object] = {"program": program, "copybook": copybook, "used": used, "used_dataset": used_dsn,
                                 "how": how, "member_id": mid, "listing_datasets": said,
                                 "ddnames": sorted({r[1] for r in rows if r[1]}),
-                                "listings": sorted({r[3] for r in rows if r[3]}), "index_has": ""}
+                                "listings": sorted({r[3] for r in rows if r[3]}), "index_has": "",
+                                "current": None, "matched": None, "dated": "", "named": ""}
         if program not in srcs:
             v.update(verdict="UNKNOWN", why="no listing of the program was read")
         elif not srcs[program]:
@@ -1110,59 +1242,111 @@ def check_choices(conn: sqlite3.Connection, sources: Optional[Dict[str, List[Cop
             v.update(verdict="UNKNOWN", why="the chosen member's library dataset is not known (no `library` row for its "
                                             "folder, and the folder is not named after a dataset)")
         elif said == [used_dsn]:
-            v.update(verdict="CONFIRMED", why="")
+            cur, matched = _dating(rows)
+            v.update(verdict="CONFIRMED", why="", current=cur, matched=matched, named=used_dsn)
+        elif next((s for p, s in copies_of(copybook) if _fkey(p) == _fkey(used)), None) is None:
+            v.update(verdict="UNKNOWN", why="the copy the build used is no longer a member of the index (its path is gone), "
+                                            "so its text cannot be compared with the listing's copy")
         else:
-            other = [d for d in said if d != used_dsn]
-            have = ""
-            for (path,) in conn.execute(f"SELECT path FROM member WHERE UPPER(name) = ? AND kind IN "
-                                        f"({','.join('?' * len(RESOLVER_KINDS))})", (copybook, *RESOLVER_KINDS)):
-                if dataset_of(path, libs) in other:
-                    have = f"the index holds that copy at {_tail(path)} - the build chose the other"
-                    break
-            if not have:
-                have = (f"the index holds that library ({_tail(holders[other[0]])}) but no {copybook} in it"
-                        if other[0] in holders else "not a library the index holds - fetch it")
-            v.update(verdict="CONTRADICTED", why="the listing names another library", index_has=have)
+            held = copies_of(copybook)
+            used_sha = next(s for p, s in held if _fkey(p) == _fkey(used))
+            findings: List[Tuple[str, str, Optional[str]]] = []         # (what, dataset, path or folder)
+            for d in [d for d in said if d != used_dsn]:
+                at = [(p, s) for p, s in held if dataset_of(p, libs) == d]
+                if at:
+                    p, s = at[0]
+                    findings.append(("same" if s is not None and s == used_sha else "differs", d, p))
+                elif d in holders:
+                    findings.append(("no member", d, holders[d]))
+                else:
+                    findings.append(("not held", d, None))
+            differs = [f for f in findings if f[0] == "differs"]
+            unheld = [f for f in findings if f[0] in ("no member", "not held")]
+            if differs:
+                _what, d, p = differs[0]
+                cur, matched = _dating([r for r in rows if r[2] == d])
+                have = f"the index holds that copy at {_tail(str(p))} - the build chose the other"
+                if cur is False:
+                    v.update(verdict="OLDER", index_has=have, current=cur, matched=matched, named=d,
+                             why=f"an older listing names {d}, whose text differs from the copy the build used; the "
+                                 "program as indexed may use another copy now; not counted as a wrong fact")
+                elif cur is True:
+                    v.update(verdict="CONTRADICTED", index_has=have, current=cur, matched=matched, named=d,
+                             why=f"a current listing names {d}, whose text differs from the copy the build used")
+                else:
+                    dated = NOT_YET_DATED if program in indexed else NOT_IN_INDEX_TO_DATE
+                    v.update(verdict="CONTRADICTED", index_has=have, current=None, matched=None, named=d, dated=dated,
+                             why=f"the listing names {d}, whose text differs from the copy the build used; {dated}")
+            elif unheld:
+                what, d, folder = unheld[0]
+                cur, matched = _dating([r for r in rows if r[2] == d])
+                have = (f"the index holds that library ({_tail(str(folder))}) but no {copybook} in it" if what == "no member"
+                        else "not a library the index holds")
+                v.update(verdict="NOT HELD", why=NOT_HELD_WHY, index_has=have, current=cur, matched=matched, named=d)
+            else:
+                _what, d, p = findings[0]
+                cur, matched = _dating([r for r in rows if r[2] == d])
+                v.update(verdict="CONFIRMED", why=f"same text as the copy the listing names in {d} - promoted",
+                         index_has=f"the index holds that copy at {_tail(str(p))}", current=cur, matched=matched, named=d)
         out.append(v)
     return out
 
 
-def choice_counts(checks: Sequence[Dict[str, object]]) -> Tuple[int, int, int]:
+def choice_counts(checks: Sequence[Dict[str, object]]) -> Tuple[int, int, int, int, int]:
+    """(confirmed, contradicted, older, not held, unknown) - the VERDICTS order."""
     c = Counter(str(v["verdict"]) for v in checks)
-    return c["CONFIRMED"], c["CONTRADICTED"], c["UNKNOWN"]
+    return c["CONFIRMED"], c["CONTRADICTED"], c["OLDER"], c["NOT HELD"], c["UNKNOWN"]
+
+
+def choice_words(checks: Sequence[Dict[str, object]]) -> str:
+    """The five counts with their words, as every summary line prints them."""
+    a, b, o, h, u = choice_counts(checks)
+    return (f"{a} confirmed, {b} contradicted by a current listing, {o} named by an older listing, {h} name a library "
+            f"the index does not hold, {u} unknown")
 
 
 def choice_line(checks: Sequence[Dict[str, object]]) -> str:
-    a, b, u = choice_counts(checks)
-    return f"copybook choices checked against the listings: {a} confirmed, {b} contradicted, {u} unknown"
+    return "copybook choices checked against the listings: " + choice_words(checks)
 
 
 def choice_report(checks: Sequence[Dict[str, object]], root: Optional[str]) -> List[str]:
-    """The report section: every contradicted choice (each is a wrong fact in
-    the index), and the counts for the rest."""
-    a, b, u = choice_counts(checks)
+    """The report section: the counts, then every choice with something to
+    say - contradicted by a current listing (each a wrong fact in the index)
+    first, then named by an older listing, then naming a library the index
+    does not hold, then confirmed through a same-text copy (promoted) - with
+    whether the listing is current and why the verdict is what it is."""
+    a, b, o, h, u = choice_counts(checks)
     whys = Counter(str(v["why"]) for v in checks if v["verdict"] == "UNKNOWN")
     lines = ["\n## Copybook choices, checked against the listings\n\n"
              "Where a copybook's name exists in several libraries with different content the build chose one copy "
              "('ambiguous_copybook' rows: COPY..OF, then the program's own system in its declared order, then the "
              "authoritative copy, then the same folder, then the first found). The compiler listing names the library "
-             "the compiler read each copybook from - that is the truth the choice is checked against. The build "
-             "itself does not read this table yet (ROADMAP re-parse item 19); a contradicted choice is a wrong fact "
+             "the compiler read each copybook from - that is the record the choice is checked against. A name is not a "
+             "fact about content: the listing's library is looked up in the index and its copy's text compared with the "
+             "copy the build used (a copybook compiled against a staging library and promoted unchanged has the same "
+             "text: confirmed, 'promoted'); a library the index does not hold says nothing against the copy used; a "
+             "listing whose source is not the program as indexed is an older compile's, and what it names is not counted "
+             "as a wrong fact. Only a current listing naming a held copy with different text contradicts the choice. The "
+             "build itself does not read this table yet (ROADMAP re-parse item 19); a contradicted choice is a wrong fact "
              "until then, and `program NAME` shows the listing's library under its notes.\n\n"
-             f"- {len(checks)} choice{'s' if len(checks) != 1 else ''} checked: {a} confirmed, {b} contradicted, {u} unknown"
+             f"- {len(checks)} choice{'s' if len(checks) != 1 else ''} checked: {choice_words(checks)}"
              + ("" if not whys else " (" + "; ".join(f"{n}: {w}" for w, n in sorted(whys.items(), key=lambda kv: (-kv[1], kv[0])))
                                            + ")") + "\n"]
     if not b:
-        lines.append("\n_no contradicted choice_\n")
+        lines.append("\n_no choice contradicted by a current listing_\n")
+    order = {"CONTRADICTED": 0, "OLDER": 1, "NOT HELD": 2, "CONFIRMED": 3}   # a confirmed choice is shown only when promoted
+    shown = [v for v in checks if v["verdict"] in order and (v["verdict"] != "CONFIRMED" or v["why"])]
+    if not shown:
         return lines
-    lines.append("\n| program | copybook | the index used | the listing says | verdict |\n|---|---|---|---|---|\n")
-    for v in checks:
-        if v["verdict"] != "CONTRADICTED":
-            continue
+    shown.sort(key=lambda v: (order[str(v["verdict"])], str(v["program"]), str(v["copybook"])))
+    lines.append("\n| program | copybook | the index used | the listing says | listing current? | verdict | why |\n"
+                 "|---|---|---|---|---|---|---|\n")
+    for v in shown:
         used = f"{v['used_dataset']} ({_tail(str(v['used']))}; {v['how']})"
         says = (", ".join(str(d) for d in v["listing_datasets"]) + (f" ({', '.join(str(d) for d in v['ddnames'])})" if v["ddnames"] else "")
-                + f" - {v['index_has']}")
-        lines.append(f"| {v['program']} | {v['copybook']} | {used} | {says} | CONTRADICTED |\n")
+                + (f" - {v['index_has']}" if v["index_has"] else ""))
+        dated = dated_cell(v["current"], v["matched"])                 # type: ignore[arg-type]
+        lines.append(f"| {v['program']} | {v['copybook']} | {used} | {says} | {dated} | {v['verdict']} | {v['why']} |\n")
     return lines
 
 
@@ -2718,7 +2902,8 @@ def fetch_list(conn: sqlite3.Connection, sources: Dict[str, List[CopySource]], m
     per: Dict[str, Dict[str, object]] = {}
     named: Set[str] = set()
     for program, rows in sources.items():
-        for cb, _dd, dsn, _lst in rows:
+        for row in rows:
+            cb, dsn = row[0], row[2]
             if not dsn or not cb:
                 continue
             named.add(cb)
@@ -3110,8 +3295,16 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
         fmt, regions, stats = extract(text, path, wanted or set(), original, system, lines=lines_, how=how)
         if how["kind"] in ("current", "older"):
             # a listing: its copybook-source table says which library each copybook came from (no table: an empty list,
-            # stored as such, so the check says 'no table' rather than 'no listing read')
-            copy_src.setdefault(stem.upper(), []).extend((c, d, ds, path) for c, d, ds, _n in copy_sources(lines_))
+            # stored as such, so the check says 'no table' rather than 'no listing read'); each row carries whether the
+            # listing is the compile of the program as indexed - its own program lines against the member's - so what
+            # an older compile's listing names is never counted as a wrong fact (LESSONS 193)
+            table = copy_sources(lines_)
+            cur: Optional[bool] = None
+            matched: Optional[int] = None
+            if table and original is not None:
+                recs, _off = listing_records(lines_, how["old"] if how["kind"] == "older" else None)   # type: ignore[arg-type]
+                cur, matched = listing_is_current(recs, original)
+            copy_src.setdefault(stem.upper(), []).extend((c, d, ds, path, cur, matched) for c, d, ds, _n in table)
         del lines_
         formats[fmt] += 1
         unattached += stats.get("flagged lines with no COPY before them", 0)
@@ -3326,8 +3519,8 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
             f"({REFILED_ITEM})")
     if checks:
         n_contra = choice_counts(checks)[1]
-        log(choice_line(checks) + (" - every contradicted choice is a wrong fact in the index: the report names each "
-                                   "one with the library the listing says" if n_contra else ""))
+        log(choice_line(checks) + (" - every choice contradicted by a current listing is a wrong fact in the index: the "
+                                   "report names each one with the library the listing says" if n_contra else ""))
     if fetch:
         log(f"libraries the listings name: {len(fetch):,} datasets, {to_fetch:,} not fetched yet - the report's fetch list "
             "names them" + (f"; {list_file} holds the {to_fetch:,} to fetch, one dataset per line, for the UI's Bulk add"

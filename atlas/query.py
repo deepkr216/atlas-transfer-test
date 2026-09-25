@@ -1822,9 +1822,11 @@ def _choices_checked(conn: sqlite3.Connection) -> str:
     from . import recover
     if not recover.has_copy_sources(conn):
         return ""
-    a, b, u = recover.choice_counts(recover.check_choices(conn))
-    return (f"\n{a} of these choices {'is' if a == 1 else 'are'} confirmed by the program's listing, {b} contradicted "
-            f"(see work/recover.md), {u} unknown - the listing names the library the compiler read the copybook from.\n")
+    a, b, o, h, u = recover.choice_counts(recover.check_choices(conn))
+    return (f"\n{a} of these choices {'is' if a == 1 else 'are'} confirmed by the program's listing, {b} contradicted by a "
+            f"current listing (see work/recover.md), {o} named by an older listing, {h} name a library the index does not "
+            f"hold, {u} unknown - the listing names the library the compiler read the copybook from; a name is not a fact "
+            "about content, so the listing's copy is compared by text with the copy used before a choice is called wrong.\n")
 
 
 def _listing_says(conn: sqlite3.Connection, member_id: int) -> str:
@@ -1847,9 +1849,16 @@ def _listing_says(conn: sqlite3.Connection, member_id: int) -> str:
         line = f"- listing says: {r['copybook']} came from {r['dataset']} ({r['ddname'] or 'no DD name'})"
         v = verdicts.get(r["copybook"])
         if v is not None and v["verdict"] == "CONTRADICTED":
-            line += f" - CONTRADICTS the copy the build used ({v['used_dataset']}; {v['index_has']}) - see work/recover.md"
+            dated = "a current listing: its source matches this program as indexed" if v["current"] else str(v["dated"])
+            line += (f" - CONTRADICTS the copy the build used ({v['used_dataset']}; {v['index_has']}; {dated}) - see "
+                     "work/recover.md")
+        elif v is not None and v["verdict"] == "OLDER":
+            line += (f" - an older listing names {v['named']} (its source differs from this program as indexed; the text "
+                     "differs from the copy used)")
+        elif v is not None and v["verdict"] == "NOT HELD":
+            line += f" - names {v['named']}, a library the index does not hold - the copy the build used stands"
         elif v is not None and v["verdict"] == "CONFIRMED":
-            line += " - confirms the copy the build used"
+            line += " - confirms the copy the build used" + (f" (same text, promoted from {v['named']})" if v["why"] else "")
         out.append(line + "\n")
     return "".join(out)
 
@@ -1863,12 +1872,36 @@ def _listing_sources_of(conn: sqlite3.Connection, copybook: str, missing: bool =
     from . import recover
     if not recover.has_copy_sources(conn):
         return ""
-    rows = conn.execute("SELECT dataset, COUNT(DISTINCT program) AS n FROM listing_copy_source WHERE copybook=? "
-                        "AND dataset IS NOT NULL AND dataset<>'' GROUP BY dataset ORDER BY n DESC, dataset",
-                        (copybook.upper(),)).fetchall()
+    where = "FROM listing_copy_source WHERE copybook=? AND dataset IS NOT NULL AND dataset<>'' GROUP BY dataset, program"
+    try:                                                               # per (dataset, program): is any listing naming it current?
+        rows = conn.execute(f"SELECT dataset, program, MAX(current) AS current {where}", (copybook.upper(),)).fetchall()
+    except sqlite3.OperationalError:                                   # a table written before the dating columns
+        rows = conn.execute(f"SELECT dataset, program, NULL AS current {where}", (copybook.upper(),)).fetchall()
     if not rows:
         return ""
-    said = ", ".join(f"{r['dataset']} ({r['n']} program{'s' if r['n'] != 1 else ''})" for r in rows)
+    per: Dict[str, Dict[str, int]] = {}
+    for r in rows:
+        e = per.setdefault(str(r["dataset"]), {"n": 0, "older": 0, "undated": 0, "no_program": 0})
+        e["n"] += 1
+        if r["current"] is None:
+            # undated: the row is from before the tool dated listings, or the program is not in the index to date it against
+            in_index = conn.execute("SELECT 1 FROM member WHERE kind='cobol' AND UPPER(name)=? LIMIT 1",
+                                    (str(r["program"]).upper(),)).fetchone()
+            e["undated" if in_index else "no_program"] += 1
+        elif not r["current"]:
+            e["older"] += 1
+
+    def cell(dsn: str, e: Dict[str, int]) -> str:
+        parts = [f"{e['n']} program{'s' if e['n'] != 1 else ''}"]
+        if e["older"]:
+            parts.append(f"{e['older']} by an older listing")
+        if e["undated"]:
+            parts.append(f"{e['undated']} not yet dated")
+        if e["no_program"]:
+            parts.append(f"{e['no_program']} whose program is not in the index to date the listing against")
+        return f"{dsn} ({'; '.join(parts)})"
+
+    said = ", ".join(cell(d, e) for d, e in sorted(per.items(), key=lambda kv: (-kv[1]["n"], kv[0])))
     how = ("the UI's Bulk add takes the dataset name; `python -m atlas.recover` writes every such dataset to "
            "work/fetch-list.txt")
     if missing:
