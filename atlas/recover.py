@@ -55,6 +55,19 @@ index, its programs are marked, and the next build expands it; the report
 says which member the folder name decided instead (rename the folder) and
 which it could not re-file, and why.
 
+Every missing name is also looked for ON DISK before any listing is read -
+the estate root walked once - and the report's first table says per name
+what the disk holds: a file with that name that is not in the index (arrived
+after the last build: build again; or there at the last build and skipped:
+atlas-problems.txt), a member the build filed 'empty' because its text sits
+in columns 1-7 (a bare number: the sequence area and the indicator column,
+where the reader sees no code - ROADMAP re-parse item 23), the nearest
+names in the copybook folders when no file carries the name (an extension
+or a suffix in the stem, another spelling), or nothing near (fetch the
+library, or it is gone from the host). The misfiled scan reads the index
+only; 25 of his 27 missing copybooks had no member row at all while the
+files sat in the COPYLIB folders (LESSONS 192).
+
 The listing also settles a second question. After the source, Enterprise
 COBOL prints one row per copybook: the member, the DD name and the LIBRARY
 DATASET the compiler read it from. Where a copybook's name exists in several
@@ -1477,6 +1490,37 @@ DECLARED_CELL = ("the library's kind in the UI's table decided it - declare it c
                  "COPYLIB), then build")
 DECLARABLE_KINDS = ("cobol", "copybook", "jcl", "proc", "ctlcard", "dbd", "psb", "bms", "mfs", "csd", "imsgen", "sql",
                     "listing", "doc", "sched")                    # what build.load_declared_kinds accepts from the manifest
+# a member the build filed 'empty' whose text is a bare number in column 1 (two of his 27 missing copybooks, LESSONS
+# 192): columns 1-6 are the sequence area and column 7 the indicator of fixed-format COBOL, so the reader sees no code
+# and build.code_line_count gives 0 - 'no code lines' said nothing about where the text sits
+STUB_ITEM = "ROADMAP re-parse item 23"
+EMPTY_SEEN = "no code lines, nothing a program could copy"
+EMPTY_WHY_NOT = "it has no code lines (comments and blanks only): nothing a program could copy"
+
+
+def stub_lines(text: str, data: bytes = b"", enc: str = "utf-8") -> int:
+    """How many non-blank lines the text has when EVERY one of them keeps its
+    text within columns 1-7 - the sequence area and the indicator column of
+    fixed-format COBOL, which the reader never reads as code: `1234567` in
+    column 1 gives build.code_line_count 0 and the build files the member
+    'empty'. 0 when the text has no line or any non-blank line reaches
+    column 8 (a member of comments only: the old sentence stands). Records
+    split as the reader splits them, tabs widened as it widens them."""
+    n = 0
+    for rec in reader._split_records(text, data, enc):
+        rec = rec.replace("\t", "    ")
+        if not rec.strip():
+            continue
+        if rec[7:].strip():
+            return 0
+        n += 1
+    return n
+
+
+def stub_sentence(n: int) -> str:
+    """The sentence for a member whose every non-blank line sits in columns 1-7."""
+    return (f"the file holds {n} line(s) whose text sits in columns 1-7 - the sequence area and the indicator column of "
+            f"fixed-format COBOL - so the reader sees no code ({STUB_ITEM})")
 
 
 def _signature_hit(kind: str, head: str) -> Tuple[int, str]:
@@ -1533,17 +1577,26 @@ def how_classified(path: str, stored_kind: Optional[str] = None, stored_sha: Opt
             data = fh.read(HEAD_BYTES)
     except OSError:
         return out
-    text, _enc = reader.decode_bytes(data)
+    text, enc = reader.decode_bytes(data)
     head = text[:8192]                                              # as the build hands it to the classifier
     kind, reason = classify.classify(path, head)
     # the shape checks are line-anchored: a member downloaded with CR LF must not slip past a `$`
     out.update(kind=kind, reason=reason, text=text.replace("\r\n", "\n").replace("\r", "\n"))
     ext = os.path.splitext(path)[1].lower()
     if stored_kind == "empty":
-        # the build files a code member with no code lines (comments and blanks only) as empty, after classifying
-        out.update(kind="empty", by="content",
-                   seen=f"the classifier read it as {kind} ({reason}) and the build filed it empty: no code lines, nothing "
-                        "a program could copy")
+        # the build files a code member with no code lines as empty, after classifying: comments and blanks only -
+        # or a bare number in column 1, which the fixed-format reader takes for the sequence area and the indicator
+        # (LESSONS 192): the sentence says where the text sits, and `stub` how many such lines there are
+        whole = text
+        if len(data) >= HEAD_BYTES:                                 # every line counts: the whole file, when it is longer
+            try:
+                whole = reader.load(path)[0]
+            except OSError:
+                whole = text
+        n = stub_lines(whole, data, enc)
+        out.update(kind="empty", by="content", stub=n,
+                   seen=f"the classifier read it as {kind} ({reason}) and the build filed it empty: "
+                        + (stub_sentence(n) if n else EMPTY_SEEN))
     elif stored_kind and kind != stored_kind:
         # the same bytes the build read, and the classifier's own answer differs from the index: the build's step
         # AFTER the classifier decided - 'unknown' becomes the kind declared for the library (_inventory_one) -
@@ -1625,7 +1678,9 @@ def refile_verdict(r: Dict[str, object], folder: str) -> Tuple[bool, str]:
     kind = str(r["kind"])
     text = str(r["text"])
     if kind == "empty":
-        return False, "it has no code lines (comments and blanks only): nothing a program could copy"
+        # the reader would expand nothing: comments and blanks only - or text in columns 1-7 alone, said as such
+        n = int(r.get("stub") or 0)                                 # type: ignore[arg-type]
+        return False, stub_sentence(n) if n else EMPTY_WHY_NOT
     if kind not in WEAK_KINDS and not _signature_only_in_comments(kind, text):
         return False, (f"its text carries a {kind} signature ({r['reason']}): not a COBOL copybook - the copybook the "
                        "programs copy is another member, still to fetch")
@@ -1979,6 +2034,341 @@ def copier_names(conn: sqlite3.Connection, missing: Dict[str, int], limit: int =
         users[name].append(user + (" (copybook)" if kind == "copybook" else "") + (f":{line}" if line else ""))
         # NAME:line - the line of the COPY statement, so a name that is not a copybook at all can be looked at
     return {n: ", ".join(u[:limit]) + (f", +{len(u) - limit:,} more" if len(u) > limit else "") for n, u in users.items()}
+
+
+# --------------------------------------------------------------------------
+# the missing copybooks looked for on disk (LESSONS 192)
+# --------------------------------------------------------------------------
+#
+# 'missing copybooks in the index: 27' while the files sat in the COPYLIB
+# folders he had fetched that day. Only two of the names had a member row at
+# all - both 'empty': a 7-digit number in column 1 and nothing else, which the
+# fixed-format reader takes for the sequence area and the indicator, so it
+# sees no code - and the misfiled scan (arrival_scan) reads the index only,
+# so the other 25 (on disk under another name, or arrived after the build, or
+# skipped by it) got no word at all; he spent an evening on it. Now every
+# missing name is looked for under the estate root ONCE - one os.walk over his
+# 121k files, the stems kept in a local map, never a walk per name - and the
+# report says per name what the disk holds and what to do.
+
+DISK_READ_BYTES = 4 * 1024 * 1024        # a copybook is never this long: the code lines of a file on disk are counted in it
+NEAR_CUTOFF = 0.75                       # difflib ratio for a near name (6 of 8 characters in order)
+NEAR_MAX = 6                             # near names shown per missing copybook
+NEAR_PREFIX_MIN = 4                      # a stem the name starts with must be this long to count (`B` is not a near name)
+NO_FILE_TODO = ("no file with this name under the estate: fetch the library the listings name (the fetch list) - or the "
+                "library is gone from the host")
+EMPTY_TODO = ("open the file: if the number is all it holds, the library copy is a stub and the copybook's text is in the "
+              "listings of the programs copying it (this run reads them) or on the host (fetch the member again); until "
+              f"{STUB_ITEM} the build reads no code from it")
+THERE_TODO = ("see atlas-problems.txt for a skip (a time limit, unreadable, too large) and the coverage report's 'failed' "
+              "table, or a build that stopped before it recorded every file")
+
+
+def estate_files(root: str, copy_folders: Sequence[str] = (), log=None) -> Tuple[Dict[str, List[str]], Set[str]]:
+    """One walk of the estate root, listing what the build lists
+    (build.SKIP_DIRS and every folder or file whose name starts with a dot
+    left out, a folder the toolkit wrote - build.OUTPUT_MARKER - not
+    entered, `.exp.cbl` left out; RECOVERED-COPYBOOKS is listed): ({STEM:
+    [path, ...]}, the stems in the copybook folders) - the stem being the
+    member name the build gives a file, its name without the extension in
+    upper case. A copybook folder is one classify.DIR_HINTS maps to
+    copybook, or one of `copy_folders` (the folders the index files
+    copybooks in: his hand-fetched libraries carry no COPY hint). A line
+    every 10 s while the walk runs."""
+    from . import build as _build                                   # local: build imports nothing from here
+    files: Dict[str, List[str]] = defaultdict(list)
+    copy_stems: Set[str] = set()
+    extra = {str(f).upper() for f in copy_folders}
+    t0 = last = time.time()
+    n = 0
+    for dirpath, dirs, fnames in os.walk(root):
+        if _build.OUTPUT_MARKER in fnames:
+            dirs[:] = []
+            continue
+        dirs[:] = [d for d in dirs if d not in _build.SKIP_DIRS and not d.startswith(".")]
+        parent = os.path.basename(dirpath)
+        hint = next((k for rx, k in classify.DIR_HINTS if rx.search(parent)), None)
+        is_copy = hint == "copybook" or parent.upper() in extra
+        for fn in fnames:
+            if fn.startswith(".") or fn.lower().endswith(".exp.cbl"):
+                continue
+            stem = os.path.splitext(fn)[0].upper()
+            files[stem].append(os.path.join(dirpath, fn))
+            if is_copy:
+                copy_stems.add(stem)
+            n += 1
+        if log and time.time() - last >= 10:
+            last = time.time()
+            log(f"  ... {n:,} files listed under the estate, {int(time.time() - t0)} s")
+    return files, copy_stems
+
+
+def last_build_started(conn: sqlite3.Connection) -> Optional[float]:
+    """When the last build started, as seconds since the epoch (build_run
+    .started_at is local time, `%Y-%m-%dT%H:%M:%S`); None when no run is
+    recorded or the stamp does not read."""
+    row = conn.execute("SELECT started_at FROM build_run ORDER BY id DESC LIMIT 1").fetchone()
+    if not row or not row[0]:
+        return None
+    try:
+        return time.mktime(time.strptime(str(row[0])[:19], "%Y-%m-%dT%H:%M:%S"))
+    except (ValueError, OverflowError):
+        return None
+
+
+def file_dated(path: str) -> Optional[float]:
+    """When the file came to be where it is: the later of its modification
+    time and, on Windows, its creation time - Explorer and `copy` keep the
+    modification time of the original, so a copybook copied into the estate
+    after the build carries a date before it, and only the creation time
+    says it arrived."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return max(st.st_mtime, st.st_ctime)
+
+
+def file_reading(path: str) -> Dict[str, object]:
+    """What the build would make of a file on disk: `kind` as
+    classify.classify reads its first 8 KB, 'empty' for a copybook / cobol
+    member with no code lines (build._inventory_one), `code_lines` for a
+    copybook / cobol kind (build.code_line_count), `stub` for an empty one
+    (stub_lines), and `what` - the sentence for the report's 'what the file
+    is' cell. Reads the first DISK_READ_BYTES."""
+    from . import build as _build
+    out: Dict[str, object] = {"kind": "?", "reason": "", "code_lines": None, "stub": 0, "what": ""}
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as fh:
+            data = fh.read(DISK_READ_BYTES)
+    except OSError as exc:
+        out.update(reason=str(exc), what=f"could not be read from disk ({exc.strerror or exc})")
+        return out
+    text, enc = reader.decode_bytes(data)
+    kind, reason = classify.classify(path, text[:8192])
+    what = f"{kind} ({reason})"
+    if kind == "unknown":
+        what = f"unknown ({reason}) - or the kind declared for its library in the UI's table"
+    if kind in ("copybook", "cobol"):
+        n = _build.code_line_count(kind, text, data, enc)
+        out["code_lines"] = n
+        if n == 0:
+            stub = stub_lines(text, data, enc)
+            out["stub"] = stub
+            kind = "empty"
+            what = ("the build files it empty: " + (stub_sentence(stub) if stub else "no code lines (comments and blanks only)"))
+        else:
+            what = f"{kind} ({reason}), {n:,} code line(s)" + (f" in the first {DISK_READ_BYTES // 1024 // 1024} MB"
+                                                               if size > DISK_READ_BYTES else "")
+    out.update(kind=kind, reason=reason, what=what)
+    return out
+
+
+def _stamp(t: Optional[float]) -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t)) if t else "?"
+
+
+def _rel(path: str, root: str) -> str:
+    try:
+        return os.path.relpath(path, root)
+    except ValueError:                                              # another drive
+        return path
+
+
+def near_names(name: str, copy_stems: Sequence[str], files: Dict[str, List[str]], root: str) -> List[Tuple[str, str]]:
+    """[(stem, path relative to the root)] - the copybook-folder stems nearest
+    to a missing name: every stem that starts with the name (`BOOKB-V2`,
+    `BOOKB.CPY` - an extension or a suffix in the stem: the likeliest
+    member under another name, so first) or that the name starts with
+    (NEAR_PREFIX_MIN characters at least), then difflib.get_close_matches
+    (NEAR_CUTOFF, at most 3: another spelling), NEAR_MAX in all.
+    `copy_stems` is the sorted list estate_files() gives, made once per
+    run."""
+    found: List[str] = [s for s in copy_stems if s != name and s.startswith(name)]
+    found += [s for s in copy_stems if s != name and len(s) >= NEAR_PREFIX_MIN and name.startswith(s)]
+    for s in difflib.get_close_matches(name, copy_stems, n=3, cutoff=NEAR_CUTOFF):
+        if s != name and s not in found:
+            found.append(s)
+    return [(s, _rel(files[s][0], root)) for s in found[:NEAR_MAX]] + ([(f"+{len(found) - NEAR_MAX:,} more", "")]
+                                                                       if len(found) > NEAR_MAX else [])
+
+
+def disk_check(missing: "Sequence[str] | Dict[str, int]", root: str, conn: sqlite3.Connection, log=None
+               ) -> Dict[str, Dict[str, object]]:
+    """Per missing copybook name, what the estate's files say - the estate
+    root walked once (estate_files), then each name looked up in the map:
+
+      (a) a file whose stem is the name -> `status` 'indexed' (the file is a
+          member of the index filed 'empty': the stub sentence says where
+          its text sits), 'late' (not in the index, dated after the last
+          build started: build again) or 'there' (not in the index, there
+          at the last build: the build did not index it - a skip, said in
+          atlas-problems.txt); a name the index holds under another kind
+          (asm, proc, doc ...) is left to the misfiled section, which says
+          where that member is and what to do;
+      (b) no such file -> 'near': the nearest stems in the copybook folders
+          (near_names), for a COPY whose name is not the member's name;
+      (c) nothing near -> 'none': the library is to fetch, or gone.
+
+    Only the estate root is walked - a --from folder is read for expanded
+    programs, not for copybooks. Each verdict carries `path` (relative to
+    the root, '' when none), `kind`, `what` (the file, in words), `todo`,
+    `on_disk` (the report's cell), `near` and `dated`."""
+    names = [str(n).upper() for n in missing]
+    out: Dict[str, Dict[str, object]] = {}
+    if not names:
+        return out
+    copy_folders = [str(f) for (f,) in conn.execute("SELECT DISTINCT library FROM member WHERE kind = 'copybook' "
+                                                     "AND library IS NOT NULL AND library <> ''")]
+    files, copy_set = estate_files(root, copy_folders, log)
+    copy_stems = sorted(copy_set)
+    indexed: Dict[str, str] = {}                                    # normcase(abspath(path)) -> kind, for the missing names
+    said_already: Set[str] = set()                                  # names a member of another kind carries: the misfiled section
+    for k in range(0, len(names), 500):
+        chunk = names[k:k + 500]
+        for name, path, kind in conn.execute("SELECT UPPER(name), path, kind FROM member WHERE UPPER(name) IN "
+                                             f"({','.join('?' * len(chunk))})", chunk):
+            indexed[os.path.normcase(os.path.abspath(path))] = str(kind)
+            if kind != "empty":
+                said_already.add(str(name))
+    started = last_build_started(conn)
+    for name in names:
+        if name in said_already:
+            # the index holds the name under a kind the build does not expand (asm, proc, doc ...): the section 'A
+            # member with the copybook's name exists but is filed as something else' says where it is and what to
+            # do, and the disk has nothing to add - only a member filed 'empty' has (where its text sits)
+            continue
+        paths = files.get(name, [])
+        if paths:
+            out[name] = _found_verdict(name, paths, indexed, started, root)
+            continue
+        near = near_names(name, copy_stems, files, root)
+        if near:
+            shown = ", ".join(s if not p else f"{s} ({p})" for s, p in near)
+            out[name] = {"status": "near", "path": "", "paths": [], "kind": "", "what": "-", "near": near, "dated": None,
+                         "on_disk": "no",
+                         "todo": f"no file with this name under the estate; nearest names in the copybook folders: {shown} "
+                                 "(is the COPY statement's name the member's name?)"}
+        else:
+            out[name] = {"status": "none", "path": "", "paths": [], "kind": "", "what": "-", "near": [], "dated": None,
+                         "on_disk": "no", "todo": NO_FILE_TODO}
+    return out
+
+
+def _found_verdict(name: str, paths: Sequence[str], indexed: Dict[str, str], started: Optional[float], root: str
+                   ) -> Dict[str, object]:
+    """The verdict for a name a file carries: a copy the index holds first
+    (the misfiled section says the rest), else the one dated latest."""
+    in_index = [(p, indexed[os.path.normcase(os.path.abspath(p))]) for p in paths
+                if os.path.normcase(os.path.abspath(p)) in indexed]
+    rels = [_rel(p, root) for p in paths]
+
+    def more(path: str) -> str:
+        others = [r for r in rels if r != _rel(path, root)]
+        return f" (+{len(others)} more file(s) with this name: {', '.join(others[:3])})" if others else ""
+
+    if in_index:
+        path, kind = in_index[0]
+        reading = file_reading(path)
+        what = str(reading["what"])
+        if kind == "empty":
+            stub = int(reading["stub"] or 0)                        # type: ignore[arg-type]
+            what = stub_sentence(stub) if stub else "no code lines (comments and blanks only): nothing a program could copy"
+        return {"status": "indexed", "path": _rel(path, root), "paths": rels, "kind": kind, "what": what,
+                "near": [], "dated": file_dated(path),
+                "on_disk": f"yes: {_rel(path, root)} - in the index, filed as {kind}{more(path)}", "todo": EMPTY_TODO}
+    dated = [(file_dated(p) or 0.0, p) for p in paths]
+    when, path = max(dated)
+    reading = file_reading(path)
+    kind = str(reading["kind"])
+    late = started is not None and when > started
+    on_disk = f"yes: {_rel(path, root)} - not in the index{more(path)}"
+    if late:
+        todo = (f"arrived after the last build (file dated {_stamp(when)}, last build started {_stamp(started)}): run your "
+                "usual build command")
+    elif started is None:
+        todo = f"the index records no build start to date it against: the build did not index it - its kind would be {kind}; {THERE_TODO}"
+    else:
+        todo = (f"was there at the last build (file dated {_stamp(when)}, last build started {_stamp(started)}): the build did "
+                f"not index it - its kind would be {kind}"
+                + (" / it has no code lines" if kind == "empty" else "") + f"; {THERE_TODO}")
+    return {"status": "late" if late else "there", "path": _rel(path, root), "paths": rels, "kind": kind,
+            "what": str(reading["what"]), "near": [], "dated": when, "on_disk": on_disk, "todo": todo}
+
+
+def disk_counts(checked: Dict[str, Dict[str, object]]) -> Dict[str, int]:
+    """The stats: on_disk (a file with the name, in the index or not),
+    arrived_late, no_file - and the parts the console line needs."""
+    c = Counter(str(v["status"]) for v in checked.values())
+    return {"on_disk": c["late"] + c["there"] + c["indexed"], "arrived_late": c["late"], "no_file": c["near"] + c["none"],
+            "there": c["there"], "indexed": c["indexed"], "near": c["near"]}
+
+
+def disk_line(checked: Dict[str, Dict[str, object]]) -> str:
+    """The console's one line, zero counts left out."""
+    c = disk_counts(checked)
+    on = []
+    if c["arrived_late"]:
+        on.append(f"{c['arrived_late']:,} arrived after the last build - not in the index yet")
+    if c["indexed"]:
+        on.append(f"{c['indexed']:,} in the index filed empty - no code lines the reader sees")
+    if c["there"]:
+        on.append(f"{c['there']:,} there at the last build yet not in the index")
+    parts = []
+    if c["on_disk"]:
+        parts.append(f"{c['on_disk']:,} on disk ({', '.join(on)})")
+    if c["no_file"]:
+        parts.append(f"{c['no_file']:,} with no file under the estate"
+                     + (f" ({c['near']:,} with a near name)" if c["near"] else ""))
+    return "  missing copybooks checked on disk: " + ", ".join(parts)
+
+
+def disk_next(checked: Dict[str, Dict[str, object]]) -> str:
+    """The single most useful 'next:' after the console line: the build when
+    a file arrived after it; else the fetch list; else the report's table."""
+    c = disk_counts(checked)
+    if c["arrived_late"]:
+        return (f"  next: run your usual build command - it indexes the {c['arrived_late']:,} copybook(s) that arrived after "
+                "the last build, and the programs copying them re-expand by themselves")
+    if c["no_file"]:
+        return ("  next: fetch the libraries that hold these copybooks - the report's fetch list names the datasets the "
+                r"listings say (work\fetch-list.txt)"
+                + (f"; the {c['near']:,} near name(s) the report lists may be the members under another name: check them "
+                   "against the COPY statements" if c["near"] else ""))
+    return ("  next: the report's table says per file why the build did not index it as a copybook - a member filed empty "
+            "(its text in columns 1-7), a skipped file (atlas-problems.txt)")
+
+
+def disk_cell(v: Dict[str, object]) -> str:
+    """One cell for `coverage` and `copybook`: where the file is and what to do."""
+    status = str(v["status"])
+    if status in ("late", "there"):
+        return f"on disk at {v['path']}, not in the index - {v['todo']}"
+    if status == "indexed":
+        return f"on disk at {v['path']}, in the index as {v['kind']}: {v['what']}"
+    return str(v["todo"])
+
+
+def disk_report(checked: Dict[str, Dict[str, object]], missing: Dict[str, int], users: Dict[str, str], root: str
+                ) -> List[str]:
+    """The report's section, right after the summary lines."""
+    if not checked:
+        return []
+    lines = ["\n## Missing copybooks, checked on disk\n\n"
+             f"Every missing name was looked for under the estate root `{root}` - the folders the build lists; a --from "
+             "folder is read for expanded programs, not for copybooks - first as a file whose name without its extension "
+             "is the copybook's name, then as a near name in the copybook folders. A file on disk that is not in the index "
+             "either arrived after the last build started (run your usual build command) or was there and the build did "
+             "not index it (atlas-problems.txt and the coverage report's 'failed' table say why a file was skipped). A "
+             "member the build filed 'empty' holds no code the reader sees: when its text sits in columns 1-7 - the "
+             f"sequence area and the indicator column of fixed-format COBOL - the table says so ({STUB_ITEM}).\n\n"
+             "| copybook | programs copying it | on disk? | what the file is | what to do |\n|---|---|---|---|---|\n"]
+    for name in sorted(checked):
+        v = checked[name]
+        progs = f"{missing.get(name, 0)}" + (f" ({users[name]})" if users.get(name) else "")
+        lines.append(f"| {name} | {progs} | {v['on_disk']} | {v['what']} | {v['todo']} |\n")
+    return lines
 
 
 def real_copies(conn: sqlite3.Connection, roots: Sequence[str]) -> Set[str]:
@@ -2460,6 +2850,19 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
         missing = missing_copybooks(conn)
         copiers = copiers_by_kind(conn, missing)
         users = copier_names(conn, missing)
+        # every missing name looked for on disk, before any listing is read (also on a dry run): the misfiled scan
+        # above sees the index only, and 25 of his 27 missing copybooks had no member row at all while the files
+        # sat in the COPYLIB folders - under another name, arrived after the build, or skipped by it (LESSONS 192)
+        checked: Dict[str, Dict[str, object]] = {}
+        not_checked = ""
+        if missing:
+            if root and os.path.isdir(root):
+                checked = disk_check(missing, root, conn, log=log)
+            elif root:
+                not_checked = f"  the estate root {root} is not on disk from here: the missing names were not looked for on disk"
+            else:
+                not_checked = "  the index records no estate root: the missing names were not looked for on disk"
+        disk_stats = disk_counts(checked)
         sources = listing_sources(conn, folders)
         index = originals(conn)
         # the programs whose copybook the build CHOSE among several: their listings say which copy was right
@@ -2565,6 +2968,7 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
             f"its text ({kinds}) and this run could not re-file: {n_prog:,} program(s) stay parsed only in part - no folder "
             f"change helps; the report says why for each ({REFILED_ITEM})")
     arrival_lines = removed_lines + arrival_report(arrived, misfiled, dry_run, refiled=refiled, waiting=waiting)
+    disk_lines = disk_report(checked, missing, users, root or "")   # right after the summary lines, before the rest
     # every missing name is one a member of another kind carries and a rename (or a run without --dry-run, or a
     # rename and then a run) settles: that comes before any listing - a member this run could not re-file for any
     # other reason is left to the listings
@@ -2583,8 +2987,8 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
             head = [f"# Recovered copybooks - {time.strftime('%Y-%m-%d %H:%M')}\n",
                     f"\n- missing in the index: {len(missing)}; expanded texts read: 0; removed (real member arrived): "
                     f"{len(removed)}\n"]
-            if arrival_lines:
-                _write_report(report, head + arrival_lines)
+            if disk_lines or arrival_lines:
+                _write_report(report, head + disk_lines + arrival_lines)
                 log(f"every name: {report}")
             elif os.path.exists(report):
                 _write_report(report, head + [f"\nNothing to report on this run: {nothing}.\n"])
@@ -2596,7 +3000,9 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
         if content_folder:
             log(NEXT_FOLDER_REFILE)
         stats.update({"arrived": len(arrived), "misfiled": len(misfiled), "refiled": 0 if dry_run else len(refiled),
-                      "waiting": len(waiting), "marked": marked + marked_removed + marked_refiled})
+                      "waiting": len(waiting), "marked": marked + marked_removed + marked_refiled,
+                      "on_disk": disk_stats["on_disk"], "arrived_late": disk_stats["arrived_late"],
+                      "no_file": disk_stats["no_file"]})
         return stats
 
     log(f"missing copybooks in the index: {len(missing):,}, used in {sum(missing.values()):,} places (a place = one program "
@@ -2613,6 +3019,11 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
         else:
             log("  every one of them is the name of a member this run would re-file as a copybook (above): run without "
                 "--dry-run first - the listings only if a program still says NOT FOUND after the build")
+    if checked:
+        log(disk_line(checked))
+        log(disk_next(checked))
+    elif not_checked:
+        log(not_checked)
     if recovered:
         log(f"  held only as recovered copies: {len(recovered):,} - the build has read them, so they are not missing any more; "
             "their libraries stay on the fetch list until the real members arrive")
@@ -2826,6 +3237,7 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
              + f"; already there: {kept}; unconfirmed: {len(unconfirmed)}; rejected: {len(rejected)}; removed (real member arrived): {len(removed)}",
              f"\n- not in any expanded text: {len(not_found)}"
              + (f"; in an older listing whose source column could not be proven: {len(unread)}" if unread else "") + "\n"]
+    lines += disk_lines                                                 # every missing name, looked for on disk
     lines += arrival_lines                                              # arrived after the parse / filed as another kind
     if written:
         lines.append("\n## Written\n\n| copybook | programs copying it | folder | how |\n|---|---|---|---|\n")
@@ -2950,7 +3362,8 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
             "checked": choice_counts(checks) if checks else None,
             "fetch": (len(fetch), to_fetch), "unnamed": len(unnamed), "misread": len(misread_written),
             "arrived": len(arrived), "misfiled": len(misfiled), "refiled": 0 if dry_run else len(refiled),
-            "waiting": len(waiting), "marked": marked + marked_removed + marked_refiled}
+            "waiting": len(waiting), "marked": marked + marked_removed + marked_refiled,
+            "on_disk": disk_stats["on_disk"], "arrived_late": disk_stats["arrived_late"], "no_file": disk_stats["no_file"]}
 
 
 def trace(db: str, name: str, folders: Sequence[str] = (), log=print) -> int:

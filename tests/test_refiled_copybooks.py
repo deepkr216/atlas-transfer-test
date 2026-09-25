@@ -1152,7 +1152,8 @@ class TheDocsSayIt(unittest.TestCase):
             self.assertIn("instead of the rename. A build that re-parses every member — <code>--rebuild</code>, the manifest "
                           "changed (every library added or re-kinded in the UI's table rewrites it), a parser module changed "
                           "— files such a member as before and parses its programs again without it, so they read partial "
-                          "with COPY NOT FOUND: run recover after such a build and it re-files them. Such a member", fh.read())
+                          "with COPY NOT FOUND: run recover after such a build and it re-files them. Every missing copybook "
+                          "is also looked for on disk", fh.read())
 
 
 class TheVerdict(unittest.TestCase):

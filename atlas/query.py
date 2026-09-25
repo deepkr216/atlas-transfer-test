@@ -1327,6 +1327,42 @@ def _exists_as_other_kind(conn: sqlite3.Connection, name: str) -> str:
             f"that copies it is parsed only in part. " + " ".join(fixes))
 
 
+def disk_verdicts(conn: sqlite3.Connection, names: Sequence[str]) -> Tuple[str, Dict[str, str]]:
+    """(the estate root, or why it was not walked; {NAME: one cell}) - what
+    the disk says for copybook names the index holds NO member for
+    (recover.disk_check, one walk of the estate root when there is a name
+    to look for): 'on disk at PATH, not in the index - arrived after the
+    last build ...: run your usual build command', 'on disk at PATH, not in
+    the index - was there at the last build ...', 'no file with this name
+    under the estate; nearest names in the copybook folders: ...' or the
+    fetch sentence. Nothing is walked when the index records no root or the
+    root is not on disk from here (the cell says so)."""
+    from . import recover
+    wanted = [str(n).upper() for n in names]
+    if not wanted:
+        return "", {}
+    root = recover.estate_root(conn)
+    if not root:
+        why = "the index records no estate root: not looked for on disk"
+        return "", {n: why for n in wanted}
+    if not os.path.isabs(root) and os.path.isdir(root):
+        root = os.path.abspath(root)                                # built as `estate` from the toolkit's folder
+    if not os.path.isdir(root):
+        why = f"the estate root {root} is not on disk from here: not looked for on disk"
+        return "", {n: why for n in wanted}
+    checked = recover.disk_check(wanted, root, conn)
+    return root, {n: recover.disk_cell(v) for n, v in checked.items()}
+
+
+def _disk_note(conn: sqlite3.Connection, name: str) -> str:
+    """`copybook`'s line under NOT FOUND for a name no member carries."""
+    root, cells = disk_verdicts(conn, [name])
+    cell = cells.get(name.upper(), "")
+    if not cell:
+        return ""
+    return f"\nLooked for on disk{f' under the estate root `{root}`' if root else ''}: {cell}.\n"
+
+
 def _cap(s: str) -> str:
     return s[:1].upper() + s[1:]
 
@@ -1341,7 +1377,11 @@ def cmd_copybook(conn: sqlite3.Connection, name: str) -> str:
     copies = conn.execute("SELECT m.* FROM member m WHERE UPPER(m.name)=? AND m.kind IN ('copybook','cobol','unknown')",
                           (name.upper(),)).fetchall()
     if not copies:
-        return out[0] + "\n**NOT FOUND**" + _exists_as_other_kind(conn, name) + "\n" + _listing_sources_of(conn, name, missing=True)
+        other = _exists_as_other_kind(conn, name)
+        # no member at all under the name: the estate root is walked once for a file with that name, or a near one
+        # (LESSONS 192) - a member of another kind is said by the note above, the disk check has nothing to add
+        disk = "" if other else _disk_note(conn, name)
+        return out[0] + "\n**NOT FOUND**" + other + "\n" + disk + _listing_sources_of(conn, name, missing=True)
     if len(copies) > 1:
         out.append(f"> **{len(copies)} copies of this member** ({len({c['norm_sha'] for c in copies})} distinct contents). "
                    f"Record lengths per copy:\n")
@@ -2120,7 +2160,12 @@ def cmd_coverage(conn: sqlite3.Connection, everything: bool = False) -> str:
     for book, n in sorted(uses.items(), key=lambda kv: (-kv[1], kv[0]))[:40]:
         note = same_named_note(conn, book, list(copiers_of[book]))
         nf_rows.append((book, n, f"yes: {note}" if note else "-"))
-    out.append(table(["copybook", "uses", "a member with this name exists?"], nf_rows))
+    # the names no member carries, looked for on disk - one walk of the estate root, only when the table has such a
+    # name (LESSONS 192); a name a member carries is said by the column before
+    _root, cells = disk_verdicts(conn, [b for b, _n, note in nf_rows if note == "-"])
+    nf_rows = [(book, n, note, cells.get(str(book).upper(), "in the index (the column before says as what)"))
+               for book, n, note in nf_rows]
+    out.append(table(["copybook", "uses", "a member with this name exists?", "on disk?"], nf_rows))
     if skips:
         out.append("\n> Not in this table: " + "; ".join(f"`COPY {b}` skipped - {w} in {', '.join(ps[:6])}"
                                                           + (f", +{len(ps) - 6} more" if len(ps) > 6 else "")
