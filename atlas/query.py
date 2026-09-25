@@ -1636,11 +1636,6 @@ UNRESOLVED_MEANING = {
         "nothing to fetch; an index built before ROADMAP re-parse item 18 repeats the choice as a COPY warning, and "
         "the next full re-parse stops it - check the manifest's system / copybook order if the copy named is the "
         "wrong one"),
-    "expand (copybook chosen among several - by the listing)": (
-        "the resolver's choice repeated as a COPY warning: the program expanded completely with the copy its compiler "
-        "listing names (its 'ambiguous_copybook' row) - not a missing copybook",
-        "nothing: the compiler's own record decided, not a guess; an index built before ROADMAP re-parse item 18 repeats "
-        "the choice as a COPY warning, and the next full re-parse stops it"),
     "ambiguous_copybook": ("two copies of one copybook with different content; one was chosen",
                            "declare the department's copybook order (manifest `copylib_order`) or remove the stale copy"),
     "ambiguous_copybook (decided by the listing)": (
@@ -1867,10 +1862,14 @@ def _choices_checked(conn: sqlite3.Connection) -> str:
     from . import recover
     if not recover.has_copy_sources(conn):
         return ""
-    a, b, o, h, u = recover.choice_counts(recover.check_choices(conn))
-    return (f"\n{a} of these choices {'is' if a == 1 else 'are'} confirmed by the program's listing, {b} contradicted by a "
-            f"current listing (see work/recover.md), {o} named by an older listing, {h} name a library the index does not "
-            f"hold, {u} unknown - the listing names the library the compiler read the copybook from; a name is not a fact "
+    checks = recover.check_choices(conn)
+    a, _b, o, h, u = recover.choice_counts(checks)
+    # the contradicted in two parts - by a current listing, and by one not yet dated (recover.contradicted_words): an
+    # undated listing is never counted as a current one
+    return (f"\n{a} of these choices {'is' if a == 1 else 'are'} confirmed by the program's listing, "
+            f"{recover.contradicted_words(checks)} (see work/recover.md), {o} named by an older listing, {h} name a "
+            f"library the index does not hold, {u} unknown - the listing names the library the compiler read the copybook "
+            "from; a name is not a fact "
             "about content, so the listing's copy is compared by text with the copy used before a choice is called wrong.\n")
 
 
@@ -1889,9 +1888,9 @@ def _listing_says(conn: sqlite3.Connection, member_id: int) -> str:
     stored = [(str(r[0]).upper(), str(r[1] or ""), str(r[2] or "").upper(), str(r[3] or "")) for r in conn.execute(
         "SELECT copybook, ddname, dataset, listing FROM listing_copy_source WHERE program=? AND copybook<>'' ORDER BY rowid",
         (program,))]
-    # the rows that speak for THIS program (build.rows_that_count, the resolver's rule): its own system's listing, else
-    # any listing of its name while no other system holds a program of that name; GC-TEST's listing of its own GCPGM2
-    # says nothing for GC's
+    # the rows that speak for THIS program (build.rows_that_count, the resolver's rule, row by row - the same rows per
+    # copybook as the resolver read): every listing of its name while no other system holds a program of that name,
+    # else its own system's listings only; GC-TEST's listing of its own GCPGM2 says nothing for GC's
     twins = recover.program_systems(conn, [program]).get(program, set()) - {system}
     own = recover.rows_of_system(stored, system, recover.listing_systems(conn, {program: stored}), twins)
     rows = sorted({(cb, dd, dsn) for cb, dd, dsn, _lst in own})
@@ -2359,19 +2358,19 @@ def cmd_coverage(conn: sqlite3.Connection, everything: bool = False) -> str:
                    f"the index ({recover.REFILED_ITEM}), then build; the cell says why when it cannot.\n")
     out.append("\n### Unresolved by kind - what the index could NOT work out, and what closes each one\n")
     # a chosen copybook's rows apart from the rest; the ones the program's compiler listing decided (build.LISTING_HOW
-    # in the note) or confirmed through a same-text copy (build.LISTING_SAME) apart again: those have nothing to declare
+    # in the note) or confirmed through a same-text copy (build.LISTING_SAME) apart again: those have nothing to declare.
+    # An 'expand' note repeating a choice comes only from a build before ROADMAP re-parse item 18, and no such build read
+    # the listing (item 19 ships with item 18): it is always the chain's choice
     from .build import LISTING_HOW, LISTING_SAME
     rows = conn.execute("""SELECT CASE WHEN kind = 'expand' AND instr(COALESCE(detail, ''), ?) > 0
-                                       THEN CASE WHEN instr(COALESCE(detail, ''), ?) > 0
-                                                 THEN 'expand (copybook chosen among several - by the listing)'
-                                                 ELSE 'expand (copybook chosen among several)' END
+                                       THEN 'expand (copybook chosen among several)'
                                        WHEN kind = 'ambiguous_copybook' AND instr(COALESCE(detail, ''), ?) > 0
                                        THEN 'ambiguous_copybook (decided by the listing)'
                                        WHEN kind = 'ambiguous_copybook' AND instr(COALESCE(detail, ''), ?) > 0
                                        THEN 'ambiguous_copybook (confirmed by the listing)'
                                        ELSE kind END AS k, COUNT(*)
                            FROM unresolved GROUP BY 1 ORDER BY 2 DESC""",
-                        (AMBIGUOUS_PICK, LISTING_HOW, LISTING_HOW, LISTING_SAME)).fetchall()
+                        (AMBIGUOUS_PICK, LISTING_HOW, LISTING_SAME)).fetchall()
     out.append(table(["kind", "count", "what it means", "what closes it"],
                      [(k, n, *UNRESOLVED_MEANING.get(k, ("(see the members below)", "send this kind's name for a fix")))
                       for k, n in rows]))

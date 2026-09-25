@@ -84,12 +84,14 @@ does not hold, or holds without that member: the copy used stands), OLDER
 (the texts differ but the listing is an older compile's: not a wrong fact),
 CONTRADICTED (a listing names a held copy with different text and is current,
 or not yet dated - the wrong fact, named in the report with the library the
-listing says) or UNKNOWN. A listing speaks for the program in its own
-system; when that system has no listing of it, any other listing of the name
-(a SHARED listings folder, a --from folder) speaks for it only while no
-other system holds a program of that name (build.rows_that_count - the
-build's rule too). Since ROADMAP re-parse item 19 the build reads the table
-before its precedence chain and follows a CURRENT listing that names a held
+listing says) or UNKNOWN. While no other system holds a program of its name,
+every listing of that name speaks for the program wherever it is filed (its
+own system, a SHARED listings folder, a --from folder), and a current one
+decides over an older one; when another system holds a program of the same
+name, only the listings in the program's own system speak for it
+(build.rows_that_count - the build's rule too). Since ROADMAP re-parse item
+19 the build reads the table before its precedence chain and follows a
+CURRENT listing that names a held
 copy whose text differs from the chain's pick; a program parsed before its
 rows were stored carries the chain's guess until it is parsed again - this
 tool marks every program whose choice a current listing contradicts for the
@@ -1164,29 +1166,37 @@ def rows_of_system(rows: Sequence[CopySource], system: Optional[str], systems: D
                    twins: AbstractSet[Optional[str]]) -> List[CopySource]:
     """The rows a program in `system` is checked against - build.rows_that_count,
     the rule the resolver applies when it reads the rows, so what the build
-    expanded and what this tool checks it against never differ: the rows of
-    the program's own system's listing; when it has none, every other
-    listing of that name (a SHARED listings folder, a --from folder: not in
-    `systems`) while no other system holds a program of that name. `twins`:
-    the systems other than the program's holding a program of that name."""
+    expanded and what this tool checks it against never differ: every
+    listing of the program's name, wherever it is filed (its own system, a
+    SHARED listings folder, a --from folder: not in `systems`), while no
+    other system holds a program of that name; else only the rows of the
+    listings in the program's own system. A row counts by itself, so the
+    rule gives the same rows over all of a program's rows as over one
+    copybook's (the build's key). `twins`: the systems other than the
+    program's holding a program of that name."""
     from . import build as _build
     return _build.rows_that_count(rows, _build.system_key(system), twins, lambda r: systems.get(r[3]))
 
 
 # which listing speaks for which program (build.rows_that_count), in the report's words
-LISTING_RULE = ("A listing speaks for the program in its own system. When that system has no listing of it, any other "
-                "listing of that name - a SHARED listings folder, a --from folder - speaks for it only while no other "
-                "system holds a program of that name: two environments holding one program name (GC and GC-TEST) each "
-                "keep their own listing's word, and a listing filed elsewhere cannot say which of them it is.")
+LISTING_RULE = ("While no other system holds a program of its name, every listing of that name speaks for the program, "
+                "wherever it is filed - its own system's listing folder, a SHARED listings folder, a --from folder - and "
+                "where two of them disagree the current one (its source is the program as indexed) decides. When another "
+                "system holds a program of the same name (GC and GC-TEST), only the listings in the program's own system "
+                "speak for it: each environment keeps its own listing's word, and a listing filed anywhere else cannot say "
+                "which of them it is.")
 
 
 def not_counted_why(program: str, system: Optional[str], rows: Sequence[CopySource], systems: Dict[str, Optional[str]],
-                    twins: AbstractSet[Optional[str]]) -> str:
-    """Why no row of the listings read speaks for this program, and what to
-    do next - the UNKNOWN reason when the program's own system has no
-    listing of it while another system holds a program of that name: a
-    listing read in that system is that program's own, and one filed
-    anywhere else cannot say which of the two it is."""
+                    twins: AbstractSet[Optional[str]], copybook: str = "", has_own: bool = False) -> str:
+    """Why no row of the listings read for this copybook speaks for the
+    program, and what to do next - the UNKNOWN reason when another system
+    holds a program of that name and the rows naming the copybook are all in
+    listings outside the program's own system: a listing read in that other
+    system is that program's own, and one filed anywhere else cannot say
+    which of the two it is. `rows`: the rows naming the copybook;
+    `has_own`: the program's own system has a listing of it (with no row
+    for this copybook - an older compile's, say)."""
     theirs = sorted({str(systems[r[3]]) for r in rows if systems.get(r[3]) and systems.get(r[3]) in twins})
     where = []                                                          # the listings read that belong to no twin
     for r in rows:
@@ -1206,6 +1216,10 @@ def not_counted_why(program: str, system: Optional[str], rows: Sequence[CopySour
     if where:
         said.append(f"the listing {' / '.join(where)} cannot say which {program} it is while {', '.join(named)} "
                     f"{'holds' if len(named) == 1 else 'hold'} one too")
+    if system and has_own:
+        return ("; ".join(said) + f": {system}'s own listing of the program has no row for {copybook} - next: put "
+                f"{system}'s current listing of {program} in a folder under estate\\{system}, run the build, then run "
+                "recover again")
     if system:
         return ("; ".join(said) + f": no listing of the program in {system} - next: put {system}'s own listing of "
                 f"{program} in a folder under estate\\{system}, run the build, then run recover again")
@@ -1316,8 +1330,14 @@ def check_choices(conn: sqlite3.Connection, sources: Optional[Dict[str, List[Cop
       index, or the row was stored before this tool dated listings): the
       real wrong fact;
     UNKNOWN - no listing read for the program, no table in it, no row for
-      that copybook, or the chosen member's dataset is not known.
+      that copybook, no row that speaks for this program (another system
+      holds a program of that name and the rows are all in listings outside
+      its own system: not_counted_why), or the chosen member's dataset is
+      not known.
 
+    The rows checked are the copybook's rows that speak for the program
+    (rows_of_system, build.rows_that_count) - exactly the rows the resolver
+    read for this (program, copybook).
     Where listings name several other datasets the most serious finding
     decides (contradicted, then older, then not held, then promoted).
     `sources`: the rows to check against, else the stored table."""
@@ -1345,9 +1365,10 @@ def check_choices(conn: sqlite3.Connection, sources: Optional[Dict[str, List[Cop
     for program, copybook, used, how, mid, system in chosen_picks(conn):
         used_dsn = dataset_of(used, libs)
         twins = held_by.get(program, set()) - {system}                  # the same name as a program in another system
-        own = rows_of_system(srcs.get(program, []), system, systems, twins)   # the rows that speak for THIS program
-        rows = [r for r in own if r[0] == copybook]
-        said = sorted({r[2] for r in rows if r[2]})
+        read = srcs.get(program, [])
+        naming = [r for r in read if r[0] == copybook]                  # every listing read's rows for this copybook
+        rows = rows_of_system(naming, system, systems, twins)          # the ones that speak for THIS program - the
+        said = sorted({r[2] for r in rows if r[2]})                    # rows the resolver read for this (program, copybook)
         v: Dict[str, object] = {"program": program, "copybook": copybook, "used": used, "used_dataset": used_dsn,
                                 "how": how, "member_id": mid, "system": system, "listing_datasets": said,
                                 "ddnames": sorted({r[1] for r in rows if r[1]}),
@@ -1357,10 +1378,15 @@ def check_choices(conn: sqlite3.Connection, sources: Optional[Dict[str, List[Cop
             v.update(verdict="UNKNOWN", why="no listing of the program was read")
         elif not srcs[program]:
             v.update(verdict="UNKNOWN", why="the program's listing has no copybook-source table")
-        elif not own:
-            v.update(verdict="UNKNOWN", why=not_counted_why(program, system, srcs[program], systems, twins))
+        elif not naming:
+            n_read = len({r[3] for r in read})
+            v.update(verdict="UNKNOWN", why=f"the listing's table has no row for {copybook}" if n_read <= 1 else
+                     f"none of the {n_read} listings read has a row for {copybook} in its table")
+        elif not rows:
+            has_own = bool(rows_of_system(read, system, systems, twins))   # a twin: the own system's rows, any copybook
+            v.update(verdict="UNKNOWN", why=not_counted_why(program, system, naming, systems, twins, copybook, has_own))
         elif not said:
-            v.update(verdict="UNKNOWN", why=f"the listing's table has no row for {copybook}")
+            v.update(verdict="UNKNOWN", why=f"the listing's table names no library for {copybook}")
         elif used_dsn is None:
             v.update(verdict="UNKNOWN", why="the chosen member's library dataset is not known (no `library` row for its "
                                             "folder, and the folder is not named after a dataset)")
@@ -1521,10 +1547,29 @@ def choice_counts(checks: Sequence[Dict[str, object]]) -> Tuple[int, int, int, i
     return c["CONFIRMED"], c["CONTRADICTED"], c["OLDER"], c["NOT HELD"], c["UNKNOWN"]
 
 
+def contradicted_split(checks: Sequence[Dict[str, object]]) -> Tuple[int, int]:
+    """(contradicted by a current listing, contradicted by a listing not yet
+    dated) - the CONTRADICTED count of choice_counts, in its two parts: only
+    the first are marked and followed by the build (marks()); the second
+    wait for this tool to date their listing (--from)."""
+    now = sum(1 for v in checks if marks(v))
+    return now, sum(1 for v in checks if v["verdict"] == "CONTRADICTED") - now
+
+
+def contradicted_words(checks: Sequence[Dict[str, object]]) -> str:
+    """'N contradicted by a current listing', then ', M contradicted by a
+    listing not yet dated' when there are such - an undated one is never
+    counted as current."""
+    now, undated = contradicted_split(checks)
+    return (f"{now} contradicted by a current listing"
+            + (f", {undated} contradicted by a listing not yet dated" if undated else ""))
+
+
 def choice_words(checks: Sequence[Dict[str, object]]) -> str:
-    """The five counts with their words, as every summary line prints them."""
-    a, b, o, h, u = choice_counts(checks)
-    return (f"{a} confirmed, {b} contradicted by a current listing, {o} named by an older listing, {h} name a library "
+    """The five counts with their words, as every summary line prints them
+    (the contradicted ones in their two parts: contradicted_words)."""
+    a, _b, o, h, u = choice_counts(checks)
+    return (f"{a} confirmed, {contradicted_words(checks)}, {o} named by an older listing, {h} name a library "
             f"the index does not hold, {u} unknown")
 
 
@@ -1538,7 +1583,6 @@ def choice_report(checks: Sequence[Dict[str, object]], root: Optional[str]) -> L
     first, then named by an older listing, then naming a library the index
     does not hold, then confirmed through a same-text copy (promoted) - with
     whether the listing is current and why the verdict is what it is."""
-    a, b, o, h, u = choice_counts(checks)
     whys = Counter(str(v["why"]) for v in checks if v["verdict"] == "UNKNOWN")
     lines = ["\n## Copybook choices, checked against the listings\n\n"
              "Where a copybook's name exists in several libraries with different content the build chose one copy "
@@ -1577,7 +1621,7 @@ def choice_report(checks: Sequence[Dict[str, object]], root: Optional[str]) -> L
     if undated:
         lines.append(f"- {len(undated)} of the contradicted {'is' if len(undated) == 1 else 'are'} named by a listing not yet "
                      f"dated - {UNDATED_NEXT}\n")
-    if not b:
+    if not held:
         lines.append("\n_no choice contradicted by a current listing_\n")
     order = {"CONTRADICTED": 0, "OLDER": 1, "NOT HELD": 2, "CONFIRMED": 3}   # a confirmed choice is shown only when promoted
     shown = [v for v in checks if v["verdict"] in order and (v["verdict"] != "CONFIRMED" or v["why"])]
@@ -3771,7 +3815,7 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
             f"misreads ({kinds}): after the build, run this tool once more - it re-files them in the index - then build again "
             f"({REFILED_ITEM})")
     if checks:
-        n_contra = choice_counts(checks)[1]
+        n_contra = contradicted_split(checks)[0]                           # by a current listing: the wrong facts
         log(choice_line(checks) + (" - every choice contradicted by a current listing is a wrong fact in the index: the "
                                    "report names each one with the library the listing says" if n_contra else ""))
         for line in contradicted_lines(checks, dry_run, toolkit_changed):

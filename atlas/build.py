@@ -1288,10 +1288,12 @@ def load_listing_sources(conn: sqlite3.Connection) -> Dict[Tuple[str, str], Tupl
     keys the rows by the listing's file stem, so every listing of one program
     NAME shares the key - GC's and GC-TEST's listings of GCPGM1, and one filed
     under estate\\SHARED\\PROD.LISTINGS - and rows_that_count decides which
-    of them speak for the program being parsed. The system is the listing
-    member's own (member.path = the stored listing path, member.system as
-    derive_systems set it); a listing the index does not hold (a folder given
-    to recover with --from) has none. atlas.recover's `listing_copy_source`,
+    of them speak for the program being parsed (every one while no other
+    system holds a program of that name, else its own system's only). The
+    system is the listing member's own (member.path = the stored listing
+    path, member.system as derive_systems set it); a listing the index does
+    not hold (a folder given to recover with --from) has none.
+    atlas.recover's `listing_copy_source`,
     read ONCE for the whole build (one dict lookup per COPY afterwards). The
     table is recover's own: absent on an index recover never ran on, or
     empty - then nothing is known, and the build never creates it. A row with
@@ -1327,39 +1329,42 @@ def rows_that_count(rows: Sequence[_R], system: Optional[str], twins: AbstractSe
                     listing_system: Callable[[_R], Optional[str]]) -> List[_R]:
     """The listing rows that speak for one program - ONE rule, applied by the
     resolver (current_datasets) and by atlas.recover's check
-    (recover.rows_of_system), so what the build expanded and what recover
-    checks it against never differ. Every listing of a program NAME shares
-    the rows' key; each row carries the system of the listing member that
-    names it (derive_systems: the top-level folder under the estate root).
+    (recover.rows_of_system) and `program`'s 'listing says' lines, so what
+    the build expanded and what recover checks it against never differ.
+    Every listing of a program NAME shares the rows' key; each row carries
+    the system of the listing member that names it (derive_systems: the
+    top-level folder under the estate root - where the file was put, not
+    whose it is).
 
-    1. The rows from listings in the program's own system, when it has any.
-    2. When it has none, every other listing of that name - one filed under
-       a system that holds no program of that name (SHARED holds no WRONGPK,
-       so estate\\SHARED\\PROD.LISTINGS\\WRONGPK.lst speaks for the CLAIMS
-       program WRONGPK), one held outside any system folder, one the index
-       does not hold (a --from folder) - but only while no other system
-       holds a program of that name (a twin). GC-TEST holds a GCPGM2, so
-       GC-TEST's listing is its own GCPGM2's and says nothing for GC's; and a
-       listing filed elsewhere cannot say which of the two it is - recover
-       dates it against one program of the name only, and a test compile's
-       SYSLIB must never decide the production program's copy.
+    - No other system holds a program member of that name (no twin): every
+      listing of the name is this program's, wherever it is filed - its own
+      system's listing folder, estate\\SHARED\\PROD.LISTINGS, a folder
+      outside any system, a --from folder the index does not hold - and
+      recover dates each one against this program, so where two of them
+      disagree the CURRENT one decides (current_datasets keeps only a
+      current listing's rows; recover.check_choices ranks a current
+      listing's findings first). An older compile's listing in the
+      program's own folder never hides a current one filed elsewhere.
+    - Another system holds a program of that name (GC and GC-TEST each hold
+      GCPGM1): only the rows of listings in the program's own system count.
+      GC-TEST's listing is its own program's, and a listing filed anywhere
+      else cannot say which of the two it is - recover dates it against one
+      program of the name only, and a test compile's SYSLIB must never
+      decide the production program's copy. A program with no system has
+      no own rows then.
+
+    A row counts or not by itself (its listing's system against the
+    program's), so the rule gives the same rows whether it is applied to
+    one copybook's rows (the build: load_listing_sources is keyed by
+    (program, copybook)) or to all of a program's rows (recover, `program`).
 
     `system`: the program's (system_key); `twins`: the systems (None for a
     member with none) of the program members of that name in systems OTHER
     than the program's; `listing_system(row)`: the row's listing system (None
-    for none). A program with no system has no own rows: 2 decides."""
-    own = [r for r in rows if system and listing_system(r) == system]
-    if own:
-        return own
-    return [] if twins else list(rows)
-
-
-def listing_rows_for(rows: Sequence[Tuple], system: Optional[str], twins: AbstractSet[Optional[str]]) -> List[str]:
-    """The datasets, in stored order, of every listing row that speaks for a
-    program in `system` ((dataset, listing system, ...) tuples):
-    rows_that_count, current or not - the resolver itself reads
-    current_datasets, the same rows with only the current listings kept."""
-    return [r[0] for r in rows_that_count(rows, system_key(system), twins, lambda r: r[1])]
+    for none)."""
+    if not twins:
+        return list(rows)
+    return [r for r in rows if system and listing_system(r) == system]
 
 
 def current_datasets(rows: Sequence[ListingRow], system: Optional[str], twins: AbstractSet[Optional[str]]) -> List[str]:
@@ -1481,11 +1486,11 @@ def make_resolver(ctx: Ctx, prog: Mem, notes: List[Tuple[str, str, int]]):
             # The precedence chain's pick, then the program's compiler
             # listing: it names the library dataset the compiler read this
             # copybook from (atlas.recover's listing_copy_source). Only the
-            # rows that speak for THIS program count (rows_that_count): its
-            # own system's listing; else any listing of its name (a SHARED
-            # listings folder) while no other system holds a program of that
-            # name - GC and GC-TEST each hold GCPGM1 with its own listing, and
-            # one's listing must not decide for the other's copy. Only a
+            # rows that speak for THIS program count (rows_that_count): every
+            # listing of its name, wherever filed, while no other system holds
+            # a program of that name; else its own system's listing only - GC
+            # and GC-TEST each hold GCPGM1 with its own listing, and one's
+            # listing must not decide for the other's copy. Only a
             # CURRENT listing (its source is the program as indexed) decides,
             # and only where the copy it names is held with a different text
             # from the chain's pick (listing_pick). Everywhere else - none

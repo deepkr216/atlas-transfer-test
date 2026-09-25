@@ -880,7 +880,11 @@ class RowsFromBeforeTheToolDatedListings(unittest.TestCase):
             self.assertIn(f"CONTRADICTS the copy the build used (PROD.CLAIMS.COPYLIB; {POLICY_HELD}; {recover.NOT_YET_DATED}) - "
                           "see work/recover.md", out)
             self.assertIn("PROD.POLICY.COPYLIB (1 program; 1 not yet dated)", query.cmd_copybook(conn, "DUPREC"))
-            self.assertIn("1 contradicted by a current listing (see work/recover.md)", query.cmd_coverage(conn))
+            # the undated one counted apart from the current ones (the verifier: coverage said '1 contradicted by a
+            # current listing' while `program` said the same row was not yet dated)
+            self.assertIn("1 of these choices is confirmed by the program's listing, 0 contradicted by a current listing, "
+                          "1 contradicted by a listing not yet dated (see work/recover.md), 0 named by an older listing",
+                          query.cmd_coverage(conn))
             self.assertEqual(self.columns(), ["program", "copybook", "ddname", "dataset", "listing", "seen"], "nothing altered")
         finally:
             conn.close()
