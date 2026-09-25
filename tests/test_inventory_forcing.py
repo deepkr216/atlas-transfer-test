@@ -844,6 +844,17 @@ class PrecompilerIncludes(_Forcing):
             self.assert_precompiler_cells(query.cmd_program(conn, "DB2PGM"))
             self.assert_precompiler_cells(query.cmd_pack(conn, "DB2PGM"))
             self.assertEqual(recover.unlinked_ok_programs(conn), {})
+            # `copybook SQLCA` with no member of the name: nothing to fetch, the precompiler supplies it
+            book = query.cmd_copybook(conn, "SQLCA")
+        finally:
+            conn.close()
+        self.assertIn("**Supplied by the DB2 precompiler** - `EXEC SQL INCLUDE SQLCA` is written into the program", book)
+        self.assertIn("### Programs including it (1)\nDB2PGM @DB2PGM:7\n", book)
+        for words in ("NOT FOUND", "fetch", "Looked for on disk"):
+            self.assertNotIn(words, book)
+        conn = query.connect(self.db)
+        try:
+            self.assertEqual(recover.missing_copybooks(conn), {})
         finally:
             conn.close()
         stats, said = self.recover()
@@ -890,6 +901,7 @@ class PrecompilerIncludes(_Forcing):
         conn = query.connect(self.db)
         try:
             self.assertIn("| SQLCA | **NOT FOUND** |", query.cmd_program(conn, "CPYPGM"))
+            self.assertIn("**NOT FOUND**", query.cmd_copybook(conn, "SQLCA"))
         finally:
             conn.close()
 

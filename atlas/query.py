@@ -1458,6 +1458,19 @@ def cmd_copybook(conn: sqlite3.Connection, name: str) -> str:
     out = [f"# Impact of copybook {name.upper()}\n"]
     copies = conn.execute("SELECT m.* FROM member m WHERE UPPER(m.name)=? AND m.kind IN ('copybook','cobol','unknown')",
                           (name.upper(),)).fetchall()
+    if not copies and name.upper() in expand._SYSTEM_INCLUDES:
+        # no member of the name, and every program's row for it is the precompiler's (no NOT FOUND note of its
+        # own): nothing to fetch - the disk check's 'fetch the library the listings name' would send him looking
+        # for a library that does not exist (LESSONS 203). A COBOL `COPY SQLCA` with no member says NOT FOUND below.
+        from . import recover
+        users = conn.execute("SELECT DISTINCT m.id, m.name, c.line FROM copy_use c JOIN member m ON m.id = c.member_id "
+                             "WHERE UPPER(c.copybook) = ? AND c.resolved_member_id IS NULL ORDER BY m.name, c.line",
+                             (name.upper(),)).fetchall()
+        noted = recover.not_found_copies(conn, [u[0] for u in users])
+        if not any((u[0], name.upper()) in noted for u in users):
+            return (out[0] + f"\n**Supplied by the DB2 precompiler** - {precompiler_why(name)}.\n"
+                    + f"\n### Programs including it ({len({u[0] for u in users})})\n"
+                    + (", ".join(f"{u[1]} @{u[1]}:{u[2]}" for u in users) or "_none_") + "\n")
     if not copies:
         other = _exists_as_other_kind(conn, name)
         # no member at all under the name: the estate root is walked once for a file with that name, or a near one
@@ -2221,8 +2234,13 @@ def precompiler_cell(copybook: str) -> str:
     `program` and `pack` told him to run recover, then the build, on every
     DB2 program - on an index this toolkit built too, where neither run
     changes the row (LESSONS 203)."""
-    return (f"**supplied by the DB2 precompiler** - `EXEC SQL INCLUDE {copybook.upper()}` is written into the program by "
-            "the precompiler, not copied from a library: no member is expanded for it and none is missing")
+    return f"**supplied by the DB2 precompiler** - {precompiler_why(copybook)}"
+
+
+def precompiler_why(copybook: str) -> str:
+    """What precompiler_cell says after its bold words; `copybook` says it too."""
+    return (f"`EXEC SQL INCLUDE {copybook.upper()}` is written into the program by the precompiler, not copied from a "
+            "library: no member is expanded for it and none is missing")
 
 
 def precompiler_row(copybook: str, noted: bool) -> bool:
