@@ -163,8 +163,20 @@ class _Forcing(_Estate):
         finally:
             conn.close()
 
-    def ids(self):
-        return self.q("SELECT name, kind, id, parse_status FROM member ORDER BY name, kind")
+    def stamp(self):
+        """Mark every member row as it stands: a member the next build records again - parsed again - loses the
+        mark (the build writes scanned_at only when it inserts a member), whatever id it gets (SQLite may give the
+        same id back when the highest rows were removed)."""
+        conn = sqlite3.connect(self.db)
+        try:
+            conn.execute("UPDATE member SET scanned_at='kept by the last build'")
+            conn.commit()
+        finally:
+            conn.close()
+
+    def recorded_again(self):
+        """The members recorded since stamp(): new, or parsed again."""
+        return {r[0] for r in self.q("SELECT name FROM member WHERE COALESCE(scanned_at, '') != 'kept by the last build'")}
 
     def stand_ins_say_nothing(self, program, book):
         """On an index this toolkit built nothing is left for the stand-ins: no program 'ok' with an un-linked row,
@@ -214,9 +226,9 @@ class ArrivingUnderEveryKind(_Forcing):
         self.assert_ok_and_linked("VALPGM", "VALBK")
         self.assert_ok_and_linked("SQLPGM", "POLTAB")
         self.stand_ins_say_nothing("VALPGM", "VALBK")
-        before = self.ids()
+        self.stamp()
         self.build()
-        self.assertEqual(self.ids(), before, "settled: the next build parses nothing again")
+        self.assertEqual(self.recorded_again(), set(), "settled: the next build parses nothing again")
 
     def test_before_the_batch_they_forced_nothing(self):
         self.write("SHARED/PROD.GC.CPYLIB/VALBK.txt", VALBK)
@@ -403,20 +415,19 @@ class NothingElseIsParsedAgain(_Forcing):
     """The control: a member nobody copies, a document, or a new program forces no other member."""
 
     def test_unrelated_arrivals_and_departures_force_nothing(self):
-        before = self.ids()
+        self.stamp()
         self.write("SHARED/PROD.GC.CPYLIB/NOBODY.txt", VALBK)                     # 'unknown', copied by nobody
         self.write("SHARED/DOCS/RUNBOOK.txt", "Please run the job after the close.\n")
         self.write("GC/PROD.GC.SRC/NEWPGM.cbl", data_program("NEWPGM", "STARTBK", "START-DATE"))
         self.build()
         self.assertEqual(self.member("NOBODY")[0], "unknown")
-        after = {r[0]: r for r in self.ids()}
-        for row in before:
-            self.assertEqual(after[row[0]], row, "kept with the same id and status")
+        self.assertEqual(self.recorded_again(), {"NOBODY", "RUNBOOK", "NEWPGM"}, "STPGM and STARTBK kept as they were")
         self.assert_ok_and_linked("NEWPGM")
-        kept = self.ids()
+        self.stamp()
         self.remove("SHARED/PROD.GC.CPYLIB/NOBODY.txt")
         self.build()
-        self.assertEqual([r for r in self.ids() if r[0] != "NOBODY"], [r for r in kept if r[0] != "NOBODY"])
+        self.assertEqual(self.recorded_again(), set())
+        self.assertEqual(self.q("SELECT COUNT(*) FROM member WHERE name='NOBODY'"), [(0,)])
 
 
 if __name__ == "__main__":

@@ -178,6 +178,21 @@ class _Estate(unittest.TestCase):
         with open(self.report, encoding="utf-8") as fh:
             return fh.read()
 
+    def stamp(self):
+        """Mark every member row as it stands: a member the next build records again - parsed again - loses the
+        mark (the build writes scanned_at only when it inserts a member), whatever id it gets (SQLite may give the
+        same id back when the highest rows were removed)."""
+        conn = sqlite3.connect(self.db)
+        try:
+            conn.execute("UPDATE member SET scanned_at='kept by the last build'")
+            conn.commit()
+        finally:
+            conn.close()
+
+    def recorded_again(self):
+        """The members recorded since stamp(): new, or parsed again."""
+        return {r[0] for r in self.q("SELECT name FROM member WHERE COALESCE(scanned_at, '') != 'kept by the last build'")}
+
     def age_fingerprint(self):
         """The index's last build recorded as an older toolkit's, as his index is before the re-parse night."""
         conn = sqlite3.connect(self.db)
@@ -274,15 +289,15 @@ class ArrivedAfterTheParse(_Estate):
         # ROADMAP re-parse item 21 (LESSONS 183): LITBOOK is filed 'unknown' - a kind the resolver expands - and the
         # incremental build parses VALPGM again: whole, its COPY row linked, the literal in its field
         self.assert_parsed_without_the_book("VALPGM", "LITBOOK")
-        secpgm = self.member_id("SECPGM")
+        self.stamp()
         self.write("SHARED/PROD.GC.CPYLIB/LITBOOK.txt", LITBOOK)
         self.build()
+        self.assertEqual(self.recorded_again(), {"LITBOOK", "VALPGM"}, "SECPGM copies nothing that moved: kept as it was")
         self.assertEqual(self.book("LITBOOK"), [("unknown", "PROD.GC.CPYLIB")])
         self.assertEqual(self.status("VALPGM"), "ok")
         self.assertEqual(self.copy_use("LITBOOK", "VALPGM"), [(self.member_id("LITBOOK", "unknown"),)])
         self.assertIn(("NYNJCTPAMA",), self.q("SELECT l.literal FROM literal_ref l JOIN member m ON m.id=l.member_id "
                                               "WHERE m.name='VALPGM'"))
-        self.assertEqual(self.member_id("SECPGM"), secpgm, "a program copying nothing that moved is kept as it was")
         self.assertEqual(self.status(), "partial", "SECPGM's PROCBOOK is still missing")
         # the stand-ins have nothing to say: no 'parsed before it arrived', nothing arrived, nothing un-linked
         cov, nf, prog, book = self.outputs("VALPGM", "LITBOOK")
@@ -306,9 +321,9 @@ class ArrivedAfterTheParse(_Estate):
         self.assertNotIn("LITBOOK", said)
         self.assertNotIn("arrived after the program was parsed", self.report_text())
         # settled: a further build parses nothing again
-        before = self.ids()
+        self.stamp()
         self.build()
-        self.assertEqual(self.ids(), before)
+        self.assertEqual(self.recorded_again(), set())
 
     def test_a_procedure_copybook_in_lower_case_arriving_unknown_is_expanded_at_the_next_build(self):
         # the COBOL-statement signature reads upper case: PROCLOW has none and is filed 'unknown' in a folder with
