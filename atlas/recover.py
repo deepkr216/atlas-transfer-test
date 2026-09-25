@@ -75,8 +75,11 @@ libraries with different content the build could only choose one copy (its
 'ambiguous_copybook' row says which and how); this tool reads the listing of
 every such program too, stores the rows (listing_copy_source) and checks
 each choice: CONFIRMED, CONTRADICTED (a wrong fact - the report names every
-one with the library the listing says) or UNKNOWN. The build does not read
-the table yet (ROADMAP re-parse item 19); nothing in the fact tables changes.
+one with the library the listing says) or UNKNOWN. Since ROADMAP re-parse
+item 19 the build reads the table before its precedence chain: a program
+parsed with its rows in place expands the copy the listing names; one parsed
+before they were stored carries the chain's guess until it is parsed again.
+Nothing in the fact tables changes here.
 
 The same rows are the FETCH LIST: per library dataset named by the listings
 this tool reads (those of the programs that copy a missing copybook, one the
@@ -979,8 +982,9 @@ def copy_sources(lines: Sequence[str]) -> List[Tuple[str, str, str, str]]:
 
 # The table the rows go to: one row per (program, copybook) the listing named,
 # replaced per program each time that program's listing is read. Its own
-# small table - no fact table changes (the build's use of it is ROADMAP
-# re-parse item 19).
+# small table - no fact table changes here; build.make_resolver reads it
+# once (build.load_listing_sources) before its precedence chain (ROADMAP
+# re-parse item 19), so the rows must be there BEFORE the program is parsed.
 COPY_SOURCE_TABLE = ("CREATE TABLE IF NOT EXISTS listing_copy_source (program TEXT NOT NULL, copybook TEXT NOT NULL, "
                      "ddname TEXT, dataset TEXT, listing TEXT, seen TEXT)")
 _PICK = re.compile(r"(\d+) copies of (\S+) with different content; used (.+?) \(([^()]*)\)\s*$")
@@ -1146,9 +1150,12 @@ def choice_report(checks: Sequence[Dict[str, object]], root: Optional[str]) -> L
              "Where a copybook's name exists in several libraries with different content the build chose one copy "
              "('ambiguous_copybook' rows: COPY..OF, then the program's own system in its declared order, then the "
              "authoritative copy, then the same folder, then the first found). The compiler listing names the library "
-             "the compiler read each copybook from - that is the truth the choice is checked against. The build "
-             "itself does not read this table yet (ROADMAP re-parse item 19); a contradicted choice is a wrong fact "
-             "until then, and `program NAME` shows the listing's library under its notes.\n\n"
+             "the compiler read each copybook from - that is the truth the choice is checked against. Since ROADMAP "
+             "re-parse item 19 the build reads this table first: a program parsed with its rows in place expands the "
+             "listing's copy (its note says 'the program's compiler listing names DATASET'); a program parsed before "
+             "its rows were stored, or by an earlier toolkit, carries the chain's guess - a contradicted choice is a "
+             "wrong fact until that program is parsed again, and `program NAME` shows the listing's library under "
+             "its notes.\n\n"
              f"- {len(checks)} choice{'s' if len(checks) != 1 else ''} checked: {a} confirmed, {b} contradicted, {u} unknown"
              + ("" if not whys else " (" + "; ".join(f"{n}: {w}" for w, n in sorted(whys.items(), key=lambda kv: (-kv[1], kv[0])))
                                            + ")") + "\n"]

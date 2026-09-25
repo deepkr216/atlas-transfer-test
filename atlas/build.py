@@ -353,6 +353,11 @@ class Ctx:
         self.progress: Optional["Progress"] = None      # the status line's clock, stopped by whoever ends the build
         self.problems: List[Tuple[str, str, str]] = []   # (kind of problem, path, detail) - listed at the end of the build
         self.problems_file: Optional[str] = None
+        # what the compiler listings say (atlas.recover's listing_copy_source, read once): (PROGRAM, COPYBOOK) ->
+        # the library datasets the listing names; and the dataset each folder holds (the `library` table, else the
+        # folder's own name), cached per folder - make_resolver reads both before its precedence chain
+        self.listing_sources: Dict[Tuple[str, str], Tuple[str, ...]] = {}
+        self.folder_dataset: Dict[str, Optional[str]] = {}
 
     def problem(self, kind: str, path: str, detail: str, line: Optional[str] = None) -> None:
         """A member or file that could not be indexed: shown now (with the time),
@@ -1253,6 +1258,82 @@ def _proc_facts(ctx: Ctx, name: str, job_mem: Optional[Mem] = None,
     return _parsed_proc(ctx, m)
 
 
+# A library dataset's shape: dotted qualifiers of 1-8 characters, 44 at most
+# (the same shape atlas.recover reads a listing's copybook-source row by).
+_LIB_DSN = re.compile(r"^[A-Z0-9@#$][A-Z0-9@#$\-]{0,7}(?:\.[A-Z0-9@#$][A-Z0-9@#$\-]{0,7})+$")
+LIB_DSN_MAX = 44
+LISTING_HOW = "the program's compiler listing names "          # the 'how' of a choice the listing decided
+
+
+def _folder_key(folder: str) -> str:
+    return os.path.normcase(os.path.normpath(os.path.abspath(folder)))
+
+
+def load_listing_sources(conn: sqlite3.Connection) -> Dict[Tuple[str, str], Tuple[str, ...]]:
+    """{(PROGRAM, COPYBOOK): the library datasets the program's compiler
+    listing names for that copybook, in stored order} - atlas.recover's
+    `listing_copy_source`, read ONCE for the whole build (one dict lookup per
+    COPY afterwards). The table is recover's own: absent on an index recover
+    never ran on, or empty - then nothing is known, and the build never
+    creates it. A row with no copybook (a listing read with no table) says
+    nothing."""
+    out: Dict[Tuple[str, str], Tuple[str, ...]] = {}
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='listing_copy_source'").fetchone() is None:
+        return out
+    for program, copybook, dataset in conn.execute("SELECT program, copybook, dataset FROM listing_copy_source "
+                                                   "WHERE copybook IS NOT NULL AND copybook <> '' "
+                                                   "AND dataset IS NOT NULL AND dataset <> '' ORDER BY rowid"):
+        key = (str(program).strip().upper(), str(copybook).strip().upper())
+        dsn = str(dataset).strip().upper()
+        have = out.get(key, ())
+        if dsn not in have:
+            out[key] = have + (dsn,)
+    return out
+
+
+def load_folder_datasets(conn: sqlite3.Connection) -> Dict[str, Optional[str]]:
+    """{folder (normalised): dataset} from the `library` table - the fetcher's
+    `.atlas-library.json` ties each fetched folder to the dataset it holds.
+    The seed of ctx.folder_dataset; a folder not in it is judged by its own
+    name (folder_dataset)."""
+    out: Dict[str, Optional[str]] = {}
+    for folder, dataset in conn.execute("SELECT folder, dataset FROM library WHERE folder IS NOT NULL AND dataset IS NOT NULL"):
+        out[_folder_key(str(folder))] = str(dataset).strip().upper() or None
+    return out
+
+
+def folder_dataset(ctx: Ctx, path: str) -> Optional[str]:
+    """The library dataset a member's folder holds: the `library` table first
+    (the fetcher's marker), else the folder's own name when it is shaped like
+    a dataset (the fetcher names each folder after its dataset; a hand-made
+    folder such as `downloads` or `RECOVERED-COPYBOOKS` names none). Cached
+    per folder: 121k members sit in a few hundred folders."""
+    folder = os.path.dirname(path)
+    key = _folder_key(folder)
+    if key not in ctx.folder_dataset:
+        base = os.path.basename(folder).upper()
+        ctx.folder_dataset[key] = base if "." in base and len(base) <= LIB_DSN_MAX and _LIB_DSN.match(base) else None
+    return ctx.folder_dataset[key]
+
+
+def _chain_pick(ctx: Ctx, prog: Mem, cands: List[Mem], lib: Optional[str]) -> Tuple[Mem, str]:
+    """The precedence chain over same-named candidates: COPY x OF lib > the
+    program's own department in its declared SYSLIB order > same department
+    > authoritative > same folder > first. A CLAIMS program must never
+    silently expand a POLICY department's copy of a same-named copybook.
+    Returns the pick and how it was picked."""
+    by_lib = [c for c in cands if lib and c.library.upper() == lib.upper()]
+    same_sys = [c for c in cands if prog.system and c.system == prog.system]
+    order = ctx.copylib_order.get(prog.system, [])
+    if order and same_sys:
+        same_sys.sort(key=lambda c: order.index(c.library.upper()) if c.library.upper() in order else 999)
+    auth = [c for c in cands if c.authoritative]
+    same_lib = [c for c in cands if c.library == prog.library]
+    how = ("COPY ... OF" if by_lib else "same system" + (" + declared order" if order and same_sys else "")
+           if same_sys else "authoritative" if auth else "same folder" if same_lib else "FIRST FOUND")
+    return (by_lib or same_sys or auth or same_lib or cands)[0], how
+
+
 def make_resolver(ctx: Ctx, prog: Mem, notes: List[Tuple[str, str, int]]):
     def resolve(name: str, lib: Optional[str]):
         cands = [c for c in ctx.by_name.get(name.upper(), [])
@@ -1262,20 +1343,21 @@ def make_resolver(ctx: Ctx, prog: Mem, notes: List[Tuple[str, str, int]]):
         note = None
         pick = cands[0]
         if len(cands) > 1:
-            # Precedence: COPY x OF lib > the program's own department in its
-            # declared SYSLIB order > same department > authoritative > same
-            # folder > first. A CLAIMS program must never silently expand a
-            # POLICY department's copy of a same-named copybook.
-            by_lib = [c for c in cands if lib and c.library.upper() == lib.upper()]
-            same_sys = [c for c in cands if prog.system and c.system == prog.system]
-            order = ctx.copylib_order.get(prog.system, [])
-            if order and same_sys:
-                same_sys.sort(key=lambda c: order.index(c.library.upper()) if c.library.upper() in order else 999)
-            auth = [c for c in cands if c.authoritative]
-            same_lib = [c for c in cands if c.library == prog.library]
-            how = ("COPY ... OF" if by_lib else "same system" + (" + declared order" if order and same_sys else "")
-                   if same_sys else "authoritative" if auth else "same folder" if same_lib else "FIRST FOUND")
-            pick = (by_lib or same_sys or auth or same_lib or cands)[0]
+            # The program's compiler listing FIRST: it names the library
+            # dataset the compiler read this copybook from (atlas.recover's
+            # listing_copy_source). A candidate in a folder tied to that
+            # dataset is the copy the compiler used - not a guess. Only where
+            # no listing says (none read, no table, no row, no candidate in
+            # the dataset it names) does the precedence chain decide.
+            pick, how = None, ""
+            for dsn in ctx.listing_sources.get((prog.name.upper(), name.upper()), ()):
+                in_dsn = [c for c in cands if folder_dataset(ctx, c.path) == dsn]
+                if in_dsn:
+                    pick, _tie = _chain_pick(ctx, prog, in_dsn, lib)     # two folders holding one dataset: the chain breaks the tie
+                    how = LISTING_HOW + dsn
+                    break
+            if pick is None:
+                pick, how = _chain_pick(ctx, prog, cands, lib)
             if len({c.norm_sha for c in cands}) > 1:
                 note = (f"{len(cands)} copies of {name} with different content; used {pick.path} ({how})")
                 notes.append(("ambiguous_copybook", note, 0))
@@ -2523,6 +2605,14 @@ def _build(args: argparse.Namespace, progress: Progress, t0: float) -> int:
     for sched_path in args.sched or []:
         load_sched(ctx, sched_path)
     conn.commit()
+    # what the compiler listings say each copybook came from (atlas.recover's
+    # table, read once) and which dataset each fetched folder holds: the
+    # resolver reads both before it guesses (ROADMAP re-parse item 19)
+    ctx.listing_sources = load_listing_sources(conn)
+    ctx.folder_dataset = load_folder_datasets(conn)
+    if ctx.listing_sources:
+        ctx.say(f"  copybook libraries named by the compiler listings: {len(ctx.listing_sources):,} (program, copybook) "
+                f"row(s) for {len({p for p, _c in ctx.listing_sources}):,} program(s) - read before the resolver guesses")
 
     # Copybooks first so field rows exist; programs; then everything else -
     # grouped by kind, so the screen says when one kind is done.

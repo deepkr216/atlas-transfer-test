@@ -94,6 +94,8 @@ class ChosenCopybookIsNotPartial(unittest.TestCase):
                                            (mid,)).fetchone()[0], 1)
         self.assertEqual(self.member("MISSPGM")[1], "partial")
         self.assertEqual(self.member("PLAINPGM")[1], "ok")
+        # no listing table (recover never ran on this index): the chain decided, and the build did not create the table
+        self.assertIsNone(self.conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='listing_copy_source'").fetchone())
 
     def test_partial_kind_tells_the_two_apart(self):
         self.assertEqual(query.partial_kind(self.conn, self.member("CHOSEN")[0]), "chosen")
