@@ -882,14 +882,16 @@ class PrecompilerIncludes(_Forcing):
             self.assertNotIn(words, book)
         stats, said = self.recover()
         self.assertEqual((stats["arrived"], stats["marked"]), (0, 0), said)
-        # on an index the build before ROADMAP re-parse item 21 left, the same words: the row is the precompiler's
-        self.stamp()
-        with build_before_item_21():
-            self.build()
+        # the SQLCA copybook goes: the build parses CPYPGM again, and its COBOL COPY says NOT FOUND - the row with
+        # no member is its own note's, never read as the precompiler's
+        self.remove("GC/PROD.GC.COPYLIB/SQLCA.cpy")
+        self.build()
+        self.assert_not_found("CPYPGM", "SQLCA")
         conn = query.connect(self.db)
         try:
+            self.assertIn("| SQLCA | **NOT FOUND** |", query.cmd_program(conn, "CPYPGM"))
             self.assert_precompiler_cells(query.cmd_program(conn, "DB2PGM"))
-            self.assertNotIn("left the index", query.cmd_copybook(conn, "SQLCA"))
+            self.assertIn("**NOT FOUND**", query.cmd_copybook(conn, "SQLCA"))
         finally:
             conn.close()
 

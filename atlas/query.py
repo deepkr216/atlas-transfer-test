@@ -2248,7 +2248,13 @@ def precompiler_row(copybook: str, noted: bool) -> bool:
     SQLDA with no 'COPY X NOT FOUND' note of the program's own (a COBOL
     `COPY SQLCA` the resolver found no member for carries that note, and
     stays NOT FOUND). The same names coverage, recover and the un-linked
-    note leave out."""
+    note leave out. The row keeps no trace of the statement that wrote it:
+    a COBOL `COPY SQLCA` that had expanded a SQLCA copybook which then left
+    the index, on an index whose build did not parse the program again
+    (one built before ROADMAP re-parse item 21), reads as the precompiler's
+    too, as coverage and recover have always read it - the first build of
+    this toolkit parses every program again, and it says NOT FOUND or links
+    the copy then."""
     return (copybook or "").upper() in expand._SYSTEM_INCLUDES and not noted
 
 
