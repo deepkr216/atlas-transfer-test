@@ -1,0 +1,20 @@
+{
+ "title": "several CBLTDLI calls in one sentence: only the first is indexed, at the sentence's first line",
+ "recover": false,
+ "checks": [
+  {
+   "sql": "SELECT COUNT(*) FROM dli_call",
+   "truth": 2,
+   "symptom": 1
+  },
+  {
+   "sql": "SELECT line FROM dli_call ORDER BY line",
+   "truth": [
+    16,
+    18
+   ],
+   "symptom": 15,
+   "scalar": true
+  }
+ ]
+}

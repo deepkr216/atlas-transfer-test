@@ -1,0 +1,16 @@
+{
+ "title": "a PROC's SYSIN DD DSN=LIB(&CARDS): the effective step takes the card member from the PROC default, not the job's CARDS= override",
+ "recover": false,
+ "checks": [
+  {
+   "sql": "SELECT d.card_member FROM dd d JOIN step s ON s.id=d.step_id JOIN job j ON j.id=s.job_id WHERE s.step_name='WEEK3.SRT010' AND d.dd_name='SYSIN'",
+   "truth": "R10CARD",
+   "symptom": "DEFCARD"
+  },
+  {
+   "sql": "SELECT COUNT(*) FROM card_field_ref c JOIN step s ON s.id=c.step_id WHERE s.step_name='WEEK3.SRT010'",
+   "truth": 2,
+   "symptom": 0
+  }
+ ]
+}

@@ -1,0 +1,29 @@
+{
+ "title": "a copybook written for COPY REPLACING with a :TAG: in its names has no field rows, no 88s and no aliases",
+ "recover": false,
+ "checks": [
+  {
+   "sql": "SELECT COUNT(*) FROM field f JOIN member m ON m.id=f.member_id WHERE m.name='R07PCB'",
+   "truth": 4,
+   "symptom": 0
+  },
+  {
+   "sql": "SELECT COUNT(*) FROM field_alias WHERE new_name='POL-STATUS'",
+   "truth": 1,
+   "symptom": 0
+  },
+  {
+   "sql": "SELECT COUNT(*) FROM pfield f JOIN program p ON p.id=f.program_id WHERE p.program_id='R07PGM' AND f.name='POL-STATUS'",
+   "truth": 1,
+   "symptom": 1
+  },
+  {
+   "query": [
+    "layout",
+    "R07PCB"
+   ],
+   "truth_has": ":PCB:-STATUS",
+   "symptom_has": "**NOT FOUND**"
+  }
+ ]
+}

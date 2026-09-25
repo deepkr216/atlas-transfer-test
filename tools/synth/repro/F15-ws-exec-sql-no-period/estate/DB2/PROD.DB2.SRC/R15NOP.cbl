@@ -1,0 +1,15 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. R15NOP.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01  WS-STATUS        PIC X(02).
+           EXEC SQL
+               DECLARE R15CUR CURSOR FOR
+               SELECT STATUS_CD FROM PRD.R15_TBL
+           END-EXEC
+       PROCEDURE DIVISION.
+       0000-MAIN.
+           PERFORM 1000-OPEN
+           GOBACK.
+       1000-OPEN.
+           EXEC SQL OPEN R15CUR END-EXEC.

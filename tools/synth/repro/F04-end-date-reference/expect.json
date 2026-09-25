@@ -1,0 +1,16 @@
+{
+ "title": "a data name beginning with END- (END-DATE) is never recorded as a field reference",
+ "recover": false,
+ "checks": [
+  {
+   "sql": "SELECT COUNT(*) FROM field_ref WHERE name='END-DATE'",
+   "truth": 2,
+   "symptom": 0
+  },
+  {
+   "sql": "SELECT COUNT(*) FROM field_ref WHERE name='START-DATE'",
+   "truth": 2,
+   "symptom": 1
+  }
+ ]
+}

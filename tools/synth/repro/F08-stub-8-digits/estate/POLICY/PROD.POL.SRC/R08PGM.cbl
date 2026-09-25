@@ -1,0 +1,13 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. R08PGM.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01  WS-COUNT         PIC S9(04) COMP.
+       01  WS-STUB-AREA.
+           COPY R08STUB.
+       PROCEDURE DIVISION.
+       0000-MAIN.
+           PERFORM 1000-COUNT
+           GOBACK.
+       1000-COUNT.
+           ADD 1 TO WS-COUNT.

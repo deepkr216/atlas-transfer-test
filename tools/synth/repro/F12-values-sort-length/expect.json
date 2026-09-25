@@ -1,0 +1,13 @@
+{
+ "title": "`values` reports the sort card's LENGTH token as an observed value of the field",
+ "recover": false,
+ "checks": [
+  {
+   "query": [
+    "values",
+    "R12-STATUS"
+   ],
+   "symptom_has": "| 2 | (none) |"
+  }
+ ]
+}

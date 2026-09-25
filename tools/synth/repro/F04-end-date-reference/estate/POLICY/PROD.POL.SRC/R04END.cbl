@@ -1,0 +1,15 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. R04END.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01  START-DATE       PIC 9(08).
+       01  END-DATE         PIC 9(08).
+       01  WS-DAYS          PIC S9(05) COMP.
+       PROCEDURE DIVISION.
+       0000-MAIN.
+           MOVE 20260101 TO START-DATE
+           MOVE 20260930 TO END-DATE
+           IF END-DATE < START-DATE
+               MOVE ZERO TO WS-DAYS
+           END-IF
+           GOBACK.

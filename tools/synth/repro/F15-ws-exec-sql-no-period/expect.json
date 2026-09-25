@@ -1,0 +1,16 @@
+{
+ "title": "an EXEC SQL in WORKING-STORAGE without its period (a compile error) erases every procedure-division fact while the member reads ok",
+ "recover": false,
+ "checks": [
+  {
+   "sql": "SELECT COUNT(*) FROM paragraph",
+   "truth": 2,
+   "symptom": 0
+  },
+  {
+   "sql": "SELECT parse_status FROM member WHERE name='R15NOP'",
+   "truth": "partial",
+   "symptom": "ok"
+  }
+ ]
+}

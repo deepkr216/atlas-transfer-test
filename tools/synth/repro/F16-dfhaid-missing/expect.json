@@ -1,0 +1,18 @@
+{
+ "title": "COPY DFHAID (a CICS-supplied copybook no shop keeps in its own COPYLIB) makes every CICS program partial",
+ "recover": false,
+ "checks": [
+  {
+   "sql": "SELECT parse_status FROM member WHERE name='R16CIC'",
+   "truth": "ok",
+   "symptom": "partial"
+  },
+  {
+   "query": [
+    "coverage"
+   ],
+   "truth_has": "| DFHAID | 0 |",
+   "symptom_has": "| DFHAID | 1 |"
+  }
+ ]
+}
