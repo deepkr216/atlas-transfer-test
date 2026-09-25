@@ -93,7 +93,10 @@ arrives, changes, disappears, is filed as another kind or is recorded again
 forces every program that copies it to be re-parsed; a member a job reads -
 a PROC, an INCLUDE member, a control-card member (filed proc, jcl, ctlcard,
 unknown or sql) - that arrives, changes, disappears or is filed as another
-kind forces every job to be re-parsed; and members that disappeared are
+kind forces every job to be re-parsed; a program that arrives in another
+system, or leaves it, forces the programs of its name a current compiler
+listing speaks of (which listings speak for a program depends on which
+systems hold one of its name); and members that disappeared are
 pruned. For what a COPY and a job expand, an incremental build gives the
 facts a full one would (the tests compare the two indexes row for row),
 save one list: a dataset name no DD names any more stays in the index's

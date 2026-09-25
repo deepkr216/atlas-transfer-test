@@ -326,55 +326,68 @@ shipped alone and cost one such night; these still wait for the next one:
    ArrivedAfterTheParse, FiledAsAnotherKind, NestedCopybookArrivesLater; tests/test_library_says.py
    TheClassifierReadsTheLibrary, JobsReadTheirCards, TheSecondRoundInABuild (LESSONS 198, 199, 200).
 21. **Delivered in the batch - an incremental build parses again every program whose COPY may now resolve
-   differently, and every job whose PROC, INCLUDE or card member may now read differently: a member of any kind
-   the resolver expands that arrives, changes, goes, is re-typed or is recorded again; a member of any kind a job
-   reads that arrives, changes, goes or is re-typed.** The build forced the copiers of a new or changed member only
-   when it was filed copybook or cobol (`changed_names`), while the resolver expands copybook, cobol, sql and
-   unknown: a copybook typed 'unknown' by its dataset-named folder (since item 20 one with no signature - a literal
-   copied into a VALUE clause, a procedure copybook written in lower case) or a DDL member filed 'sql' arrived, was
-   in the index, and forced nothing - every program that copied it stayed 'partial - COPY X NOT FOUND' until
-   something else re-parsed it (his two builds after the fetch changed nothing; LESSONS 183). A member that went from
-   disk, whose new text was filed as another kind, or that was recorded again under a new id with its bytes
-   unchanged (a copybook marked pending, as LESSONS 184's recover once did; a build stopped before it was parsed; a
-   parser exception) forced nothing either: `_forget_member` set the programs' copy_use rows to NULL and they kept
-   'ok' with the fields of the earlier read (LESSONS 188's un-linked 'ok'). The jobs had the same gap under their own
-   rule: only a new or changed member filed proc, jcl or ctlcard forced them, so a PROC that went from disk left its
-   jobs with the PROC's steps and datasets and no 'missing_proc' row, and a card member arriving 'unknown' or 'sql'
-   (which the card lookup reads) left them without its cards (LESSONS 202). Now `build.RESOLVER_KINDS` is one tuple
-   for the resolver and the forcing (recover.RESOLVER_KINDS is pinned equal to it); `moved_names` takes every member
-   of those kinds that is new, whose bytes changed, that is recorded again or that went, under its kind in the last
-   build and in this one, so a member re-typed into or out of them counts; and `copiers_to_parse` finds every member
-   copying one of the names, then the copiers of what is recorded again - each name asked once, 500 to a query, so
-   the cost grows with the names and not with the chain. `build.JOB_READ_KINDS` is the union of the kinds the PROC,
-   INCLUDE and card lookups read (PROC_KINDS, INCLUDE_KINDS, CARD_KINDS: proc, jcl, ctlcard, unknown, sql), and a
-   name `moved_names(..., JOB_READ_KINDS, again=False)` finds parses every job and PROC again - every one, because a
-   card looked up by its sequential dataset's last qualifier leaves no name behind when nothing is found; a member
-   recorded again with the same bytes does not count there, since a job keeps the names of what it read, never a
-   member id. For what a COPY and a job expand, an incremental build gives the facts a --rebuild of the same estate
-   gives, checked row for row (tests/test_inventory_forcing.py `facts`): a copybook removed from disk leaves its
-   programs 'partial - COPY X NOT FOUND', or resolved to the other copy of the name, never 'ok' with a NULL row; a
-   PROC removed leaves its job with 'missing_proc'. The one list left out is the dataset names (item 24, with a DD
-   direction an OPEN verb set, which outlives its OPEN the same way). The price: a copybook the parser fails on
-   with an exception (not a time limit, which settles) is recorded again on every build until the parser is fixed,
-   and its programs are parsed again with it - the problem list names the member each time; and a member of an
-   'unknown' or 'sql' kind arriving parses every job again (JCL is cheap next to COBOL). The stand-ins stay for an
-   index built before the batch, and tell its two states apart by the program's own note
-   (`recover.not_found_copies`): a program that says `COPY X NOT FOUND` was parsed before X arrived - 'copybooks
-   that have arrived since the program was parsed', with the kind clause ('that build parsed them again only for a
-   member filed copybook or cobol') only for an unknown or sql member; a program that says nothing had expanded a
-   copy of X that left the index after the parse - 'parsed with a copy that has left the index since', its own
-   report section, `program`'s '**no longer linked**' cell and un-linked note (LESSONS 188), `copybook`'s 'was
-   parsed with a copy of this copybook that has left the index since'. `atlas.recover` marks both PENDING; on an
-   index this toolkit built both find nothing, and their words say the state came from the build that made the
-   index. Marking alone was never the whole fix for an 'unknown' member: its own lines stay outside the index until
-   the folder is renamed to end in COPYLIB or the library's kind is declared (item 20, LESSONS 184) - and since the
-   build now makes such a program whole at once, `program` (the 'resolved to' cell), `paragraph` (a note under the
-   Source lines, which carry no cite) and `copybook` say so wherever the member is expanded; the stand-in marks
-   PROGRAMS only - a copybook member's own COPY rows are never resolved by the build - and leaves alone a COPY the
-   expander SKIPPED (LESSONS 185). tests/test_inventory_forcing.py (TheRule, CopiersToParse, ArrivingUnderEveryKind,
-   RemovedFromDisk, ReTyped, RecordedAgain, NothingElseIsParsedAgain, JobsFollowWhatTheyRead),
-   tests/test_arrived_copybooks.py ArrivedAfterTheParse, NestedLiteralArrivesLater, FiledAsAnotherKind (LESSONS
-   201, 202).
+   differently, and every job whose PROC, INCLUDE or card member may now read differently: a member of any kind the
+   resolver expands that arrives, changes, goes, is re-typed or is recorded again; a member of any kind a job reads
+   that arrives, changes, goes or is re-typed; and every program a current listing speaks for when a program of its
+   name arrives in another system or leaves it.** The build forced the copiers of a new or changed member only when
+   it was filed copybook or cobol (`changed_names`), while the resolver expands copybook, cobol, sql and unknown: a
+   copybook typed 'unknown' by its dataset-named folder (since item 20 one with no signature - a literal copied into
+   a VALUE clause, a procedure copybook written in lower case) or a DDL member filed 'sql' arrived, was in the index,
+   and forced nothing - every program that copied it stayed 'partial - COPY X NOT FOUND' until something else
+   re-parsed it (his two builds after the fetch changed nothing; LESSONS 183). A member that went from disk, whose
+   new text was filed as another kind, or that was recorded again under a new id with its bytes unchanged (a copybook
+   marked pending, as LESSONS 184's recover once did; a build stopped before it was parsed; a parser exception)
+   forced nothing either: `_forget_member` set the programs' copy_use rows to NULL and they kept 'ok' with the fields
+   of the earlier read (LESSONS 188's un-linked 'ok'). The jobs had the same gap under their own rule: only a new or
+   changed member filed proc, jcl or ctlcard forced them, so a PROC that went from disk left its jobs with the PROC's
+   steps and datasets and no 'missing_proc' row, and a card member arriving 'unknown' or 'sql' (which the card lookup
+   reads) left them without its cards (LESSONS 202). Now `build.RESOLVER_KINDS` is one tuple for the resolver and the
+   forcing (recover.RESOLVER_KINDS is pinned equal to it); `moved_names` takes every member of those kinds that is
+   new, whose bytes changed, that is recorded again or that went, under its kind in the last build and in this one,
+   so a member re-typed into or out of them counts; and `copiers_to_parse` finds every member copying one of the
+   names, then the copiers of what is recorded again - each name asked once, 500 to a query, so the cost grows with
+   the names and not with the chain. What a COPY expands also depends on the program's OWN name: item 19's rule lets
+   every current listing of a name speak while one system holds a program of it, and only the program's own system's
+   once another does - so a program member that arrives, goes or is re-typed changes the copy in the other programs
+   of its name, which copy nothing that moved (a KVTPGM arriving in KVB left KVA's KVTPGM with the copy a listing
+   filed outside KVA had named; LESSONS 203). `program_names_moved` takes those names and `twins_to_parse` the
+   program members of them that a current `listing_copy_source` row speaks of (copybook and dataset named, dated
+   current - the rows current_datasets follows), one query per 500 names; with no such row nothing else is parsed.
+   `build.JOB_READ_KINDS` is the union of the kinds the PROC, INCLUDE and card lookups read (PROC_KINDS,
+   INCLUDE_KINDS, CARD_KINDS: proc, jcl, ctlcard, unknown, sql), and a name `moved_names(..., JOB_READ_KINDS,
+   again=False)` finds parses every job and PROC again - every one, because a card looked up by its sequential
+   dataset's last qualifier leaves no name behind when nothing is found; a member recorded again with the same bytes
+   does not count there, since a job keeps the names of what it read, never a member id. For what a COPY and a job
+   expand, an incremental build gives the facts a --rebuild of the same estate gives, checked row for row
+   (tests/test_inventory_forcing.py `facts`; for the programs of a name, against the programs parsed again, since a
+   --rebuild deletes the listing rows): a copybook removed from disk leaves its programs 'partial - COPY X NOT
+   FOUND', or resolved to the other copy of the name, never 'ok' with a NULL row; a PROC removed leaves its job with
+   'missing_proc'. The one list left out is the dataset names (item 24, with a DD direction an OPEN verb set, which
+   outlives its OPEN the same way). The price: a copybook the parser fails on with an exception (not a time limit,
+   which settles) is recorded again on every build until the parser is fixed, and its programs are parsed again with
+   it - the problem list names the member each time; and a member of an 'unknown' or 'sql' kind arriving parses every
+   job again (JCL is cheap next to COBOL). The stand-ins stay for an index built before the batch, and tell its two
+   states apart by the program's own note (`recover.not_found_copies`): a program that says `COPY X NOT FOUND` was
+   parsed before X arrived - 'copybooks that have arrived since the program was parsed', with the kind clause ('that
+   build parsed them again only for a member filed copybook or cobol') only for an unknown or sql member; a program
+   that says nothing had expanded a copy of X that left the index after the parse - 'parsed with a copy that has left
+   the index since', its own report section, `program`'s '**no longer linked**' cell and un-linked note (LESSONS
+   188), `copybook`'s 'was parsed with a copy of this copybook that has left the index since'. `atlas.recover` marks
+   both PENDING; on an index this toolkit built both find nothing, and their words say the state came from the build
+   that made the index. A row for `EXEC SQL INCLUDE SQLCA` or `SQLDA` has no member and no note on purpose - the DB2
+   precompiler supplies the area - and says so in `program`, `pack` and `copybook` ('supplied by the DB2
+   precompiler'), never 'no longer linked' or a library to fetch; a COBOL `COPY SQLCA` with no member stays NOT FOUND
+   (LESSONS 203). Marking alone was never the whole fix for an 'unknown' member: its own lines stay outside the index
+   until the folder is renamed to end in COPYLIB or the library's kind is declared (item 20, LESSONS 184) - and since
+   the build now makes such a program whole at once, `program` (the 'resolved to' cell), `paragraph` (a note under
+   the Source lines, which carry no cite) and `copybook` say so wherever the member is expanded, and only there - a
+   card member filed 'unknown' that a job reads and no program copies gets no folder fix, which would file its cards
+   as a copybook no card lookup reads; the stand-in marks PROGRAMS only - a copybook member's own COPY rows are never
+   resolved by the build - and leaves alone a COPY the expander SKIPPED (LESSONS 185).
+   tests/test_inventory_forcing.py (TheRule, CopiersToParse, ArrivingUnderEveryKind, RemovedFromDisk, ReTyped,
+   RecordedAgain, NothingElseIsParsedAgain, JobsFollowWhatTheyRead, PrecompilerIncludes,
+   ASameNamedProgramArrivesOrGoes, TwinsToParse), tests/test_arrived_copybooks.py ArrivedAfterTheParse,
+   NestedLiteralArrivesLater, FiledAsAnotherKind (LESSONS 201, 202, 203).
 22. **Delivered in the batch - the level-number and COBOL-statement signatures are checked BEFORE the
    Assembler, listing and MFS signatures, `_SIG_ASM` requires the Assembler shape, and a declared kind wins
    over a shape.** His copybook in a `.COPYLIB` folder was filed `asm`: `_SIG_ASM`
