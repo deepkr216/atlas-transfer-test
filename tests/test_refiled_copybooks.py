@@ -56,8 +56,10 @@ import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
+sys.path.insert(0, HERE)
 
 from atlas import build, query, recover  # noqa: E402
+from test_recover import ibm_listing  # noqa: E402 - the Enterprise COBOL listing generator
 
 HEAD = ("       IDENTIFICATION DIVISION.\n       PROGRAM-ID. {name}.\n"
         "       DATA DIVISION.\n       WORKING-STORAGE SECTION.\n"
@@ -242,6 +244,74 @@ class ProcedureCopybookWithTheStartVerb(_Estate):
         self.assertNotIn("STARTVB", nf)
         stats, said = self.recover()
         self.assertEqual((stats["misfiled"], stats["refiled"], stats["marked"]), (0, 0, 0), said)
+
+
+class WrittenThoughTheClassifierMisreadsIt(_Estate):
+    """Case K (LESSONS 191): the copybook's library copy on disk is a bare number (the fetched member holds
+    no COBOL: kind 'empty'), the program's compiler listing in the estate carries the copybook expanded
+    under the `A-100-BEGIN SECTION.  COPY STARTVB.` line, and the text holds the COBOL START verb the
+    classifier reads as Assembler. recover writes it all the same, says the build will misread it, the
+    build files it asm, recover re-files it and marks the program, the build makes the program whole."""
+
+    files = (("GC/PROD.GC.SRC/SVPGM.cbl", section_program("SVPGM", "STARTVB")),
+             ("SHARED/PROD.GC.COPYLIB/STARTVB.txt", "1234567\n"),
+             ("GC/PROD.GC.LISTING/SVPGM.lst", ibm_listing(section_program("SVPGM", "STARTVB").splitlines(),
+                                                          {"STARTVB": STARTVERB.splitlines()})))
+
+    def test_the_whole_cycle(self):
+        # the bug: the member on disk is empty of code, the program says NOT FOUND, and the listing is not used
+        self.assertEqual(self.member("STARTVB")[:3], ("empty", "PROD.GC.COPYLIB", "skipped"))
+        self.assertEqual(self.status("SVPGM"), "partial")
+        # 1. recover writes the copybook from the listing, and says what the build will make of it
+        stats, said = self.recover()
+        self.assertEqual((stats["written"], stats["rejected"], stats["misread"], stats["refiled"]), (1, 0, 1, 0), said)
+        self.assertIn("recovered: 1 of 1 missing copybooks", said)
+        self.assertIn("  1 of them carries a line the build's classifier misreads (asm): after the build, run this tool once "
+                      "more - it re-files them in the index - then build again (ROADMAP re-parse item 22)", said)
+        self.assertIn("next: run your usual build command", said)
+        rep = self.report_text()
+        self.assertIn("## Written", rep)
+        self.assertIn("the build's classifier reads it as asm by a line of its text (ROADMAP re-parse item 22): run this tool "
+                      "again after the build - it re-files it - then build once more", rep)
+        self.assertNotIn("the build would file this as asm", rep)
+        recovered = os.path.join(self.root, "SHARED", "RECOVERED-COPYBOOKS", "STARTVB.cpy")
+        self.assertTrue(os.path.isfile(recovered))
+        with open(os.path.join(self.root, "SHARED", "RECOVERED-COPYBOOKS", recover.MARKER), encoding="utf-8") as fh:
+            self.assertEqual(json.load(fh)["copybooks"]["STARTVB"]["misread_as"], "asm")
+        # 2. the build files the recovered copy as asm (item 22): the program is still partial
+        self.build()
+        kinds = sorted(k for (k,) in self.q("SELECT kind FROM member WHERE UPPER(name)='STARTVB'"))
+        self.assertEqual(kinds, ["asm", "empty"])
+        self.assertEqual(self.status("SVPGM"), "partial")
+        # 3. recover re-files it, marks the program, and does not call it 'recovered earlier, still missing'
+        stats, said = self.recover()
+        self.assertEqual((stats["written"], stats["refiled"], stats["marked"]), (0, 1, 1), said)
+        self.assertIn("1 misfiled copybook(s) re-filed as copybook in the index", said)
+        self.assertNotIn("recovered on an earlier run are still missing", said)
+        self.assertNotIn("## Recovered on an earlier run, still missing in the index", self.report_text())
+        self.assertEqual(self.status("SVPGM"), "pending")
+        # 4. the build makes the program whole: the section and the copybook's paragraphs are its own
+        self.build()
+        self.assertEqual(self.status("SVPGM"), "ok")
+        names = [(p[0], p[1]) for p in self.paragraphs("SVPGM")]
+        self.assertIn(("A-100-BEGIN", "section"), names)
+        self.assertIn(("S-100-POSITION", "paragraph"), names)
+        resolved = self.copy_use("SVPGM", "STARTVB")[0][0]
+        self.assertEqual(self.q("SELECT kind, library FROM member WHERE id=?", resolved), [("copybook", "RECOVERED-COPYBOOKS")])
+        stats, said = self.recover()
+        self.assertEqual((stats["written"], stats["refiled"], stats["marked"], stats["misread"]), (0, 0, 0, 0), said)
+
+    def test_a_real_assembler_block_is_still_refused(self):
+        # the listing carries an Assembler control section where the copybook should be: not written
+        self.write("GC/PROD.GC.LISTING/SVPGM.lst", ibm_listing(section_program("SVPGM", "STARTVB").splitlines(),
+                                                                {"STARTVB": ASMBK.splitlines()}))
+        self.build()
+        stats, said = self.recover()
+        self.assertEqual((stats["written"], stats["rejected"], stats["misread"]), (0, 1, 0), said)
+        rep = self.report_text()
+        self.assertIn("## Rejected", rep)
+        self.assertIn("| STARTVB |", rep.split("## Rejected")[1].split("\n## ")[0])
+        self.assertFalse(os.path.exists(os.path.join(self.root, "SHARED", "RECOVERED-COPYBOOKS", "STARTVB.cpy")))
 
 
 class DataCopybookWithStartDate(_Estate):

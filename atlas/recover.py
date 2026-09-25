@@ -200,6 +200,21 @@ def _is_comment(rec: str) -> bool:
     return (len(rec) > 6 and rec[6:7] in ("*", "/")) or rec.lstrip().startswith("*>")
 
 
+def _copy_closed(stmt: str) -> bool:
+    """Whether the COPY statement gathered so far has reached its period. A
+    period inside a literal or inside pseudo-text (`REPLACING ==WS-REC.==
+    BY ==WS-REC-2.==`) ends nothing, and an open `==` keeps the statement
+    open on to the next line - his shop writes `BY ==XX-999-XXXXX-` and the
+    rest of the pseudo-text on the line after (LESSONS 190). Read as closed
+    at the first period, the COPY was forgotten at the next line and every
+    copied line after it was 'not tied to a COPY statement'."""
+    masked = expand._mask_literals(stmt)
+    if masked.count("==") % 2:
+        return False
+    outside = re.sub(r"==.*?==", " ", masked, flags=re.S)
+    return re.search(r"\.(?:\s|$)", outside) is not None
+
+
 def _blank_statement(rec: str, statement: str) -> str:
     """The record with the COPY statement text blanked, the rest kept."""
     k = rec.find(statement.strip()[:20])
@@ -613,10 +628,11 @@ def from_ibm_listing(lines: Sequence[str], source: str, system: Optional[str],
                     sql_open = []
                 continue
             if pending and not pending[2] and not found:               # a COPY statement continued on the next line
-                pending = (pending[0], pending[1] + " " + code.strip(), "." in code)
+                whole = pending[1] + " " + code.strip()
+                pending = (pending[0], whole, _copy_closed(whole))
                 continue
             if found:
-                pending = (found[0], found[1], "." in found[1])
+                pending = (found[0], found[1], _copy_closed(found[1]))
             elif _EXEC_SQL.search(expand._mask_literals(code)) and "END-EXEC" not in code.upper():
                 sql_open = [code.strip()]
                 sql_line = lineno
@@ -2755,11 +2771,21 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
                                  + shape_of(pick.records) + where))
                 continue
             body = render(name, pick, how)
-            kind, _why = classify.classify(os.path.join(folder, name + ".cpy"), body[:8192])
+            kind, why_kind = classify.classify(os.path.join(folder, name + ".cpy"), body[:8192])
+            misread = ""
             if kind not in ("copybook", "cobol"):
-                rejected.append((name, f"the build would file this as {kind}: " + shape_of(pick.records) + where))
-                continue
-            written.append((name, folder, how + f"; {shape} copybook, {len(pick.records)} lines"))
+                # the classifier reads a line of the copybook as another kind (a START- name as Assembler, LESSONS
+                # 191): written all the same when this tool could re-file it afterwards - which it does on the run
+                # after the build - and refused when the text really has that kind's shape
+                read_as = {"kind": kind, "reason": why_kind, "by": "content", "text": body, "line": 0, "word": ""}
+                ok, why_not = refile_verdict(read_as, FOLDER)
+                if not ok:
+                    rejected.append((name, f"the build would file this as {kind} ({why_not}): " + shape_of(pick.records) + where))
+                    continue
+                misread = kind
+            written.append((name, folder, how + f"; {shape} copybook, {len(pick.records)} lines"
+                            + (f"; the build's classifier reads it as {misread} by a line of its text ({REFILED_ITEM}): "
+                               "run this tool again after the build - it re-files it - then build once more" if misread else "")))
             if not dry_run:
                 try:
                     os.makedirs(folder, exist_ok=True)
@@ -2773,7 +2799,8 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
                     continue
                 entries.setdefault(folder, {})[name] = {"from": pick.source_name(), "format": pick.fmt, "how": how,
                                                         "written": time.strftime("%Y-%m-%d %H:%M:%S"),
-                                                        "lines": len(pick.records)}
+                                                        "lines": len(pick.records),
+                                                        **({"misread_as": misread} if misread else {})}
     if not dry_run:
         for d, ents in entries.items():
             if ents or os.path.isdir(d):
@@ -2786,6 +2813,11 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
     unread = sorted(n for n in missing if n not in seen_names and n in unprovable)   # in a listing, column unproven
     not_found = sorted(n for n in missing if n not in seen_names and n not in unprovable)
     no_marks = sum(n for f, n in formats.items() if "no copy marks" in f or "not flagged" in f)
+    misread_written = {n: ents[n]["misread_as"] for _d, ents in entries.items() for n in ents
+                       if ents[n].get("misread_as") and any(w[0] == n for w in written)}
+    if dry_run:                                                        # nothing entered the marker: read the note instead
+        misread_written = {n: h.split("classifier reads it as ")[1].split(" ")[0] for n, _f, h in written
+                           if "classifier reads it as " in h}
 
     lines = [f"# Recovered copybooks - {time.strftime('%Y-%m-%d %H:%M')}\n",
              f"\n- missing in the index: {len(missing)}; expanded texts read: {len(sources)}; formats: "
@@ -2805,7 +2837,8 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
         lines.append("\n## Rejected\n\n| copybook | why |\n|---|---|\n")
         lines += [f"| {n} | {why} |\n" for n, why in rejected]
     nested_only = [n for n in not_found if nested_in.get(n)]
-    stale = [n for n in kept_names if n in missing]                      # recovered earlier, the index still lacks it
+    handled = {str(e["copybook"]) for e in list(refiled) + list(misfiled) + list(waiting)}   # said in their own sections
+    stale = [n for n in kept_names if n in missing and n not in handled]   # recovered earlier, the index still lacks it
     if not_found:
         lines.append("\n## Not in any expanded text (fetch these libraries)\n\n"
                      "A copybook copied only from inside another copybook has no COPY statement in any program: its lines "
@@ -2874,6 +2907,11 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
             + (f", {len(unread):,} in older listings whose source column could not be proven (see the report)" if unread else "")
             + (f"; {lined_up:,} text(s) read by lining up with the program" if lined_up else "")
             + (f"; {kept:,} already recovered earlier" if kept else ""))
+    if misread_written:
+        kinds = ", ".join(sorted(set(misread_written.values())))
+        log(f"  {len(misread_written):,} of them carr{'ies' if len(misread_written) == 1 else 'y'} a line the build's classifier "
+            f"misreads ({kinds}): after the build, run this tool once more - it re-files them in the index - then build again "
+            f"({REFILED_ITEM})")
     if checks:
         n_contra = choice_counts(checks)[1]
         log(choice_line(checks) + (" - every contradicted choice is a wrong fact in the index: the report names each "
@@ -2910,7 +2948,7 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
             "not_found": len(not_found), "removed": len(removed), "kept": kept, "formats": dict(formats),
             "out": out_dir, "unconfirmed": len(unconfirmed), "per_system": per_system,
             "checked": choice_counts(checks) if checks else None,
-            "fetch": (len(fetch), to_fetch), "unnamed": len(unnamed),
+            "fetch": (len(fetch), to_fetch), "unnamed": len(unnamed), "misread": len(misread_written),
             "arrived": len(arrived), "misfiled": len(misfiled), "refiled": 0 if dry_run else len(refiled),
             "waiting": len(waiting), "marked": marked + marked_removed + marked_refiled}
 

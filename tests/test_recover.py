@@ -88,11 +88,27 @@ def ibm_listing(program_records, copybooks, ruler=True, flag="C", prefix_lines=0
         out.append(line)
         on_page += 1
 
+    def stmt_closed(stmt):
+        # the generator's own reading (not the tool's): a period outside literals and outside ==pseudo-text==
+        bare = re.sub(r"'[^']*'|\"[^\"]*\"", " ", stmt)
+        if bare.count("==") % 2:
+            return False
+        return re.search(r"\.(\s|$)", re.sub(r"==.*?==", " ", bare)) is not None
+
+    open_copy = None                                                   # a COPY statement spanning lines: gathered first
     for rec in program_records:
         n += 1
         emit(f"   {n:06d}         {rec.ljust(80)}")
         code = rec[7:72] if len(rec) > 7 else ""
         found = recover.copy_in(code)
+        if open_copy and not found:
+            open_copy = (open_copy[0], open_copy[1] + " " + code.strip())
+            if not stmt_closed(open_copy[1]):
+                continue
+            found, open_copy = open_copy, None                         # the period reached: the copied lines follow
+        elif found and not stmt_closed(found[1]):
+            open_copy = found                                          # as the compiler prints it: the whole statement, then the copy
+            continue
         if sql or ("EXEC SQL" in code.upper() and "END-EXEC" not in code.upper()):
             sql.append(code.strip())                                   # a three-line EXEC SQL INCLUDE
             if "END-EXEC" in code.upper():
@@ -1393,6 +1409,44 @@ class EndToEnd(unittest.TestCase):
                 conn.close()
         finally:
             os.chdir(cwd)
+
+
+class CopyStatementsOverLines(unittest.TestCase):
+    """His 'Please look' case (LESSONS 190): a COPY whose REPLACING clause runs over several lines, with a period
+    INSIDE the pseudo-text (`==XXXX-XXXX.==`) and the BY pseudo-text broken across two lines. Read as closed at
+    the first period, the statement was forgotten at the next line and 61,909 copied lines were 'not tied to a
+    COPY statement'."""
+
+    def setUp(self):
+        self.pmast = records_of(os.path.join(FIX, "PMASTREC.cpy"))
+        self.poldcl = POLDCL.splitlines()
+
+    def test_closed_only_at_a_period_outside_literals_and_pseudo_text(self):
+        closed, open_ = recover._copy_closed, lambda s: not recover._copy_closed(s)
+        self.assertTrue(closed("COPY PMASTREC."))
+        self.assertTrue(closed("COPY 'PM.REC'."))
+        self.assertTrue(closed("COPY PMASTREC REPLACING ==PM-REC.== BY ==WS-REC.==."))
+        self.assertTrue(closed("COPY PMASTREC REPLACING ==PM-== BY ==WS-==.   REMARK"))
+        self.assertTrue(open_("COPY PMASTREC"))
+        self.assertTrue(open_("COPY PMASTREC REPLACING ==PM-REC.== BY ==WS-REC.=="))
+        self.assertTrue(open_("COPY PMASTREC REPLACING ==PM-REC.== BY ==WS-"))            # the pseudo-text goes on
+        self.assertTrue(open_("COPY PMASTREC REPLACING ==PM-== BY 'A.B'"))                 # a period inside a literal
+        self.assertTrue(open_("COPY PMASTREC REPLACING ==PM-== BY ==WS-== ==XX.== BY"))
+
+    def test_a_replacing_clause_over_three_lines_ties_the_copied_lines(self):
+        prog = list(PROG)
+        prog[5:6] = ["000600     COPY PMASTREC REPLACING ==PM-REC.== BY ==WS-REC.==",
+                     "000610                             ==PM-== BY ==WS-123-ABCDE-",
+                     "000620     FGHIJ-KL==."]
+        text = ibm_listing(prog, {"PMASTREC": self.pmast, "POLDCL": self.poldcl})
+        _fmt, regions, stats = recover.extract(text, "x.lst", set())
+        self.assertEqual(stats.get("flagged lines with no COPY before them", 0), 0, stats)
+        by = {r.name: r for r in regions}
+        self.assertEqual(sorted(by), ["PMASTREC", "POLDCL"])
+        self.assertEqual(len(by["PMASTREC"].records), len(self.pmast))
+        self.assertTrue(by["PMASTREC"].replacing)
+        self.assertIn("FGHIJ-KL==.", by["PMASTREC"].statement, "the whole clause was gathered")
+        self.assertEqual(len(by["POLDCL"].records), len(self.poldcl), "the next COPY is untouched")
 
 
 if __name__ == "__main__":
