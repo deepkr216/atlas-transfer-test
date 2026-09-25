@@ -233,13 +233,22 @@ shipped alone and cost one such night; these still wait for the next one:
    says 'the program's compiler listing names DATASET' as its how - the compiler's fact, not a
    guess; a nested COPY is looked up by the program's name, as the listing lists it; only where no
    listing says (none read, no table, no row, no candidate in the dataset it names) does the chain
-   decide as before. The table absent (recover never ran on that index) or empty changes nothing,
-   and the build never creates it. Two things follow for the re-parse night: run `python -m
-   atlas.recover --db atlas.db` BEFORE the build so the rows are stored (a `--rebuild` deletes the
-   index and the table with it - the toolkit change re-parses every member without it), and a
-   program parsed before its rows were stored keeps the chain's guess until it is parsed again
-   (`recover` still reports it CONTRADICTED; it does not yet mark such a program pending).
-   tests/test_listing_resolver.py.
+   decide as before. The rows are keyed by the listing's file stem, so every listing of one program
+   NAME shares the key; which of them speak for a program is one rule, one function for the build
+   and for recover's check (`build.rows_that_count`): the listings in the program's own system
+   (the member's top-level folder); when that system has none, every other listing of the name -
+   one filed under SHARED or a LISTINGS folder, one read from a `--from` folder - but only while no
+   other system holds a program of that name. GC and GC-TEST each keep their own listing's word; a
+   listing filed elsewhere for a name both hold decides for neither, and recover says UNKNOWN with
+   the next step (put the program's own listing under its system's folder, build, run recover
+   again). The table absent (recover never ran on that index) or empty changes nothing, and the
+   build never creates it. Two things follow for the re-parse night: run `python -m atlas.recover
+   --db atlas.db` BEFORE the build so the rows are stored (a `--rebuild` deletes the index and the
+   table with it - the toolkit change re-parses every member without it), and a program parsed
+   before its rows were stored keeps the chain's guess until it is parsed again: where the index
+   holds the copy the listing names, `recover` marks that program for the next build (on an index
+   this toolkit built; after a toolkit change the next build re-parses every member anyway).
+   tests/test_listing_resolver.py, tests/test_listing_systems.py (LESSONS 194).
 20. **classify.py: a procedure copybook is a copybook by its CONTENT, before the folder hint.**
    His `A-100-BEGIN SECTION.  COPY PROCBOOK.` copies a member of paragraph names and statements -
    no level numbers, no DIVISION header - which has no content signature today, so the FOLDER NAME

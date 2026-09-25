@@ -140,7 +140,11 @@ everything else:
   program's compiler listing's copybook-source table (`listing_copy_source`),
   the build reads it first: the copy in the library the listing names is
   expanded and the note says `the program's compiler listing names DATASET`
-  — the chain guesses only where no listing says. The declared order is simply the
+  — the chain guesses only where no listing says. A listing speaks for the
+  program in its own system; when that system has none, a listing filed
+  elsewhere (a SHARED listings folder, a `--from` folder) speaks for it only
+  while no other system holds a program of that name, so GC and GC-TEST each
+  keep their own listing's word. The declared order is simply the
   order of a department's copybook rows in the table (Move up / Move down):
   that is the SYSLIB concatenation its programs compile against.
 - **Cross-department flow** — `dataset X` shows each writer's and reader's
