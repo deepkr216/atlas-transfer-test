@@ -146,11 +146,15 @@ everything else:
   against, the copybook promoted to production unchanged — the chain's copy
   stays and the note says `confirmed by the program's listing (same text as
   DATASET)`. An older compile's listing, one not yet dated, or a library the
-  index does not hold changes nothing. A listing speaks for the
-  program in its own system; when that system has none, a listing filed
-  elsewhere (a SHARED listings folder, a `--from` folder) speaks for it only
-  while no other system holds a program of that name, so GC and GC-TEST each
-  keep their own listing's word. The declared order is simply the
+  index does not hold changes nothing. While no other system holds a
+  program of its name, every listing of that name speaks for the program
+  wherever it is filed (its own system's listing folder, a SHARED listings
+  folder, a `--from` folder), and where two disagree the current one
+  decides - an older compile's listing in the program's own folder never
+  hides a current one filed elsewhere. When another system holds a program
+  of the same name, only the listings in the program's own system speak for
+  it, so GC and GC-TEST each keep their own listing's word and a listing
+  filed anywhere else decides for neither. The declared order is simply the
   order of a department's copybook rows in the table (Move up / Move down):
   that is the SYSLIB concatenation its programs compile against.
 - **Cross-department flow** — `dataset X` shows each writer's and reader's

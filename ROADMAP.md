@@ -233,14 +233,19 @@ shipped alone and cost one such night; these still wait for the next one:
    listing changes the pick only where the compiler's record and the chain's guess differ in
    CONTENT (`current_datasets`, `listing_pick`):
    - the row must speak for the program. The rows are keyed by the listing's file stem, so every
-     listing of one program NAME shares the key; one rule, one function for the build and for
-     recover's check (`build.rows_that_count`): the listings in the program's own system (the
-     member's top-level folder); when that system has none, every other listing of the name - one
-     filed under SHARED or a LISTINGS folder, one read from a `--from` folder - but only while no
-     other system holds a program of that name. GC and GC-TEST each keep their own listing's word;
-     a listing filed elsewhere for a name both hold decides for neither (recover dates a listing
-     against one program of the name only), and recover says UNKNOWN with the next step (put the
-     program's own listing under its system's folder, build, run recover again);
+     listing of one program NAME shares the key; one rule, one function for the build, recover's
+     check and `program`'s 'listing says' lines (`build.rows_that_count`), decided row by row so it
+     gives the same rows per (program, copybook) - the build's key - as per program: while no
+     other system holds a program of that name, every listing of the name speaks for it wherever
+     it is filed (its own system's listing folder, SHARED or a LISTINGS folder, a `--from`
+     folder), and recover dates each against that one program, so where two disagree the current
+     one decides - an older compile's listing in the program's own folder never hides a current
+     one filed elsewhere; when another system holds a program of that name, only the listings in
+     the program's own system (the member's top-level folder) count. GC and GC-TEST each keep
+     their own listing's word; a listing filed elsewhere for a name both hold decides for neither
+     (recover dates a listing against one program of the name only), and recover says UNKNOWN
+     with the next step (put the program's own listing under its system's folder, build, run
+     recover again);
    - the listing must be current (`current` = 1): an older compile's listing or one not yet dated
      never decides, and a table written before recover dated listings decides nothing;
    - the index must hold a copy in the dataset it names (the `library` table from the fetcher's
@@ -260,13 +265,15 @@ shipped alone and cost one such night; these still wait for the next one:
    `recover` marks for the next build exactly the programs whose choice a CURRENT listing
    contradicts (on an index this toolkit built; after a toolkit change the next build re-parses
    every member anyway) - never one contradicted by a listing not yet dated, which the build would
-   not follow: the console says to run recover again with `--from` so it dates it. The table absent
+   not follow: every count says those apart ('N contradicted by a current listing, M contradicted
+   by a listing not yet dated') and the console says to run recover again with `--from` so it
+   dates them. The table absent
    (recover never ran on that index) or empty changes nothing, and the build never creates it. For
    the re-parse night, his sequence: pull, `python -m atlas.recover --db atlas.db` (with `--from
    FOLDER` for listings outside the estate), which stores and dates the rows, then the build (a
    `--rebuild` deletes the index and the table with it - the toolkit change re-parses every member
    without it). tests/test_listing_resolver.py, tests/test_listing_systems.py,
-   tests/test_copy_sources.py TheReparseNightOnTheStagingEstate (LESSONS 193, 194, 195).
+   tests/test_copy_sources.py TheReparseNightOnTheStagingEstate (LESSONS 193, 194, 195, 196).
 20. **classify.py: a procedure copybook is a copybook by its CONTENT, before the folder hint.**
    His `A-100-BEGIN SECTION.  COPY PROCBOOK.` copies a member of paragraph names and statements -
    no level numbers, no DIVISION header - which has no content signature today, so the FOLDER NAME
