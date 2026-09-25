@@ -35,6 +35,12 @@ carried by a re-filable COPYLIB copy AND a folder-typed PROCS copy sends
 him to no folder on a dry run; (I) a re-filed copybook whose text changed
 on disk leaves its program 'ok' with a NULL COPY row and the old fields -
 `program` and coverage say so, and recover then the build heal it.
+
+His real copybook (LESSONS 189): (J) the COBOL START verb on a line of its
+own with KEY IS on the next read as an Assembler START to the shape guard,
+so the re-file was refused; START now counts as Assembler only with a label
+in column 1 or a numeric / quoted operand, and a strong signature that fires
+only inside comment lines no longer refuses a re-file.
 """
 
 import contextlib
@@ -202,6 +208,40 @@ class _Estate(unittest.TestCase):
         self.assertEqual(self.status(program), "partial")
         self.assertEqual(self.copy_use(program, book), [(None,)])
         self.assertEqual(len(self.not_found_note(program, book)), 1)
+
+
+STARTVERB = ("       S-100-POSITION.\n           MOVE WS-KEY-IN TO CUST-KEY.\n           START CUSTFILE\n"
+             "              KEY IS >= CUST-KEY\n              INVALID KEY MOVE 'N' TO WS-FOUND\n           END-START.\n"
+             "       S-199-EXIT.\n           EXIT.\n")
+
+
+class ProcedureCopybookWithTheStartVerb(_Estate):
+    """Case J (LESSONS 189): his procedure copybook - the COBOL START verb on a line of its own, its KEY IS
+    clause on the next - copied on the `A-100-BEGIN SECTION.  COPY STARTVB.` line. The classifier files it
+    asm; the first shape guard refused the re-file as 'the shape of an Assembler member'; now it is re-filed
+    and the next build gives the program its section and the copybook's paragraphs."""
+
+    files = (("GC/PROD.GC.SRC/SVPGM.cbl", section_program("SVPGM", "STARTVB")),
+             ("SHARED/PROD.GC.COPYLIB/STARTVB.txt", STARTVERB))
+
+    def test_re_filed_and_expanded(self):
+        self.assert_the_bug("SVPGM", "STARTVB", "asm")
+        stats, said = self.recover()
+        self.assertEqual((stats["misfiled"], stats["refiled"], stats["marked"]), (0, 1, 1), said)
+        self.assertIn("1 misfiled copybook(s) re-filed as copybook in the index", said)
+        self.assertNotIn("shape of an Assembler member", self.report_text())
+        self.assertEqual(self.member("STARTVB")[:3], ("copybook", "PROD.GC.COPYLIB", "skipped"))
+        self.build()
+        self.assertEqual(self.status("SVPGM"), "ok")
+        self.assertEqual(self.copy_use("SVPGM", "STARTVB"), [(self.member_id("STARTVB"),)])
+        names = [(p[0], p[1]) for p in self.paragraphs("SVPGM")]
+        self.assertIn(("A-100-BEGIN", "section"), names)
+        self.assertIn(("S-100-POSITION", "paragraph"), names)
+        self.assertIn(("S-199-EXIT", "paragraph"), names)
+        cov, nf, _prog, _book, _as_prog = self.outputs("SVPGM", "STARTVB")
+        self.assertNotIn("STARTVB", nf)
+        stats, said = self.recover()
+        self.assertEqual((stats["misfiled"], stats["refiled"], stats["marked"]), (0, 0, 0), said)
 
 
 class DataCopybookWithStartDate(_Estate):
@@ -1093,15 +1133,16 @@ class TheVerdict(unittest.TestCase):
         self.assertEqual((r["kind"], ok, "a program, not a copybook" in why), ("listing", False, True))
         # (a DS / DC line alone trips no signature, and neither does START in column 1: the `B START` line does,
         # and the DS / DC shape then refuses)
-        for text in (ASMBK, "STARTBK  START 0\n         END\n", "         START\n         END\n",
+        for text in (ASMBK, "STARTBK  START 0\n         END\n", "PGM      START\n         END\n", "         START 0\n",
                      "STID     DS    CL5\n         B     START\n", "STDC     DC    F'0'\n         B     START\n",
                      "         DFHEIENT\n"):
             r, ok, why = self.reading("PROD.GC.COPYLIB", text)
             self.assertEqual((r["kind"], ok), ("asm", False), text)
             self.assertIn("it has the shape of an Assembler member", why)
         # the shapes the first guard let through (LESSONS 187): a label of any length or none before CSECT, START
-        # with a quoted operand or a remark, one bare symbol, address constants, USING * - and never a COBOL line
-        for text in (LONGLBL, NOLABEL, HEXSTART, "PGM      START 0   BEGIN HERE\n", "         START SYM\n",
+        # with a quoted operand or a remark, a labelled START with a symbol, address constants, USING * - and never
+        # a COBOL line
+        for text in (LONGLBL, NOLABEL, HEXSTART, "PGM      START 0   BEGIN HERE\n", "PGM      START SYM\n",
                      "      * 05 START-DATE\nX        CSECT\n", "D        DSECT\n         B     START\n",
                      "         USING *,12\n         B     START\n", "V        DC    V(SUBPGM)\n         B     START\n"):
             r, ok, why = self.reading("PROD.GC.COPYLIB", text)
@@ -1110,11 +1151,23 @@ class TheVerdict(unittest.TestCase):
         # the COBOL START verb with a file name that carries no hyphen, its KEY clause on the same line: no shape
         r, ok, why = self.reading("PROD.GC.COPYLIB", "       S-100.\n           START CUSTFILE KEY IS > CUST-KEY.\n")
         self.assertEqual((r["kind"], r["word"], ok), ("asm", "START", True))
-        # ... and alone on its line it reads as START with a symbol operand: refused, the honest sentence (the price of
-        # erring towards refusing - item 22 closes it)
-        r, ok, why = self.reading("PROD.GC.COPYLIB", "       S-100.\n           START CUSTFILE\n               KEY IS > K.\n")
-        self.assertEqual((r["kind"], ok), ("asm", False))
-        self.assertIn("if this member IS the COBOL copybook", why)
+        # ... and alone on its line, the KEY IS or INVALID KEY clause on the next (his procedure copybook, LESSONS
+        # 189): a COBOL line never begins in column 1, an Assembler START names its control section there or gives
+        # a self-defining term - an unlabelled START with a bare symbol is the COBOL verb, re-filed
+        for text in ("       S-100.\n           START CUSTFILE\n               KEY IS > K.\n",
+                     "       S-100.\n           START INFILE\n              INVALID KEY MOVE 'N' TO WS-OK\n           END-START.\n",
+                     "       S-100.\n           START CUSTFILE\n"):
+            r, ok, why = self.reading("PROD.GC.COPYLIB", text)
+            self.assertEqual((r["kind"], r["word"], ok, why), ("asm", "START", True, ""), text)
+        # a STRONG signature that fires only inside comment lines says nothing about the member: a BMS macro name in
+        # a remark, a REXX header behind a slash in column 7 - re-filed; the same word on a code line refuses
+        r, ok, why = self.reading("PROD.GC.COPYLIB", "      * BMS FIELD DFHMDF MAPPED HERE\n" + PLAINBK)
+        self.assertEqual((r["kind"], r["by"], ok, why), ("bms", "content", True, ""))
+        r, ok, why = self.reading("PROD.GC.COPYLIB", "      /* REXX */\n" + PLAINBK)
+        self.assertEqual((r["kind"], ok, why), ("rexx", True, ""))
+        r, ok, why = self.reading("PROD.GC.COPYLIB", "MAP1     DFHMDF POS=(1,1),LENGTH=8\n" + PLAINBK)
+        self.assertEqual((r["kind"], ok), ("bms", False))
+        self.assertIn("its text carries a bms signature", why)
         for text in ("           05  CSECT-NAME   PIC X(8).\n           PERFORM CSECT-PARA.\n           B START\n",
                      "           MOVE DS TO WS-X.\n           PERFORM DC-PARA.\n           B START\n"):
             self.assertIsNone(recover._ASM_SHAPE.search(text), text)

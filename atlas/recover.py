@@ -1399,15 +1399,22 @@ REFILED_ITEM = "ROADMAP re-parse item 22"
 # a listing's banner or its numbered source lines; an MFS macro with a label in column 1, TYPE= / POS= /
 # LTH= operands, MSGEND / FMTEND
 _ASM_LABEL = r"(?:[A-Z@#$_][A-Z0-9@#$_]*)?"                   # an HLASM label in column 1: any length, or none
+_ASM_LABEL_REQ = r"[A-Z@#$_][A-Z0-9@#$_]*"                     # ... required: the CSECT name before START
+# START: the COBOL verb (`START CUSTFILE`, its KEY IS or INVALID KEY clause on the NEXT line - his procedure
+# copybook, LESSONS 189) is `START` alone on its line with the file name after it, and a COBOL line never begins
+# in column 1; the Assembler statement names the control section in column 1 (`PGM      START 0`) or gives a
+# self-defining term (` START X'100'`). So START counts as Assembler only with a label, or with a numeric or
+# quoted operand - never unlabelled with a bare symbol, never unlabelled and alone.
 _ASM_SHAPE = re.compile(
     rf"^{_ASM_LABEL}[ \t]+(?:CSECT|DSECT)(?:[ \t]|$)"                                                   # the exact word: not CSECT-NAME
-    rf"|^{_ASM_LABEL}[ \t]+START(?:[ \t]+(?:\d+|[XBC]'[^']*')(?:[ \t]+.*)?|[ \t]+[A-Z@#$_][A-Z0-9@#$_]*)?[ \t]*$"
+    rf"|^{_ASM_LABEL_REQ}[ \t]+START(?:[ \t]+[^ \t\n].*)?[ \t]*$"
+    rf"|^[ \t]+START[ \t]+(?:\d+|[XBC]'[^']*')(?:[ \t]+.*)?[ \t]*$"
     rf"|^{_ASM_LABEL}[ \t]+DFHEIENT\b"
     rf"|^{_ASM_LABEL}[ \t]+D[SC][ \t]+\d*[ABCDEFHPXZVSQ]L?\d*(?:'|\(|[ \t]|$)"
     rf"|^{_ASM_LABEL}[ \t]+(?:USING|EQU)[ \t]+\*"
     rf"|^{_ASM_LABEL}[ \t]+(?:BR|BALR|BASR)[ \t]+R?1[45]\b", re.I | re.M)
-ASM_SHAPES = ("CSECT or DSECT as the operation, with a label of any length or none; START alone or with a numeric, quoted or "
-              "symbol operand; DFHEIENT; DS / DC with a type, address constants included; USING * or EQU *; BR 14")
+ASM_SHAPES = ("CSECT or DSECT as the operation, with a label of any length or none; START with a label in column 1, or with a "
+              "numeric or quoted operand; DFHEIENT; DS / DC with a type, address constants included; USING * or EQU *; BR 14")
 _MFS_SHAPE = re.compile(r"^[A-Z@#$][A-Z0-9@#$]{0,7}[ \t]+(?:MSG|FMT|DEV|DFLD|MFLD)\b"
                         r"|[ \t](?:MSG|DEV)[ \t]+TYPE=|[ \t]DFLD[ \t]+(?:POS|LTH)=|^[ \t]+(?:MSGEND|FMTEND)\b", re.I | re.M)
 _JCL_LINE = re.compile(r"^//", re.M)
@@ -1563,6 +1570,30 @@ def how_classified(path: str, stored_kind: Optional[str] = None, stored_sha: Opt
     return out
 
 
+def _code_only(text: str) -> str:
+    """The text without its COBOL comment lines (an asterisk or a slash in
+    column 7, or a line beginning with an asterisk when nothing says fixed
+    format): what a signature must fire on to say what the member IS."""
+    try:
+        lines, _fixed = reader.read_cobol_lines(text)
+    except Exception:                                                  # noqa: BLE001 - any text: never a crash here
+        return text
+    return "\n".join(ln.raw for ln in lines if not ln.is_comment)     # the whole record: a JCL // or a label sits in column 1
+
+
+def _signature_only_in_comments(kind: str, text: str) -> bool:
+    """A strong signature (a BMS macro name, a REXX header, a DBD macro ...)
+    that fires on the whole text and on none of its code lines came from a
+    comment - `* BMS FIELD DFHMDF MAPPED HERE` - and says nothing about
+    what the member is. A signature the classifier applied to a kind this
+    table does not know is trusted as it stands."""
+    sigs = _STRONG_SIGS.get(kind)
+    if not sigs:
+        return False
+    code = _code_only(text)
+    return not any(rx.search(code) for rx in sigs)
+
+
 def refile_verdict(r: Dict[str, object], folder: str) -> Tuple[bool, str]:
     """(can be re-filed as a copybook, why not). Only a member the classifier
     typed asm / listing / mfs BY ITS CONTENT that (a) sits in a folder
@@ -1579,7 +1610,7 @@ def refile_verdict(r: Dict[str, object], folder: str) -> Tuple[bool, str]:
     text = str(r["text"])
     if kind == "empty":
         return False, "it has no code lines (comments and blanks only): nothing a program could copy"
-    if kind not in WEAK_KINDS:
+    if kind not in WEAK_KINDS and not _signature_only_in_comments(kind, text):
         return False, (f"its text carries a {kind} signature ({r['reason']}): not a COBOL copybook - the copybook the "
                        "programs copy is another member, still to fetch")
     hint = next((k for rx, k in classify.DIR_HINTS if rx.search(folder or "")), None)
