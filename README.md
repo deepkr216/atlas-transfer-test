@@ -484,9 +484,20 @@ FOLDER` adds expanded programs the index does not hold; `--dry-run` says
 what would be written. The same run reads the listing of every program whose
 copybook the build chose among several same-named ones (the listing's
 copybook-source table names the library the compiler read each copybook
-from) and checks each choice: confirmed, contradicted - a wrong fact, named
-in `work\recover.md` with the library the listing says - or unknown; `coverage`,
-`program` and `copybook` repeat what the listings say. The same listing rows
+from) and checks each choice, in five verdicts: confirmed - the listing names
+the library the copy used came from, or a library the index holds whose copy
+has the same text (a copybook compiled against staging and promoted to
+production unchanged); contradicted by a current listing - the index holds
+the listing's copy, its text differs, and the listing's source is the program
+as indexed: a wrong fact, named in `work\recover.md` with the library the
+listing says; named by an older listing - the text differs, but the listing's
+source is not the program as indexed, so it is not counted as a wrong fact; a
+library the index does not hold - the copy the build used stands; or unknown.
+A name is not a fact about content: two copies are the same when their text
+is (columns 8-72, comments dropped), whatever their libraries are called. A
+listing is current when its own program lines match the member as indexed;
+for an older one the report says how much still matches, in percent.
+`coverage`, `program` and `copybook` repeat what the listings say. The same listing rows
 give the fetch list: `work\recover.md` tables the library datasets named by
 the listings the run reads - those of the programs that copy a missing
 copybook, one the index holds only as a recovered copy, or one chosen among

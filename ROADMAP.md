@@ -214,14 +214,19 @@ shipped alone and cost one such night; these still wait for the next one:
 19. **The resolver reads `listing_copy_source` first: the listing's library beats every guess.**
    His compiler listings end with a table naming, per copybook, the DD name and the LIBRARY DATASET
    the compiler read it from. `atlas.recover` reads that table from every program's listing into
-   `listing_copy_source(program, copybook, ddname, dataset, listing, seen)` and checks each
-   'ambiguous_copybook' choice against it (confirmed / contradicted / unknown - `work\recover.md`
-   names every contradicted one; LESSONS 182). At the re-parse `make_resolver` must look that table
+   `listing_copy_source(program, copybook, ddname, dataset, listing, seen, current, matched)` and
+   checks each 'ambiguous_copybook' choice against it (confirmed / contradicted by a current listing /
+   named by an older listing / a library the index does not hold / unknown - `work\recover.md`
+   names each with why; LESSONS 182, 193). At the re-parse `make_resolver` must look that table
    up before its precedence chain (COPY..OF > same system in declared order > authoritative > same
    folder > first): where the listing names a dataset the index holds (member.library / the
    `library` table tie a folder to its dataset), that copy is the one to expand and the row is not
-   ambiguous at all; only where no listing says does the chain guess. A contradicted choice today
-   is a wrong fact in every field, offset and flow answer for that program.
+   ambiguous at all; only where no listing says does the chain guess. The resolver follows a listing
+   only when it is current (its source is the program as indexed - the `current` column), the named
+   copy is held and its text differs from what the chain would pick: a staging library promoted
+   unchanged, an older compile's listing or a library gone from the host changes nothing (LESSONS 193;
+   the batch branch carries the code). A contradicted choice today is a wrong fact in every field,
+   offset and flow answer for that program.
 20. **classify.py: a procedure copybook is a copybook by its CONTENT, before the folder hint.**
    His `A-100-BEGIN SECTION.  COPY PROCBOOK.` copies a member of paragraph names and statements -
    no level numbers, no DIVISION header - which has no content signature today, so the FOLDER NAME
