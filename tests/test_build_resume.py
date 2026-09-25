@@ -184,17 +184,17 @@ class Resume(unittest.TestCase):
 
     def test_inventory_gives_up_on_a_file_that_will_not_classify(self):
         import time as _t
-        real = build.classify.classify
+        real = build.classify.decide                            # what the build calls for a text member
 
-        def slow(path, head, ext_hint=None, **kw):             # kw: the declared kind the build passes
+        def slow(path, head, declared=None):                    # declared: the kind declared for its library
             if path.endswith("STUCK.txt"):
                 while True:
                     _t.sleep(0.01)
-            return real(path, head, ext_hint, **kw)
+            return real(path, head, declared)
 
         with open(os.path.join(self.root, "STUCK.txt"), "w") as fh:
             fh.write("just text\n")
-        with mock.patch.object(build.classify, "classify", slow), mock.patch.object(build, "INVENTORY_TIME_LIMIT", 1), \
+        with mock.patch.object(build.classify, "decide", slow), mock.patch.object(build, "INVENTORY_TIME_LIMIT", 1), \
                 mock.patch.object(build, "PROGRESS_SECONDS", 0.2):
             rc, out = self._build(extra=["--rebuild"])
         self.assertEqual(rc, 0)
@@ -211,7 +211,7 @@ class Resume(unittest.TestCase):
         # same parser, the stored outcome stands (and so does every other
         # unchanged file's classification - the inventory of an unchanged
         # estate is a hash per file, nothing more)
-        with mock.patch.object(build.classify, "classify", slow), mock.patch.object(build, "INVENTORY_TIME_LIMIT", 5):
+        with mock.patch.object(build.classify, "decide", slow), mock.patch.object(build, "INVENTORY_TIME_LIMIT", 5):
             t0 = _t.time()
             rc, out = self._build()
         self.assertEqual(rc, 0)
@@ -222,7 +222,7 @@ class Resume(unittest.TestCase):
         self.assertEqual((st, err[:16]), ("failed", "InventoryTimeout"))
         conn.close()
         # a parser change (new fingerprint) reads it again
-        with mock.patch.object(build.classify, "classify", slow), mock.patch.object(build, "INVENTORY_TIME_LIMIT", 1), \
+        with mock.patch.object(build.classify, "decide", slow), mock.patch.object(build, "INVENTORY_TIME_LIMIT", 1), \
                 mock.patch.object(build, "tool_fingerprint", return_value="feedfacefeedface"):
             rc, out = self._build()
         self.assertEqual(rc, 0)
@@ -230,16 +230,16 @@ class Resume(unittest.TestCase):
 
     def test_inventory_names_a_file_that_cannot_be_interrupted(self):
         import time as _t
-        real = build.classify.classify
+        real = build.classify.decide                            # what the build calls for a text member
 
-        def stuck(path, head, ext_hint=None, **kw):             # kw: the declared kind the build passes
+        def stuck(path, head, declared=None):                   # declared: the kind declared for its library
             if path.endswith("STUCK.txt"):
                 _t.sleep(3)
-            return real(path, head, ext_hint, **kw)
+            return real(path, head, declared)
 
         with open(os.path.join(self.root, "STUCK.txt"), "w") as fh:
             fh.write("just text\n")
-        with mock.patch.object(build.classify, "classify", stuck), mock.patch.object(build, "INVENTORY_TIME_LIMIT", 0.5), \
+        with mock.patch.object(build.classify, "decide", stuck), mock.patch.object(build, "INVENTORY_TIME_LIMIT", 0.5), \
                 mock.patch.object(build, "STUCK_GRACE", 0.3):
             rc, out = self._build(extra=["--rebuild"])
         self.assertEqual(rc, 3)

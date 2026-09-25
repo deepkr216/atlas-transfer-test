@@ -490,12 +490,15 @@ def cmd_program(conn: sqlite3.Connection, name: str) -> str:
 
         # copybooks
         cps = conn.execute("""
-            SELECT c.copybook, c.replacing, c.line, m.name AS resolved
+            SELECT c.copybook, c.replacing, c.line, m.name AS resolved,
+                   (SELECT u.detail FROM unresolved u WHERE u.member_id = c.resolved_member_id AND u.kind = 'declared_kind'
+                    LIMIT 1) AS declared_over
             FROM copy_use c LEFT JOIN member m ON m.id = c.resolved_member_id
             WHERE c.member_id = ? ORDER BY c.line""", (p["member_id"],)).fetchall()
         out.append("\n### Copybooks\n")
         out.append(table(["copybook", "resolved to", "REPLACING", "line"],
-                         [(c["copybook"], c["resolved"] or _not_found_cell(conn, c["copybook"], p["member_id"]),
+                         [(c["copybook"], (declared_over_cell(c["resolved"], c["declared_over"]) if c["resolved"]
+                                           else _not_found_cell(conn, c["copybook"], p["member_id"])),
                            (c["replacing"] or "")[:40], f"{p['member_name']}:{c['line']}") for c in cps]))
 
         # files
@@ -1401,6 +1404,22 @@ def _sentence(s: str) -> str:
     return _cap(s) + "."
 
 
+_OVER_SHAPE = re.compile(r"over the shape of [^:]*")
+
+
+def declared_over_cell(resolved: str, detail: Optional[str]) -> str:
+    """`program`'s 'resolved to' cell: the member's name - and, for a member
+    the kind declared for its library typed copybook over the shape of an
+    Assembler, listing or MFS member (its 'declared_kind' row), that it was,
+    so a program whole over such a member does not say only 'ok' (LESSONS
+    199)."""
+    if not detail:
+        return resolved
+    m = _OVER_SHAPE.search(detail)
+    return (f"{resolved} (filed copybook by its library's declared kind, {m.group(0) if m else 'over a shape'} - see "
+            f"`copybook {resolved}`)")
+
+
 def cmd_copybook(conn: sqlite3.Connection, name: str) -> str:
     out = [f"# Impact of copybook {name.upper()}\n"]
     copies = conn.execute("SELECT m.* FROM member m WHERE UPPER(m.name)=? AND m.kind IN ('copybook','cobol','unknown')",
@@ -1423,6 +1442,13 @@ def cmd_copybook(conn: sqlite3.Connection, name: str) -> str:
     refiled = [c for c in copies if (c["parse_error"] or "").startswith(recover.REFILED_MARK)]
     if refiled and len(refiled) == len(copies):
         out.append(f"\n**{_cap(recover.REFILED_NOTE)}**: {refiled[0]['parse_error']}.\n")
+    # a copy the kind declared for its library typed copybook over the shape of an Assembler, listing or MFS member:
+    # the programs below expand it - said here, not only in the unresolved rows at the end (LESSONS 199)
+    for c in copies:
+        over = conn.execute("SELECT detail FROM unresolved WHERE member_id=? AND kind='declared_kind' LIMIT 1",
+                            (c["id"],)).fetchone()
+        if over:
+            out.append(f"\n**Declared copybook over a shape** (`{c['path']}`): {over[0]}.\n")
     out.append(_listing_sources_of(conn, name, recovered=all(recover.FOLDER.lower() in (c["path"] or "").lower() for c in copies)))
     progs = conn.execute("""SELECT DISTINCT m.name AS member_name, m.id AS mid, m.parse_status AS mstatus, p.program_id,
                                    p.id AS pid, c.replacing, c.line,
@@ -1681,6 +1707,10 @@ UNRESOLVED_MEANING = {
     "ims_switch": ("an IMS message switch destination built at run time", "as above - a human must confirm the target"),
     "layout_warning": ("a record layout the parser could not compute exactly (OCCURS DEPENDING, REDEFINES overlap)",
                        "check the offsets in `layout` before using them for test data or an interface contract"),
+    "declared_kind": ("a member the UI's table declares copybook whose text has the shape of an Assembler, listing or MFS "
+                      "member: the kind declared wins over a shape, so the build expands it into every program copying it",
+                      "check it is the COBOL copybook those programs copy; if it is not, correct the library's kind in the "
+                      "UI's table and run the build"),
     "procedure_copybook": ("a copybook that contributes PROCEDURE DIVISION code, not data",
                            "nothing to fix: its paragraphs belong to every program that copies it"),
     "missing_proc": ("an EXEC PROC= whose PROC member is not in the index",

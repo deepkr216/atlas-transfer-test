@@ -350,6 +350,10 @@ class Ctx:
         self.proc_cache: Dict[str, Optional[jcl.JclFacts]] = {}
         self.copylib_order: Dict[str, List[str]] = {}   # SYSTEM -> copybook library folder names, SYSLIB order
         self.kind_of: Dict[str, str] = {}               # library folder name -> kind declared in sources.json
+        # path -> (the shape's kind, its line) for a member the kind declared for its library typed copybook over the
+        # shape of an Assembler, listing or MFS member: kept beside the member as a 'declared_kind' row, so `program`
+        # and `copybook` say it (LESSONS 199); written by the inventory's workers
+        self.shape_over: Dict[str, Tuple[str, int]] = {}
         self.progress: Optional["Progress"] = None      # the status line's clock, stopped by whoever ends the build
         self.problems: List[Tuple[str, str, str]] = []   # (kind of problem, path, detail) - listed at the end of the build
         self.problems_file: Optional[str] = None
@@ -430,7 +434,7 @@ def open_db(path: str, rebuild: bool = False) -> sqlite3.Connection:
                              ("dataset", "recordsize_max", "INTEGER"), ("dataset", "key_len", "INTEGER"),
                              ("dataset", "key_off", "INTEGER"), ("dataset", "gdg_limit", "INTEGER"),
                              ("dataset", "relates_to", "TEXT"), ("build_run", "fingerprint", "TEXT"),
-                             ("build_run", "manifest_sha", "TEXT"),
+                             ("build_run", "manifest_sha", "TEXT"), ("build_run", "declared_kinds", "TEXT"),
                              ("field_ref", "pfield_id", "INTEGER"), ("call_edge", "returning_item", "TEXT"),
                              ("sql_col_ref", "pfield_id", "INTEGER")):
         _ensure_column(conn, table, col, decl)
@@ -778,7 +782,9 @@ def _inventory_one(ctx: Ctx, path: str, fn: str, dirpath: str, data: bytes) -> t
         # shape (asm / listing / mfs), the folder name and the extension;
         # a strong signature and a COBOL copybook's own lines win over it
         # (classify.declared_wins, ROADMAP re-parse item 22)
-        kind, _why = classify.classify(path, text[:8192], declared=ctx.kind_of.get(os.path.basename(dirpath).upper()))
+        kind, _why, over, at = classify.decide(path, text[:8192], ctx.kind_of.get(os.path.basename(dirpath).upper()))
+        if over and kind == "copybook":
+            ctx.shape_over[path] = (over, at)
         norm, nlines, fixed = norm_hash(kind, text, data, enc)
         if kind in CODE_KINDS and code_line_count(kind, text, data, enc) == 0:
             kind = "empty"           # a stub or a retired member: never a program row
@@ -991,6 +997,10 @@ def inventory(ctx: Ctx, roots, limit: Optional[int] = None, force_all: bool = Fa
                 mem = Mem(cur.lastrowid, path, name, kind, library, norm, skip=bool(note), nbytes=nbytes)
                 if path not in existing:
                     ctx.bump("new")
+                over = ctx.shape_over.get(path) if kind == "copybook" else None
+                if over:
+                    conn.execute("INSERT INTO unresolved(member_id,kind,detail,line) VALUES(?,?,?,?)",
+                                 (mem.id, "declared_kind", declared_note(library, *over), over[1] or None))
             ctx.members.append(mem)
             ctx.by_name.setdefault(name, []).append(mem)
             ctx.bump(f"kind:{kind}")
@@ -1079,6 +1089,17 @@ def load_sched(ctx: Ctx, csv_path: str) -> None:
                 n_job += 1
     ctx.conn.commit()
     ctx.say(f"scheduler: {n_job} job definition(s), {n_dep} dependency edge(s) loaded")
+
+
+SHAPE_OF = {"asm": "an Assembler member", "listing": "a compiler listing", "mfs": "MFS source"}
+
+
+def declared_note(library: str, over: str, line: int) -> str:
+    """The 'declared_kind' row of a member the kind declared for its library
+    typed copybook over the shape of an Assembler, listing or MFS member."""
+    return (f"filed copybook by the kind declared for library {library} in the UI's table, over the shape of "
+            f"{SHAPE_OF.get(over, over)}" + (f" on line {line}" if line else "") + ": every program copying it expands this "
+            "text - if it is not the COBOL copybook they copy, correct the library's kind in the UI's table and run the build")
 
 
 def load_declared_kinds(ctx: Ctx, manifest_path: Optional[str]) -> None:
@@ -2721,7 +2742,12 @@ def _build(args: argparse.Namespace, progress: Progress, t0: float) -> int:
             man_sha = sha(fh.read())[:16]
     # the LATEST run, finished or not: members parsed by an interrupted run
     # were parsed by that run's toolkit, and must be redone if it changed
-    last = conn.execute("SELECT fingerprint, manifest_sha FROM build_run ORDER BY id DESC LIMIT 1").fetchone()
+    last = conn.execute("SELECT fingerprint, manifest_sha, declared_kinds FROM build_run ORDER BY id DESC LIMIT 1").fetchone()
+    # the kinds declared per library in the UI's table (the manifest kinds): read BEFORE the inventory types a
+    # member, and recorded with the run, so atlas.recover and `coverage` tell a declared kind from a rule of the
+    # build's own without the manifest file (LESSONS 199)
+    load_declared_kinds(ctx, args.manifest)
+    kinds_json = json.dumps(ctx.kind_of, sort_keys=True)
     force_all = False
     if last is not None and not args.rebuild:
         if last["fingerprint"] and last["fingerprint"] != fp:
@@ -2733,9 +2759,11 @@ def _build(args: argparse.Namespace, progress: Progress, t0: float) -> int:
     # Until the old facts are removed and every member is recorded again, this
     # run carries the PREVIOUS fingerprint: stopped or crashed during the
     # inventory, the next run must still see the toolkit as changed.
-    run = conn.execute("INSERT INTO build_run(started_at,root,tool_version,fingerprint,manifest_sha) VALUES(?,?,?,?,?)",
+    run = conn.execute("INSERT INTO build_run(started_at,root,tool_version,fingerprint,manifest_sha,declared_kinds) "
+                       "VALUES(?,?,?,?,?,?)",
                        (time.strftime("%Y-%m-%dT%H:%M:%S"), args.root, VERSION,
-                        last["fingerprint"] if force_all else fp, last["manifest_sha"] if force_all else man_sha))
+                        last["fingerprint"] if force_all else fp, last["manifest_sha"] if force_all else man_sha,
+                        last["declared_kinds"] if force_all else kinds_json))
     run_id = run.lastrowid
     conn.commit()                              # a crash leaves a run with no finished_at: visible in `coverage`
 
@@ -2750,7 +2778,6 @@ def _build(args: argparse.Namespace, progress: Progress, t0: float) -> int:
     ctx.inventory_skips = load_inventory_skips(args.skip_list)
     roots = [args.root, *(args.also or [])]
     ctx.say("inventory: " + ", ".join(roots))
-    load_declared_kinds(ctx, args.manifest)
     try:
         inventory(ctx, roots, args.limit, force_all=force_all)
     except ParserStuck:
@@ -2760,7 +2787,8 @@ def _build(args: argparse.Namespace, progress: Progress, t0: float) -> int:
         conn.rollback()                        # nothing half-removed is kept; the next run starts the inventory again
         ctx.say("\nstopped by Ctrl+C during the inventory - nothing was changed; run the same command again")
         return 130
-    conn.execute("UPDATE build_run SET fingerprint=?, manifest_sha=? WHERE id=?", (fp, man_sha, run_id))
+    conn.execute("UPDATE build_run SET fingerprint=?, manifest_sha=?, declared_kinds=? WHERE id=?",
+                 (fp, man_sha, kinds_json, run_id))
     conn.commit()
     ctx.say(f"  {len(ctx.members)} files: " + ", ".join(
         f"{k[5:]}={v}" for k, v in sorted(ctx.stats.items()) if k.startswith("kind:")))

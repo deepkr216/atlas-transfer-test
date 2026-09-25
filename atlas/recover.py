@@ -155,9 +155,11 @@ _EXEC_SQL = re.compile(r"(?<![A-Z0-9\-])EXEC\s+SQL\b", re.I)
 _LISTING_LINE = re.compile(r"^[ 01\-+]?\s*(\d{6})([^\s\d]*)(?=\s|$)")
 # a listing line: the line number, the blank PL/SL columns, then the source record with its OWN
 # sequence number in columns 1-6 - two numbers, where a plain source record has one; and the compiler's banner
-# (the classifier's shapes since ROADMAP re-parse item 22 - one definition for both)
+# (the classifier's shapes since ROADMAP re-parse item 22 - one definition for both). In a text read AS a listing
+# the compiler's name anywhere counts as the banner (classify._LISTING_BANNER); what makes a member a listing is
+# the banner at the start of a line (classify._LISTING_HEAD, LESSONS 199)
 _LISTING_SHAPE = classify._LISTING_SHAPE
-_LISTING_HEAD = classify._LISTING_HEAD
+_LISTING_HEAD = classify._LISTING_BANNER
 _RULER = re.compile(r"-{3,}\+-\*A")
 RULER_MIN_COL = 9          # a listing prints its ruler after the line number; an editor's COLS line kept in a source starts in column 1-8
 _RULER_HEAD = re.compile(r"\bLine\s*I[Dd]\b|\bLINE\b", re.I)   # the ruler line's own heading: LineID / LineId / LINE
@@ -1966,6 +1968,9 @@ _EARLIER_SIGS = {"asm": re.compile(r"^(?:[ \t]*\w+)?[ \t]+(CSECT|DSECT|START|DFH
 _EARLIER_WORDS = {"asm": ("Assembler", "a first or second word beginning with START, CSECT or DSECT"),
                   "listing": ("a compiler listing", "a comment naming MODULE MAP or CROSS REFERENCE TABLE"),
                   "mfs": ("an MFS statement", "a line whose first word is MSG, FMT, DEV, DFLD or MFLD")}
+# ... and its CREATE TABLE, anywhere on a line (a remark, a literal): the classifier of this toolkit reads it where a
+# statement begins
+_EARLIER_STRONG = {"sql": (re.compile(r"\bCREATE\s+(TABLE|VIEW|INDEX|TABLESPACE|DATABASE)\b", re.I),)}
 _JCL_LINE = re.compile(r"^//", re.M)
 _WORD_AT = re.compile(r"[A-Z0-9@#$\-_]+", re.I)
 # the strong signatures, by kind, for the word that fired (a member of these kinds is not a copybook)
@@ -2022,6 +2027,19 @@ DECLARED_OVER_FIX = ("the kind declared for the library in the UI's table decide
 DECLARED_OVER_CELL = ("the library's kind in the UI's table decided it, over the classifier's own reading - declare it copybook "
                       "there, then build")
 DECLARABLE_KINDS = classify.DECLARABLE                        # what build.load_declared_kinds accepts from the manifest
+# an index built before this batch whose manifest is not beside it: whether the library is declared copybook already
+# cannot be told, and the refusal must not send him to declare what is declared (LESSONS 199)
+DECLARED_UNKNOWN = ("; if it is declared copybook there already, the build alone files it one - this index was built "
+                    "before a declared kind won over a shape (ROADMAP re-parse item 22), and its manifest.json is not beside "
+                    "it to tell")
+# a member of an older index whose library is declared copybook: the build of this toolkit puts the declaration
+# before the shape the older build left in force (it let a declared kind replace 'unknown' only)
+EARLIER_DECLARED_FIX = ("its library is declared copybook in the UI's table, which the build of this toolkit puts before the "
+                        "shape, so nothing else is needed: run `python -m atlas.recover --db atlas.db`, which re-files it as "
+                        "one in the index, then the build")
+EARLIER_DECLARED_FIX_DRY = ("its library is declared copybook in the UI's table, which the build of this toolkit puts before "
+                            "the shape, so nothing else is needed: a run without --dry-run re-files it as one in the index and "
+                            "marks the programs")
 # a member the build filed 'empty' whose text is a bare number in column 1 (two of his 27 missing copybooks, LESSONS
 # 192): columns 1-6 are the sequence area and column 7 the indicator of fixed-format COBOL, so the reader sees no code
 # and build.code_line_count gives 0 - 'no code lines' said nothing about where the text sits
@@ -2090,7 +2108,8 @@ def _earlier_reading(head: str, parent: str, ext: str, kind: str) -> Tuple[str, 
     line of its text ('content', with the line and the word), the folder
     name, the extension, or the kind declared for its library (which then
     replaced 'unknown' only) - for an index built with it."""
-    strong = next((x for sig in _STRONG_SIGS.get(kind, ()) for x in [sig.search(head)] if x), None)
+    strong = next((x for sig in _EARLIER_STRONG.get(kind, _STRONG_SIGS.get(kind, ())) for x in [sig.search(head)] if x),
+                  None)
     if strong:
         # a strong signature that classifier read anywhere - a remark naming DFHMDF, a REXX header behind a slash in
         # column 7 (LESSONS 189); the classifier of this toolkit reads it on code lines only
@@ -2131,26 +2150,98 @@ def _file_sha(path: str, head: bytes) -> str:
         return hashlib.sha256(fh.read()).hexdigest()
 
 
-def how_classified(path: str, stored_kind: Optional[str] = None, stored_sha: Optional[str] = None) -> Dict[str, object]:
+def declared_kinds_used(conn: sqlite3.Connection) -> Optional[Dict[str, str]]:
+    """{library folder, upper case: kind} - the kinds declared in the UI's
+    table (sources.json -> the manifest kinds) that the index's members were
+    typed with: what the last build recorded (build_run.declared_kinds - a
+    build of this batch records them, {} when it had no manifest; a build
+    that re-parses every member follows every manifest change, so the last
+    build's kinds are every member's); for an index built before this batch,
+    the manifest.json beside the index or in the working folder whose sha is
+    the one that build recorded, {} when it recorded none. None when it
+    cannot be known: an older index whose manifest is not at hand - then no
+    sentence may say a kind was declared, or was not (LESSONS 199)."""
+    try:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(build_run)")}
+        if not cols:
+            return None
+        sel = ", ".join(c if c in cols else "NULL" for c in ("fingerprint", "manifest_sha", "declared_kinds"))
+        row = conn.execute(f"SELECT {sel} FROM build_run ORDER BY id DESC LIMIT 1").fetchone()
+        db_file = next((r[2] for r in conn.execute("PRAGMA database_list") if r[1] == "main"), "") or ""
+    except sqlite3.Error:
+        return None
+    if row is None:
+        return None
+    fingerprint, man_sha, kinds = row[0], row[1], row[2]
+
+    def kinds_of(d: object) -> Dict[str, str]:
+        return {str(k).upper(): str(v).lower() for k, v in (d if isinstance(d, dict) else {}).items()
+                if str(v).lower() in DECLARABLE_KINDS}
+    if kinds is not None:
+        try:
+            return kinds_of(json.loads(kinds))
+        except ValueError:
+            return None
+    if not man_sha:
+        return {} if fingerprint else None                  # a build that recorded its toolkit and no manifest had none
+    for folder in dict.fromkeys(f for f in (os.path.dirname(os.path.abspath(db_file)) if db_file else "", os.getcwd()) if f):
+        try:
+            with open(os.path.join(folder, "manifest.json"), "rb") as fh:
+                data = fh.read()
+        except OSError:
+            continue
+        if hashlib.sha256(data).hexdigest()[:16] == man_sha:             # build.py: sha(manifest)[:16]
+            try:
+                return kinds_of(json.loads(data.decode("utf-8")).get("kinds"))
+            except (ValueError, UnicodeDecodeError, AttributeError):
+                return None
+    return None
+
+
+def _same_bytes(path: str, head: bytes, stored_sha: Optional[str]) -> bool:
+    """Whether the file holds the bytes the build read (member.sha256)."""
+    try:
+        return stored_sha is not None and _file_sha(path, head) == stored_sha
+    except OSError:
+        return False
+
+
+def _declared_seen(parent: str, kind: str, reason: str, basis: str) -> str:
+    """The sentence for a member the kind declared for its library decided."""
+    if basis == "none":
+        return (f"the kind declared for library {parent} in the UI's table (sources.json, the manifest kinds) - the "
+                f"classifier itself read no signature and no folder hint ({reason})")
+    return (f"the kind declared for library {parent} in the UI's table (sources.json, the manifest kinds), which the build "
+            f"puts before what the classifier itself reads: {kind} ({reason})")
+
+
+def how_classified(path: str, stored_kind: Optional[str] = None, stored_sha: Optional[str] = None,
+                   declared: Optional[Dict[str, str]] = None) -> Dict[str, object]:
     """How the build's classifier came to file a member: classify.reading()
-    run again over the member's first 8 KB, decoded as the build decodes it.
-    `by` is 'content' (a signature or a shape fired: the line and the word
-    are quoted in `seen`), 'folder' (the library folder name), 'extension',
-    'declared' (the kind declared for the library in the UI's table - known
-    by the file being unchanged since the build, `stored_sha`, while the
-    classifier reads a kind the declaration replaces; `over` is set when it
+    run again over the member's first 8 KB, decoded as the build decodes it,
+    with the kind declared for its library (`declared`: declared_kinds_used,
+    None when it cannot be known). `by` is 'content' (a signature or a shape
+    fired: the line and the word are quoted in `seen`), 'folder' (the
+    library folder name - or, for a member of a JCL-named folder with no
+    JCL statement, the build's rule that files it ctlcard), 'extension',
+    'declared' (the kind declared for the library in the UI's table decided:
+    known from `declared`, or - that unknown - from the file being unchanged
+    since the build, `stored_sha`, while the classifier reads 'unknown', the
+    one kind every build let a declaration replace; `over` is set when it
     replaced a shape, the folder name or the extension rather than
     'unknown'), 'changed' (the file now reads as another kind than the index
     holds: build first), 'build' (unchanged, yet filed otherwise) or
     'unreadable'. On an index built by the classifier before ROADMAP
     re-parse items 20 and 22 - the file unchanged, the index holding a kind
-    the build does not expand, the classifier of this toolkit reading a
-    copybook - `by` is 'content' and `earlier` says how that classifier
-    filed it ('content', 'folder', 'extension', 'declared kind'), which
-    refile_verdict() re-files. `text` is what was read (up to HEAD_BYTES),
+    the build does not expand, the build of this toolkit filing a copybook
+    (its own lines, or the copybook kind declared for its library over a
+    shape: `declared_over`) - `by` is 'content' and `earlier` says how that
+    classifier filed it ('content', 'folder', 'extension', 'declared kind'),
+    which refile_verdict() re-files. `declared_known` says whether the
+    declared kinds were known. `text` is what was read (up to HEAD_BYTES),
     line ends made LF, for the checks refile_verdict() makes."""
     out: Dict[str, object] = {"kind": stored_kind, "reason": "", "by": "unreadable", "line": 0, "word": "", "text": "",
-                              "earlier": "", "over": "",
+                              "earlier": "", "over": "", "declared_known": declared is not None, "declared_over": False,
                               "seen": "the file could not be read from disk to say what decided its kind - is the estate "
                                       "where the build saw it?"}
     try:
@@ -2160,11 +2251,13 @@ def how_classified(path: str, stored_kind: Optional[str] = None, stored_sha: Opt
         return out
     text, enc = reader.decode_bytes(data)
     head = classify.normalized(text[:8192])                          # as the build hands it to the classifier
-    kind, reason, basis = classify.reading(path, text[:8192])
-    # the shape checks are line-anchored: a member downloaded with CR LF must not slip past a `$`
-    out.update(kind=kind, reason=reason, text=classify.normalized(text))
     ext = os.path.splitext(path)[1].lower()
     parent = os.path.basename(os.path.dirname(path))
+    lib_decl = (declared or {}).get(parent.upper())
+    kind, reason, basis = classify.reading(path, text[:8192], lib_decl)
+    files_as = lib_decl if lib_decl and classify.declared_wins(kind, basis, lib_decl) else kind   # this toolkit's build
+    # the shape checks are line-anchored: a member downloaded with CR LF must not slip past a `$`
+    out.update(kind=kind, reason=reason, text=classify.normalized(text))
     if stored_kind == "empty":
         # the build files a code member with no code lines as empty, after classifying: comments and blanks only -
         # or a bare number in column 1, which the fixed-format reader takes for the sequence area and the indicator
@@ -2179,28 +2272,40 @@ def how_classified(path: str, stored_kind: Optional[str] = None, stored_sha: Opt
         out.update(kind="empty", by="content", stub=n,
                    seen=f"the classifier read it as {kind} ({reason}) and the build filed it empty: "
                         + (stub_sentence(n) if n else EMPTY_SEEN))
+    elif stored_kind and kind != stored_kind and files_as == stored_kind:
+        # the build's step AFTER the classifier decided: the kind declared for the library (classify.declared_wins),
+        # known from the kinds the index was built with - a build files it the same again
+        out.update(kind=stored_kind, by="declared", over="" if basis == "none" else basis,
+                   seen=_declared_seen(parent, kind, reason, basis))
+    elif (stored_kind and (kind != stored_kind or files_as != stored_kind) and files_as == "copybook"
+          and stored_kind not in RESOLVER_KINDS and _same_bytes(path, data, stored_sha)):
+        # the same bytes the build read, the index holding a kind the build does not expand, and the build of this
+        # toolkit filing a copybook: an index built before ROADMAP re-parse items 20 and 22 - by its classifier, which
+        # filed a copybook as another kind by a line of its text or its folder name, and by its build, which let a
+        # declared kind replace 'unknown' only (a library declared copybook kept an Assembler shape's asm): re-filed
+        by, line, word, seen = _earlier_reading(head, parent, ext, stored_kind)
+        if kind == "copybook":
+            seen = f"{seen}; the classifier of this toolkit reads it as a copybook ({reason}) - {EARLIER_ITEMS}"
+        else:
+            seen = (f"{seen}; its library {parent} is declared copybook in the UI's table, which the build of this "
+                    f"toolkit puts before {kind} ({reason}) - {EARLIER_ITEMS}")
+        out.update(kind=stored_kind, by="content", earlier=by, line=line, word=word, seen=seen,
+                   declared_over=kind != "copybook")
     elif stored_kind and kind != stored_kind:
-        # the same bytes the build read, and the classifier's own answer differs from the index: an index built by
-        # the classifier before ROADMAP re-parse items 20 and 22 (a copybook it filed as another kind - re-filed
-        # here), or the build's step AFTER the classifier decided - the kind declared for the library
-        # (classify.declared_wins) - and a build would file it the same again; different bytes: the file changed
-        # since, and the build comes first
-        try:
-            same = stored_sha is not None and _file_sha(path, data) == stored_sha
-        except OSError:
-            same = False
-        if same and kind == "copybook" and stored_kind not in RESOLVER_KINDS:
-            by, line, word, seen = _earlier_reading(head, parent, ext, stored_kind)
-            out.update(kind=stored_kind, by="content", earlier=by, line=line, word=word,
-                       seen=f"{seen}; the classifier of this toolkit reads it as a copybook ({reason}) - {EARLIER_ITEMS}")
-        elif same and classify.declared_wins(kind, basis, stored_kind):
-            if basis == "none":
-                seen = (f"the kind declared for library {parent} in the UI's table (sources.json, the manifest kinds) - "
-                        f"the classifier itself read no signature and no folder hint ({reason})")
-            else:
-                seen = (f"the kind declared for library {parent} in the UI's table (sources.json, the manifest kinds), which "
-                        f"the build puts before what the classifier itself reads: {kind} ({reason})")
-            out.update(kind=stored_kind, by="declared", over="" if basis == "none" else basis, seen=seen)
+        # the classifier's own answer differs from the index, and the build of this toolkit would not file a
+        # copybook: a rule of the build's own, or - the declared kinds unknown - the kind declared for the library
+        # over 'unknown'; different bytes: the file changed since, and the build comes first
+        same = _same_bytes(path, data, stored_sha)
+        if same and declared is None and basis == "none" and classify.declared_wins(kind, basis, stored_kind):
+            # the declared kinds unknown (an older index whose manifest is not at hand): nothing but a declaration
+            # replaces 'unknown', in every build
+            out.update(kind=stored_kind, by="declared", over="", seen=_declared_seen(parent, kind, reason, basis))
+        elif same and kind == "jcl" and stored_kind == "ctlcard" and basis == "folder":
+            # build._index_jcl_facts: a member of a JCL-named folder with no JOB, EXEC or PROC statement is a card member
+            tail = next((m.group(0) for rx, _k in classify.DIR_HINTS for m in [rx.search(parent)] if m), parent)
+            out.update(kind=stored_kind, by="folder",
+                       seen=f"the folder name ends in {tail.upper()} and it holds no JOB, EXEC or PROC statement, so the build "
+                            "filed it as a control-card member")
         elif same:
             out.update(kind=stored_kind, by="build",
                        seen=f"the classifier reads it as {kind} ({reason}) and the build filed it {stored_kind} by a rule of "
@@ -2284,7 +2389,7 @@ def refile_verdict(r: Dict[str, object], folder: str) -> Tuple[bool, str]:
                        "programs copy is another member, still to fetch")
     if _JCL_LINE.search(text):
         return False, ("it holds a JCL line (//) - if it is the copybook after all, declare its library copybook in the UI's "
-                       "table and run the build")
+                       "table and run the build" + ("" if r.get("declared_known", True) else DECLARED_UNKNOWN))
     if classify._SIG_COBOL.search(text) or classify._SIG_PROGRAM_ID.search(text):
         return False, "it holds an IDENTIFICATION DIVISION or PROGRAM-ID: a program, not a copybook"
     shape = ""
@@ -2297,7 +2402,8 @@ def refile_verdict(r: Dict[str, object], folder: str) -> Tuple[bool, str]:
     if shape:
         return False, (f"it has the shape of {shape} - the copybook the programs copy is then another member, still to "
                        "fetch; if this member IS the COBOL copybook, declare its library copybook in the UI's table and run "
-                       "the build (a declared kind wins over the shape)")
+                       "the build (a declared kind wins over the shape)"
+                       + ("" if r.get("declared_known", True) else DECLARED_UNKNOWN))
     hint = next((k for rx, k in classify.DIR_HINTS if rx.search(folder or "")), None)
     if hint != "copybook" and not classify._SIG_LEVEL_NUMBER.search(text):
         return False, ("neither its folder (the name does not end in COPYLIB) nor its text (no level numbers) says it is a "
@@ -2310,10 +2416,12 @@ def member_readings(found: Sequence[Tuple[int, str, str, str]], conn: Optional[s
     """Per member (id, kind, folder, path) as members_named() lists them: how
     the classifier decided (how_classified) and whether refile_misfiled()
     may re-file it (refile_verdict). Reads each member's file once. With
-    `conn`, the stored sha256 of each member goes to how_classified(), which
-    tells a kind the UI's table declared from a file changed since the
-    build."""
+    `conn`, the stored sha256 of each member and the kinds declared in the
+    UI's table the index was built with (declared_kinds_used) go to
+    how_classified(), which tells a declared kind from a rule of the build's
+    own and from a file changed since the build."""
     shas: Dict[int, str] = {}
+    declared = declared_kinds_used(conn) if conn is not None else None
     if conn is not None and found:
         ids = [int(m[0]) for m in found]
         for k in range(0, len(ids), 500):
@@ -2322,7 +2430,7 @@ def member_readings(found: Sequence[Tuple[int, str, str, str]], conn: Optional[s
                 f"SELECT id, sha256 FROM member WHERE id IN ({','.join('?' * len(chunk))})", chunk)})
     readings: List[Dict[str, object]] = []
     for mid, kind, folder, path in found:
-        r = how_classified(path, kind, shas.get(int(mid)))
+        r = how_classified(path, kind, shas.get(int(mid)), declared)
         r.update(id=int(mid), folder=folder, path=path)
         ok, why_not = refile_verdict(r, folder)
         r.update(refile=ok, why_not=why_not)
@@ -2391,6 +2499,8 @@ def content_fix(r: Dict[str, object], dry_run: bool = False) -> str:
     """What to do for a member typed by its content: this tool re-files it
     (or would, on a dry run), the folder fix and a second run when only a
     COPYLIB folder is missing, or why it cannot."""
+    if r.get("refile") and r.get("earlier") and r.get("declared_over"):
+        return EARLIER_DECLARED_FIX_DRY if dry_run else EARLIER_DECLARED_FIX
     if r.get("refile") and r.get("earlier"):
         return EARLIER_FIX_DRY if dry_run else EARLIER_FIX
     if r.get("refile"):
@@ -2454,7 +2564,10 @@ def _refile_member(conn: sqlite3.Connection, r: Dict[str, object], today: str) -
         conn.execute("DELETE FROM screen_field WHERE screen_id=?", (sid,))
     conn.execute("DELETE FROM screen WHERE member_id=?", (mid,))
     conn.execute("DELETE FROM literal_ref WHERE member_id=? AND program_id IS NULL", (mid,))
-    if r.get("earlier"):
+    if r.get("earlier") and r.get("declared_over"):
+        why = (f"the classifier this index was built with filed it as {r['kind']} by its {r['earlier']}, and its library is "
+               f"declared copybook in the UI's table, which the build of this toolkit puts before the shape ({EARLIER_ITEMS})")
+    elif r.get("earlier"):
         why = (f"the classifier this index was built with filed it as {r['kind']} by its {r['earlier']}, the classifier of "
                f"this toolkit reads it as a copybook ({EARLIER_ITEMS})")
     else:
@@ -3563,9 +3676,15 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
         kinds = "/".join(sorted({str(r["kind"]) for r in done}))
         # on an index built before ROADMAP re-parse items 20 and 22 the older classifier filed them - by a line of their
         # text, or by the folder name for a procedure copybook
-        how = (f"the classifier this index was built with had filed them as {kinds}; the classifier of this toolkit reads "
-               f"them as copybooks - {EARLIER_ITEMS}" if all(r.get("earlier") for r in done)
-               else f"the classifier had read them as {kinds} by a line of their text")
+        if all(r.get("earlier") for r in done) and any(r.get("declared_over") for r in done):
+            how = (f"the classifier this index was built with had filed them as {kinds}; the build of this toolkit files them "
+                   "as copybooks - by their own lines, or by the copybook kind declared for their library in the UI's table, "
+                   f"which it puts before a shape - {EARLIER_ITEMS}")
+        elif all(r.get("earlier") for r in done):
+            how = (f"the classifier this index was built with had filed them as {kinds}; the classifier of this toolkit "
+                   f"reads them as copybooks - {EARLIER_ITEMS}")
+        else:
+            how = f"the classifier had read them as {kinds} by a line of their text"
         if dry_run:
             log(f"  {len(refiled):,} misfiled copybook(s) would be re-filed as copybook in the index ({how}): {n_prog:,} "
                 "program(s) would be marked for the next build (dry run: nothing changed)")
@@ -3603,9 +3722,13 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
     if content_left:
         n_prog = len({p[0] for e in content_left for p in e["programs"]})       # type: ignore[union-attr]
         kinds = ", ".join(sorted({k for e in content_left for k, _f in e["members"]}))   # type: ignore[union-attr]
+        unknown = any(not r.get("declared_known", True) for e in content_left
+                      for r in e.get("readings", []))                                # type: ignore[union-attr]
         log(f"  {len(content_left):,} copybook name(s) exist in the index only as a member the classifier typed by a line of "
             f"its text ({kinds}) and this run could not re-file: {n_prog:,} program(s) stay parsed only in part - no folder "
-            "change helps; the report says why for each")
+            "change helps; the report says why for each"
+            + (" (a library declared copybook in the UI's table already needs only the build: this index predates ROADMAP "
+               "re-parse item 22 and its manifest.json is not beside it to tell)" if unknown else ""))
     arrival_lines = removed_lines + arrival_report(arrived, misfiled, dry_run, refiled=refiled, waiting=waiting)
     disk_lines = disk_report(checked, missing, users, root or "")   # right after the summary lines, before the rest
     # every missing name is one a member of another kind carries and a rename (or a run without --dry-run, or a

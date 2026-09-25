@@ -17,6 +17,16 @@ name and the extension (ROADMAP re-parse items 20 and 22, LESSONS 183, 186).
 A signature a comment line carries (a remark naming DFHMDF, PROGRAM-ID,
 CREATE TABLE or the compiler, a REXX header behind a slash in column 7)
 says nothing about the member (LESSONS 189).
+
+The COBOL statements are words other texts use too, so the library says
+how much they need to say (LESSONS 199): an Easytrieve program or a
+Connect:Direct process - read by the jobs through SYSIN - is neither a
+copybook nor typed by them at all; in a library of documents (its folder
+name, its declared kind, or a document's extension on a text with prose
+lines) they count for nothing - a run book says PERFORM THE FOLLOWING
+STEPS, a design note quotes a paragraph; in a library of control cards
+(its folder name or its declared kind) two statement lines are needed, one
+of a form no card language has.
 """
 
 from __future__ import annotations
@@ -91,7 +101,10 @@ _SIG_CSD = re.compile(r"^[ \t]*(?:DEFINE|ALTER|USERDEFINE)[ \t]+(?:TRANSACTION|P
                       r"|^[ \t]*(?:TRANSACTION|PROGRAM|FILE)\([A-Z0-9@#$]+\)[ \t]+GROUP\(", re.I | re.M)
 # IMS stage-1 system definition: APPLCTN / TRANSACT macros (label optional in col 1).
 _SIG_IMSGEN = re.compile(r"^(?:[A-Z0-9@#$]{1,8})?[ \t]+(?:APPLCTN|TRANSACT)[ \t]+(?:PSB|GPSB|CODE)=", re.I | re.M)
-_SIG_SQL_DDL = re.compile(r"\bCREATE\s+(TABLE|VIEW|INDEX|TABLESPACE|DATABASE)\b", re.I)
+# CREATE TABLE where a statement begins - at the start of a line or after a `;` - never in the middle of one: an
+# Assembler remark `BAL 14,BLDTAB  CREATE TABLE OF RATES` or a COBOL literal 'CREATE TABLE' is no DDL (LESSONS 199)
+_SIG_SQL_DDL = re.compile(r"(?:^|;)[ \t]*CREATE\s+(?:(?:UNIQUE|LOB|AUX|AUXILIARY|LARGE|GLOBAL\s+TEMPORARY)\s+)?"
+                          r"(TABLE|VIEW|INDEX|TABLESPACE|DATABASE)\b", re.I | re.M)
 _SIG_REXX = re.compile(r"^\s*/\*\s*REXX", re.I)
 # A folder named like a dataset (PROD.CLAIMS.SRC) holds mainframe members:
 # an unrecognised member there is UNKNOWN, never a document.
@@ -170,6 +183,72 @@ _SIG_COBOL_SHARED = re.compile(_CODE_AT + _SHARED_VERB, re.M)
 # a DIVISION header on a code line: such a member is a program's part, not a procedure copybook
 _SIG_DIVISION = re.compile(_CODE_AT + r"(?:IDENTIFICATION|ID|ENVIRONMENT|DATA|PROCEDURE)[ \t]+DIVISION\b", re.I | re.M)
 
+# ---- statement languages that are not COBOL, and what the library says -----
+#
+# The COBOL statements are words other texts use too (LESSONS 199). His CNTL / PARMLIB libraries hold, beside the
+# sort and IDCAMS cards, two statement languages that share them: an Easytrieve program - read by EZTPA00 through
+# its SYSIN - with JOB INPUT, MOVE ... TO, PERFORM, IF ... END-IF; and a Connect:Direct process - submitted by
+# DMBATCH `SUBMIT PROC=` - with its label and PROCESS SNODE=, COPY FROM (DSN=...), IF (SENDIT = 0) THEN ... EIF,
+# whose label `STEP01` the loose level-number signature read as level 01. Filed a copybook, the job never read it
+# (build._card_text reads a control-card member, never a copybook): the Easytrieve files and fields, the
+# Connect:Direct datasets and the step's cards were gone from `job` and `dataset`. A member with either shape is
+# typed by the kind declared for its library, its folder name or its extension - never by a COBOL signature.
+_EZT_ACTIVITY = re.compile(r"^[ \t]*JOB(?:[ \t]+(?:INPUT|NAME|START|FINISH|ENVIRONMENT)\b|[ \t]*$)"
+                           r"|^[ \t]*END-PROC\b|^[ \t]*[A-Z0-9@#$\-]{1,40}\.[ \t]+PROC\b"
+                           r"|^[ \t]*SORT[ \t]+[A-Z0-9@#$\-]{1,8}[ \t]+TO[ \t]+[A-Z0-9@#$\-]{1,8}\b", re.I | re.M)
+_EZT_FILE = re.compile(r"^[ \t]*FILE[ \t]+[A-Z0-9@#$\-]{1,8}(?:[ \t]|$)", re.I | re.M)          # FILE POLIN ...
+_EZT_FIELD = re.compile(r"^[ \t]+[A-Z0-9@#$:\-]{1,40}[ \t]+\d{1,5}[ \t]+\d{1,5}[ \t]+[ANPBUK]\b", re.I | re.M)  # IN-ID 1 10 A
+_NDM_PROCESS = re.compile(r"^[A-Z@#$][A-Z0-9@#$]{0,7}[ \t]+PROCESS(?:[ \t]|$)", re.I | re.M)     # QZNDM1 PROCESS ...
+_NDM_NODE = re.compile(r"\b[SP]NODE[ \t]*=", re.I)                                              # ... SNODE=QZREMOTE
+_NDM_STMT = re.compile(r"^(?:[A-Z@#$][A-Z0-9@#$]{0,7})?[ \t]+(?:COPY[ \t]+FROM[ \t]*\([ \t]*(?:DSN|PNODE|SNODE|FILE)\b"
+                       r"|RUN[ \t]+(?:TASK|JOB)[ \t]*\(|EIF[ \t]*$)", re.I | re.M)
+EZT_WORDS = "an Easytrieve program"
+NDM_WORDS = "a Connect:Direct process"
+# A line of prose or Markdown: a letter in column 1 and, in column 7, neither a blank nor a COBOL indicator - no line
+# of a COBOL member in reference format has that (columns 1-6 are its sequence area, column 7 its indicator) - or a
+# Markdown heading or code fence. It makes a text with a document's extension a document for the COBOL statements.
+_PROSE = re.compile(r"^[A-Za-z][^\n]{5}[^ \t*/\-Dd\n]|^#{1,6}[ \t]|^```", re.M)
+
+
+def not_cobol(head: str) -> str:
+    """'an Easytrieve program' / 'a Connect:Direct process' when `head`
+    (normalized) has the shape of one - statements whose words are COBOL's
+    in a language that is not - or ''."""
+    if _EZT_ACTIVITY.search(head) or (_EZT_FILE.search(head) and _EZT_FIELD.search(head)):
+        return EZT_WORDS
+    if (_NDM_PROCESS.search(head) and _NDM_NODE.search(head)) or _NDM_STMT.search(head):
+        return NDM_WORDS
+    return ""
+
+
+def library_says(path: str, head: str, declared: Optional[str] = None) -> str:
+    """What the member's library says it holds, for how much the COBOL
+    statements must say (LESSONS 199): 'doc' - the kind declared for the
+    library, else its folder name, is doc, or a text with a document's
+    extension outside a dataset-named folder has a line of prose - where
+    a run book's PERFORM THE FOLLOWING STEPS or a design note's quoted
+    paragraph count for nothing; 'cards' - declared or named ctlcard (or
+    declared sched) - where two statement lines are needed, one of a form
+    no card language has; '' otherwise. 'cobol', the UI table's default,
+    says nothing."""
+    parent = os.path.basename(os.path.dirname(path))
+    said = declared if declared in DECLARABLE and declared != "cobol" else None
+    if said is None:
+        said = next((k for rx, k in DIR_HINTS if rx.search(parent)), None)
+        if (said is None and EXT_HINTS.get(os.path.splitext(path)[1].lower()) == "doc"
+                and not _DATASET_FOLDER.match(parent.upper()) and _PROSE.search(head)):
+            said = "doc"
+    return "doc" if said == "doc" else "cards" if said in ("ctlcard", "sched") else ""
+
+
+def statement_lines(head: str) -> Tuple[int, int]:
+    """(lines with a COBOL statement no other language has, lines with any
+    COBOL statement) in `head` (normalized) - every match starts a line."""
+    strong = {m.start() for m in _SIG_COBOL_PROC.finditer(head)}
+    if not strong:
+        return 0, 0
+    return len(strong), len(strong | {m.start() for m in _SIG_COBOL_SHARED.finditer(head)})
+
 # ---- the Assembler, listing and MFS shapes ---------------------------------
 #
 # The shape a REAL member of each of these kinds has and a COBOL copybook
@@ -200,13 +279,18 @@ _MFS_SHAPE = re.compile(r"^[A-Z@#$][A-Z0-9@#$]{0,7}[ \t]+(?:MSG|FMT|DEV|DFLD|MFL
                         r"|[ \t](?:MSG|DEV)[ \t]+TYPE=|[ \t]DFLD[ \t]+(?:POS|LTH)=|^[ \t]+(?:MSGEND|FMTEND)\b", re.I | re.M)
 MFS_SHAPES = "a labelled MSG / FMT / DEV / DFLD / MFLD, TYPE= / POS= / LTH= operands, MSGEND / FMTEND"
 # A compiler listing echoes the source: without this it is filed as a second copy of the program, with line-number
-# prefixes as fields - so it is looked for BEFORE the COBOL signatures. Its shape: the compiler's banner on a line
-# that is not a COBOL comment (a copybook's comment may name the compiler), a map heading at the start of a line
-# (a comment naming MODULE MAP is not one), or numbered source lines - the listing's line number, then the source
-# record with its OWN sequence number in columns 1-6: two numbers, where a plain source record has one (one line
-# at a time).
+# prefixes as fields - so it is looked for BEFORE the COBOL signatures. Its shape: the compiler's banner at the
+# start of a line (`1PP 5655-EC6 IBM Enterprise COBOL for z/OS ...`, the carriage control optional) or the source
+# heading `LineID PL SL`, a map heading at the start of a line (a comment naming MODULE MAP is not one), or
+# numbered source lines - the listing's line number, then the source record with its OWN sequence number in
+# columns 1-6: two numbers, where a plain source record has one (one line at a time). The compiler's name alone is
+# no banner: a program's `DISPLAY 'BUILT WITH IBM ENTERPRISE COBOL'` or a copybook's VALUE literal names it too
+# (LESSONS 199).
 _LISTING_SHAPE = re.compile(r"^[ 01\-+]?\s*\d{6}[^\s\d]*\s+\d{6}[ *\-/D]")
-_LISTING_HEAD = re.compile(r"^[ \t\f]*LineID[ \t]+PL[ \t]+SL\b|IBM Enterprise COBOL|^1?PP[ \t]+5655-", re.I | re.M)
+_LISTING_HEAD = re.compile(r"^[ \t\f]*LineID[ \t]+PL[ \t]+SL\b|^[ \t\f]*1?[ \t]*PP[ \t]+5655-", re.I | re.M)
+# ... and, in a text already known to be a listing (atlas.recover reading one: its page headers, its sections),
+# the compiler's name anywhere on a line counts as the banner as well
+_LISTING_BANNER = re.compile(r"^[ \t\f]*LineID[ \t]+PL[ \t]+SL\b|IBM Enterprise COBOL|^1?PP[ \t]+5655-", re.I | re.M)
 _LISTING_MAP = re.compile(r"^1?[ \t]*(?:DATA DIVISION MAP|MODULE MAP|CROSS REFERENCE TABLE)\b", re.I | re.M)
 LISTING_LINES = 3                                               # numbered source lines that make a listing
 LISTING_EXTS = (".lst", ".listing", ".sysprint")
@@ -219,6 +303,7 @@ WEAK_KINDS = ("asm", "listing", "mfs")
 DECLARABLE = ("cobol", "copybook", "jcl", "proc", "ctlcard", "dbd", "psb", "bms", "mfs", "csd", "imsgen", "sql",
               "listing", "doc", "sched")
 
+CARD_LINES = 2                                                  # COBOL statement lines a card library needs
 REASON_DATA = "COBOL level numbers with no PROCEDURE DIVISION"
 REASON_PROC = "COBOL procedure statements with no level numbers and no DIVISION header"
 REASON_ASM = "the shape of an Assembler member"
@@ -291,9 +376,24 @@ def cobol_proc_hit(head: str, shared: bool = False):
     return m
 
 
-def reading(path: str, head: str) -> Tuple[str, str, str]:
+def _cobol_statements(head: str, says: str) -> bool:
+    """Whether the COBOL statements in `head` (normalized) make it a
+    procedure copybook, before the Assembler shape, where the library says
+    `says` (library_says): never in a library of documents; in a library of
+    control cards, CARD_LINES lines of statements, one of a form no card
+    language has; elsewhere one statement of such a form."""
+    if says == "doc":
+        return False
+    if says != "cards":
+        return cobol_proc_hit(head) is not None
+    strong, lines = statement_lines(head)
+    return strong >= 1 and lines >= CARD_LINES and not _SIG_DIVISION.search(head)
+
+
+def reading(path: str, head: str, declared: Optional[str] = None) -> Tuple[str, str, str]:
     """(kind, reason, basis): what the text, the folder name and the
-    extension say, before any declared kind. `basis`: 'binary'; 'strong' (a
+    extension say, before any declared kind - which says only how much the
+    COBOL statements must say (library_says). `basis`: 'binary'; 'strong' (a
     JOB card, a PROC, stage-1, CSD, DBD, PSB, BMS, IDENTIFICATION DIVISION /
     PROGRAM-ID, a REXX header, CREATE TABLE, a JCL EXEC); 'cobol' (level
     numbers or COBOL statements: a copybook); 'weak' (the shape of an
@@ -328,43 +428,57 @@ def reading(path: str, head: str) -> Tuple[str, str, str]:
         return "listing", REASON_LISTING, "weak"
     if _SIG_COBOL.search(head) or _code_hit(_SIG_PROGRAM_ID, head):
         return "cobol", "IDENTIFICATION DIVISION / PROGRAM-ID", "strong"
-    if _code_hit(_SIG_REXX, head):
-        return "rexx", "REXX comment header", "strong"
+    # the REXX header opens the text; six blanks before it put the slash in column 7, where a COBOL comment has it:
+    # there the COBOL copybook's own lines decide first (a banner comment of a copybook), then it is the exec's header
+    rexx_after_cobol = False
+    rx = _SIG_REXX.search(head)
+    if rx:
+        if not _is_comment_line(_line_of(head, rx.start() + len(rx.group(0)) - len(rx.group(0).lstrip()))):
+            return "rexx", "REXX comment header", "strong"
+        rexx_after_cobol = True
     if _code_hit(_SIG_SQL_DDL, head):
         return "sql", "CREATE TABLE/VIEW", "strong"
     if _SIG_EXEC.search(head):
         return "jcl", "EXEC statement without a JOB card (JCL fragment)", "strong"
 
     # ---- a COBOL copybook by its own lines (ROADMAP re-parse items 20, 22) -
-    if _SIG_DATA_LEVEL.search(head):
-        return "copybook", REASON_DATA, "cobol"
-    if cobol_proc_hit(head):
-        return "copybook", REASON_PROC, "cobol"
+    # never an Easytrieve program or a Connect:Direct process; the COBOL statements say as much as the library
+    # lets them (library_says, LESSONS 199)
+    other = not_cobol(head)
+    says = "" if other else library_says(path, head, declared)
+    if not other:
+        if _SIG_DATA_LEVEL.search(head):
+            return "copybook", REASON_DATA, "cobol"
+        if _cobol_statements(head, says):
+            return "copybook", REASON_PROC, "cobol"
+    if rexx_after_cobol:
+        return "rexx", "REXX comment header", "strong"
 
     # ---- the Assembler and MFS shapes -------------------------------------
     if _ASM_SHAPE.search(head):
         return "asm", REASON_ASM, "weak"
-    if cobol_proc_hit(head, shared=True):
+    if not other and not says and cobol_proc_hit(head, shared=True):
         return "copybook", REASON_PROC, "cobol"
     if _MFS_SHAPE.search(head):
         return "mfs", REASON_MFS, "weak"
-    if _SIG_LEVEL_NUMBER.search(head):
+    if not other and not says and _SIG_LEVEL_NUMBER.search(head):
         return "copybook", REASON_DATA, "cobol"
+    also = f" - {other}, whose statements are not COBOL" if other else ""
 
     # ---- fall back to the library folder name -----------------------------
     for rx, kind in DIR_HINTS:
         if rx.search(parent):
-            return kind, f"library folder {parent}", "folder"
+            return kind, f"library folder {parent}{also}", "folder"
 
     # ---- last resort: the extension ---------------------------------------
     if ext in EXT_HINTS:
         if EXT_HINTS[ext] == "doc" and _DATASET_FOLDER.match(parent.upper()):
             # A .txt in PROD.CLAIMS.BIND is a mainframe member the toolkit
             # cannot type (BIND cards, DBRM, PL/I ...) - not a specification.
-            return "unknown", f"unrecognised member of library {parent} (extension {ext} ignored)", "none"
-        return EXT_HINTS[ext], f"extension {ext}", "extension"
+            return "unknown", f"unrecognised member of library {parent} (extension {ext} ignored){also}", "none"
+        return EXT_HINTS[ext], f"extension {ext}{also}", "extension"
 
-    return "unknown", "no signature, no library hint, no extension", "none"
+    return "unknown", f"no signature, no library hint, no extension{also}", "none"
 
 
 def declared_wins(kind: str, basis: str, declared: Optional[str]) -> bool:
@@ -387,13 +501,35 @@ def declared_wins(kind: str, basis: str, declared: Optional[str]) -> bool:
     return declared != "cobol" and basis in ("weak", "folder", "extension")
 
 
+def decide(path: str, head: str, declared: Optional[str] = None) -> Tuple[str, str, str, int]:
+    """(kind, reason, over, line): classify() and, when the kind declared
+    for the library replaced the shape of an Assembler, listing or MFS
+    member, that kind (`over`) and the line its shape is on - the build
+    keeps it beside the member (a 'declared_kind' row), so no page says a
+    program is whole over an Assembler member without saying so (LESSONS
+    199)."""
+    kind, reason, basis = reading(path, head, declared)
+    if declared_wins(kind, basis, declared):
+        parent = os.path.basename(os.path.dirname(path))
+        return (declared, (f"the kind declared for library {parent} in the UI's table"
+                           + ("" if basis == "none" else f", over {kind} ({reason})")),
+                kind if basis == "weak" else "", shape_line(kind, normalized(head)) if basis == "weak" else 0)
+    return kind, reason, "", 0
+
+
+def shape_line(kind: str, head: str) -> int:
+    """The line (1-based) of `head` (normalized) whose shape makes it an
+    Assembler, MFS or listing member, or 0."""
+    if kind == "listing":
+        hit = listing_hit(head)
+        return head.count("\n", 0, hit[0]) + 1 if hit else 0
+    rx = _ASM_SHAPE if kind == "asm" else _MFS_SHAPE if kind == "mfs" else None
+    m = rx.search(head) if rx else None
+    return head.count("\n", 0, m.start()) + 1 if m else 0
+
+
 def classify(path: str, head: str, ext_hint: Optional[str] = None, declared: Optional[str] = None) -> Tuple[str, str]:
     """Return (kind, reason). `head` is the first ~8KB of decoded text;
     `declared` the kind declared for the member's library in the UI's table
     (the build passes it; declared_wins() says when it counts)."""
-    kind, reason, basis = reading(path, head)
-    if declared_wins(kind, basis, declared):
-        parent = os.path.basename(os.path.dirname(path))
-        return declared, (f"the kind declared for library {parent} in the UI's table"
-                          + ("" if basis == "none" else f", over {kind} ({reason})"))
-    return kind, reason
+    return decide(path, head, declared)[:2]

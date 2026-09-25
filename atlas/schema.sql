@@ -861,5 +861,7 @@ CREATE TABLE IF NOT EXISTS build_run (
     failed      INTEGER,
     tool_version TEXT,
     fingerprint TEXT,                     -- sha256 of the parser source: a change re-parses everything
-    manifest_sha TEXT                     -- sha256 of the manifest used
+    manifest_sha TEXT,                    -- sha256 of the manifest used
+    declared_kinds TEXT                   -- JSON {library folder: kind} the inventory typed members with (the
+                                          -- manifest kinds): a declared kind told from a rule of the build's own
 );

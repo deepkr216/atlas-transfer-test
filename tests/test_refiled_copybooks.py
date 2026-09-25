@@ -1157,9 +1157,17 @@ class TheVerdict(unittest.TestCase):
         a = self.path("PROD.GC.MISC", ASMBK, "ASMBK.txt")
         with open(a, "rb") as fh:
             asha = hashlib.sha256(fh.read()).hexdigest()
-        r = recover.how_classified(a, "proc", asha)
-        self.assertEqual((r["by"], r["over"]), ("declared", "weak"))
+        # over a shape: 'declared' only when the kinds the index was built with say so (LESSONS 199) - with none
+        # declared, or with the declared kinds unknown, the build's own rule (or an older classifier) did it
+        r = recover.how_classified(a, "proc", asha, {"PROD.GC.MISC": "proc"})
+        self.assertEqual((r["by"], r["over"], r["declared_known"]), ("declared", "weak", True))
+        for declared in ({}, {"PROD.GC.OTHER": "proc"}, None):
+            r = recover.how_classified(a, "proc", asha, declared)
+            self.assertEqual((r["by"], r["declared_known"]), ("build", declared is not None), declared)
         self.assertEqual(recover.how_classified(a, "cobol", asha)["by"], "build")
+        # over 'unknown' with the declared kinds known: 'declared' only for the library declared so
+        self.assertEqual(recover.how_classified(p, "proc", sha, {"PROD.GC.MISC": "proc"})["by"], "declared")
+        self.assertEqual(recover.how_classified(p, "proc", sha, {})["by"], "build")
         # the same bytes, a kind the table cannot declare: a rule of the build's own
         r = recover.how_classified(p, "binary", sha)
         self.assertEqual(r["by"], "build")
