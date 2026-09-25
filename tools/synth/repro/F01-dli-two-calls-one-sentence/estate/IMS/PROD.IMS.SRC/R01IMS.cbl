@@ -1,0 +1,19 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. R01IMS.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01  WS-GU            PIC X(04) VALUE 'GU  '.
+       01  WS-CHKP          PIC X(04) VALUE 'CHKP'.
+       01  WS-CHKP-ID       PIC X(08) VALUE 'R01IMS01'.
+       01  WS-ROOT-AREA     PIC X(120).
+       LINKAGE SECTION.
+       01  IO-PCB           PIC X(40).
+       01  DB-PCB           PIC X(40).
+       PROCEDURE DIVISION
+USING IO-PCB DB-PCB.
+       0000-MAIN.
+           MOVE SPACES TO WS-ROOT-AREA
+           CALL 'CBLTDLI' USING WS-GU DB-PCB WS-ROOT-AREA
+           DISPLAY 'READ ONE'
+           CALL 'CBLTDLI' USING WS-CHKP IO-PCB WS-CHKP-ID
+           GOBACK.

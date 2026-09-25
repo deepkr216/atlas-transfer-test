@@ -1,0 +1,8 @@
+//R13FTP   JOB  (ACCT),'FTP',CLASS=A,MSGCLASS=X
+//FTP010   EXEC PGM=FTP,PARM='PEERHOST (EXIT'
+//SYSPRINT DD   SYSOUT=*
+//INPUT    DD   *
+put 'STG.R13.EXTRACT' extract.txt
+quit
+/*
+//

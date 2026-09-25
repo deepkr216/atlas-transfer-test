@@ -1,0 +1,12 @@
+{
+ "title": "a SELECT file name and an intrinsic FUNCTION name are recorded as field references",
+ "recover": false,
+ "checks": [
+  {
+   "sql": "SELECT COUNT(*) FROM field_ref WHERE name IN ('IN-FILE','INTEGER-OF-DATE')",
+   "truth": 0,
+   "symptom": 3,
+   "scalar": true
+  }
+ ]
+}

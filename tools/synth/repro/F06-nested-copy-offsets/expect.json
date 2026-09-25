@@ -1,0 +1,24 @@
+{
+ "title": "a copybook that COPYs another: the copybook's own layout ignores the nested bytes (the program's view is right)",
+ "recover": false,
+ "checks": [
+  {
+   "sql": "SELECT offset FROM field f JOIN member m ON m.id=f.member_id WHERE m.name='R06OUTER' AND f.name='R06-AFTER'",
+   "truth": 35,
+   "symptom": 10
+  },
+  {
+   "sql": "SELECT offset FROM pfield f JOIN program p ON p.id=f.program_id WHERE p.program_id='R06PGM' AND f.name='R06-AFTER'",
+   "truth": 35,
+   "symptom": 35
+  },
+  {
+   "query": [
+    "layout",
+    "R06OUTER"
+   ],
+   "truth_has": "    35    5   5  R06-AFTER",
+   "symptom_has": "    10    5   5  R06-AFTER"
+  }
+ ]
+}

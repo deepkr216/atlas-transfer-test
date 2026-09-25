@@ -1272,10 +1272,8 @@ class Checker:
             mem, _, line = cite.partition(":")
             if mem != proc:
                 self.find("jcl", "job", f"{name} {step}", f"cited to the PROC member {proc}", f"cited `{cite}`", facts=1, severity="cite")
-            elif mem == name:
-                # PROC named like the job: the gate cannot tell which member `NAME:line` means (no (kind))
-                self.find("gate", "job / program (Runs in)", f"{name} {step}", f"a cite the gate can resolve: `{proc}(proc):{line}`",
-                          f"`{cite}` - the job and the PROC share the name; the gate takes the jcl member first", facts=1, severity="cite")
+            else:
+                self.ok("job: effective step cited to its PROC member")
 
     # ---- copybook report
     def report_copybook(self, name: str) -> None:
@@ -1727,9 +1725,13 @@ class Checker:
             self.find("gate", "verify_citations", "a cite with a token the line does not hold", "FAIL", "verified", facts=1)
         else:
             self.ok("gate: wrong cite rejected")
-        if re.search(r"POLNIGHT 3 .*(FAIL|not found|does not)", outp) or ("POLNIGHT 3" in outp and "FAIL" in outp):
-            self.find("gate", "verify_citations", "[[POLNIGHT 3 \"PGM=POLUPD01\"]] - the cite `program` and `job` print for a PROC step",
-                      "verified (the PROC member's line 3 holds PGM=POLUPD01)", "FAIL: the gate reads POLNIGHT as the JCL member (jcl before proc)", facts=1, severity="cite")
+        # a name shared by the job and its PROC: the gate must pick the member whose line holds the token
+        for line_ in outp.splitlines():
+            if "POLNIGHT 3-3" in line_ and '"PGM=POLUPD01"' in line_:
+                if line_.startswith("PASS"):
+                    self.ok("gate: a job/PROC name resolved by the token")
+                else:
+                    self.find("gate", "verify_citations", "[[POLNIGHT 3 \"PGM=POLUPD01\"]]", "PASS (the PROC's line 3 holds the token)", line_[:160], facts=1, severity="cite")
         self.gate_out = outp
 
     # ------------------------------------------------------------ report
@@ -1745,9 +1747,13 @@ class Checker:
                 seen[k] = f
         # group identical shapes (same module+command+truth pattern) into one row with a count
         grouped: Dict[str, List[Finding]] = defaultdict(list)
+
+        def norm(x: str) -> str:
+            x = re.sub(r"'[^']*'", "'L'", x)
+            x = re.sub(r"[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)+|[A-Z][A-Z0-9]{3,}(?:\.[A-Z0-9_]+)*", "NAME", x)
+            return re.sub(r"\d+", "N", x)[:80]
         for f in seen.values():
-            pat = re.sub(r"\d+", "N", f.truth)[:70]
-            grouped[f"{f.module}|{f.command}|{f.severity}|{pat}"].append(f)
+            grouped[f"{f.module}|{f.command}|{f.severity}|{norm(f.truth)}|{norm(f.tool)[:40]}"].append(f)
         rows = []
         for key, fs in grouped.items():
             facts = sum(x.facts for x in fs)

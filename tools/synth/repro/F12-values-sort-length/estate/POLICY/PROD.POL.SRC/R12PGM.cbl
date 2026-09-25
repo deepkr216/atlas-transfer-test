@@ -1,0 +1,12 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. R12PGM.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01  R12-RECORD.
+           COPY R12REC.
+       PROCEDURE DIVISION.
+       0000-MAIN.
+           IF R12-ACTIVE
+               DISPLAY 'ACTIVE'
+           END-IF
+           GOBACK.

@@ -1,0 +1,13 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. R16CIC.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01  WS-COMM          PIC X(100).
+       COPY DFHAID.
+       PROCEDURE DIVISION.
+       0000-MAIN.
+           IF EIBAID = DFHENTER
+               DISPLAY 'ENTER'
+           END-IF
+           EXEC CICS RETURN END-EXEC
+           GOBACK.

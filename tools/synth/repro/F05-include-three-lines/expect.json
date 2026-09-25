@@ -1,0 +1,21 @@
+{
+ "title": "EXEC SQL INCLUDE written on three lines (EXEC SQL / INCLUDE name / END-EXEC.) is not expanded",
+ "recover": false,
+ "checks": [
+  {
+   "sql": "SELECT COUNT(*) FROM copy_use c JOIN member m ON m.id=c.member_id WHERE m.name='R05INC' AND c.copybook='R05TBL'",
+   "truth": 1,
+   "symptom": 0
+  },
+  {
+   "sql": "SELECT COUNT(*) FROM copy_use c JOIN member m ON m.id=c.member_id WHERE m.name='R05ONE' AND c.copybook='R05TBL'",
+   "truth": 1,
+   "symptom": 1
+  },
+  {
+   "sql": "SELECT COUNT(*) FROM pfield f JOIN program p ON p.id=f.program_id WHERE p.program_id='R05INC' AND f.name='STATUS-CD'",
+   "truth": 1,
+   "symptom": 0
+  }
+ ]
+}

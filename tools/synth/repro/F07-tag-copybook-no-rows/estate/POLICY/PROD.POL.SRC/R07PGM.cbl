@@ -1,0 +1,16 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. R07PGM.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01  WS-GU            PIC X(04) VALUE 'GU  '.
+       01  WS-AREA          PIC X(120).
+       LINKAGE SECTION.
+       COPY R07PCB REPLACING ==:PCB:== BY ==POL==.
+       PROCEDURE DIVISION
+USING POL-PCB.
+       0000-MAIN.
+           CALL 'CBLTDLI' USING WS-GU POL-PCB WS-AREA
+           IF POL-END-OF-DB
+               DISPLAY 'END'
+           END-IF
+           GOBACK.

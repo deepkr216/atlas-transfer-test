@@ -946,8 +946,9 @@ def onl01(estate, sys_: str) -> ProgramBuilder:
     pb.para("0000-MAIN")
     pb.if_open("EIBCALEN = 0", tests=["EIBCALEN"])
     pb.cics("SEND", f"MAP('{map1}') MAPSET('{mapset}') MAPONLY ERASE", "map", f"{mapset}.{map1}", "out", indent=4)
-    pb.cics("RETURN", f"TRANSID('{s3}1') COMMAREA({pa}-COMMAREA) LENGTH(100)", "transid", f"{s3}1", None, indent=4,
-            fields_out=[f"{pa}-COMMAREA"])
+    n = pb.cics("RETURN", f"TRANSID('{s3}1') COMMAREA({pa}-COMMAREA) LENGTH(100)", "transid", f"{s3}1", None, indent=4,
+                fields_out=[f"{pa}-COMMAREA"])
+    pb.fact("call", n, kind="cics_return", target=f"{s3}1", using=[], returning=None, exists=True)
     pb.end_if()
     pb.end_stmt()
     pb.cics("RECEIVE", f"MAP('{map1}') MAPSET('{mapset}') INTO({map1}I) RESP(WS-RESP)", "map", f"{mapset}.{map1}", "in",
@@ -960,9 +961,9 @@ def onl01(estate, sys_: str) -> ProgramBuilder:
     pb.move(f"{pm}-LAST-NAME", ["NAMEO"], indent=4)
     pb.move(f"{pm}-{c['amts'][0]}", ["AMOUNTO"], indent=4)
     pb.move_lit("I", [f"{pa}-FUNCTION"], indent=4)
-    pb.cics("LINK", f"PROGRAM('{s3}ONL02') COMMAREA({pa}-COMMAREA) LENGTH(LENGTH OF {pa}-COMMAREA)", "program", f"{s3}ONL02", None,
-            indent=4, fields_out=[f"{pa}-COMMAREA"])
-    pb.fact("call", pb.em.n - 1, kind="cics_link", target=f"{s3}ONL02", using=[f"{pa}-COMMAREA"], returning=None, exists=True)
+    n = pb.cics("LINK", f"PROGRAM('{s3}ONL02') COMMAREA({pa}-COMMAREA) LENGTH(LENGTH OF {pa}-COMMAREA)", "program", f"{s3}ONL02", None,
+                indent=4, fields_out=[f"{pa}-COMMAREA"])
+    pb.fact("call", n, kind="cics_link", target=f"{s3}ONL02", using=[f"{pa}-COMMAREA"], returning=None, exists=True)
     pb.move(f"{pa}-MESSAGE", ["ERRMSGO"], indent=4)
     pb.else_()
     pb.move_lit(f"{key.replace('-', ' ')} NOT FOUND ON THE MASTER FILE", ["ERRMSGO"], indent=4)
@@ -971,15 +972,15 @@ def onl01(estate, sys_: str) -> ProgramBuilder:
     pb.end_stmt()
     pb.cics("SEND", f"MAP('{map1}') MAPSET('{mapset}') FROM({map1}O) ERASE", "map", f"{mapset}.{map1}", "out", fields_out=[f"{map1}O"])
     if sys_ == "CLAIMS":
-        pb.cics("START", f"TRANSID('{s3}2') INTERVAL(0)", "transid", f"{s3}2", None)
-        pb.fact("call", pb.em.n - 1, kind="cics_start", target=f"{s3}2", using=[], returning=None, exists=True)
+        n = pb.cics("START", f"TRANSID('{s3}2') INTERVAL(0)", "transid", f"{s3}2", None)
+        pb.fact("call", n, kind="cics_start", target=f"{s3}2", using=[], returning=None, exists=True)
     if sys_ == "BILLING":
-        pb.cics("XCTL", f"PROGRAM(WS-NEXT-PGM) COMMAREA({pa}-COMMAREA) LENGTH(100)", "program", f"{s3}ONL02", None,
-                fields_out=[f"{pa}-COMMAREA"])
-        pb.fact("call", pb.em.n - 1, kind="cics_xctl", target=None, via_var="WS-NEXT-PGM", using=[f"{pa}-COMMAREA"],
+        n = pb.cics("XCTL", f"PROGRAM(WS-NEXT-PGM) COMMAREA({pa}-COMMAREA) LENGTH(100)", "program", f"{s3}ONL02", None,
+                    fields_out=[f"{pa}-COMMAREA"])
+        pb.fact("call", n, kind="cics_xctl", target=None, via_var="WS-NEXT-PGM", using=[f"{pa}-COMMAREA"],
                 resolved=[f"{s3}ONL02"], resolution="value_clause")
-    pb.cics("RETURN", f"TRANSID('{s3}1') COMMAREA({pa}-COMMAREA) LENGTH(100)", "transid", f"{s3}1", None, fields_out=[f"{pa}-COMMAREA"])
-    pb.fact("call", pb.em.n - 1, kind="cics_return", target=f"{s3}1", using=[], returning=None, exists=True)
+    n = pb.cics("RETURN", f"TRANSID('{s3}1') COMMAREA({pa}-COMMAREA) LENGTH(100)", "transid", f"{s3}1", None, fields_out=[f"{pa}-COMMAREA"])
+    pb.fact("call", n, kind="cics_return", target=f"{s3}1", using=[], returning=None, exists=True)
     pb.stmt("GOBACK.")
     return pb
 

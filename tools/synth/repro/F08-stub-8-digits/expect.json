@@ -1,0 +1,21 @@
+{
+ "title": "a stub of 8-digit numbers is filed as a copybook and, once expanded, erases the program's procedure division silently",
+ "recover": false,
+ "checks": [
+  {
+   "sql": "SELECT kind FROM member WHERE name='R08STUB'",
+   "truth": "empty",
+   "symptom": "copybook"
+  },
+  {
+   "sql": "SELECT COUNT(*) FROM paragraph",
+   "truth": 2,
+   "symptom": 0
+  },
+  {
+   "sql": "SELECT parse_status FROM member WHERE name='R08PGM'",
+   "truth": "partial",
+   "symptom": "ok"
+  }
+ ]
+}

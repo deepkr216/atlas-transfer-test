@@ -262,9 +262,10 @@ class ProgramBuilder:
             # `COPY BOOK REPLACING ==A.== BY ==B.==` on the first record - a period inside the pseudo-text -
             # and the next pair with the statement's own period on the next record (LESSONS 190)
             first = replacing[0]
-            n = self.line(self.AREA_B, f"COPY {name_txt} REPLACING {first.text()}")
-            rest = " ".join(r.text() for r in replacing[1:])
-            self.line(self.AREA_B + 4, rest + ".")
+            dot = "." if first.kind == "name_dot" else ""
+            n = self.line(self.AREA_B, f"COPY {name_txt} REPLACING =={first.src}{dot}== BY")
+            rest = f"=={first.dst}{dot}== " + " ".join(r.text() for r in replacing[1:])
+            self.line(self.AREA_B + 4, rest.rstrip() + ".")
         else:
             txt = f"COPY {name_txt}"
             if of_lib:
@@ -331,11 +332,14 @@ class ProgramBuilder:
         col = self.AREA_B + indent
         return self.wrap(col, text, cont_col=col + 4)
 
+    FIGURATIVE = {"SPACE", "SPACES", "ZERO", "ZEROS", "ZEROES", "LOW-VALUE", "LOW-VALUES", "HIGH-VALUE", "HIGH-VALUES",
+                  "TRUE", "FALSE", "OTHER", "NULL", "NULLS", "QUOTE", "QUOTES", "ALL"}
+
     def _refs(self, line: int, names: Sequence[str], mode: str, stmt: str) -> None:
         for nm in names:
             base = nm.split("(")[0].strip()
             base = base.split(" OF ")[0].strip()
-            if base and base[0].isalpha():
+            if base and base[0].isalpha() and base.upper() not in self.FIGURATIVE:
                 self.fact("ref", line, name=base, mode=mode, stmt=stmt)
 
     # statements -----------------------------------------------------------
@@ -467,7 +471,10 @@ class ProgramBuilder:
     def when(self, value: str, indent: int = 4, lit: Optional[str] = None) -> int:
         n = self.stmt(f"WHEN {value}", indent)
         if lit is not None:
-            self.fact("literal", n, literal=lit, context="when", field=getattr(self, "_eval_subject", None))
+            # `WHEN X = 'lit'` under EVALUATE TRUE names its own field; `WHEN 'lit'` the subject's
+            m = re.match(r"^\s*([A-Z0-9-]+)\s*=\s*", value)
+            fld = m.group(1) if m else getattr(self, "_eval_subject", None)
+            self.fact("literal", n, literal=lit, context="when", field=fld)
         return n
 
     def end_evaluate(self, indent: int = 0) -> int:

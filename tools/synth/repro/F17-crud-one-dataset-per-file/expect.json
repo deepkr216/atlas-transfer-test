@@ -1,0 +1,15 @@
+{
+ "title": "`crud --job` shows one dataset per file: a program two jobs run with different datasets is shown with the other job's",
+ "recover": false,
+ "checks": [
+  {
+   "query": [
+    "crud",
+    "--job",
+    "R17JOBB"
+   ],
+   "truth_has": "PROD.R17.WEEKLY",
+   "symptom_has": "PROD.R17.DAILY"
+  }
+ ]
+}

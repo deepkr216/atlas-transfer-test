@@ -1,0 +1,14 @@
+{
+ "title": "`interfaces` lists every FTP put twice",
+ "recover": false,
+ "checks": [
+  {
+   "query": [
+    "interfaces"
+   ],
+   "count": "| ftp |",
+   "truth": 1,
+   "symptom": 2
+  }
+ ]
+}

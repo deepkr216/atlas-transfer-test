@@ -1,0 +1,21 @@
+{
+ "title": "EXEC SQL statements in one sentence are cited at the sentence's first line (statements and host-variable references)",
+ "recover": false,
+ "checks": [
+  {
+   "sql": "SELECT start_line FROM sql_stmt WHERE stmt_type='UPDATE'",
+   "truth": 15,
+   "symptom": 10
+  },
+  {
+   "sql": "SELECT start_line FROM sql_stmt WHERE stmt_type='SELECT'",
+   "truth": 11,
+   "symptom": 10
+  },
+  {
+   "sql": "SELECT MIN(line) FROM field_ref WHERE name='WS-AMT' AND mode='write'",
+   "truth": 11,
+   "symptom": 10
+  }
+ ]
+}

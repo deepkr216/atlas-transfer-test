@@ -1,0 +1,19 @@
+{
+ "title": "a (+1) generation created by an earlier step and named (+1) again in a later step of the same job is recorded as a second writer",
+ "recover": false,
+ "checks": [
+  {
+   "sql": "SELECT d.mode FROM dd d JOIN step s ON s.id=d.step_id WHERE s.step_name='STEP020' AND d.dd_name='SORTIN'",
+   "truth": "input",
+   "symptom": "output"
+  },
+  {
+   "query": [
+    "dataset",
+    "PROD.R09.EXTRACT"
+   ],
+   "truth_has": "| input [gdg_relative] | POLICY | *SORT* |",
+   "symptom_has": "| output [gdg_relative] | POLICY | *SORT* |"
+  }
+ ]
+}
