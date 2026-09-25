@@ -87,10 +87,12 @@ it (`zowe.daemon: "window"`; tick **Zowe daemon off** only if zowe hangs).
 word for word; **Check Zowe** lists the configuration files zowe finds from
 that folder (paths only, never a value) or says in words that it found none.
 
-Re-indexing is **incremental**: unchanged members keep their facts, a changed
-copybook forces every program that expands it to be re-parsed, and members
-that disappeared are pruned. A full estate re-run after a small change takes
-seconds, not minutes.
+Re-indexing is **incremental**: unchanged members keep their facts, a
+member a COPY can expand (filed copybook, cobol, sql or unknown) that
+arrives, changes, disappears or is filed as another kind forces every
+program that copies it to be re-parsed, and members that disappeared are
+pruned - an incremental build gives what a full one would. A full estate
+re-run after a small change takes seconds, not minutes.
 
 ### When zowe asks for a host, a user or a password
 
@@ -461,10 +463,12 @@ where they differ the copy without a REPLACING clause wins, then the most
 common, and the report `work\recover.md` says so); when two systems hold
 different texts each system gets its own copy under its own folder. When
 the real copybook arrives in the estate the recovered one is removed on the
-next run and the programs that had expanded it are parsed again. The same
-run marks for the next build every program that still says `COPY X NOT
-FOUND` although a member named X has arrived since it was parsed (a member
-typed `unknown` by its folder name forces no re-parse by itself), and names
+next run and the programs that had expanded it are parsed again. On an index
+built before ROADMAP re-parse item 21, the same run marks for the next build
+every program that still says `COPY X NOT FOUND` although a member named X
+has arrived since it was parsed (that build did not parse them again for a
+member typed `unknown` by its folder name; the build of this toolkit does),
+and on any index it names
 in `work\recover.md` every copybook whose only member is filed as a kind the
 build never expands, with what to do (`coverage`, `program` and `copybook`
 say the same beside each such NOT FOUND). A COBOL copybook is typed by its own
