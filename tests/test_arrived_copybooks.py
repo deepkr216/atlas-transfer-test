@@ -13,16 +13,18 @@ types a procedure copybook by its COBOL statements, before the folder name:
 PROCBOOK arriving in a dataset-named folder or in a PROCS folder is now a
 copybook and the build makes its programs whole at once (cases A and B,
 the first test of each). A copybook with no signature even now - LITBOOK,
-a literal copied into a VALUE clause - still takes its folder's kind, and
-the two mechanisms below still hold for it (the other tests of cases A and
-B); the first is ROADMAP re-parse item 21, still open:
+a literal copied into a VALUE clause, or a procedure copybook written in
+lower case - still takes its folder's kind:
 
   * in a dataset-named folder with no COPY hint the member is 'unknown' - a
-    kind the resolver accepts - but the build re-parses the copiers of a NEW
-    member only when it is filed as copybook or cobol, so nothing parsed the
-    program again (case A: recover marks it now; and an 'unknown' member has
-    no handler, so its own lines are not indexed until the folder is renamed
-    - the note says so);
+    kind the resolver accepts. The build before ROADMAP re-parse item 21
+    re-parsed the copiers of a NEW member only when it was filed as copybook
+    or cobol, so nothing parsed the program again; the build of this batch
+    parses them again for every kind the resolver expands (case A, the
+    tests on a fresh build). recover's stand-in - it marks such a program -
+    is pinned on an index built by the earlier rule (build_before_item_21,
+    the tests named so); an 'unknown' member has no handler, so its own
+    lines are not indexed until the folder is renamed - the note says so;
   * in a PROCS / CNTL / plain folder the member is a proc / ctlcard / doc -
     kinds the resolver never looks at - so no re-parse would find it (case
     B: recover names it with the fix, coverage / program / copybook say so).
@@ -55,11 +57,29 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 
 from atlas import build, query, recover  # noqa: E402
+
+
+def earlier_rule(existing, found):
+    """build.py's forcing before ROADMAP re-parse item 21 (`changed_names`): the names of the members new or with
+    changed bytes that are filed copybook or cobol - nothing for one filed sql or unknown, one that went from disk,
+    or one re-typed out of those kinds."""
+    return {f[1] for f in found if (f[0] not in existing or existing[f[0]][1] != f[5]) and f[2] in ("copybook", "cobol")}
+
+
+@contextlib.contextmanager
+def build_before_item_21():
+    """A build that forces what the build before ROADMAP re-parse item 21 forced: the index it leaves is the one
+    his estate holds until the re-parse night, which the stand-ins (recover's arrived step, the un-linked 'ok'
+    note) are written for."""
+    with mock.patch.object(build, "moved_names", earlier_rule):
+        yield
+
 
 HEAD = ("       IDENTIFICATION DIVISION.\n       PROGRAM-ID. {name}.\n"
         "       DATA DIVISION.\n       WORKING-STORAGE SECTION.\n"
@@ -81,6 +101,9 @@ INBOOK = ("       A-150-SUB.\n           MOVE 2 TO WS-Y.\n")
 LITBOOK = "      * THE STATE CODES, COPIED INTO A VALUE CLAUSE\n               'NYNJCTPAMA'.\n"
 # a data copybook that copies LITBOOK into a VALUE clause (LESSONS 184 with a member of no signature)
 OUTLIT = "           05  OUT-STATES          PIC X(10) VALUE\n           COPY LITBOOK.\n"
+# a procedure copybook written in lower case: the COBOL-statement signature (ROADMAP re-parse item 20) reads upper
+# case, so it has none - 'unknown' in a dataset-named folder with no COPY hint (ROADMAP re-parse item 21's case)
+PROCLOW = "       a-110-do.\n           move 1 to ws-x.\n       a-199-exit.\n           exit.\n"
 # a copybook copying itself: the expander skips the inner COPY as recursive (LESSONS 185)
 RECBOOK = ("       R-110-DO.\n           MOVE 1 TO WS-X.\n           COPY RECBOOK.\n       R-199-EXIT.\n           EXIT.\n")
 
@@ -155,6 +178,15 @@ class _Estate(unittest.TestCase):
         with open(self.report, encoding="utf-8") as fh:
             return fh.read()
 
+    def age_fingerprint(self):
+        """The index's last build recorded as an older toolkit's, as his index is before the re-parse night."""
+        conn = sqlite3.connect(self.db)
+        try:
+            conn.execute("UPDATE build_run SET fingerprint='an older toolkit'")
+            conn.commit()
+        finally:
+            conn.close()
+
     def q(self, sql, *args):
         conn = sqlite3.connect(self.db)
         try:
@@ -209,8 +241,10 @@ class _Estate(unittest.TestCase):
 class ArrivedAfterTheParse(_Estate):
     """Case A: a copybook lands in estate\\SHARED\\PROD.GC.CPYLIB - a dataset-named folder with no COPY hint -
     after the programs that copy it were parsed. PROCBOOK (COBOL statements) is a copybook by its content now
-    and the build makes SECPGM whole at once (ROADMAP re-parse item 20); LITBOOK (no signature) is filed
-    'unknown', which forces no re-parse (item 21): recover marks VALPGM."""
+    and the build makes SECPGM whole at once (ROADMAP re-parse item 20); LITBOOK (no signature) and PROCLOW (a
+    procedure copybook in lower case) are filed 'unknown', a kind the resolver expands, and the build of this batch
+    parses their programs again too (item 21). On an index the earlier rule built, the programs stayed partial
+    and recover marks them (the tests named 'before the batch')."""
 
     def first_files(self):
         self.write("GC/PROD.GC.SRC/SECPGM.cbl", program())
@@ -236,12 +270,70 @@ class ArrivedAfterTheParse(_Estate):
         self.assertEqual((stats["arrived"], stats["misfiled"], stats["marked"]), (0, 0, 0), said)
         self.assertNotIn("PROCBOOK", said)
 
-    def test_the_incremental_build_leaves_the_program_partial_until_recover_marks_it(self):
+    def test_a_copybook_arriving_unknown_makes_its_program_whole_at_the_next_build(self):
+        # ROADMAP re-parse item 21 (LESSONS 183): LITBOOK is filed 'unknown' - a kind the resolver expands - and the
+        # incremental build parses VALPGM again: whole, its COPY row linked, the literal in its field
         self.assert_parsed_without_the_book("VALPGM", "LITBOOK")
+        secpgm = self.member_id("SECPGM")
         self.write("SHARED/PROD.GC.CPYLIB/LITBOOK.txt", LITBOOK)
         self.build()
-        # ROADMAP re-parse item 21: the member is in the index, of a kind the resolver accepts, and the program
-        # that copies it was not parsed again - coverage still says NOT FOUND
+        self.assertEqual(self.book("LITBOOK"), [("unknown", "PROD.GC.CPYLIB")])
+        self.assertEqual(self.status("VALPGM"), "ok")
+        self.assertEqual(self.copy_use("LITBOOK", "VALPGM"), [(self.member_id("LITBOOK", "unknown"),)])
+        self.assertIn(("NYNJCTPAMA",), self.q("SELECT l.literal FROM literal_ref l JOIN member m ON m.id=l.member_id "
+                                              "WHERE m.name='VALPGM'"))
+        self.assertEqual(self.member_id("SECPGM"), secpgm, "a program copying nothing that moved is kept as it was")
+        self.assertEqual(self.status(), "partial", "SECPGM's PROCBOOK is still missing")
+        # the stand-ins have nothing to say: no 'parsed before it arrived', nothing arrived, nothing un-linked
+        cov, nf, prog, book = self.outputs("VALPGM", "LITBOOK")
+        self.assertNotIn("LITBOOK", nf)
+        self.assertNotIn("NOT FOUND", prog)
+        self.assertNotIn("still say", book)
+        self.assertNotIn("parsed before it arrived", cov)
+        self.assertNotIn("A copybook marked `yes`", cov)
+        self.assertNotIn("Not counted above", cov)
+        conn = query.connect(self.db)
+        try:
+            self.assertEqual(recover.arrived_copybooks(conn), ([], []))
+            self.assertEqual(recover.unlinked_ok_programs(conn), {})
+            self.assertEqual(recover.missing_copybooks(conn), {"PROCBOOK": 1})
+            self.assertEqual(query.same_named_note(conn, "PROCBOOK"), "")
+        finally:
+            conn.close()
+        stats, said = self.recover()
+        self.assertEqual((stats["arrived"], stats["misfiled"], stats["waiting"], stats["marked"]), (0, 0, 0, 0), said)
+        self.assertNotIn("has arrived since", said)
+        self.assertNotIn("LITBOOK", said)
+        self.assertNotIn("arrived after the program was parsed", self.report_text())
+        # settled: a further build parses nothing again
+        before = self.ids()
+        self.build()
+        self.assertEqual(self.ids(), before)
+
+    def test_a_procedure_copybook_in_lower_case_arriving_unknown_is_expanded_at_the_next_build(self):
+        # the COBOL-statement signature reads upper case: PROCLOW has none and is filed 'unknown' in a folder with
+        # no COPY hint - the build parses LOWPGM again and its section holds the copybook's paragraphs
+        self.write("GC/PROD.GC.SRC/LOWPGM.cbl", program("LOWPGM", book="PROCLOW"))
+        self.build()
+        self.assertEqual(self.status("LOWPGM"), "partial")
+        self.write("SHARED/PROD.GC.CPYLIB/PROCLOW.txt", PROCLOW)
+        self.build()
+        self.assertEqual(self.book("PROCLOW"), [("unknown", "PROD.GC.CPYLIB")])
+        self.assertEqual(self.status("LOWPGM"), "ok")
+        self.assertEqual(self.copy_use("PROCLOW", "LOWPGM"), [(self.member_id("PROCLOW", "unknown"),)])
+        paras = [(p[0].upper(), p[1], p[2].upper()) for p in self.paragraphs("LOWPGM")]
+        self.assertIn(("A-110-DO", "paragraph", "A-100-BEGIN"), paras)
+        self.assertIn(("A-199-EXIT", "paragraph", "A-100-BEGIN"), paras)
+        stats, said = self.recover()
+        self.assertEqual((stats["arrived"], stats["marked"]), (0, 0), said)
+
+    def test_before_the_batch_the_build_left_the_program_partial_and_recover_marks_it(self):
+        self.assert_parsed_without_the_book("VALPGM", "LITBOOK")
+        self.write("SHARED/PROD.GC.CPYLIB/LITBOOK.txt", LITBOOK)
+        with build_before_item_21():
+            self.build()
+        # the earlier rule (ROADMAP re-parse item 21): the member is in the index, of a kind the resolver accepts, and
+        # the program that copies it was not parsed again - coverage still says NOT FOUND
         self.assertEqual(self.book("LITBOOK"), [("unknown", "PROD.GC.CPYLIB")])
         self.assertEqual(self.status("VALPGM"), "partial")
         self.assertEqual(self.copy_use("LITBOOK", "VALPGM"), [(None,)])
@@ -249,13 +341,19 @@ class ArrivedAfterTheParse(_Estate):
         # the note says the whole fix: recover + build, AND the folder rename - an 'unknown' member has no
         # handler, so its own lines are not in the index until it is filed as a copybook (LESSONS 184)
         self.assertIn(f"| LITBOOK | 1 | yes: PROD.GC.CPYLIB (unknown) - {ARRIVED}{UNKNOWN_FIX} |", nf)
-        self.assertIn("A copybook marked `yes` is not missing", cov)
+        self.assertIn("A copybook marked `yes` is not missing - a member with its name is in the index. Either the programs "
+                      "that copy it were parsed before it arrived and nothing parsed them again (the build that made this "
+                      "index parsed them again only for a member filed copybook or cobol - ROADMAP re-parse item 21)", cov)
+        self.assertIn("A member filed `unknown` is expanded but has no parser of its own", cov)
         self.assertIn("1 of the copybooks reported NOT FOUND has a member with that name in the index now", cov)
         self.assertNotIn("0 exist", cov, "a zero-count clause with an instruction attached")
         self.assertIn(f"| LITBOOK | **NOT FOUND** - a member with this name exists: PROD.GC.CPYLIB (unknown) - {ARRIVED}"
                       f"{UNKNOWN_FIX} |", prog)
         self.assertIn("1 of the programs above still say", book)
-        self.assertIn("parsed before this member arrived and nothing parsed them again", book)
+        self.assertIn("parsed before this member arrived and nothing parsed them again - the build that made this index "
+                      "parsed the programs again only for a member filed copybook or cobol, and this one is filed `unknown` "
+                      "(ROADMAP re-parse item 21).", book)
+        self.assertNotIn("forces no re-parse", book, "the build of this toolkit does parse them again")
         self.assertIn("`python -m atlas.recover --db atlas.db` marks them, then run your usual build" + UNKNOWN_FIX, book)
         # a dry run reports and marks nothing
         stats, said = self.recover(dry_run=True)
@@ -280,6 +378,12 @@ class ArrivedAfterTheParse(_Estate):
         self.assertIn("| copybook | kind the index filed it as | folder | programs |", rep)
         self.assertIn("| LITBOOK | unknown | PROD.GC.CPYLIB | VALPGM |", rep)
         self.assertIn("so its own lines are not indexed", rep)
+        # why nothing parsed them, said of the build that made this index - the build of this toolkit does
+        self.assertIn("the build that made this index re-parsed the copiers of a new member only when it was filed as "
+                      "copybook or cobol, so one typed by its folder name - 'unknown' in a dataset-named folder - forced "
+                      "nothing (ROADMAP re-parse item 21: the build of this toolkit parses them again for every kind it "
+                      "expands)", rep)
+        self.assertNotIn("forces nothing", rep)
         self.assertNotIn("filed as something else", rep)
         # the next build, without --rebuild, parses the program again: whole
         self.build()
@@ -302,12 +406,13 @@ class ArrivedAfterTheParse(_Estate):
         self.assertNotIn("arrived after the program was parsed", rep)
         self.assertNotIn("marked for the next build", rep)
 
-    def test_a_program_whose_own_copy_resolved_is_left_alone(self):
+    def test_before_the_batch_a_program_whose_own_copy_resolved_is_left_alone(self):
         # OTHERPGM arrives together with the book and resolves it at its first parse; VALPGM, parsed
         # earlier, does not - the marking is by member, so only VALPGM is marked, OTHERPGM stays ok
         self.write("GC2/PROD.GC2.SRC/OTHERPGM.cbl", value_program("OTHERPGM"))
         self.write("GC2/PROD.GC2.CPYLIB/LITBOOK.txt", LITBOOK)
-        self.build()
+        with build_before_item_21():
+            self.build()
         self.assertEqual(self.book("LITBOOK"), [("unknown", "PROD.GC2.CPYLIB")])
         self.assertEqual((self.status("VALPGM"), self.status("OTHERPGM")), ("partial", "ok"))
         stats, said = self.recover()
@@ -317,21 +422,39 @@ class ArrivedAfterTheParse(_Estate):
         self.build()
         self.assertEqual((self.status("VALPGM"), self.status("OTHERPGM")), ("ok", "ok"))
 
-    def test_copybook_counts_programs_not_copy_sites(self):
+    def test_the_book_arriving_with_a_new_program_makes_both_whole(self):
+        # the same arrival on this batch's build: VALPGM parsed again, OTHERPGM parsed for the first time
+        self.write("GC2/PROD.GC2.SRC/OTHERPGM.cbl", value_program("OTHERPGM"))
+        self.write("GC2/PROD.GC2.CPYLIB/LITBOOK.txt", LITBOOK)
+        self.build()
+        self.assertEqual((self.status("VALPGM"), self.status("OTHERPGM")), ("ok", "ok"))
+        stats, said = self.recover()
+        self.assertEqual((stats["arrived"], stats["marked"]), (0, 0), said)
+
+    def test_before_the_batch_copybook_counts_programs_not_copy_sites(self):
         # TWICEPGM copies LITBOOK on two lines: `copybook LITBOOK` counts it once, with VALPGM twice in all
         self.write("GC/PROD.GC.SRC/TWICEPGM.cbl", value_program("TWICEPGM", times=2))
         self.build()
         self.assertEqual(self.copy_use("LITBOOK", "TWICEPGM"), [(None,), (None,)])
         self.write("SHARED/PROD.GC.CPYLIB/LITBOOK.txt", LITBOOK)
-        self.build()
+        with build_before_item_21():
+            self.build()
         _cov, _nf, _prog, book = self.outputs("VALPGM", "LITBOOK")
         self.assertIn("### Programs including it (3)", book)
         self.assertIn("> 2 of the programs above still say `COPY LITBOOK NOT FOUND`", book)
         self.assertNotIn("3 of the programs", book)
-
-    def test_the_index_side_helpers(self):
-        self.write("SHARED/PROD.GC.CPYLIB/LITBOOK.txt", LITBOOK)
+        # the re-parse night: the first build of this toolkit on that index (its last build an older toolkit's)
+        # parses every member again - every row linked, nothing left to say
+        self.age_fingerprint()
         self.build()
+        _cov, _nf, _prog, book = self.outputs("VALPGM", "LITBOOK")
+        self.assertIn("### Programs including it (3)", book)
+        self.assertNotIn("still say", book)
+
+    def test_before_the_batch_the_index_side_helpers(self):
+        self.write("SHARED/PROD.GC.CPYLIB/LITBOOK.txt", LITBOOK)
+        with build_before_item_21():
+            self.build()
         conn = query.connect(self.db)
         try:
             accepted, other = recover.members_named(conn, "litbook")
@@ -407,7 +530,12 @@ class FiledAsAnotherKind(_Estate):
         self.build()
         cov, nf, prog, book = self.outputs("VALPGM", "LITBOOK")
         self.assertIn(f"| LITBOOK | 1 | yes: PROD.GC.PROCS, filed as proc - {MISFILED} |", nf)
-        self.assertIn("A copybook marked `yes` is not missing", cov)
+        # no row of the arrived sort: the legend does not offer that cause (only a build before ROADMAP re-parse item
+        # 21 left it)
+        self.assertIn("A copybook marked `yes` is not missing - a member with its name is in the index. Where the cell "
+                      "says so, the member is filed as a kind the build never expands", cov)
+        self.assertNotIn("parsed before it arrived", cov)
+        self.assertNotIn("A member filed `unknown` is expanded", cov)
         self.assertIn("1 exists only as a member of a kind the build does not expand", cov)
         self.assertNotIn("0 of the copybooks", cov, "a zero-count clause with an instruction attached")
         self.assertIn(f"| LITBOOK | **NOT FOUND** - a member with this name exists: PROD.GC.PROCS, filed as proc - {MISFILED} |",
@@ -553,21 +681,34 @@ class NestedCopybookArrivesLater(_Estate):
 
 
 class NestedLiteralArrivesLater(_Estate):
-    """Case E with a member of no signature (ROADMAP re-parse item 21, still open): the data copybook OUTLIT copies
-    LITBOOK into a VALUE clause; LITBOOK arrives 'unknown' and forces no re-parse. recover marks the PROGRAM only -
-    never the copybook - and the next build makes the program whole (LESSONS 184)."""
+    """Case E with a member of no signature (ROADMAP re-parse item 21): the data copybook OUTLIT copies LITBOOK into
+    a VALUE clause; LITBOOK arrives 'unknown'. The build of this batch parses the program again - it carries its own
+    row for the nested COPY - and it is whole. On an index the earlier rule built LITBOOK forced nothing: recover
+    marks the PROGRAM only - never the copybook - and the next build makes the program whole (LESSONS 184)."""
+
+    def test_the_build_makes_the_program_whole(self):
+        self.write("SHARED/PROD.GC.CPYLIB/LITBOOK.txt", LITBOOK)
+        self.build()
+        self.assertEqual(self.book("LITBOOK"), [("unknown", "PROD.GC.CPYLIB")])
+        self.assertEqual((self.status("NESTPGM"), self.status("OUTLIT", "copybook")), ("ok", "ok"))
+        self.assertEqual(self.copy_use("LITBOOK", "NESTPGM"), [(self.member_id("LITBOOK", "unknown"),)])
+        self.assertEqual(self.copy_use("OUTLIT", "NESTPGM"), [(self.member_id("OUTLIT", "copybook"),)])
+        self.assertEqual(self.copy_use("LITBOOK", "OUTLIT"), [(None,)], "a copybook's own COPY rows are never resolved")
+        stats, said = self.recover()
+        self.assertEqual((stats["arrived"], stats["misfiled"], stats["marked"]), (0, 0, 0), said)
 
     def first_files(self):
         self.write("GC/PROD.GC.SRC/NESTPGM.cbl", HEAD.format(name="NESTPGM", data="       01  WS-REC.\n           COPY OUTLIT.\n")
                    + "       A-100-BEGIN SECTION.\n           MOVE 1 TO WS-X.\n" + TAIL)
         self.write("GC/PROD.GC.COPYLIB/OUTLIT.cpy", OUTLIT)
 
-    def test_the_program_is_marked_and_the_copybook_is_left_alone(self):
+    def test_before_the_batch_the_program_is_marked_and_the_copybook_is_left_alone(self):
         self.assertEqual(self.status("NESTPGM"), "partial")
         self.assertEqual(self.copy_use("LITBOOK", "NESTPGM"), [(None,)])
         self.assertEqual(self.copy_use("LITBOOK", "OUTLIT"), [(None,)])
         self.write("SHARED/PROD.GC.CPYLIB/LITBOOK.txt", LITBOOK)
-        self.build()
+        with build_before_item_21():
+            self.build()
         self.assertEqual(self.book("LITBOOK"), [("unknown", "PROD.GC.CPYLIB")])
         self.assertEqual(self.status("NESTPGM"), "partial")
         outlit_id = self.q("SELECT id FROM member WHERE name='OUTLIT'")

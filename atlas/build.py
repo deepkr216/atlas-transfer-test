@@ -288,6 +288,11 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 CODE_KINDS = {"cobol", "copybook", "jcl", "proc", "ctlcard", "dbd", "psb", "bms", "mfs",
               "sql", "asm", "rexx"}
+# the kinds a COPY is expanded from (make_resolver's candidates). What a COPY of a name resolves to changes whenever a
+# member of that name and of one of these kinds arrives, changes, goes, is recorded again under a new id, or is
+# re-typed into or out of them - so an incremental build parses again every program that copies such a name
+# (moved_names, copiers_to_parse; ROADMAP re-parse item 21). atlas.recover keeps the same tuple (recover.RESOLVER_KINDS).
+RESOLVER_KINDS = ("copybook", "cobol", "sql", "unknown")
 SKIP_DIRS = {".git", "__pycache__", "node_modules", ".svn", "$RECYCLE.BIN"}
 
 EXTRA_SCHEMA = """
@@ -758,6 +763,72 @@ def _settled(status: Optional[str], error: Optional[str]) -> bool:
         status == "failed" and (error or "").startswith(("MemberTimeout", "ParserStuck", "InventoryTimeout")))
 
 
+def moved_names(existing: Dict[str, tuple], found: Sequence[tuple]) -> Set[str]:
+    """The names whose COPY statements may resolve differently after this
+    inventory: every member of a kind the resolver expands (RESOLVER_KINDS)
+    that is new, whose bytes changed, that is recorded again under a new id
+    although its bytes did not change (its last outcome did not settle - a
+    build stopped before it was parsed, a parser exception), or that went
+    from disk - taken under its kind in the last build AND in this one, so a
+    member re-typed into or out of those kinds counts too.
+
+    Before ROADMAP re-parse item 21 only a new or changed member filed
+    copybook or cobol counted: a copybook arriving 'unknown' (a dataset-named
+    folder with no COPY hint) forced nothing, and every program that copied
+    it stayed 'partial - COPY X NOT FOUND' until atlas.recover marked it
+    (LESSONS 183); a copybook that went, whose new text was filed as another
+    kind, or that was recorded again under a new id, left its programs 'ok'
+    with a copy_use row _forget_member had set to NULL and the fields of the
+    earlier read (LESSONS 184, 188). `existing`: path -> the stored row as
+    inventory() reads it (id, sha256, parse_status, parse_error, kind, ...,
+    name last); `found`: inventory()'s tuples (path, name, kind, library,
+    ext, sha256, ...). Linear in the members."""
+    names: Set[str] = set()
+    here: Set[str] = set()
+    for f in found:
+        path, name, kind, sha_ = f[0], f[1], f[2], f[5]
+        here.add(path)
+        ex = existing.get(path)
+        if ex is not None and ex[1] == sha_ and _settled(ex[2], ex[3]):
+            continue                          # kept: the same bytes, the same kind, the same id
+        if kind in RESOLVER_KINDS:
+            names.add(str(name).upper())
+        if ex is not None and ex[4] in RESOLVER_KINDS:
+            names.add(str(ex[-1] or name).upper())
+    for path, ex in existing.items():
+        if path not in here and ex[4] in RESOLVER_KINDS:
+            names.add(str(ex[-1] or os.path.splitext(os.path.basename(path))[0]).upper())    # gone from disk
+    return names
+
+
+def copiers_to_parse(conn: sqlite3.Connection, names: AbstractSet[str]) -> Set[str]:
+    """The paths of every member whose COPY statements name one of `names`
+    (a program carries its own row for every nested COPY, so a program
+    reaches the name however deep it sits), and - each of those being
+    recorded again under a new id, which un-links every row that resolved to
+    it (_forget_member) - of every member copying one of THEIR names, until
+    nothing new turns up. Each name is asked once, 500 to a query: linear in
+    the names, however long the chain."""
+    forced: Set[str] = set()
+    pending = {n.upper() for n in names}
+    asked: Set[str] = set()
+    while pending:
+        batch = sorted(pending)
+        asked |= pending
+        pending = set()
+        for k in range(0, len(batch), 500):
+            chunk = batch[k:k + 500]
+            q = ",".join("?" * len(chunk))
+            for path, name, kind in conn.execute(f"SELECT DISTINCT m.path, m.name, m.kind FROM copy_use c "
+                                                 f"JOIN member m ON m.id=c.member_id WHERE UPPER(c.copybook) IN ({q})",
+                                                 tuple(chunk)):
+                forced.add(path)
+                n = str(name or "").upper()
+                if kind in RESOLVER_KINDS and n not in asked:
+                    pending.add(n)
+    return forced
+
+
 def _inventory_one(ctx: Ctx, path: str, fn: str, dirpath: str, data: bytes) -> tuple:
     """Classify and fingerprint one file. Pure: no database, so it can run
     on a worker thread under a time limit."""
@@ -799,8 +870,10 @@ def inventory(ctx: Ctx, roots, limit: Optional[int] = None, force_all: bool = Fa
     documentation folder is usually NOT a mainframe dataset and lives elsewhere.
 
     Incremental by default: a member whose bytes are unchanged keeps its facts.
-    A changed COPYBOOK forces every program that expands it (and every
-    copybook that copies it) to be re-parsed; a changed PROC / INCLUDE /
+    A member of a kind the resolver expands (copybook, cobol, sql, unknown)
+    that arrives, changes, goes or is re-typed forces every program that
+    copies its name (and every copybook that copies it) to be re-parsed
+    (moved_names, copiers_to_parse); a changed PROC / INCLUDE /
     control-card member forces every job. `force_all` (parser or manifest
     changed) re-parses everything. Members that vanished are pruned.
     `--rebuild` starts from an empty db.
@@ -813,7 +886,7 @@ def inventory(ctx: Ctx, roots, limit: Optional[int] = None, force_all: bool = Fa
     now = time.strftime("%Y-%m-%dT%H:%M:%S")
     existing = {r[0]: tuple(r[1:]) for r in
                 conn.execute("SELECT path, id, sha256, parse_status, parse_error, kind, library, ext, norm_sha, "
-                             "lines, fixed_format FROM member")}
+                             "lines, fixed_format, name FROM member")}
     if isinstance(roots, str):
         roots = [roots]
     own = ctx.progress is None
@@ -937,26 +1010,15 @@ def inventory(ctx: Ctx, roots, limit: Optional[int] = None, force_all: bool = Fa
         _load_library_markers(ctx, roots)
 
         changed = [f for f in found if f[0] not in existing or existing[f[0]][1] != f[5]]
-        changed_names = {f[1] for f in changed if f[2] in ("copybook", "cobol")}
         forced: set = set()
-        if changed_names and existing and not force_all:
-            # programs and copybooks that expand a changed copybook, transitively
-            progress.now(f"finding the programs that copy {len(changed_names):,} changed copybook(s) and program(s)")
-            pending = set(changed_names)
-            seen_names: set = set()
-            while pending:
-                batch = list(pending)
-                seen_names |= pending
-                pending = set()
-                for k in range(0, len(batch), 500):
-                    chunk = batch[k:k + 500]
-                    q = ",".join("?" * len(chunk))
-                    rows = conn.execute(f"SELECT DISTINCT m.path, m.name, m.kind FROM copy_use c JOIN member m ON m.id=c.member_id "
-                                        f"WHERE UPPER(c.copybook) IN ({q})", tuple(chunk)).fetchall()
-                    for r in rows:
-                        forced.add(r[0])
-                        if r[2] == "copybook" and r[1] not in seen_names:
-                            pending.add(r[1])
+        moved = moved_names(existing, found) if existing and not force_all else set()
+        if moved:
+            # every program whose COPY may now resolve differently - a member of a kind the resolver expands arrived,
+            # changed, went, is recorded again or was re-typed (ROADMAP re-parse item 21) - and, transitively, the
+            # members copying what is recorded again: an incremental build gives what a full one would
+            progress.now(f"finding the programs to parse again: {len(moved):,} name(s) of members that arrived, changed, "
+                         f"went or were re-typed since the last build")
+            forced |= copiers_to_parse(conn, moved)
         if any(f[2] in ("proc", "jcl", "ctlcard") for f in changed) and existing and not force_all:
             # a PROC, INCLUDE or card member changed: every job that expands it
             # carries its facts - re-parse all JCL (cheap next to COBOL)
@@ -1530,7 +1592,7 @@ def listing_pick(ctx: Ctx, prog: Mem, cands: List[Mem], lib: Optional[str], pick
 def make_resolver(ctx: Ctx, prog: Mem, notes: List[Tuple[str, str, int]]):
     def resolve(name: str, lib: Optional[str]):
         cands = [c for c in ctx.by_name.get(name.upper(), [])
-                 if c.kind in ("copybook", "cobol", "sql", "unknown") and c.id != prog.id]
+                 if c.kind in RESOLVER_KINDS and c.id != prog.id]
         if not cands:
             return None
         pick = cands[0]

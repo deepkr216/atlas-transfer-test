@@ -1770,14 +1770,17 @@ def unlinked_ok_programs(conn: sqlite3.Connection, member_id: Optional[int] = No
     marked `ok` that has a COPY row no member resolves any more - not a
     system include, not a COPY the expander skipped. The build sets a
     program's copy_use row to NULL when the member it had expanded leaves
-    the index (`_forget_member`: the file changed on disk, or went), and
-    parses the program again only when the member's NEW text is filed as
-    copybook or cobol; on an index built before ROADMAP re-parse items 20
+    the index (`_forget_member`: the file changed on disk, went, or was
+    recorded again under a new id); the build before ROADMAP re-parse item
+    21 parsed the program again only when the member's NEW text was filed as
+    copybook or cobol, and on an index built before ROADMAP re-parse items 20
     and 22 a re-filed copybook re-fetched with new text was filed by its
     weak signature again (asm / listing / mfs), so its programs kept 'ok'
     with the fields of the earlier read and a NULL row nothing explains
-    (LESSONS 188) - the classifier of this toolkit files the new text as a
-    copybook and the build parses them again. `program` says so beside 'parse: ok' and `coverage`
+    (LESSONS 188). The build of this toolkit parses every such program again
+    - the member went, changed, was re-typed or recorded again
+    (build.moved_names) - so on an index it built this finds nothing.
+    `program` says so beside 'parse: ok' and `coverage`
     counts them apart from the partial members; a run of this tool re-files
     the member and marks them by name, and the build makes them whole."""
     out: Dict[int, Tuple[str, List[str]]] = {}
@@ -1808,11 +1811,14 @@ def arrived_copybooks(conn: sqlite3.Connection) -> Tuple[List[Dict[str, object]]
 
       arrived  - a member of a kind the resolver expands exists (copybook,
                  cobol, sql, unknown), so the programs were parsed BEFORE it
-                 arrived and nothing parsed them again: the build re-parses
-                 the copiers of a NEW member only when it is filed as
-                 copybook or cobol (ROADMAP re-parse item 21), so a member
-                 typed 'unknown' by its folder forces nothing. These
-                 programs are marked for the next build.
+                 arrived and nothing parsed them again: the build before
+                 ROADMAP re-parse item 21 re-parsed the copiers of a NEW
+                 member only when it was filed as copybook or cobol, so a
+                 member typed 'unknown' by its folder forced nothing. These
+                 programs are marked for the next build. The build of this
+                 toolkit parses them again for every kind the resolver
+                 expands (build.moved_names), so on an index it built the
+                 list is empty.
       misfiled - the only members with that name are of a kind the resolver
                  never looks at (proc, ctlcard, doc, jcl, listing ...): a
                  re-parse would find nothing; the folder name decided the
@@ -2655,9 +2661,10 @@ def arrival_report(arrived: Sequence[Dict[str, object]], misfiled: Sequence[Dict
     if arrived:
         lines.append("\n## Copybooks that arrived after the program was parsed\n\n"
                      "The index holds a member with the copybook's name, but the programs below were parsed while it was "
-                     "missing and nothing parsed them again: the build re-parses the copiers of a new member only when "
-                     "it is filed as copybook or cobol (ROADMAP re-parse item 21), so one typed by its folder name - "
-                     "'unknown' in a dataset-named folder - forces nothing. "
+                     "missing and nothing parsed them again: the build that made this index re-parsed the copiers of a "
+                     "new member only when it was filed as copybook or cobol, so one typed by its folder name - "
+                     "'unknown' in a dataset-named folder - forced nothing (ROADMAP re-parse item 21: the build of this "
+                     "toolkit parses them again for every kind it expands). "
                      + ("They would be marked for the next build (dry run: nothing marked). " if dry_run
                         else "They are marked for the next build: run your usual build command. ")
                      + (f"A member filed 'unknown' ({_unknown_among(arrived)} below) is expanded into its programs but has no "
@@ -3365,7 +3372,9 @@ def _on_disk(out_dir: str) -> Dict[str, int]:
 
 def _mark_programs(db: str, names: Sequence[str]) -> int:
     """Programs that copied a removed copybook are parsed again on the next
-    build (a vanished member forces nothing by itself). Programs only: a
+    build (before ROADMAP re-parse item 21 a vanished member forced nothing
+    by itself; the build of this toolkit parses them again anyway, and the
+    mark changes nothing it would not do). Programs only: a
     copybook that copies the removed one gains nothing from a re-parse (its
     own COPY rows are never resolved), and a copybook marked pending is
     re-inserted under a new id, which nulls the links of every program

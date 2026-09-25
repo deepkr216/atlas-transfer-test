@@ -275,12 +275,13 @@ def parse_label(conn: sqlite3.Connection, member_id: int, status: Optional[str])
 
 
 # a program marked `ok` whose COPY row no member resolves any more: the build un-links a program's copy_use row
-# when the member it had expanded leaves the index (its text changed on disk, or the file went) and parses the
-# program again only when the new text is filed as copybook or cobol - on an index built before ROADMAP re-parse
-# items 20 and 22, a copybook atlas.recover re-filed and then re-fetched with new text was filed by its weak signature
-# again, so the program read 'ok' with the fields of the earlier read and a NULL row beside 'NOT FOUND' on the same
-# page (LESSONS 188); said here and counted in coverage, apart from the partial members. The classifier of this
-# toolkit files the new text as a copybook, and the build parses the program again with it
+# when the member it had expanded leaves the index (its text changed on disk, or the file went), and the build before
+# ROADMAP re-parse item 21 parsed the program again only when the new text was filed as copybook or cobol - on an
+# index built before ROADMAP re-parse items 20 and 22, a copybook atlas.recover re-filed and then re-fetched with new
+# text was filed by its weak signature again, so the program read 'ok' with the fields of the earlier read and a NULL
+# row beside 'NOT FOUND' on the same page (LESSONS 188); said here and counted in coverage, apart from the partial
+# members. The build of this toolkit parses the program again whenever the member goes, changes or is re-typed
+# (build.moved_names), so on an index it built nothing is said
 UNLINKED_WHY = ("the member it had expanded went out of the index since - its text changed on disk and the classifier "
                 "filed the new text as another kind, or the file went - and nothing parsed the program again")
 UNLINKED_FIX = "run `python -m atlas.recover --db atlas.db`, then the build"
@@ -1506,13 +1507,16 @@ def cmd_copybook(conn: sqlite3.Connection, name: str) -> str:
                    + (" and marked them - run your usual build command" if pending
                       else "; `python -m atlas.recover --db atlas.db` marks them, then run your usual build") + ".\n")
     elif stale:
-        # the member is here and a program still says NOT FOUND: it was parsed before the member arrived, and a
-        # member the build files 'unknown' (or sql) forces no re-parse by itself - say why, and the whole fix
-        kinds = ", ".join(sorted({c["kind"] for c in copies}))
+        # the member is here and a program still says NOT FOUND: it was parsed before the member arrived, and the
+        # build before ROADMAP re-parse item 21 parsed its programs again only for a member filed copybook or cobol -
+        # the build of this toolkit does it for every kind the resolver expands, so on an index it built this is not
+        # said; say why, and the whole fix
+        odd = ", ".join(sorted({c["kind"] for c in copies} - {"copybook", "cobol"}))
+        why = (f" - the build that made this index parsed the programs again only for a member filed copybook or cobol, "
+               f"and this one is filed `{odd}` (ROADMAP re-parse item 21)") if odd else ""
         out.append(f"\n> {len(stale)} of the programs above still say{'s' if len(stale) == 1 else ''} `COPY {name.upper()} NOT "
                    "FOUND` (under 'Unresolved in scope' below): parsed before this member arrived and nothing parsed them "
-                   f"again - a member filed `{kinds}` forces no re-parse by itself. `python -m atlas.recover --db atlas.db` "
-                   "marks them, then run your usual build"
+                   f"again{why}. `python -m atlas.recover --db atlas.db` marks them, then run your usual build"
                    + (f"; and {recover.UNKNOWN_FIX}" if any(c["kind"] == "unknown" for c in copies) else "") + ".\n")
     pnames = [p["program_id"].upper() for p in progs]
     if pnames:
@@ -2391,13 +2395,22 @@ def cmd_coverage(conn: sqlite3.Connection, everything: bool = False) -> str:
                    "under 'Members parsed only in part' (a long chain of nested COPYs is cut short in that column; "
                    "`program NAME` prints it whole).\n")
     if any(r[2] != "-" for r in nf_rows):
-        out.append("\n> A copybook marked `yes` is not missing - a member with its name is in the index. Either the programs "
-                   "that copy it were parsed before it arrived and nothing parsed them again: `python -m atlas.recover "
-                   "--db atlas.db` marks them, then run your usual build; or the member is filed as a kind the build never "
+        # 'parsed before it arrived' is a state only a build before ROADMAP re-parse item 21 left (the build of this
+        # toolkit parses the programs again for every kind the resolver expands): said when a cell says it, not
+        # offered as a cause on an index where no row is of that sort
+        arrived_cell = any("parsed before it arrived" in str(r[2]) for r in nf_rows)
+        out.append("\n> A copybook marked `yes` is not missing - a member with its name is in the index. "
+                   + ("Either the programs that copy it were parsed before it arrived and nothing parsed them again (the "
+                      "build that made this index parsed them again only for a member filed copybook or cobol - ROADMAP "
+                      "re-parse item 21): `python -m atlas.recover --db atlas.db` marks them, then run your usual build; or "
+                      "the member" if arrived_cell else "Where the cell says so, the member")
+                   + " is filed as a kind the build never "
                    "expands, because the folder name decided its kind (its text carries no signature - no level numbers, "
                    "no COBOL statements): rename the folder to end in COPYLIB, or declare the library's kind in the UI's "
-                   "table (the manifest kinds), and build. A member filed `unknown` is expanded but has no parser of its "
-                   "own, so its own lines are not indexed or citable until that same folder fix is applied. Where the cell "
+                   "table (the manifest kinds), and build. "
+                   + ("A member filed `unknown` is expanded but has no parser of its own, so its own lines are not indexed "
+                      "or citable until that same folder fix is applied. " if arrived_cell else "")
+                   + "Where the cell "
                    "says `by its content`, a line of the member's own text has the shape of an Assembler, listing or MFS "
                    "member, which no folder change alters - the cell says what does. On an index built before "
                    f"{recover.EARLIER_ITEMS} a line of a copybook's own text could decide it (a START- name read as "
