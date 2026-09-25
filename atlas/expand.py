@@ -56,7 +56,11 @@ _SYSTEM_INCLUDES = {"SQLCA", "SQLDA"}
 
 MAX_DEPTH = 12
 
-# resolver(copybook_name, library_hint) -> (member_id, lines, note) or None
+# resolver(copybook_name, library_hint) -> (member_id, lines, note) or None.
+# A note is repeated as a COPY warning, and build.index_cobol marks the program
+# partial for every warning - so a note says a gap in THIS COPY, never a
+# decision the resolver took (which of several same-named copies it expanded
+# is its own 'ambiguous_copybook' row - ROADMAP re-parse item 18).
 Resolver = Callable[[str, Optional[str]], Optional[Tuple[int, List[Line], Optional[str]]]]
 
 

@@ -1340,7 +1340,6 @@ def make_resolver(ctx: Ctx, prog: Mem, notes: List[Tuple[str, str, int]]):
                  if c.kind in ("copybook", "cobol", "sql", "unknown") and c.id != prog.id]
         if not cands:
             return None
-        note = None
         pick = cands[0]
         if len(cands) > 1:
             # The program's compiler listing FIRST: it names the library
@@ -1359,9 +1358,15 @@ def make_resolver(ctx: Ctx, prog: Mem, notes: List[Tuple[str, str, int]]):
             if pick is None:
                 pick, how = _chain_pick(ctx, prog, cands, lib)
             if len({c.norm_sha for c in cands}) > 1:
-                note = (f"{len(cands)} copies of {name} with different content; used {pick.path} ({how})")
-                notes.append(("ambiguous_copybook", note, 0))
-        return pick.id, ctx.lines_for(pick), note
+                # A choice, recorded once: the 'ambiguous_copybook' row names the
+                # copy and says how. It is NOT handed back to the expander as a COPY
+                # warning - a warning is a gap (NOT FOUND, skipped), and the repeat
+                # made every such program 'partial' although every COPY expanded
+                # (his 701 'partial' programs with ~60 copybooks missing - LESSONS
+                # 181, ROADMAP re-parse item 18).
+                notes.append(("ambiguous_copybook",
+                              f"{len(cands)} copies of {name} with different content; used {pick.path} ({how})", 0))
+        return pick.id, ctx.lines_for(pick), None
     return resolve
 
 
@@ -1618,7 +1623,7 @@ def index_cobol(ctx: Ctx, mem: Mem) -> None:
             notes.append(("layout_warning", w, 0))
     for (kind, detail, ln) in facts.unresolved:
         notes.append((kind, detail, ln))
-    for w in exp.warnings:
+    for w in exp.warnings:          # each one a gap: a COPY NOT FOUND, or skipped (recursive, nested too deep)
         notes.append(("expand", w, 0))
     conn.executemany(
         "INSERT INTO unresolved(member_id,kind,detail,line) VALUES(?,?,?,?)",
@@ -1630,6 +1635,8 @@ def index_cobol(ctx: Ctx, mem: Mem) -> None:
         with open(os.path.join(ctx.write_expanded, f"{pid_name}.exp.cbl"), "w", encoding="utf-8") as fh:
             fh.write(exp_text)
 
+    # 'partial' only for a gap the expander reported; a copybook chosen among several is its own
+    # 'ambiguous_copybook' row and leaves the program 'ok' (ROADMAP re-parse item 18)
     status = "partial" if any(k in ("expand",) for (k, _d, _l) in notes) else "ok"
     conn.execute("UPDATE member SET parse_status=? WHERE id=?", (status, mem.id))
 

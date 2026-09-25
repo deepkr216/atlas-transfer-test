@@ -201,29 +201,43 @@ def table(headers: Sequence[str], rows: Iterable[Sequence]) -> str:
 
 # The resolver's own wording when several members share a copybook's name
 # with different content and one was chosen (build.make_resolver): the
-# 'ambiguous_copybook' row carries it, expand.py repeats it as a COPY warning
-# ("L12: COPY X: 2 copies of X with different content; used PATH (how)") and
-# build.py stores that warning as an 'expand' note - which marks the program
-# `partial` although every COPY expanded. The build-side fix waits for the
-# next re-parse (ROADMAP "Next re-parse batch" 18, LESSONS 181); until then
-# every query-side reader of parse_status='partial' tells the two apart
-# through partial_kind(), never by the status column alone.
+# 'ambiguous_copybook' row carries it. An index built BEFORE ROADMAP re-parse
+# item 18 carries it a second time as an 'expand' note ("L12: COPY X: 2 copies
+# of X with different content; used PATH (how)": expand.py repeated it as a
+# COPY warning and build.py stored every warning as a gap), which marks the
+# program `partial` although every COPY expanded; since the batch the build
+# hands the expander no note and such a program is `ok` with the row alone.
+# Every query-side reader of parse_status='partial' tells the two apart
+# through partial_kind(), never by the status column alone (LESSONS 181), and
+# chose_a_copybook() reads the choice on either shape.
 AMBIGUOUS_PICK = " with different content; used "
 PARSE_CHOSEN = "complete (copybook chosen among several - see notes)"
 # SQL: member alias `m` is marked partial only by the resolver's pick - every
-# 'expand' note is that note (one bound parameter: AMBIGUOUS_PICK)
+# 'expand' note is that note (one bound parameter: AMBIGUOUS_PICK); an index
+# built before ROADMAP re-parse item 18
 _CHOSEN_PRED = """EXISTS (SELECT 1 FROM unresolved u WHERE u.member_id = m.id AND u.kind = 'expand')
     AND NOT EXISTS (SELECT 1 FROM unresolved u WHERE u.member_id = m.id AND u.kind = 'expand'
                     AND instr(COALESCE(u.detail, ''), ?) = 0)"""
+# SQL: member alias `m` is `ok` with an 'ambiguous_copybook' row - the choice as the build of the batch records
+# it. An IN over the rows of that kind, not an EXISTS per member: `unresolved` is indexed by kind only, SQLite
+# materialises the (few thousand) rows once, and `coverage` walks his ~121k members against that set
+_CHOSEN_OK_PRED = """m.parse_status = 'ok' AND m.id IN (SELECT u.member_id FROM unresolved u
+    WHERE u.kind = 'ambiguous_copybook')"""
+# SQL: member alias `m` is complete with a copybook chosen among several, on either shape of the index (one bound
+# parameter: AMBIGUOUS_PICK)
+_COMPLETE_WITH_CHOICE = f"((m.parse_status = 'partial' AND {_CHOSEN_PRED}) OR ({_CHOSEN_OK_PRED}))"
 
 
 def partial_kind(conn: sqlite3.Connection, member_id: int) -> Optional[str]:
-    """None: the member is not marked partial. 'chosen': marked partial only
-    because a copybook was chosen among several same-named ones (every
-    'expand' note is the resolver's pick) - the program expanded COMPLETELY
-    with the copy the 'ambiguous_copybook' row names. 'partial': parsed only
-    in part (a copybook NOT FOUND, a COPY skipped as recursive or too deeply
-    nested, a scan with no text, an unrecognised map)."""
+    """None: the member is not marked partial - an `ok` program that took a
+    copybook chosen among several (the build of the batch) is here, and
+    chose_a_copybook() says so. 'chosen': marked partial only because a
+    copybook was chosen among several same-named ones (every 'expand' note is
+    the resolver's pick - an index built before ROADMAP re-parse item 18) -
+    the program expanded COMPLETELY with the copy the 'ambiguous_copybook'
+    row names. 'partial': parsed only in part (a copybook NOT FOUND, a COPY
+    skipped as recursive or too deeply nested, a scan with no text, an
+    unrecognised map)."""
     row = conn.execute("SELECT parse_status FROM member WHERE id=?", (member_id,)).fetchone()
     if not row or row[0] != "partial":
         return None
@@ -238,10 +252,26 @@ def is_truly_partial(conn: sqlite3.Connection, member_id: int) -> bool:
     return partial_kind(conn, member_id) == "partial"
 
 
+def chose_a_copybook(conn: sqlite3.Connection, member_id: int) -> bool:
+    """The member carries an 'ambiguous_copybook' row: a copybook it copies
+    exists in several libraries with different content and the build
+    expanded one copy (the row names it and says how). A decision, not a
+    gap - since ROADMAP re-parse item 18 such a program is `ok`."""
+    return conn.execute("SELECT 1 FROM unresolved WHERE member_id=? AND kind='ambiguous_copybook' LIMIT 1",
+                        (member_id,)).fetchone() is not None
+
+
 def parse_label(conn: sqlite3.Connection, member_id: int, status: Optional[str]) -> str:
     """The parse status as a header line states it: `ok`, `partial`, or the
-    chosen-among-several wording for a member marked partial only by that."""
-    return PARSE_CHOSEN if partial_kind(conn, member_id) == "chosen" else (status or "?")
+    chosen-among-several wording for a member complete with a copybook chosen
+    among several - `ok` with its 'ambiguous_copybook' row (built by the
+    re-parse batch) or `partial` only by the resolver's note (built before
+    it): the same words on both, so a program's header does not change with
+    the re-parse."""
+    kind = partial_kind(conn, member_id)
+    if kind == "chosen" or (kind is None and status == "ok" and chose_a_copybook(conn, member_id)):
+        return PARSE_CHOSEN
+    return status or "?"
 
 
 # a program marked `ok` whose COPY row no member resolves any more: the build un-links a program's copy_use row
@@ -1603,8 +1633,9 @@ UNRESOLVED_MEANING = {
     "expand (copybook chosen among several)": (
         "the resolver's own choice repeated as a COPY warning: the program expanded completely with the copy its "
         "'ambiguous_copybook' row names - not a missing copybook",
-        "nothing to fetch; the next re-parse stops the repeat (ROADMAP item 18) - check the manifest's system / "
-        "copybook order if the copy named is the wrong one"),
+        "nothing to fetch; an index built before ROADMAP re-parse item 18 repeats the choice as a COPY warning, and "
+        "the next full re-parse stops it - check the manifest's system / copybook order if the copy named is the "
+        "wrong one"),
     "ambiguous_copybook": ("two copies of one copybook with different content; one was chosen",
                            "declare the department's copybook order (manifest `copylib_order`) or remove the stale copy"),
     "include_member": ("a JCL `INCLUDE MEMBER=` whose member is not in the index",
@@ -1966,18 +1997,37 @@ def _not_found_cell(conn: sqlite3.Connection, copybook: str, member_id: int) -> 
     return "**NOT FOUND**" + (f" - a member with this name exists: {note}" if note else "")
 
 
+def _chosen_marked(n_old: int, n_new: int) -> str:
+    """How the index marks the members complete with a chosen copybook:
+    `ok` (the build of the batch records the choice once), `partial` (an
+    index built before ROADMAP re-parse item 18 repeats it as a COPY
+    warning), or both when members of both builds sit in one index."""
+    if not n_old:
+        return ("They are marked `ok`: the build records the choice once, as the 'ambiguous_copybook' row "
+                "(ROADMAP re-parse item 18).")
+    if not n_new:
+        return ("The index marks them `partial` only because the build that made it repeated the resolver's choice as "
+                "a COPY warning - an index built before ROADMAP re-parse item 18; the next full re-parse marks them `ok`.")
+    return (f"{n_new} of them {'is' if n_new == 1 else 'are'} marked `ok` (the build records the choice once, as the "
+            f"'ambiguous_copybook' row - ROADMAP re-parse item 18); the other {n_old} {'is' if n_old == 1 else 'are'} marked "
+            "`partial` only because the build that parsed them repeated the resolver's choice as a COPY warning (parsed "
+            "before the item); the next full re-parse marks them `ok`.")
+
+
 def _chosen_members(conn: sqlite3.Connection, limit: int = COVERAGE_ROWS) -> str:
-    """Members the index marks `partial` only because a copybook was chosen
-    among several same-named ones with different content: every COPY
-    expanded, so they are complete for the copy the resolver named. Their
-    own table, so that `coverage` does not count them with the members whose
-    copybook is missing (his 701 'partial' with ~60 copybooks missing)."""
+    """Members complete with a copybook chosen among several same-named ones
+    with different content: every COPY expanded, so they are complete for the
+    copy the resolver named - `ok` with the 'ambiguous_copybook' row (the
+    build of the batch), or `partial` only by the resolver's repeated note
+    (an index built before ROADMAP re-parse item 18). Their own table, so
+    that `coverage` does not count them with the members whose copybook is
+    missing (his 701 'partial' with ~60 copybooks missing)."""
     rows = conn.execute(f"""
-        SELECT m.kind, m.name, m.library,
+        SELECT m.kind, m.name, m.library, m.parse_status,
                (SELECT COUNT(*) FROM unresolved u WHERE u.member_id = m.id AND u.kind = 'ambiguous_copybook') AS picks,
                (SELECT GROUP_CONCAT(u.detail, CHAR(10)) FROM unresolved u
                 WHERE u.member_id = m.id AND u.kind = 'ambiguous_copybook') AS notes
-        FROM member m WHERE m.parse_status = 'partial' AND {_CHOSEN_PRED}
+        FROM member m WHERE {_COMPLETE_WITH_CHOICE}
         ORDER BY m.kind, m.name""", (AMBIGUOUS_PICK,)).fetchall()
     if not rows:
         return ""
@@ -2017,13 +2067,13 @@ def _chosen_members(conn: sqlite3.Connection, limit: int = COVERAGE_ROWS) -> str
         out.append(f"_... {len(rows) - limit} more; every one of them: `coverage --all`; `program NAME` shows each "
                    "member's choice under Unresolved in scope_\n")
     out.append(_choices_checked(conn))
+    n_old = sum(1 for r in rows if r["parse_status"] == "partial")
+    marked = _chosen_marked(n_old, len(rows) - n_old)
+    rule = ("The choice follows `COPY ... OF`, then the member's own system in its declared copybook order, then the "
+            f"manifest's authoritative copy; {len(pick_names(rows))} copybook name(s) are involved - `ambiguous` lists "
+            "them per department, and a choice is wrong only where the manifest's system or copybook order is.")
     out.append(f"\n> {'This member is' if len(rows) == 1 else f'These {len(rows)} members are'} NOT parsed only in "
-               "part: every COPY expanded, and their facts are "
-               "complete for the copy named. The index marks them `partial` only because the build repeats the "
-               "resolver's choice as a COPY warning (fixed at the next re-parse - ROADMAP item 18). The choice "
-               "follows `COPY ... OF`, then the member's own system in its declared copybook order, then the "
-               f"manifest's authoritative copy; {len(pick_names(rows))} copybook name(s) are involved - `ambiguous` lists "
-               "them per department, and a choice is wrong only where the manifest's system or copybook order is.\n")
+               f"part: every COPY expanded, and their facts are complete for the copy named. {marked} {rule}\n")
     return "".join(out)
 
 
@@ -2097,24 +2147,31 @@ def cmd_coverage(conn: sqlite3.Connection, everything: bool = False) -> str:
     out.append("\n### Members\n")
     out.append(table(["kind", "status", "count"], conn.execute(
         "SELECT kind, parse_status, COUNT(*) FROM member GROUP BY 1,2 ORDER BY 1,2").fetchall()))
+    n_part = conn.execute("SELECT COUNT(*) FROM member WHERE parse_status = 'partial'").fetchone()[0]
+    n_chosen = conn.execute(f"SELECT COUNT(*) FROM member m WHERE m.parse_status = 'partial' AND {_CHOSEN_PRED}",
+                            (AMBIGUOUS_PICK,)).fetchone()[0]
+    n_ok_chosen = conn.execute(f"SELECT COUNT(*) FROM member m WHERE {_CHOSEN_OK_PRED}").fetchone()[0]
+    # the `partial` word covers a chosen copybook only on an index built before ROADMAP re-parse item 18
+    chosen_clause = (" - or, for a COBOL member, a copybook was chosen among several same-named ones: complete, its own "
+                     "table" if n_chosen else "")
     out.append("\n- **ok**: parsed, its facts are in the index. **skipped**: nothing to parse - either the kind has "
                "no parser of its own (control cards, REXX, SQL scripts, assembler: still indexed and searchable, and a "
                "control card is read in full where a job points at it; listings and unrecognised members are recorded "
                "by name only - `search` does not see their text), or the "
                "member sits in a source library but is not a program (no PROGRAM-ID and no DIVISION header - a "
                "procedure copybook or a card deck filed there); the member itself says which. **partial**: a parser "
-               "ran but could not complete the picture - the next table says which members and why - or, for a "
-               "COBOL member, a copybook was chosen among several same-named ones: complete, its own table. "
+               f"ran but could not complete the picture - the next table says which members and why{chosen_clause}. "
                "**failed**: not "
                "indexed at all - the table after it names every one, including those given up on before a restart.\n")
-    n_part = conn.execute("SELECT COUNT(*) FROM member WHERE parse_status = 'partial'").fetchone()[0]
-    n_chosen = conn.execute(f"SELECT COUNT(*) FROM member m WHERE m.parse_status = 'partial' AND {_CHOSEN_PRED}",
-                            (AMBIGUOUS_PICK,)).fetchone()[0]
     if n_chosen:
         n_true = n_part - n_chosen
         out.append(f"- of the {n_part} members marked `partial`, **{n_true} {'is' if n_true == 1 else 'are'} parsed only "
                    f"in part** and **{n_chosen} {'is' if n_chosen == 1 else 'are'} complete with a copybook chosen among "
                    "several** (the two tables below).\n")
+    if n_ok_chosen:
+        one = n_ok_chosen == 1
+        out.append(f"- {n_ok_chosen} member{'' if one else 's'} marked `ok` took a copybook chosen among several same-named "
+                   f"ones: complete for the copy named, and listed in a table of {'its' if one else 'their'} own below.\n")
     from . import recover
     n_refiled = len(recover.refiled_members(conn))
     if n_refiled:

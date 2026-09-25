@@ -242,7 +242,9 @@ class ChoicesCheckedAgainstTheListings(unittest.TestCase):
         conn = sqlite3.connect(self.db)
         try:
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM unresolved WHERE kind='ambiguous_copybook'").fetchone()[0], 6)
-            self.assertEqual(conn.execute("SELECT COUNT(*) FROM member WHERE kind='cobol' AND parse_status='partial'").fetchone()[0], 6)
+            # the six chosen programs are `ok` (ROADMAP re-parse item 18): whole for the copy named, none partial
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM member WHERE kind='cobol' AND parse_status='ok'").fetchone()[0], 6)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM member WHERE parse_status='partial'").fetchone()[0], 0)
         finally:
             conn.close()
 
