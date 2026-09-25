@@ -22,8 +22,9 @@ Deliberate defects - the shapes LESSONS 181-192 were written for:
   D5  POLMISSB is copied by two programs (one with a REPLACING clause over
       two lines, the period inside the pseudo-text) and is nowhere in the
       estate: their listings hold its text, atlas.recover must write it.
-  D6  POLSTUBB is a stub: 8-digit numbers in columns 1-8 and nothing else,
-      so the build files it `empty`; the disk check must say so.
+  D6  POLSTUBB is a stub: 7-digit numbers in columns 1-7 and nothing else,
+      and POLSTUBC its 8-digit twin: the build files both `stub` and never
+      expands them (ROADMAP re-parse item 23); every report says 'a stub'.
   +   POLARRVB arrives in the COPYLIB after the first build (the checker
       drops it in): recover must mark its program, the next build resolves it.
 """
@@ -417,15 +418,17 @@ class Estate:
         ], kind="procs", paragraphs=["B-100-EDIT-KEY", "B-200-EDIT-DATE"], status="ok",
             why="a copybook by its COBOL statements, before the folder name (ROADMAP re-parse item 20)",
             role="D3 procedure copybook in a PROCS folder")
-        # D6: a stub - 8-digit numbers in columns 1-8, nothing else
+        # D6: a stub - 7-digit numbers in columns 1-7, nothing else
         stub = [f"{k * 100:07d}" for k in range(1, 7)]
         self.write_text_copybook("POLICY", "POLSTUBB", stub, ck="stub", status="skipped",
-                                 why="text sits in columns 1-7: filed empty", role="D6 stub", member_kind="empty")
-        # the same stub with EIGHT digits: the eighth sits in column 8, so the reader sees one character of 'code'
+                                 why="only numbers: a stub, never expanded (ROADMAP re-parse item 23)", role="D6 stub",
+                                 member_kind="stub")
+        # the same stub with EIGHT digits: the eighth sits in column 8, which the reader takes for code - a stub all
+        # the same: expanded, it erased the copying program's procedure division (tools/synth/repro/F08)
         stub8 = [f"{k * 100:08d}" for k in range(1, 7)]
-        self.write_text_copybook("POLICY", "POLSTUBC", stub8, ck="stub", status="ok",
-                                 why="an 8-digit stub: column 8 holds a digit the reader takes for code", role="D6 stub (8 digits)",
-                                 member_kind="copybook")
+        self.write_text_copybook("POLICY", "POLSTUBC", stub8, ck="stub", status="skipped",
+                                 why="only numbers, one in column 8: a stub, never expanded (ROADMAP re-parse item 23)",
+                                 role="D6 stub (8 digits)", member_kind="stub")
         # D5: the missing copybook's text (only in listings) - a full 01 the two programs rename
         miss_root = Item(1, "PMSS-AUDIT-REC", children=[dom.x(5, "PMSS-AUDIT-KEY", 12), dom.x(5, "PMSS-AUDIT-USER", 8),
                                                         dom.n9(5, "PMSS-AUDIT-DT", 8), dom.packed(5, "PMSS-AUDIT-AMT", 9),
@@ -1056,9 +1059,10 @@ class Estate:
                    "copybook": "POLMISSB", "programs": ["POLUPD03", "POLUPD04"],
                    "recover_words": ["recovered: 1 of", "## Written", "POLMISSB"], "final_status": "ok",
                    "recovered_path": os.path.join(self.root, "SHARED", "RECOVERED-COPYBOOKS", "POLMISSB.cpy")},
-            "D6": {"title": "a stub copybook whose text sits in columns 1-7, filed empty (LESSONS 192)", "copybook": "POLSTUBB",
-                   "program": "POLUPD05", "recover_words": ["## Missing copybooks, checked on disk", "columns 1-7"],
-                   "coverage_words": ["on disk?"], "copybook_words": ["columns 1-7"], "final_status": "partial"},
+            "D6": {"title": "stub copybooks holding only numbers (7 and 8 digits), filed stub and never expanded (LESSONS "
+                            "192, 204)", "copybook": "POLSTUBB",
+                   "program": "POLUPD05", "recover_words": ["## Missing copybooks, checked on disk", "in the index as a stub"],
+                   "coverage_words": ["on disk?"], "copybook_words": ["a stub"], "final_status": "partial"},
             "ARRIVED": {"title": "a copybook that arrived after its program was parsed (LESSONS 183/192)", "copybook": "POLARRVB",
                         "program": "POLUPD06", "recover_words": ["arrived after the last build"],
                         "recover_words_after_build": ["copy a copybook that has arrived since they were parsed"], "final_status": "ok"},

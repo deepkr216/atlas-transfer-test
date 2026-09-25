@@ -463,15 +463,34 @@ shipped alone and cost one such night; these still wait for the next one:
    TheVerdict), tests/test_library_says.py (TheClassifierReadsTheLibrary, TheSecondRoundInABuild,
    TheBuildsOwnRuleIsNoDeclaration, ADeclaredCopybookOverAShape, TheNoteOutlivesAForcedReparse, DeclaredKindsUsed),
    LESSONS 186-189, 198, 199, 200.
-23. **reader.py: a copybook member whose every non-blank line keeps its text within columns 1-7 is read as
-   code.** Two of his missing copybooks hold a 7-8 digit number in column 1 and nothing else (a stub, or a
-   value meant to be copied): fixed-format reading takes columns 1-6 as the sequence area and column 7 as
-   the indicator, `read_cobol_lines` yields no code, `build.code_line_count` gives 0 and the build files the
-   member `empty` - the resolver never looks at it and every program copying it says COPY X NOT FOUND
-   (LESSONS 192). At the re-parse: a member with no line reaching column 8 is read as free format (its
-   text is the code) and counted; the reader says so in the member's note. Until then `atlas.recover`,
-   `coverage` and `copybook NAME` say where the text sits ('the file holds N line(s) whose text sits in
-   columns 1-7 ...') instead of the bare word `empty`, and the disk check names the file.
+23. **Delivered in the batch - a member holding only numbers is a stub, never expanded.** Two of his missing
+   copybooks hold a 7-8 digit number and nothing else. A 7-digit number in column 1 sits in the sequence area and
+   the indicator column of fixed-format COBOL, so the reader saw no code and the build filed the member `empty`:
+   every program copying it said COPY X NOT FOUND (LESSONS 192). An 8-digit one puts a digit in column 8: the
+   member was a copybook `ok` with no fields, and expanded under `01 WS-STUB-AREA.` it ran that data entry on into
+   the PROCEDURE DIVISION and erased every paragraph, PERFORM and reference of the program while it read
+   `parse: ok` (the synthetic reproduction tools/synth/repro/F08-stub-8-digits). This item used to say 'read such
+   a member as free format so its text is code' - wrong: expanding the number is what erases the program. The
+   compiler could compile neither text, so the program was compiled against another copy. Now a member of a kind
+   the resolver expands whose every non-blank, non-comment line holds only digits and blanks, whatever the
+   columns (`reader.stub_count`), is filed `stub` (`build.STUB_KIND`; a member of comments and blanks only stays
+   `empty`). The resolver never expands a stub: a real copy of the name in any library comes first (also for a
+   `COPY ... OF` naming the stub's library), and with none the program keeps its own lines, is `partial`, and
+   carries in place of NOT FOUND the note 'COPY X: the member in LIBRARY holds only numbers (N lines) - a stub,
+   not the copybook's text; the program was compiled against another copy (its listing, or another library,
+   holds it)' (`expand.stub_note`, found again by `expand.STUB_NOTE_RE`). A stub arriving, changing, going or
+   re-typed parses its copiers again (`build.COPY_KINDS` for `moved_names`); the jobs read a stub as cards wherever
+   they read a member filed 'unknown' (a date card in a PARMS library with no hint was one), and never in place of
+   another member of the name. `atlas.recover`'s disk check says 'N in the index as a stub - only numbers, not the
+   copybook's text' with its own 'next:', and the same run writes the copybook from the listings of the programs
+   copying it; coverage's 'Copybooks not found' table, its partial-members note, `copybook NAME` and `program NAME`
+   say 'a stub' in the same words. A stub is neither arrived nor misfiled: `recover.members_named` leaves it out,
+   so nothing re-files, renames or declares it. On an index built before the item the 7-digit stub is still
+   `empty` and the stand-ins say where its text sits, as before; the first build of this toolkit re-parses every
+   member and files it `stub`. tests/test_stub_copybooks.py (TheReader, SevenAndEightDigits,
+   ARealCopyBeatsTheStub, AStubArrivesChangesAndGoes, TheListingHoldsTheText, CardsHoldingOnlyNumbers,
+   TheReproduction, AnIndexBuiltBeforeTheItem, TheDocsSayIt), tests/test_disk_check.py (TheStubFiledEmpty and
+   CoverageAndCopybookCarryTheVerdicts on an aged index), LESSONS 192, 204.
 24. **Two facts an incremental build keeps after their source is gone: the list of dataset names keeps a name no DD
    names any more, and a DD keeps the direction an OPEN verb gave it after the program stops opening the file.**
    The build adds a row to `dataset` for every

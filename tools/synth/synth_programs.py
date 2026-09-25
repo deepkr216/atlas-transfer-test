@@ -343,9 +343,10 @@ def build_policy_specials(estate) -> None:
     estate.add_program(pb, role="D5")
     # D6: the stub
     pb = small_batch(estate, sys_, "POLUPD05", [{"wrapper": "WS-STUB-AREA", "book": "POLSTUBB", "expect": "not_found"},
-                                                 {"wrapper": "WS-STUB-AREA-2", "book": "POLSTUBC", "expect": "resolved_empty"}],
+                                                 {"wrapper": "WS-STUB-AREA-2", "book": "POLSTUBC", "expect": "not_found"}],
                      pid_own_line=True)
-    estate.add_program(pb, status="partial", why="COPY POLSTUBB NOT FOUND (member filed empty: text in columns 1-7)", role="D6")
+    estate.add_program(pb, status="partial", why="COPY POLSTUBB and COPY POLSTUBC: stubs holding only numbers, never "
+                                                  "expanded (ROADMAP re-parse item 23)", role="D6")
     # arrived after the first build
     def body6(pb, c):
         pb.if_open("PARR-RESTARTING", tests=["PARR-RESTARTING"])

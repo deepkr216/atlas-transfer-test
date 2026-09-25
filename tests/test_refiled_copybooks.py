@@ -1018,10 +1018,11 @@ class OkWithAnUnlinkedCopyRow(_Estate):
 
 
 class WrittenCopybookIsFiledRight(_Estate):
-    """Case K (LESSONS 191): the copybook's library copy on disk is a bare number (kind 'empty'), the program's
-    compiler listing carries the copybook expanded under the `A-100-BEGIN SECTION.  COPY STARTVB.` line, and its
-    text holds the COBOL START verb. recover writes it; before the batch the build then filed it asm and it took a
-    second recover and a third build - now the build files the written copybook as a copybook at once."""
+    """Case K (LESSONS 191): the copybook's library copy on disk is a bare number (kind 'stub' since ROADMAP re-parse
+    item 23, 'empty' before), the program's compiler listing carries the copybook expanded under the
+    `A-100-BEGIN SECTION.  COPY STARTVB.` line, and its text holds the COBOL START verb. recover writes it; before
+    the batch the build then filed it asm and it took a second recover and a third build - now the build files the
+    written copybook as a copybook at once, and expands it over the stub."""
 
     files = (("GC/PROD.GC.SRC/SVPGM.cbl", section_program("SVPGM", "STARTVB")),
              ("SHARED/PROD.GC.COPYLIB/STARTVB.txt", "1234567\n"),
@@ -1029,8 +1030,11 @@ class WrittenCopybookIsFiledRight(_Estate):
                                                           {"STARTVB": STARTVERB.splitlines()})))
 
     def test_written_then_one_build(self):
-        self.assertEqual(self.member("STARTVB")[:3], ("empty", "PROD.GC.COPYLIB", "skipped"))
+        self.assertEqual(self.member("STARTVB")[:3], ("stub", "PROD.GC.COPYLIB", "skipped"))
         self.assertEqual(self.status("SVPGM"), "partial")
+        self.assertIn("COPY STARTVB: the member in PROD.GC.COPYLIB holds only numbers (1 line) - a stub, not the "
+                      "copybook's text; the program was compiled against another copy (its listing, or another library, "
+                      "holds it)", self.q("SELECT detail FROM unresolved WHERE kind='expand'")[0][0])
         stats, said = self.recover()
         self.assertEqual((stats["written"], stats["rejected"], stats["misread"], stats["refiled"]), (1, 0, 0, 0), said)
         self.assertIn("recovered: 1 of 1 missing copybooks", said)

@@ -1316,7 +1316,16 @@ def _copied_as_copybook(conn: sqlite3.Connection, name: str) -> str:
             return f"\n> {_cap(recover.REFILED_NOTE)}: {notes[0]}.\n"
         return ""
     if not other:
-        return ""
+        # a stub (only numbers - ROADMAP re-parse item 23): what it is to the programs copying it, in their own note
+        copiers = [(int(r[0]), str(r[1])) for r in conn.execute(
+            "SELECT DISTINCT m.id, UPPER(m.name) FROM copy_use c JOIN member m ON m.id=c.member_id "
+            "WHERE UPPER(c.copybook)=? AND m.kind='cobol' AND c.resolved_member_id IS NULL ORDER BY 2", (name.upper(),))]
+        note = recover.stub_note_of(conn, name, [i for i, _n in copiers]) if copiers else ""
+        if not note:
+            return ""
+        who = ", ".join(n for _i, n in copiers[:8]) + (f", +{len(copiers) - 8} more" if len(copiers) > 8 else "")
+        return (f"\n> {len(copiers)} program{'s' if len(copiers) != 1 else ''} cop{'y' if len(copiers) != 1 else 'ies'} it as "
+                f"a copybook and {'are' if len(copiers) != 1 else 'is'} parsed only in part ({who}): {note}.\n")
     unresolved = [r[0] for r in conn.execute(
         "SELECT DISTINCT UPPER(m.name) FROM copy_use c JOIN member m ON m.id=c.member_id "
         "WHERE UPPER(c.copybook)=? AND m.kind='cobol' AND c.resolved_member_id IS NULL ORDER BY 1", (name.upper(),))]
@@ -1342,6 +1351,7 @@ def _exists_as_other_kind(conn: sqlite3.Connection, name: str) -> str:
     accepted, other = recover.members_named(conn, name)
     if not accepted and not other:
         return ""
+    stub = f" {_cap(recover.stub_note_of(conn, name))}." if recover.stubs_named(conn, name) else ""
     if accepted:                                                        # sql: the resolver expands it, this report does not read it
         where = "; ".join(f"filed as {k} (folder {f})" for _i, k, f, _p in accepted[:4]) + (" ..." if len(accepted) > 4 else "")
         return (f" as a copybook - a member with this name exists, {where}: a kind the build expands, but not one this "
@@ -1363,7 +1373,7 @@ def _exists_as_other_kind(conn: sqlite3.Connection, name: str) -> str:
     for fix in dict.fromkeys(recover.content_fix(r) for r in readings if r["by"] == "content"):
         fixes.append(f"For the copy filed by its content, {fix}." if fixes else _sentence(fix))
     return (f" as a copybook - a member with this name exists, {where}: not a kind the build expands, so every program "
-            f"that copies it is parsed only in part. " + " ".join(fixes))
+            f"that copies it is parsed only in part. " + " ".join(fixes) + stub)
 
 
 def disk_verdicts(conn: sqlite3.Connection, names: Sequence[str]) -> Tuple[str, Dict[str, str]]:
@@ -1473,6 +1483,18 @@ def cmd_copybook(conn: sqlite3.Connection, name: str) -> str:
                     + (", ".join(f"{u[1]} @{u[1]}:{u[2]}" for u in users) or "_none_") + "\n")
     if not copies:
         other = _exists_as_other_kind(conn, name)
+        from . import recover
+        if not other and recover.stubs_named(conn, name):
+            # only a stub carries the name (ROADMAP re-parse item 23): what it holds, who copies it, what to do - the
+            # disk has nothing to add
+            users = conn.execute("SELECT DISTINCT m.id, UPPER(m.name) FROM copy_use c JOIN member m ON m.id=c.member_id "
+                                 "WHERE UPPER(c.copybook)=? AND m.kind='cobol' AND c.resolved_member_id IS NULL "
+                                 "ORDER BY 2", (name.upper(),)).fetchall()
+            who = ", ".join(u[1] for u in users[:8]) + (f", +{len(users) - 8} more" if len(users) > 8 else "")
+            return (out[0] + f"\n**NOT FOUND** as a copybook - {recover.stub_note_of(conn, name, [u[0] for u in users])}.\n"
+                    + (f"\n{len(users)} program{'s' if len(users) != 1 else ''} cop{'y' if len(users) != 1 else 'ies'} it and "
+                       f"{'are' if len(users) != 1 else 'is'} parsed only in part: {who}.\n" if users else "")
+                    + f"\nA stub is {recover.STUB_TODO}.\n" + _listing_sources_of(conn, name, missing=True))
         # no member at all under the name: the estate root is walked once for a file with that name, or a near one
         # (LESSONS 192) - a member of another kind is said by the note above, the disk check has nothing to add
         disk = "" if other else _disk_note(conn, name)
@@ -1484,6 +1506,13 @@ def cmd_copybook(conn: sqlite3.Connection, name: str) -> str:
             r = conn.execute("SELECT MAX(offset+length) AS len, COUNT(*) AS n FROM field WHERE member_id=?", (c["id"],)).fetchone()
             out.append(f"  - `{c['path']}`: {r['len']} bytes, {r['n']} fields" + ("  [authoritative]" if c["authoritative"] else "") + "\n")
     from . import recover
+    stubs = recover.stubs_named(conn, name)
+    if stubs:
+        # a real copy beats a stub of the name wherever each sits (ROADMAP re-parse item 23): said, so the stub's
+        # library is not taken for the one the programs expand
+        folders = ", ".join(dict.fromkeys(f for _i, f, _p in stubs))
+        out.append(f"\n> Also a stub of this name in {folders}: it holds only numbers - the build never expands it, and "
+                   "the programs below expand the copy above.\n")
     # a member atlas.recover re-filed as a copybook (the classifier had typed it asm / listing / mfs by a line of
     # its text): indexed, expanded into its programs, its own layout rows absent until the next full re-parse
     refiled = [c for c in copies if (c["parse_error"] or "").startswith(recover.REFILED_MARK)]
@@ -1979,6 +2008,13 @@ def _partial_members(conn: sqlite3.Connection, limit: int = COVERAGE_ROWS) -> st
                            "not found' table says why")
                 clauses.append(f"{n} exist{'s' if n == 1 else ''} only as a member the classifier typed by a line of its text "
                                f"({kinds}): {fix}")
+        stub_books = sorted({book for (_mid, book) in recover.stub_copies(conn)})
+        if stub_books:
+            n = len(stub_books)
+            clauses.append(f"{n} of the copybooks {'is a stub' if n == 1 else 'are stubs'} - only numbers, which the build "
+                           "never expands: the programs were compiled against another copy, which `python -m atlas.recover "
+                           "--db atlas.db --from FOLDER` writes from their compiler listings (or fetch the library the "
+                           "listings name)")
         if clauses:
             out.append("\n> " + "; ".join(clauses) + ". The 'Copybooks not found' table below says which.\n")
     out.append(unlinked_ok_clause(stale))
@@ -2154,10 +2190,19 @@ def same_named_state(conn: sqlite3.Connection, copybook: str, exclude_ids: Seque
     of this toolkit reads it as a copybook, atlas.recover re-files it as one
     in the index, and the note says that instead; once re-filed, the note
     says the programs are marked for the build (or, after a build, nothing:
-    the COPY resolves)."""
+    the COPY resolves). A member filed `stub` - only numbers, never expanded
+    (ROADMAP re-parse item 23) - is none of these: the note is the
+    program's own stub note (recover.stub_note_of) and `state` says `stub`,
+    with nothing to re-file, rename or declare."""
     from . import recover
     accepted, other = recover.members_named(conn, copybook, exclude_ids)
     state: Dict[str, object] = {"late": [], "left": [], "kinds": []}
+    # a stub of the name (only numbers - ROADMAP re-parse item 23) is neither: not misfiled, nothing to re-file,
+    # rename or declare - the program's own note says what it is, and a real copy of the name comes first
+    stub = "" if accepted else recover.stub_note_of(conn, copybook, exclude_ids)
+    if stub and not other:
+        state["stub"] = True
+        return stub, state
     if accepted:
         refiled = recover.refiled_members(conn)
         if all(i in refiled for i, _k, _f, _p in accepted):
@@ -2208,6 +2253,8 @@ def same_named_state(conn: sqlite3.Connection, copybook: str, exclude_ids: Seque
             where = "; ".join(dict.fromkeys(f"{r['folder']}, {recover.filed_phrase(r)}" for r in by_content))
             fixes = "; ".join(dict.fromkeys(recover.content_fix(r) for r in by_content))
             parts.append(f"{where} - not a kind the build expands, and {fixes}")
+        if stub:
+            parts.append(stub)
         return "; ".join(parts), state
     return "", state
 
@@ -2264,6 +2311,10 @@ def _not_found_cell(conn: sqlite3.Connection, copybook: str, member_id: int) -> 
     NOT FOUND, and where a member with that name exists now, why the build
     did not use it."""
     from . import recover
+    stub = recover.stub_copies(conn, [member_id]).get((member_id, copybook.upper()))
+    if stub:
+        # the only members of the name are stubs (ROADMAP re-parse item 23): the program's own note says so
+        return recover.stub_cell(stub)
     why = recover.skipped_copies(conn, member_id).get((member_id, copybook.upper()))
     if why:
         return skipped_cell(why)
@@ -2564,7 +2615,7 @@ def cmd_coverage(conn: sqlite3.Connection, everything: bool = False) -> str:
                    "there (a copybook copying itself, or nesting deeper than 12); the reason stands beside the program "
                    "under 'Members parsed only in part' (a long chain of nested COPYs is cut short in that column; "
                    "`program NAME` prints it whole).\n")
-    if any(r[2] != "-" for r in nf_rows):
+    if any(r[2] != "-" and not st.get("stub") for r, st in zip(nf_rows, states)):
         # 'parsed before it arrived' and 'left the index after the parse' are states only a build before ROADMAP
         # re-parse item 21 left (the build of this toolkit parses the programs again for every kind the resolver
         # expands, and whenever a member they expanded goes, changes or is recorded again): each is said when a cell
@@ -2600,6 +2651,12 @@ def cmd_coverage(conn: sqlite3.Connection, everything: bool = False) -> str:
                    "Assembler, a comment naming MODULE MAP as a listing, a first word MSG as MFS) and a procedure copybook "
                    "took its folder's kind: where the classifier of this toolkit reads it as a copybook, `python -m "
                    "atlas.recover --db atlas.db` re-files it as one in the index, then build.\n")
+    if any(st.get("stub") for st in states):
+        # only a stub carries the name (ROADMAP re-parse item 23)
+        out.append("\n> A copybook whose cell says `a stub` is held only as a member of numbers - no text a compiler could "
+                   "compile - so the build never expands it and the programs copying it are parsed only in part: they were "
+                   "compiled against another copy. `python -m atlas.recover --db atlas.db --from FOLDER` writes the copybook "
+                   "from their compiler listings; or fetch the library the listings name.\n")
     out.append("\n### Unresolved by kind - what the index could NOT work out, and what closes each one\n")
     # a chosen copybook's rows apart from the rest; the ones the program's compiler listing decided (build.LISTING_HOW
     # in the note) or confirmed through a same-text copy (build.LISTING_SAME) apart again: those have nothing to declare.
@@ -5517,7 +5574,8 @@ def _coverage_extras(conn: sqlite3.Connection) -> str:
             "asm": "no program rows, calls or DSECT layouts", "rexx": "no calls / SUBMITs / ALLOCs",
             "sql": "DDL not parsed (columns, views, triggers unknown)", "unknown": "nothing - misfiled library?",
             "doc": "prose only, never facts", "listing": "not parsed (offsets unknown)", "other": "nothing",
-            "empty": "no code lines"}
+            "empty": "no code lines",
+            "stub": "only numbers - never expanded: the programs copying it were compiled against another copy"}
     out.append(table(["kind", "members", "handler", "what is lost without one"],
                      [(k["kind"], k["n"], "yes" if k["kind"] in _build.HANDLERS else "NO",
                        "" if k["kind"] in _build.HANDLERS else lost.get(k["kind"], "not parsed")) for k in kinds]))

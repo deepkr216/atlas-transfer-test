@@ -143,6 +143,7 @@ REPORT = os.path.join("work", "recover.md")
 FETCH_LIST = "fetch-list.txt"                                       # next to the report: the datasets to fetch, one per line
 FETCH_NAMES = 12                                                    # copybook names shown per dataset in the report's table
 RESOLVER_KINDS = ("copybook", "cobol", "sql", "unknown")          # what the build's resolver accepts
+STUB_KIND = "stub"                                                  # only numbers: never expanded (build.STUB_KIND)
 MAX_SOURCE_BYTES = 64 * 1024 * 1024
 SHAPE_OK = 0.98                                                  # records that must look like 80-column source
 
@@ -1712,6 +1713,10 @@ def members_named(conn: sqlite3.Connection, name: str, exclude_ids: Sequence[int
     """Every member carrying a copybook's name, as (id, kind, folder, path),
     split into the ones the build's resolver would expand (RESOLVER_KINDS)
     and the ones it never looks at (proc, ctlcard, doc, jcl, listing ...).
+    A stub (only numbers - ROADMAP re-parse item 23) is in neither list: it
+    is not misfiled and nothing re-files, renames or declares it into a
+    copybook - the program's own note says what it is, and stubs_named()
+    lists it.
     A member with no content signature - since ROADMAP re-parse item 20 a
     procedure copybook has one, its COBOL statements; a literal copied into
     a VALUE clause has none - takes its kind from the FOLDER NAME: PROCS
@@ -1723,10 +1728,63 @@ def members_named(conn: sqlite3.Connection, name: str, exclude_ids: Sequence[int
     skip = set(exclude_ids)
     for mid, kind, folder, path in conn.execute("SELECT id, kind, library, path FROM member WHERE UPPER(name)=? "
                                                 "ORDER BY kind, library, path", (name.upper(),)):
-        if mid in skip:
+        if mid in skip or kind == STUB_KIND:
             continue
         (accepted if kind in RESOLVER_KINDS else other).append((int(mid), kind, folder or "?", path))
     return accepted, other
+
+
+def stubs_named(conn: sqlite3.Connection, name: str, exclude_ids: Sequence[int] = ()) -> List[Tuple[int, str, str]]:
+    """The members of a copybook's name the build filed `stub` - every code
+    line only numbers, never expanded (ROADMAP re-parse item 23) - as (id,
+    folder, path). An index built before the item holds none: the 7-digit
+    stub was filed 'empty' (members_named lists it among the others) and
+    the 8-digit one a copybook."""
+    skip = set(exclude_ids)
+    return [(int(mid), folder or "?", path) for mid, folder, path in conn.execute(
+        "SELECT id, library, path FROM member WHERE UPPER(name)=? AND kind=? ORDER BY library, path",
+        (name.upper(), STUB_KIND)) if mid not in skip]
+
+
+def stub_copies(conn: sqlite3.Connection, member_ids: Optional[Sequence[int]] = None) -> Dict[Tuple[int, str], str]:
+    """{(program member id, COPYBOOK): the note} for every COPY whose only
+    members of the name are stubs - the program's own 'expand' note in the
+    words of expand.stub_note ('the member in LIB holds only numbers (N
+    lines) - a stub, not the copybook's text; the program was compiled
+    against another copy (its listing, or another library, holds it)'),
+    written where NOT FOUND would be. `member_ids`: those programs only, 500
+    to a query. Empty on an index built before ROADMAP re-parse item 23."""
+    out: Dict[Tuple[int, str], str] = {}
+    sql = "SELECT member_id, detail FROM unresolved WHERE kind = 'expand' AND detail LIKE '%only numbers%'"
+    if member_ids is None:
+        chunks: List[Optional[List[int]]] = [None]
+    else:
+        ids = sorted({int(i) for i in member_ids})
+        chunks = [ids[k:k + 500] for k in range(0, len(ids), 500)]
+    for chunk in chunks:
+        q = sql + (f" AND member_id IN ({','.join('?' * len(chunk))})" if chunk is not None else "")
+        for mid, detail in conn.execute(q, tuple(chunk or ())):
+            m = expand.STUB_NOTE_RE.search(detail or "")
+            if m and mid is not None:
+                out.setdefault((int(mid), m.group(1).upper()), m.group(2))
+    return out
+
+
+def stub_cell(note: str) -> str:
+    """`program`'s 'resolved to' cell for a COPY whose only members are stubs."""
+    return f"**a stub - not expanded**: {note}"
+
+
+def stub_what(n: Optional[int]) -> str:
+    """'a stub: it holds only numbers (6 lines), not the copybook's text'."""
+    return ("a stub: it holds only numbers" + (f" ({n} line{'' if n == 1 else 's'})" if n else "")
+            + ", not the copybook's text")
+
+
+STUB_TODO = ("never expanded: the programs copying it were compiled against another copy - this tool writes the copybook "
+             "from their compiler listings (--from FOLDER), or fetch the library the listings name")
+STUB_NEXT = ("  next: a stub is not the copybook - its text is in the compiler listings of the programs copying it, which "
+             "this tool reads with --from FOLDER and writes the copybook from; or fetch the library the listings name")
 
 
 _SKIPPED_RE = re.compile(r"COPY (\S+) skipped - (recursive|nesting deeper than \d+)")
@@ -1758,8 +1816,9 @@ def skipped_copies(conn: sqlite3.Connection, member_id: Optional[int] = None) ->
         if not m or mid is None:
             continue
         name = m.group(1).upper()
-        not_found = conn.execute("SELECT 1 FROM unresolved WHERE member_id = ? AND kind = 'expand' AND detail LIKE ? LIMIT 1",
-                                 (mid, f"%COPY {name} NOT FOUND%")).fetchone()
+        not_found = conn.execute("SELECT 1 FROM unresolved WHERE member_id = ? AND kind = 'expand' "
+                                 "AND (detail LIKE ? OR detail LIKE ?) LIMIT 1",
+                                 (mid, f"%COPY {name} NOT FOUND%", f"%COPY {name}: the member% only numbers%")).fetchone()
         if not not_found:
             out[(int(mid), name)] = m.group(2)
     return out
@@ -1782,9 +1841,13 @@ def not_found_copies(conn: sqlite3.Connection, member_ids: Optional[Sequence[int
     re-parse item 21 did not parse the program again. The two states read
     alike by the row and need different words: 'parsed before it arrived'
     said of the second sent him looking for an arrival that never happened
-    (LESSONS 202)."""
+    (LESSONS 202). A COPY whose only members are stubs (stub_copies: the
+    note says 'holds only numbers' where NOT FOUND would be - ROADMAP
+    re-parse item 23) is one the program found nothing to expand for, and
+    counts here too."""
     out: Set[Tuple[int, str]] = set()
-    sql = "SELECT member_id, detail FROM unresolved WHERE kind = 'expand' AND detail LIKE '%NOT FOUND%'"
+    sql = ("SELECT member_id, detail FROM unresolved WHERE kind = 'expand' "
+           "AND (detail LIKE '%NOT FOUND%' OR detail LIKE '%only numbers%')")
     if member_ids is None:
         chunks: List[Optional[List[int]]] = [None]
     else:
@@ -1797,7 +1860,32 @@ def not_found_copies(conn: sqlite3.Connection, member_ids: Optional[Sequence[int
                 continue
             for m in _NOT_FOUND_RE.finditer(detail or ""):
                 out.add((int(mid), m.group(1).upper()))
+            stub = expand.STUB_NOTE_RE.search(detail or "")
+            if stub:
+                out.add((int(mid), stub.group(1).upper()))
     return out
+
+
+def stub_note_of(conn: sqlite3.Connection, name: str, copier_ids: Sequence[int] = ()) -> str:
+    """The note for a copybook name whose members are stubs: a copier's own
+    note (stub_copies - what the build saw), else expand.stub_note over the
+    stubs of the name with their lines counted on disk now; '' when no stub
+    carries the name."""
+    ids = [int(i) for i in copier_ids]
+    if ids:
+        for (_mid, book), note in sorted(stub_copies(conn, ids).items()):
+            if book == name.upper():
+                return note
+    stubs = stubs_named(conn, name, ids)
+    if not stubs:
+        return ""
+    counts: List[Tuple[str, Optional[int]]] = []
+    for _i, folder, path in stubs:
+        try:
+            counts.append((folder, reader.stub_count(*reader.load(path)) or None))
+        except OSError:
+            counts.append((folder, None))
+    return expand.stub_note(counts)
 
 
 def unlinked_ok_programs(conn: sqlite3.Connection, member_id: Optional[int] = None) -> Dict[int, Tuple[str, List[str]]]:
@@ -2315,7 +2403,18 @@ def how_classified(path: str, stored_kind: Optional[str] = None, stored_sha: Opt
     files_as = lib_decl if lib_decl and classify.declared_wins(kind, basis, lib_decl) else kind   # this toolkit's build
     # the shape checks are line-anchored: a member downloaded with CR LF must not slip past a `$`
     out.update(kind=kind, reason=reason, text=classify.normalized(text))
-    if stored_kind == "empty":
+    if stored_kind == STUB_KIND:
+        # every code line only numbers: filed `stub` by the build of ROADMAP re-parse item 23 and never expanded -
+        # not misfiled, and nothing re-files it (members_named leaves it out; said here when asked all the same)
+        whole, wdata = text, data
+        if len(data) >= HEAD_BYTES:
+            try:
+                whole, wdata, enc = reader.load(path)
+            except OSError:
+                pass
+        n = reader.stub_count(whole, wdata, enc)
+        out.update(kind=STUB_KIND, by="content", stub=n, seen=stub_what(n))
+    elif stored_kind == "empty":
         # the build files a code member with no code lines as empty, after classifying: comments and blanks only -
         # or a bare number in column 1, which the fixed-format reader takes for the sequence area and the indicator
         # (LESSONS 192): the sentence says where the text sits, and `stub` how many such lines there are
@@ -2437,6 +2536,8 @@ def refile_verdict(r: Dict[str, object], folder: str) -> Tuple[bool, str]:
         return True, ""
     kind = str(r["kind"])
     text = str(r["text"])
+    if kind == STUB_KIND:
+        return False, f"{stub_what(int(r.get('stub') or 0))} - {STUB_TODO}"   # type: ignore[arg-type]
     if kind == "empty":
         # the reader would expand nothing: comments and blanks only - or text in columns 1-7 alone, said as such
         n = int(r.get("stub") or 0)                                 # type: ignore[arg-type]
@@ -2882,8 +2983,8 @@ NEAR_PREFIX_MIN = 4                      # a stem the name starts with must be t
 NO_FILE_TODO = ("no file with this name under the estate: fetch the library the listings name (the fetch list) - or the "
                 "library is gone from the host")
 EMPTY_TODO = ("open the file: if the number is all it holds, the library copy is a stub and the copybook's text is in the "
-              "listings of the programs copying it (this run reads them) or on the host (fetch the member again); until "
-              f"{STUB_ITEM} the build reads no code from it")
+              "listings of the programs copying it (this run reads them) or on the host (fetch the member again); the build "
+              f"of {STUB_ITEM} files such a member `stub` and never expands it")
 THERE_TODO = ("see atlas-problems.txt for a skip (a time limit, unreadable, too large) and the coverage report's 'failed' "
               "table, or a build that stopped before it recorded every file")
 
@@ -2955,13 +3056,17 @@ def file_dated(path: str) -> Optional[float]:
 
 def file_reading(path: str) -> Dict[str, object]:
     """What the build would make of a file on disk: `kind` as
-    classify.classify reads its first 8 KB, 'empty' for a copybook / cobol
-    member with no code lines (build._inventory_one), `code_lines` for a
-    copybook / cobol kind (build.code_line_count), `stub` for an empty one
-    (stub_lines), and `what` - the sentence for the report's 'what the file
-    is' cell. Reads the first DISK_READ_BYTES."""
+    classify.classify reads its first 8 KB, 'stub' for a member of a kind
+    the resolver expands whose every code line holds only numbers
+    (reader.stub_count, ROADMAP re-parse item 23: `numbers` its lines),
+    'empty' for a copybook / cobol member with no code lines
+    (build._inventory_one), `code_lines` for a copybook / cobol kind
+    (build.code_line_count), `stub` for an empty one or a stub - the lines
+    within columns 1-7 by which an index built before the item filed it
+    'empty' (stub_lines) - and `what`, the sentence for the report's 'what
+    the file is' cell. Reads the first DISK_READ_BYTES."""
     from . import build as _build
-    out: Dict[str, object] = {"kind": "?", "reason": "", "code_lines": None, "stub": 0, "what": ""}
+    out: Dict[str, object] = {"kind": "?", "reason": "", "code_lines": None, "stub": 0, "numbers": 0, "what": ""}
     try:
         size = os.path.getsize(path)
         with open(path, "rb") as fh:
@@ -2977,6 +3082,13 @@ def file_reading(path: str) -> Dict[str, object]:
     elif classify.declared_wins(kind, basis, "copybook"):
         # a shape, the folder name or the extension typed it: a kind declared for the library comes first
         what = f"{kind} ({reason}) - or the kind declared for its library in the UI's table, which comes first"
+    numbers = reader.stub_count(text, data, enc) if kind in RESOLVER_KINDS else 0
+    if numbers:
+        # every code line only numbers: the build files it `stub` and never expands it (ROADMAP re-parse item 23);
+        # `stub` keeps the columns-1-7 count by which an index built before the item filed it 'empty'
+        out.update(kind=STUB_KIND, reason=reason, numbers=numbers, stub=stub_lines(text, data, enc),
+                   what=f"the build files it stub: {stub_what(numbers)}")
+        return out
     if kind in ("copybook", "cobol"):
         n = _build.code_line_count(kind, text, data, enc)
         out["code_lines"] = n
@@ -3028,7 +3140,9 @@ def disk_check(missing: "Sequence[str] | Dict[str, int]", root: str, conn: sqlit
 
       (a) a file whose stem is the name -> `status` 'indexed' (the file is a
           member of the index filed 'empty': the stub sentence says where
-          its text sits), 'late' (not in the index, dated after the last
+          its text sits), 'stub' (a member the build filed `stub`: only
+          numbers, never expanded - ROADMAP re-parse item 23), 'late' (not
+          in the index, dated after the last
           build started: build again) or 'there' (not in the index, there
           at the last build: the build did not index it - a skip, said in
           atlas-problems.txt); a name the index holds under another kind
@@ -3057,7 +3171,7 @@ def disk_check(missing: "Sequence[str] | Dict[str, int]", root: str, conn: sqlit
         for name, path, kind in conn.execute("SELECT UPPER(name), path, kind FROM member WHERE UPPER(name) IN "
                                              f"({','.join('?' * len(chunk))})", chunk):
             indexed[os.path.normcase(os.path.abspath(path))] = str(kind)
-            if kind != "empty":
+            if kind not in ("empty", STUB_KIND):
                 said_already.add(str(name))
     started = last_build_started(conn)
     for name in names:
@@ -3099,6 +3213,12 @@ def _found_verdict(name: str, paths: Sequence[str], indexed: Dict[str, str], sta
         path, kind = in_index[0]
         reading = file_reading(path)
         what = str(reading["what"])
+        if kind == STUB_KIND:
+            # only numbers (ROADMAP re-parse item 23): never expanded, the programs compiled against another copy
+            return {"status": "stub", "path": _rel(path, root), "paths": rels, "kind": kind,
+                    "what": stub_what(int(reading["numbers"] or 0) or None),          # type: ignore[arg-type]
+                    "near": [], "dated": file_dated(path),
+                    "on_disk": f"yes: {_rel(path, root)} - in the index as a stub{more(path)}", "todo": STUB_TODO}
         if kind == "empty":
             stub = int(reading["stub"] or 0)                        # type: ignore[arg-type]
             what = stub_sentence(stub) if stub else "no code lines (comments and blanks only): nothing a program could copy"
@@ -3111,15 +3231,16 @@ def _found_verdict(name: str, paths: Sequence[str], indexed: Dict[str, str], sta
     kind = str(reading["kind"])
     late = started is not None and when > started
     on_disk = f"yes: {_rel(path, root)} - not in the index{more(path)}"
+    stub = f"; it holds only numbers - a stub, {STUB_TODO}" if kind == STUB_KIND else ""
     if late:
         todo = (f"arrived after the last build (file dated {_stamp(when)}, last build started {_stamp(started)}): run your "
-                "usual build command")
+                f"usual build command{stub}")
     elif started is None:
         todo = f"the index records no build start to date it against: the build did not index it - its kind would be {kind}; {THERE_TODO}"
     else:
         todo = (f"was there at the last build (file dated {_stamp(when)}, last build started {_stamp(started)}): the build did "
                 f"not index it - its kind would be {kind}"
-                + (" / it has no code lines" if kind == "empty" else "") + f"; {THERE_TODO}")
+                + (" / it has no code lines" if kind == "empty" else "") + f"; {THERE_TODO}{stub}")
     return {"status": "late" if late else "there", "path": _rel(path, root), "paths": rels, "kind": kind,
             "what": str(reading["what"]), "near": [], "dated": when, "on_disk": on_disk, "todo": todo}
 
@@ -3128,8 +3249,8 @@ def disk_counts(checked: Dict[str, Dict[str, object]]) -> Dict[str, int]:
     """The stats: on_disk (a file with the name, in the index or not),
     arrived_late, no_file - and the parts the console line needs."""
     c = Counter(str(v["status"]) for v in checked.values())
-    return {"on_disk": c["late"] + c["there"] + c["indexed"], "arrived_late": c["late"], "no_file": c["near"] + c["none"],
-            "there": c["there"], "indexed": c["indexed"], "near": c["near"]}
+    return {"on_disk": c["late"] + c["there"] + c["indexed"] + c["stub"], "arrived_late": c["late"],
+            "no_file": c["near"] + c["none"], "there": c["there"], "indexed": c["indexed"], "near": c["near"], "stub": c["stub"]}
 
 
 def disk_line(checked: Dict[str, Dict[str, object]]) -> str:
@@ -3140,6 +3261,8 @@ def disk_line(checked: Dict[str, Dict[str, object]]) -> str:
         on.append(f"{c['arrived_late']:,} arrived after the last build - not in the index yet")
     if c["indexed"]:
         on.append(f"{c['indexed']:,} in the index filed empty - no code lines the reader sees")
+    if c["stub"]:
+        on.append(f"{c['stub']:,} in the index as a stub - only numbers, not the copybook's text")
     if c["there"]:
         on.append(f"{c['there']:,} there at the last build yet not in the index")
     parts = []
@@ -3163,6 +3286,8 @@ def disk_next(checked: Dict[str, Dict[str, object]]) -> str:
                 r"listings say (work\fetch-list.txt)"
                 + (f"; the {c['near']:,} near name(s) the report lists may be the members under another name: check them "
                    "against the COPY statements" if c["near"] else ""))
+    if c["stub"] and not c["indexed"] and not c["there"]:
+        return STUB_NEXT
     return ("  next: the report's table says per file why the build did not index it as a copybook - a member filed empty "
             "(its text in columns 1-7), a skipped file (atlas-problems.txt)")
 
@@ -3174,6 +3299,8 @@ def disk_cell(v: Dict[str, object]) -> str:
         return f"on disk at {v['path']}, not in the index - {v['todo']}"
     if status == "indexed":
         return f"on disk at {v['path']}, in the index as {v['kind']}: {v['what']}"
+    if status == "stub":
+        return f"on disk at {v['path']}, in the index as {v['what']} - {v['todo']}"
     return str(v["todo"])
 
 
@@ -3189,8 +3316,11 @@ def disk_report(checked: Dict[str, Dict[str, object]], missing: Dict[str, int], 
              "either arrived after the last build started (run your usual build command) or was there and the build did "
              "not index it (atlas-problems.txt and the coverage report's 'failed' table say why a file was skipped). A "
              "member the build filed 'empty' holds no code the reader sees: when its text sits in columns 1-7 - the "
-             f"sequence area and the indicator column of fixed-format COBOL - the table says so ({STUB_ITEM}).\n\n"
-             "| copybook | programs copying it | on disk? | what the file is | what to do |\n|---|---|---|---|---|\n"]
+             f"sequence area and the indicator column of fixed-format COBOL - the table says so ({STUB_ITEM})."
+             + (" A member the build filed `stub` holds only numbers, whatever the columns - not the copybook's text, "
+                "which no compiler could compile: the program was compiled against another copy, and the build never "
+                "expands a stub." if any(v["status"] == "stub" for v in checked.values()) else "")
+             + "\n\n| copybook | programs copying it | on disk? | what the file is | what to do |\n|---|---|---|---|---|\n"]
     for name in sorted(checked):
         v = checked[name]
         progs = f"{missing.get(name, 0)}" + (f" ({users[name]})" if users.get(name) else "")

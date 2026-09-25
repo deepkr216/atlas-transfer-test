@@ -34,7 +34,7 @@ instead of being copied into the truth.
 | D3 | `POLPROCB`, a procedure copybook in a PROCS folder | filed `copybook` by its COBOL statements, before the folder name (ROADMAP re-parse item 20): `POLUPD02` whole at once, no note names a folder fix |
 | D4 | `CMNDATEA` (`05 START-DATE`) and `CMNCUSTP` (the COBOL `START` verb) in COPYLIB folders | filed `copybook` by their own lines, before the Assembler shape (item 22): the programs whole at once, recover re-files nothing. On a copy of the index aged as the classifier before the batch built it (D3 `proc`, D4 `asm`), recover re-files all three, marks their programs, and the next build makes them whole |
 | D5 | `POLMISSB`, copied by two programs (one with a REPLACING over two lines, the period inside the pseudo-text), present only in their listings | recover writes it, exactly |
-| D6 | `POLSTUBB`, a stub of 7-digit numbers in columns 1-7 (and `POLSTUBC`, the 8-digit twin) | filed `empty`; the disk check says its text sits in columns 1-7 |
+| D6 | `POLSTUBB`, a stub of 7-digit numbers in columns 1-7 (and `POLSTUBC`, the 8-digit twin) | both filed `stub` and never expanded (ROADMAP re-parse item 23): `POLUPD05` is `partial` with the stub note for each and keeps its own paragraphs; the disk check, coverage, `copybook` and `program` say 'a stub' |
 | + | `POLARRVB` dropped into the COPYLIB after the first build | recover says it arrived after the last build; the next build resolves it |
 
 ## The flow the checker runs

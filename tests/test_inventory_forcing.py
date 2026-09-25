@@ -212,11 +212,22 @@ class TheRule(unittest.TestCase):
         self.assertEqual(build.moved_names({"q": stored("unknown", name="Gone")}, []), {"GONE"})
 
     def test_the_jobs_read_the_kinds_their_lookups_read(self):
-        # _proc_facts, _include_text and _card_text read these kinds; the job forcing reads the same tuple
+        # _proc_facts, _include_text and _card_text read these kinds; the job forcing reads the same tuple. A stub
+        # (only numbers, ROADMAP re-parse item 23) is read wherever a member filed 'unknown' is: a card member holding
+        # a date or a count was one before the item
         self.assertEqual(build.PROC_KINDS, ("proc", "jcl"))
-        self.assertEqual(build.INCLUDE_KINDS, ("jcl", "proc", "ctlcard", "unknown"))
-        self.assertEqual(build.CARD_KINDS, ("ctlcard", "unknown", "sql", "jcl", "proc"))
-        self.assertEqual(build.JOB_READ_KINDS, ("proc", "jcl", "ctlcard", "unknown", "sql"))
+        self.assertEqual(build.INCLUDE_KINDS, ("jcl", "proc", "ctlcard", "unknown", "stub"))
+        self.assertEqual(build.CARD_KINDS, ("ctlcard", "unknown", "stub", "sql", "jcl", "proc"))
+        self.assertEqual(build.JOB_READ_KINDS, ("proc", "jcl", "ctlcard", "unknown", "stub", "sql"))
+
+    def test_a_stub_counts_for_the_programs_copying_its_name(self):
+        # the resolver never expands a stub, but the program's note names it in place of NOT FOUND: one arriving, going
+        # or re-typed changes that note (ROADMAP re-parse item 23)
+        self.assertEqual(build.COPY_KINDS, build.RESOLVER_KINDS + ("stub",))
+        self.assertEqual(build.moved_names({}, [seen("p", "stub")]), {"BOOK"})
+        self.assertEqual(build.moved_names({r"x\book.txt": stored("stub")}, []), {"BOOK"})
+        self.assertEqual(build.moved_names({"p": stored("stub")}, [seen("p", "copybook", sha="s2")]), {"BOOK"})
+        self.assertEqual(build.moved_names({"p": stored("stub")}, [seen("p", "stub")]), set())
 
     def test_for_the_jobs_a_member_arriving_changing_going_or_re_typed_counts(self):
         J = build.JOB_READ_KINDS

@@ -61,7 +61,38 @@ MAX_DEPTH = 12
 # partial for every warning - so a note says a gap in THIS COPY, never a
 # decision the resolver took (which of several same-named copies it expanded
 # is its own 'ambiguous_copybook' row - ROADMAP re-parse item 18).
-Resolver = Callable[[str, Optional[str]], Optional[Tuple[int, List[Line], Optional[str]]]]
+# (None, [], note): the only members of the name are no COBOL to expand - stubs
+# holding only numbers (stub_note, ROADMAP re-parse item 23): nothing is
+# expanded, and the note stands where 'NOT FOUND' would.
+Resolver = Callable[[str, Optional[str]], Optional[Tuple[Optional[int], List[Line], Optional[str]]]]
+
+# A STUB: a member of a copybook's name whose every code line holds only digits
+# (reader.stub_count), filed `stub` by the build. The compiler could compile
+# neither a 7-digit number in column 1 (no code) nor an 8-digit one (a digit in
+# column 8), so the program was compiled against another copy; expanded, the
+# 8-digit one ran the data entry before the COPY on into the PROCEDURE
+# DIVISION and erased every paragraph while the program read `ok`
+# (tools/synth/repro/F08). The resolver never expands one: a real copy of the
+# name in any library comes first, and with none the program carries this note
+# in place of NOT FOUND and is `partial`. STUB_NOTE_RE finds it again (atlas.
+# recover and atlas.query read it: group 1 the copybook, group 2 the note).
+STUB_COMPILED = "the program was compiled against another copy (its listing, or another library, holds it)"
+STUB_NOTE_RE = re.compile(r"COPY (\S+): (the members? in .+? holds? only numbers\b.*)$", re.S)
+
+
+def stub_note(stubs: Sequence[Tuple[str, Optional[int]]]) -> str:
+    """The note for a COPY whose only members of the name are stubs, from
+    (library folder, lines holding numbers) per stub - the count left out
+    when it is not known: 'the member in PROD.POL.COPYLIB holds only numbers
+    (6 lines) - a stub, not the copybook's text; the program was compiled
+    against another copy (its listing, or another library, holds it)'."""
+    def count(n: Optional[int]) -> str:
+        return f" ({n} line{'' if n == 1 else 's'})" if n else ""
+    if len(stubs) == 1:
+        lib, n = stubs[0]
+        return f"the member in {lib} holds only numbers{count(n)} - a stub, not the copybook's text; {STUB_COMPILED}"
+    where = ", ".join(f"{lib}{count(n)}" for lib, n in stubs)
+    return f"the members in {where} hold only numbers - stubs, not the copybook's text; {STUB_COMPILED}"
 
 
 @dataclass
@@ -370,6 +401,13 @@ def expand(lines: Sequence[Line], member_id: int, resolver: Resolver,
             continue
 
         cb_member, cb_lines, note = resolved
+        if cb_member is None:
+            # no member to expand - a stub of numbers (stub_note): the note says so where NOT FOUND would, the
+            # program's own lines stay as they are
+            warnings.append(f"L{ln.no}: COPY {name}: {note or 'no member to expand'}")
+            copies.append((name, lib, rep_text, ln.no, None))
+            i = j + 1
+            continue
         if note:
             warnings.append(f"L{ln.no}: COPY {name}: {note}")
         copies.append((name, lib, rep_text, ln.no, cb_member))

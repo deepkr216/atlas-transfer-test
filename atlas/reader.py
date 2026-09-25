@@ -100,6 +100,37 @@ def _split_records(text: str, data: bytes, enc: str) -> List[str]:
     return [text]
 
 
+_STUB_BLANKS = str.maketrans({"\t": " ", "\x00": " ", "\x1a": " ", "\f": " "})
+
+
+def stub_count(text: str, data: bytes = b"", enc: str = "utf-8") -> int:
+    """How many lines a STUB holds, or 0: a member whose every non-blank,
+    non-comment record holds only digits and blanks, whatever the columns
+    (ROADMAP re-parse item 23). `1234567` in column 1 is the sequence area
+    and the indicator column of fixed-format COBOL - no code; `12345678`
+    puts a digit in column 8, which the reader takes for code, and expanded
+    into a program it runs the data entry before the COPY on into the
+    PROCEDURE DIVISION and erases every paragraph (tools/synth/repro/F08).
+    The compiler could compile neither text, so the program was compiled
+    against another copy: a stub is never COBOL to expand. A comment record
+    is '*' or '/' in column 7, or '*' as its first non-blank character; tabs,
+    NULs, an end-of-file mark and form feeds count as blanks. 0 for a member
+    with no such record (blank or comments only: `empty`, as before) and for
+    one with any record holding anything else. Records split as the reader
+    splits them."""
+    n = 0
+    for rec in _split_records(text, data, enc):
+        rec = rec.translate(_STUB_BLANKS)
+        if not rec.strip():
+            continue
+        if rec.lstrip().startswith("*") or (len(rec) > 6 and rec[6] in "*/"):
+            continue
+        if rec.strip(" 0123456789"):
+            return 0
+        n += 1
+    return n
+
+
 # --------------------------------------------------------------------------
 # the Line record
 # --------------------------------------------------------------------------

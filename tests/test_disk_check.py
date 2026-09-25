@@ -15,10 +15,13 @@ carry the same verdict.
 
 Cases: (A) the copybook arrived after the build - on disk, not in the index:
 run the build; (B) the folder holds BOOKB-V2 and BOOKBX only - no file,
-the near names; (C) the file holds `1234567` in column 1 - the build files
-it empty, and every report says where the text sits (ROADMAP re-parse item
-23); (D) nothing near anywhere - the fetch sentence; (E) coverage and
-`copybook` carry the verdicts; (F) an estate with nothing missing prints no
+the near names; (C) the file holds `1234567` in column 1 - an index built
+before ROADMAP re-parse item 23 filed it empty (age_stubs gives a build of
+the item that shape), and every report says where the text sits; the build
+of the item files it `stub` and every report says 'a stub'
+(tests/test_stub_copybooks.py); (D) nothing near anywhere - the fetch
+sentence; (E) coverage and `copybook` carry the verdicts (on the older
+index); (F) an estate with nothing missing prints no
 new line and no new section - the console and the report are those of the
 toolkit at aba1a2d; (G) a file there at the last build that the build did
 not record; (H) 20,000 files and 5 names in under 5 s.
@@ -31,6 +34,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import re
 import tarfile
 import tempfile
 import time
@@ -67,11 +71,36 @@ NEXT_TABLE = ("  next: the report's table says per file why the build did not in
               "empty (its text in columns 1-7), a skipped file (atlas-problems.txt)")
 
 
+def age_stubs(db):
+    """Give the index the shape a build before ROADMAP re-parse item 23 left for a 7-digit stub: the member filed
+    'empty' (the fixed-format reader saw no code in columns 1-7) and every program copying it carrying 'COPY X NOT
+    FOUND' in place of the stub note - what his index holds until the re-parse night. Only a stub within columns 1-7
+    is aged: the 8-digit one was a copybook then, expanded into its programs."""
+    conn = sqlite3.connect(db)
+    try:
+        rows = conn.execute("SELECT id, path FROM member WHERE kind = 'stub'").fetchall()
+        assert rows, "the estate must hold a stub to age"
+        for mid, path in rows:
+            with open(path, encoding="utf-8") as fh:
+                assert recover.stub_lines(fh.read()), f"{path}: only a stub within columns 1-7 was filed empty"
+            conn.execute("UPDATE member SET kind = 'empty' WHERE id = ?", (mid,))
+        for uid, detail in conn.execute("SELECT id, detail FROM unresolved WHERE kind = 'expand' "
+                                        "AND detail LIKE '%only numbers%'").fetchall():
+            m = re.match(r"(.*?COPY \S+): the member", detail)
+            conn.execute("UPDATE unresolved SET detail = ? WHERE id = ?",
+                         (f"{m.group(1)} NOT FOUND - fields/code from it are missing from this program's facts", uid))
+        conn.commit()
+    finally:
+        conn.close()
+
+
 class _Estate(unittest.TestCase):
-    """estate\\GC\\PROD.GC.SRC\\<program>.cbl and estate\\SHARED\\PROD.GC.COPYLIB\\<copybook>.txt, built with --rebuild."""
+    """estate\\GC\\PROD.GC.SRC\\<program>.cbl and estate\\SHARED\\PROD.GC.COPYLIB\\<copybook>.txt, built with --rebuild;
+    `aged`: then given the shape an index built before ROADMAP re-parse item 23 has (age_stubs)."""
 
     files = ()
     build_args = ()
+    aged = False
 
     def setUp(self):
         self.td = tempfile.mkdtemp()
@@ -81,6 +110,8 @@ class _Estate(unittest.TestCase):
         for rel, text in self.files:
             self.write(rel, text)
         self.build(["--rebuild", *self.build_args])
+        if self.aged:
+            age_stubs(self.db)
 
     def tearDown(self):
         shutil.rmtree(self.td, ignore_errors=True)
@@ -199,8 +230,12 @@ class NearNamesOnly(_Estate):
 
 
 class TheStubFiledEmpty(_Estate):
-    """Case C: PGMC copies BOOKC on its section line; BOOKC.txt holds `1234567` in column 1 - columns 1-6 are the
-    sequence area and column 7 the indicator, so the reader sees no code and the build files the member empty."""
+    """Case C, on an index built before ROADMAP re-parse item 23: PGMC copies BOOKC on its section line; BOOKC.txt
+    holds `1234567` in column 1 - columns 1-6 are the sequence area and column 7 the indicator, so the reader saw no
+    code and that build filed the member empty. The stand-ins keep saying where the text sits there; the build of the
+    item files it `stub` (tests/test_stub_copybooks.py)."""
+
+    aged = True
 
     files = (("GC/PROD.GC.SRC/PGMC.cbl", section_program("PGMC", "BOOKC")),
              ("SHARED/PROD.GC.COPYLIB/BOOKC.txt", "1234567\n"))
@@ -217,7 +252,7 @@ class TheStubFiledEmpty(_Estate):
         self.assertIn(r"| BOOKC | 1 (PGMC:11) | yes: SHARED\PROD.GC.COPYLIB\BOOKC.txt - in the index, filed as empty | "
                       + STUB_1 + " | open the file: if the number is all it holds, the library copy is a stub and the "
                       "copybook's text is in the listings of the programs copying it (this run reads them) or on the host "
-                      f"(fetch the member again); until {ITEM} the build reads no code from it |", row)
+                      f"(fetch the member again); the build of {ITEM} files such a member `stub` and never expands it |", row)
         rep = self.report_text()
         misfiled = rep.split("## A member with the copybook's name exists but is filed as something else")[1]
         cell = [ln for ln in misfiled.splitlines() if ln.startswith("| BOOKC | empty | PROD.GC.COPYLIB | PGMC | ")][0]
@@ -274,7 +309,10 @@ class NothingNearAnywhere(_Estate):
 
 
 class CoverageAndCopybookCarryTheVerdicts(_Estate):
-    """Case E: cases A-D in one estate; coverage's table and `copybook NAME` say what the disk says."""
+    """Case E: cases A-D in one estate, on an index built before ROADMAP re-parse item 23 (BOOKC filed empty);
+    coverage's table and `copybook NAME` say what the disk says."""
+
+    aged = True
 
     files = (("GC/PROD.GC.SRC/PGMA.cbl", data_program("PGMA", "BOOKA", "BK-ID")),
              ("GC/PROD.GC.SRC/PGMB.cbl", data_program("PGMB", "BOOKB", "BK-ID")),
@@ -500,7 +538,7 @@ class TheHelpers(unittest.TestCase):
                                    "empty - no code lines the reader sees, 1 there at the last build yet not in the index), "
                                    "2 with no file under the estate (1 with a near name)")
         self.assertEqual(recover.disk_counts(checked), {"on_disk": 4, "arrived_late": 2, "no_file": 2, "there": 1,
-                                                        "indexed": 1, "near": 1})
+                                                        "indexed": 1, "near": 1, "stub": 0})
         self.assertTrue(recover.disk_next(checked).startswith("  next: run your usual build command - it indexes the 2 copybook(s)"))
         self.assertEqual(recover.disk_next({"E": v("near"), "F": v("none")}),
                          NEXT_FETCH + "; the 1 near name(s) the report lists may be the members under another name: check "
@@ -509,7 +547,16 @@ class TheHelpers(unittest.TestCase):
         self.assertEqual(recover.disk_next({"C": v("indexed"), "D": v("there")}), NEXT_TABLE)
         self.assertEqual(recover.disk_line({"F": v("none")}), CHECKED + "1 with no file under the estate")
         self.assertEqual(recover.disk_counts({}), {"on_disk": 0, "arrived_late": 0, "no_file": 0, "there": 0, "indexed": 0,
-                                                   "near": 0})
+                                                   "near": 0, "stub": 0})
+        # a stub (ROADMAP re-parse item 23): counted on disk, said as one, its own 'next:' when nothing comes first
+        self.assertEqual(recover.disk_counts({"S": v("stub")})["on_disk"], 1)
+        self.assertEqual(recover.disk_line({"S": v("stub"), "F": v("none")}),
+                         CHECKED + "1 on disk (1 in the index as a stub - only numbers, not the copybook's text), 1 with no "
+                                   "file under the estate")
+        self.assertEqual(recover.disk_next({"S": v("stub")}), recover.STUB_NEXT)
+        self.assertEqual(recover.disk_next({"S": v("stub"), "F": v("none")}), NEXT_FETCH)
+        self.assertEqual(recover.disk_next({"S": v("stub"), "A": v("late")})[:40], NEXT_BUILD[:40])
+        self.assertEqual(recover.disk_next({"S": v("stub"), "C": v("indexed")}), NEXT_TABLE)
 
     def test_last_build_started(self):
         conn = sqlite3.connect(":memory:")

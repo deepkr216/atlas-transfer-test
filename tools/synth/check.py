@@ -528,8 +528,6 @@ class Checker:
             self.ok("member indexed")
             exp_kind = m["kind"]
             exp_status = m["status"]
-            if m["role"] == "D6 stub":
-                exp_kind = "empty"
             if r["kind"] != exp_kind:
                 self.find("classify", "build", m["name"], f"kind {exp_kind}", f"kind {r['kind']} ({r['parse_error'] or ''})"[:200], facts=1)
             else:
@@ -1340,14 +1338,14 @@ class Checker:
                 self.find("classify", "program", name, "COPY POLPROCB resolved to POLPROCB (a copybook by its statements, ROADMAP "
                           "re-parse item 20)", "; ".join(bad) or (" | ".join(row) if row else "no row"), facts=1)
         if name == d["D6"]["program"]:
-            if "columns 1-7" in text:
-                self.ok("program: D6 stub wording")
-            else:
-                self.find("recover", "program", name, "the NOT FOUND cell says the member's text sits in columns 1-7 (filed empty)", "absent", facts=1, severity="words")
             cell = section(text, "Copybooks")
-            if "POLSTUBC" in cell and "POLSTUBC |" in cell and "NOT FOUND" not in cell.split("POLSTUBC")[1].split("\n")[0]:
-                self.find("classify", "program / copybook", "POLSTUBC (an 8-digit stub)", "reported as a stub (no code: its text sits in columns 1-8)",
-                          "resolved as a copybook with no fields, nothing said", facts=1, severity="silent")
+            for book in ("POLSTUBB", "POLSTUBC"):
+                row = cell.split(f"| {book} |")[1].split("\n")[0] if f"| {book} |" in cell else ""
+                if "a stub - not expanded" in row:
+                    self.ok("program: D6 stub wording")
+                else:
+                    self.find("recover", "program", name, f"the {book} cell says a stub, not expanded (ROADMAP re-parse item 23)",
+                              row[:120] or "no row", facts=1, severity="words")
 
     # ---- job report
     def report_job(self, name: str) -> None:
@@ -1411,8 +1409,8 @@ class Checker:
                           "22)", "; ".join(bad), facts=len(bad), severity="words")
             else:
                 self.ok(f"copybook: {key} filed as a copybook")
-        if name == "POLSTUBB":
-            self.must("recover", "copybook", name, text, ["columns 1-7"], "the stub verdict")
+        if name in ("POLSTUBB", "POLSTUBC"):
+            self.must("recover", "copybook", name, text, ["a stub"], "the stub verdict")
         if name == "POLMISSB":
             if "recovered" not in text.lower():
                 self.find("recover", "copybook", name, "says the index holds it as a recovered copy", "does not", facts=1, severity="words")
@@ -1623,7 +1621,7 @@ class Checker:
             else:
                 self.ok("coverage partial split adds up")
         nf = {row[0]: int(row[1]) for h, hdr, rows_ in md_tables(section(text, "Copybooks not found")) for row in rows_ if len(row) >= 2 and row[1].isdigit()}
-        want_nf = {"POLSTUBB": 1, "DFHAID": 3}
+        want_nf = {"POLSTUBB": 1, "POLSTUBC": 1, "DFHAID": 3}
         for k, v in want_nf.items():
             if nf.get(k) != v:
                 self.find("query", "coverage", f"Copybooks not found {k}", f"{v} use(s)", f"{nf.get(k)}", facts=1)
@@ -1645,11 +1643,12 @@ class Checker:
         self.must("recover", "coverage", "D1", text, d["D1"]["coverage_words"], "the chosen-copybook sentences")
         self.must("recover", "coverage", "D2", text, d["D2"]["coverage_words"], "the listing-check sentence")
         self.must("recover", "coverage", "D6", text, ["POLSTUBB"], "the stub in the not-found table")
-        stub_row = next((row for h, hdr, rows_ in md_tables(section(text, "Copybooks not found")) for row in rows_ if row and row[0] == "POLSTUBB"), None)
-        if stub_row and "columns 1-7" not in " ".join(stub_row):
-            self.find("recover", "coverage", "POLSTUBB", "the on-disk verdict: its text sits in columns 1-7 (filed empty)", " | ".join(stub_row)[:200], facts=1, severity="words")
-        elif stub_row:
-            self.ok("coverage: stub verdict")
+        for book in ("POLSTUBB", "POLSTUBC"):
+            stub_row = next((row for h, hdr, rows_ in md_tables(section(text, "Copybooks not found")) for row in rows_ if row and row[0] == book), None)
+            if stub_row and "a stub" not in " ".join(stub_row):
+                self.find("recover", "coverage", book, "the cell says a stub - only numbers, never expanded (ROADMAP re-parse item 23)", " | ".join(stub_row)[:200], facts=1, severity="words")
+            elif stub_row:
+                self.ok("coverage: stub verdict")
         # the D1 programs are in the chosen table, not the partial one
         chosen = section(text, "Complete, with a copybook chosen among several")
         for pg in d["D1"]["programs"]:

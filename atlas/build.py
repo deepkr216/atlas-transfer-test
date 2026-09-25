@@ -126,6 +126,7 @@ KIND_LABELS = {"copybook": "copybooks", "cobol": "programs", "proc": "PROCs", "j
                "psb": "PSBs", "doc": "documents", "ctlcard": "control cards", "bms": "BMS maps",
                "mfs": "MFS formats", "csd": "CSD extracts", "imsgen": "IMS stage-1 members",
                "listing": "compiler listings", "unknown": "unrecognised members", "empty": "empty members",
+               "stub": "stubs (only numbers)",
                "sql": "SQL members", "sched": "scheduler exports", "asm": "assembler members", "rexx": "REXX members"}
 
 
@@ -293,6 +294,12 @@ CODE_KINDS = {"cobol", "copybook", "jcl", "proc", "ctlcard", "dbd", "psb", "bms"
 # re-typed into or out of them - so an incremental build parses again every program that copies such a name
 # (moved_names, copiers_to_parse; ROADMAP re-parse item 21). atlas.recover keeps the same tuple (recover.RESOLVER_KINDS).
 RESOLVER_KINDS = ("copybook", "cobol", "sql", "unknown")
+# a member of one of those kinds whose every code line holds only digits is filed `stub` instead (reader.stub_count,
+# _inventory_one): the resolver never expands one, and a program whose only members of a COPY's name are stubs says so
+# in place of NOT FOUND (expand.stub_note, ROADMAP re-parse item 23). A stub arriving, going or re-typed changes that
+# note, so the programs copying its name are parsed again too: COPY_KINDS is what moved_names reads for them
+STUB_KIND = "stub"
+COPY_KINDS = RESOLVER_KINDS + (STUB_KIND,)
 # the kinds a job's expansion reads a member from: a cataloged PROC (_proc_facts), an `// INCLUDE MEMBER=` member
 # (_include_text) and a control-card member, `DSN=LIB(MEMBER)` or a sequential dataset's last qualifier (_card_text).
 # A member of one of these kinds that arrives, changes, goes or is re-typed into or out of them changes the facts of
@@ -300,9 +307,12 @@ RESOLVER_KINDS = ("copybook", "cobol", "sql", "unknown")
 # that, when nothing was found) - so an incremental build parses every job and PROC again (moved_names with
 # again=False: a job holds no member id of what it read, so a member recorded again with the same bytes changes
 # nothing in it; ROADMAP re-parse item 21)
+# A stub is read by the jobs wherever a member filed 'unknown' is: a card member holding only numbers (a date or a
+# count in a PARMS library with no hint) was filed 'unknown' and read as a job's cards before ROADMAP re-parse item 23
+# filed it `stub` - only a COPY never expands it
 PROC_KINDS = ("proc", "jcl")
-INCLUDE_KINDS = ("jcl", "proc", "ctlcard", "unknown")
-CARD_KINDS = ("ctlcard", "unknown", "sql", "jcl", "proc")
+INCLUDE_KINDS = ("jcl", "proc", "ctlcard", "unknown", STUB_KIND)
+CARD_KINDS = ("ctlcard", "unknown", STUB_KIND, "sql", "jcl", "proc")
 JOB_READ_KINDS = tuple(dict.fromkeys(PROC_KINDS + INCLUDE_KINDS + CARD_KINDS))
 SKIP_DIRS = {".git", "__pycache__", "node_modules", ".svn", "$RECYCLE.BIN"}
 
@@ -379,6 +389,7 @@ class Ctx:
         # cached per folder - make_resolver reads both before its precedence chain
         self.listing_sources: Dict[Tuple[str, str], Tuple[ListingRow, ...]] = {}
         self.folder_dataset: Dict[str, Optional[str]] = {}
+        self.stub_lines: Dict[int, Optional[int]] = {}  # member id -> lines holding numbers, for a stub a COPY names
 
     def problem(self, kind: str, path: str, detail: str, line: Optional[str] = None) -> None:
         """A member or file that could not be indexed: shown now (with the time),
@@ -774,15 +785,17 @@ def _settled(status: Optional[str], error: Optional[str]) -> bool:
         status == "failed" and (error or "").startswith(("MemberTimeout", "ParserStuck", "InventoryTimeout")))
 
 
-def moved_names(existing: Dict[str, tuple], found: Sequence[tuple], kinds: Sequence[str] = RESOLVER_KINDS,
+def moved_names(existing: Dict[str, tuple], found: Sequence[tuple], kinds: Sequence[str] = COPY_KINDS,
                 again: bool = True) -> Set[str]:
     """The names whose COPY statements may resolve differently after this
-    inventory: every member of a kind the resolver expands (RESOLVER_KINDS)
-    that is new, whose bytes changed, that is recorded again under a new id
-    although its bytes did not change (its last outcome did not settle - a
-    build stopped before it was parsed, a parser exception), or that went
-    from disk - taken under its kind in the last build AND in this one, so a
-    member re-typed into or out of those kinds counts too.
+    inventory: every member of a kind the resolver expands (RESOLVER_KINDS),
+    or a stub of the name (COPY_KINDS: the resolver never expands one, but
+    the program's note names it in place of NOT FOUND - ROADMAP re-parse
+    item 23), that is new, whose bytes changed, that is recorded again under
+    a new id although its bytes did not change (its last outcome did not
+    settle - a build stopped before it was parsed, a parser exception), or
+    that went from disk - taken under its kind in the last build AND in this
+    one, so a member re-typed into or out of those kinds counts too.
 
     With `kinds` = JOB_READ_KINDS and `again` False: the names of the members
     a job's expansion reads (a PROC, an INCLUDE, a card member) that arrived,
@@ -936,8 +949,13 @@ def _inventory_one(ctx: Ctx, path: str, fn: str, dirpath: str, data: bytes) -> t
         if over and kind == "copybook":
             ctx.shape_over[path] = (over, at)
         norm, nlines, fixed = norm_hash(kind, text, data, enc)
-        if kind in CODE_KINDS and code_line_count(kind, text, data, enc) == 0:
-            kind = "empty"           # a stub or a retired member: never a program row
+        if kind in RESOLVER_KINDS and reader.stub_count(text, data, enc):
+            # only numbers - a 7-digit one in column 1 or an 8-digit one reaching column 8: no text a compiler could
+            # compile, so never COBOL to expand (ROADMAP re-parse item 23; before, the 7-digit stub was filed empty
+            # and the 8-digit one a copybook whose expansion erased the copying program's procedure division)
+            kind = STUB_KIND
+        elif kind in CODE_KINDS and code_line_count(kind, text, data, enc) == 0:
+            kind = "empty"           # comments and blanks only, or a retired member: never a program row
     return (path, os.path.splitext(fn)[0].upper(), kind, os.path.basename(dirpath), ext,
             sha(data), norm, len(data), nlines, fixed, None)
 
@@ -1406,6 +1424,10 @@ def _pick_member(ctx: Ctx, cands: List[Mem], name: str, job_mem: Optional[Mem] =
 def _member_text(ctx: Ctx, name: str, kinds: Tuple[str, ...], job_mem: Optional[Mem] = None,
                  jcllib: Sequence[str] = ()) -> Optional[str]:
     cands = [m for m in ctx.by_name.get(name.upper(), []) if m.kind in kinds]
+    if any(m.kind != STUB_KIND for m in cands):
+        # a member holding only numbers is read as cards only when no other member of the name is: a copybook stub
+        # (filed copybook or empty before ROADMAP re-parse item 23, never a card) must not take a card member's place
+        cands = [m for m in cands if m.kind != STUB_KIND]
     m, _note = _pick_member(ctx, cands, name, job_mem, jcllib)
     if m is None:
         return None
@@ -1679,11 +1701,29 @@ def listing_pick(ctx: Ctx, prog: Mem, cands: List[Mem], lib: Optional[str], pick
     return pick, how
 
 
+def _stub_lines(ctx: Ctx, mem: Mem) -> Optional[int]:
+    """The lines holding numbers in a member filed `stub` (reader.stub_count),
+    read once per build; None when the file cannot be read now."""
+    cache = ctx.stub_lines
+    if mem.id not in cache:
+        try:
+            cache[mem.id] = reader.stub_count(*reader.load(mem.path)) or None
+        except OSError:
+            cache[mem.id] = None
+    return cache[mem.id]
+
+
 def make_resolver(ctx: Ctx, prog: Mem, notes: List[Tuple[str, str, int]]):
     def resolve(name: str, lib: Optional[str]):
         cands = [c for c in ctx.by_name.get(name.upper(), [])
                  if c.kind in RESOLVER_KINDS and c.id != prog.id]
         if not cands:
+            # a stub of the name is never a candidate: any real copy in another library came first (ROADMAP
+            # re-parse item 23). With none, nothing is expanded and the note says what the member holds - the
+            # program is partial, its own lines kept
+            stubs = [c for c in ctx.by_name.get(name.upper(), []) if c.kind == STUB_KIND and c.id != prog.id]
+            if stubs:
+                return None, [], expand.stub_note([(c.library, _stub_lines(ctx, c)) for c in stubs])
             return None
         pick = cands[0]
         if len(cands) > 1:

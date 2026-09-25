@@ -534,9 +534,17 @@ every member and files them as copybooks itself.
 Every missing copybook is also looked for on disk, the estate root walked
 once: the report's first table says per name whether a file with that name
 is there and not in the index (arrived after the last build, or skipped by
-it), filed `empty` because its text sits in columns 1-7, under a near name
-in the copybook folders, or not there at all - and what to do for each;
-`coverage` and `copybook NAME` say the same.
+it), a stub, under a near name in the copybook folders, or not there at
+all - and what to do for each; `coverage` and `copybook NAME` say the same.
+A member holding only numbers is a stub: whatever the columns its digits
+sit in, no compiler could compile it, so the build files it `stub`, never
+expands it - a real copy of the name in any library comes first - and a
+program with no other copy says 'COPY X: the member in LIBRARY holds only
+numbers (N lines) - a stub, not the copybook's text; the program was
+compiled against another copy (its listing, or another library, holds it)'
+in place of NOT FOUND; the same recover run writes that copybook from the
+programs' listings (on an index built before the batch a 7-digit stub is
+still filed `empty`, and the report says its text sits in columns 1-7).
 A member typed by the kind declared for its library in the UI's table reads
 'by its declared kind' with 'declare it copybook there' - each build records
 the kinds it was declared (an older index: the manifest.json beside it tells),
@@ -768,8 +776,8 @@ classifying every file - has the same guard: a file still being read after
 file over 32 MB is a document, never decoded as a member), never indexes
 its own outputs
 (`.atlas-output` marker, `*.exp.cbl`), types empty and comment-only members
-as `empty`, refuses a program row to a member with no `PROGRAM-ID` or
-DIVISION header, re-types a card deck found in a JCL library as `ctlcard`,
+as `empty` and a member holding only numbers as `stub` (never expanded),
+refuses a program row to a member with no `PROGRAM-ID` or DIVISION header, re-types a card deck found in a JCL library as `ctlcard`,
 never files a compiler listing as a program or a mainframe member as a
 document, keeps a hand-written `manifest.json` (the generated one goes to
 `manifest.generated.json`), and never prints a `--password` / token from

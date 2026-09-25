@@ -1,3 +1,5 @@
 # F08-stub-8-digits - a stub of 8-digit numbers is filed as a copybook and, once expanded, erases the program's procedure division silently
 
 R08STUB is the 8-digit twin of the stub LESSONS 192 describes (7 digits: filed `empty`, said on disk). With 8 digits column 8 holds a digit, the reader takes it for code, the member is a copybook `ok` with no fields, and R08PGM - which copies it - loses every paragraph, PERFORM and reference while reading `parse: ok`.
+
+Fixed by ROADMAP re-parse item 23 (LESSONS 204): a member whose every code line holds only digits, whatever the columns, is filed `stub` and never expanded; R08PGM keeps its two paragraphs and is `partial` with the note 'COPY R08STUB: the member in PROD.POL.COPYLIB holds only numbers (6 lines) - a stub, not the copybook's text; the program was compiled against another copy (its listing, or another library, holds it)'. The first check's truth reads `stub` since then (it read `empty`, the kind the 7-digit stub had before the item).

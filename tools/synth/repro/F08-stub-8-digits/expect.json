@@ -4,7 +4,7 @@
  "checks": [
   {
    "sql": "SELECT kind FROM member WHERE name='R08STUB'",
-   "truth": "empty",
+   "truth": "stub",
    "symptom": "copybook"
   },
   {
