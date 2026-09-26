@@ -496,6 +496,12 @@ class NestedCopybookLayout(_Built):
         self.assertEqual(self.copy_row("NSTGAP", "NSTMISS"), [(None,)])
         self.assertEqual(self.status("GAPPGM"), "partial", "the program carries its own NOT FOUND, as before")
         self.assertIn(f"- {note}\n", self.page(query.cmd_layout, "NSTGAP"))
+        # coverage's kinds table says what such a row means and what closes it
+        row = [ln for ln in self.page(query.cmd_coverage).splitlines() if ln.startswith("| layout_warning |")]
+        self.assertEqual(len(row), 1)
+        self.assertIn("a copybook's own layout without the text of a COPY in it - not found, skipped, a stub, "
+                      "IBM-supplied", row[0])
+        self.assertIn("for a COPY not found, fetch that copybook's library and build again", row[0])
 
     def test_a_copybook_copying_itself_and_one_copying_an_ibm_copybook(self):
         self.assertEqual(self.warnings("NSTSELF"), [(

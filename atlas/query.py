@@ -2022,8 +2022,12 @@ UNRESOLVED_MEANING = {
     "ims_msw": ("an IMS message switch (CHNG) whose destination is not a literal",
                 "the transaction it switches to cannot be known from the source"),
     "ims_switch": ("an IMS message switch destination built at run time", "as above - a human must confirm the target"),
-    "layout_warning": ("a record layout the parser could not compute exactly (OCCURS DEPENDING, REDEFINES overlap)",
-                       "check the offsets in `layout` before using them for test data or an interface contract"),
+    "layout_warning": ("a record layout the parser could not compute exactly (SYNC, a REDEFINES larger than its object, "
+                       "01s mixed with stray lower levels, a copybook's own layout without the text of a COPY in it - not "
+                       "found, skipped, a stub, IBM-supplied)",
+                       "check the offsets in `layout` before using them for test data or an interface contract; for a COPY "
+                       "not found, fetch that copybook's library and build again - `layout RECORD --program PGM` gives a "
+                       "program's view"),
     "declared_kind": ("a member the UI's table declares copybook whose text has the shape of an Assembler, listing or MFS "
                       "member: the kind declared wins over a shape, so the build expands it into every program copying it",
                       "check it is the COBOL copybook those programs copy; if it is not, correct the library's kind in the "
