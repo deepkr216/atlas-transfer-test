@@ -498,19 +498,18 @@ def expand(lines: Sequence[Line], member_id: int, resolver: Resolver,
         def osvs_not_expanded() -> None:
             # "01 X" / "COPY Y." with nothing expanded for Y: the program's "01 X" line stayed live with no period
             # and joined the next entry into one wrong one - `01 X 01 NEXT.`, NEXT's items under X and NEXT lost
-            # (LESSONS 218). An 01 / 77 goes as in the one-line form "01 X COPY Y.", whose line is the COPY's
-            # comment: its text is Y's, which is not here. An FD / SD stays, closed: its record entries follow it
+            # (LESSONS 218). The entry stays, closed with a period - "01 X.", "FD F." - in both forms: X stays
+            # defined, the items the program writes after the COPY stay X's and the record entries after an FD
+            # its own; only X lacks Y's text. Dropping an 01 (its line a comment, as the one-line form had it)
+            # gave the items after the COPY to the record before it - a complete record of the program's own
+            # grew by them, with no warning of its own (LESSONS 219)
             if not osvs:
                 return
-            kind, _pname, prev, head = osvs
-            if kind in ("FD", "SD"):
-                if prev is not None:
-                    out[prev].code = out[prev].code.rstrip() + "."
-                else:
-                    emit(ln, head + ".", member_id, ln.no, depth, indicator=" ")
-            elif prev is not None:
-                pl = out[prev]
-                pl.indicator, pl.is_comment, pl.is_blank = "*", True, False
+            _kind, _pname, prev, head = osvs
+            if prev is not None:
+                out[prev].code = out[prev].code.rstrip() + "."
+            else:
+                emit(ln, head + ".", member_id, ln.no, depth, indicator=" ")
 
         if depth >= MAX_DEPTH or name in stack:
             warnings.append(f"L{ln.no}: COPY {name} skipped - "

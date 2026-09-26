@@ -1024,8 +1024,10 @@ class NestedCopyLinesOnANewIndex(_Built):
                       f"{NOT_HERE}\n", page)
 
     def test_an_osvs_copy_on_two_lines_not_found(self):
-        # the record OSG-REC is OSGMISS's text, which is not here: gone, as in the one-line form; OSG-TAIL keeps its item
-        self.assertEqual(self.rows("OSVGAP"), [("OSG-TAIL", 1, 0, 3, 1, 4), ("OSG-T", 5, 0, 3, 0, 5)])
+        # the record OSG-REC is OSGMISS's text, which is not here: the entry stays, closed and empty (LESSONS 219);
+        # OSG-TAIL keeps its item
+        self.assertEqual(self.rows("OSVGAP"), [("OSG-REC", 1, 0, 0, 0, 2), ("OSG-TAIL", 1, 0, 3, 1, 4),
+                                               ("OSG-T", 5, 0, 3, 0, 5)])
         self.assertEqual(self.q("SELECT c.line FROM copy_use c JOIN member m ON m.id = c.member_id WHERE m.name='OSVGAP'"),
                          [(2,)])
         page = self.page(query.cmd_layout, "OSVGAP")
@@ -1034,10 +1036,11 @@ class NestedCopyLinesOnANewIndex(_Built):
 
     def test_field_says_which_supplied_copybook_the_name_is_probably_in(self):
         page = self.page(query.cmd_field, "DFHENTER")
-        self.assertIn("**NOT DEFINED** in any indexed copybook or program - 1 of the 2 programs referencing it copy a "
+        # the verbs agree with the counts: '1 of the 2 ... copies', 'the other program' (LESSONS 219)
+        self.assertIn("**NOT DEFINED** in any indexed copybook or program - 1 of the 2 programs referencing it copies a "
                       "copybook the compile reads from a product's own library, not from the estate (CICSPGM copies "
                       "DFHAID, DFHBMSCA). The name is probably one of their items, which the index does not hold "
-                      "(`copybook DFHAID` says which product supplies it). For the other programs: check spelling, "
+                      "(`copybook DFHAID` says which product supplies it). For the other program: check spelling, "
                       "REPLACING renames, or an 88-level name - try `literal`.\n", page)
         self.assertIn("CICSPGM IF", page)
         self.assertIn("ENTPGM IF", page)
@@ -1046,16 +1049,95 @@ class NestedCopyLinesOnANewIndex(_Built):
                       "88-level name - try `literal`).\n", self.page(query.cmd_field, "WS-NO-SUCH-NAME"))
 
 
+SQLCA_COPY = ("       01  SQLCA.\n"
+              "           05  SQLCAID            PIC X(08).\n"
+              "           05  SQLCODE            PIC S9(9) COMP.\n")
+COPYSQL = ("       01  CPS-HEAD.\n"
+           "           05  CPS-A              PIC X(02).\n"
+           "           COPY SQLCA.\n"
+           "       01  CPS-TAIL.\n"
+           "           05  CPS-T              PIC X(02).\n")
+# a program copying COPYSQL: on an index built before the item its note says '(in COPY COPYSQL) L3: COPY SQLCA NOT
+# FOUND' when no SQLCA member is in the index
+CPSPGM = program("CPSPGM", ["    COPY COPYSQL."], ["0000-MAIN.", "    GOBACK."])
+SQLCA_NOT_FOUND = ("- `COPY SQLCA` at line 3: its bytes are NOT counted in the offsets above, so an item after it in the "
+                   "same record sits further on by SQLCA's length. No member of the index carries SQLCA, so no program's "
+                   "view counts it either (`copybook SQLCA` says what to fetch)\n")
+
+
+class FieldSaysTheCountsInWords(_Built):
+    """`field DFHENTER` with two programs copying DFHAID and two copying nothing: the plural verbs; the singular ones
+    are NestedCopyLinesOnANewIndex's (LESSONS 219: it said '1 of the 2 programs referencing it copy')."""
+    files = (("GC/PROD.GC.SRC/CICSPGM.cbl", CICSPGM),
+             ("GC/PROD.GC.SRC/CICSPG2.cbl", CICSPGM.replace("CICSPGM", "CICSPG2")),
+             ("GC/PROD.GC.SRC/ENTPGM.cbl", ENTPGM),
+             ("GC/PROD.GC.SRC/ENTPG2.cbl", ENTPGM.replace("ENTPGM", "ENTPG2")))
+
+    def test_two_of_four(self):
+        page = self.page(query.cmd_field, "DFHENTER")
+        self.assertIn("**NOT DEFINED** in any indexed copybook or program - 2 of the 4 programs referencing it copy a "
+                      "copybook the compile reads from a product's own library, not from the estate (CICSPG2 copies "
+                      "DFHAID, DFHBMSCA; CICSPGM copies DFHAID, DFHBMSCA). The name is probably one of their items, "
+                      "which the index does not hold (`copybook DFHAID` says which product supplies it). For the other "
+                      "programs: check spelling, REPLACING renames, or an 88-level name - try `literal`.\n", page)
+
+
 class NestedCopyLinesOnAnOlderIndex(_Built):
     """The same copybooks on an index built before the item (age_index): a nested COPY the index holds is counted in a
     program's view, one it does not hold - IBM-supplied or not found - in no view, the precompiler's SQLCA moves
-    nothing (LESSONS 216)."""
-    files = ROUND
+    nothing (LESSONS 216); a copybook's `COPY SQLCA` with no SQLCA member is NOT FOUND, as `program` says (LESSONS
+    219)."""
+    files = ROUND + (("GC/PROD.GC.COPYLIB/COPYSQL.cpy", COPYSQL), ("GC/PROD.GC.SRC/CPSPGM.cbl", CPSPGM))
 
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
         age_index(cls.db)
+
+    def test_a_copy_of_sqlca_no_member_carries(self):
+        # `layout COPYSQL` said '**supplied by the DB2 precompiler** - `EXEC SQL INCLUDE SQLCA` is written into the
+        # program ...' for its `COPY SQLCA.` while `program CPSPGM` said NOT FOUND for the same line (LESSONS 219)
+        page = self.page(query.cmd_layout, "COPYSQL")
+        self.assertIn(SQLCA_NOT_FOUND, page)
+        self.assertNotIn("precompiler", page)
+        self.assertNotIn("does not say which statement", page)
+        prog = self.page(query.cmd_program, "CPSPGM")
+        self.assertIn("(in COPY COPYSQL) L3: COPY SQLCA NOT FOUND", prog)
+        # the INCLUDE, on one line and on three: the precompiler's, read from the copybook's own line
+        self.assertIn(PRECOMPILED_LINE, self.page(query.cmd_layout, "SQLTHR"))
+        self.assertEqual([self.page(query.system_include_written, self.member_id(b), "SQLCA", 3)
+                          for b in ("SQLONE", "SQLTHR", "COPYSQL")], ["include", "include", "copy"])
+
+    def test_without_the_copybooks_own_line(self):
+        # no search row of the line: a copier's note says COPY; no note either - both readings, NOT FOUND for the COPY
+        td = tempfile.mkdtemp()
+        try:
+            db = os.path.join(td, "t.db")
+            shutil.copy(self.db, db)
+            conn = sqlite3.connect(db)
+            try:
+                mid = conn.execute("SELECT id FROM member WHERE name='COPYSQL'").fetchone()[0]
+                conn.execute("DELETE FROM src_fts WHERE member_id=?", (mid,))
+                conn.execute("DELETE FROM fts_span WHERE member_id=?", (mid,))
+                conn.commit()
+            finally:
+                conn.close()
+            conn = query.connect(db)
+            try:
+                self.assertIsNone(query._member_line(conn, mid, 3))
+                self.assertIn(SQLCA_NOT_FOUND, query.cmd_layout(conn, "COPYSQL"), "the copier's note")
+                conn.execute("DELETE FROM unresolved WHERE kind='expand' AND detail LIKE '(in COPY COPYSQL)%'")
+                conn.commit()
+                self.assertIn("- `SQLCA` at line 3: this index was built before ROADMAP re-parse item 27 and does not "
+                              "say which statement names it. Written `EXEC SQL INCLUDE SQLCA`, the precompiler writes "
+                              "it as a record of its own (`01 SQLCA`) and it moves no offset above; written `COPY "
+                              "SQLCA`, no member of the index carries SQLCA, so its bytes are NOT counted above nor in "
+                              "any program's view - an item after it in the same record sits further on by its length. "
+                              "The next build says which\n", query.cmd_layout(conn, "COPYSQL"))
+            finally:
+                conn.close()
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
 
     def test_what_each_line_says(self):
         self.assertTrue(self.page(query.built_before_item_27))
@@ -1102,20 +1184,10 @@ class NestedCopyLinesOnAnOlderIndex(_Built):
             conn.close()
 
 
-SQLCA_COPY = ("       01  SQLCA.\n"
-              "           05  SQLCAID            PIC X(08).\n"
-              "           05  SQLCODE            PIC S9(9) COMP.\n")
-COPYSQL = ("       01  CPS-HEAD.\n"
-           "           05  CPS-A              PIC X(02).\n"
-           "           COPY SQLCA.\n"
-           "       01  CPS-TAIL.\n"
-           "           05  CPS-T              PIC X(02).\n")
-
-
 class TheShopKeepsSqlca(_Built):
     """A SQLCA copybook in the shop's COPYLIB: `COPY SQLCA` expands it, `EXEC SQL INCLUDE SQLCA` is the precompiler's
-    on an index built by the batch; on one built before, whose rows say neither, `layout` says both and that the next
-    build tells them apart (LESSONS 216)."""
+    on an index built by the batch; on one built before, whose rows say neither, the copybook's own line tells them
+    apart (LESSONS 219), and without it `layout` says both and that the next build tells them apart (LESSONS 216)."""
     files = (("GC/PROD.GC.COPYLIB/SQLONE.cpy", SQLONE), ("GC/PROD.GC.COPYLIB/SQLCA.cpy", SQLCA_COPY),
              ("GC/PROD.GC.COPYLIB/COPYSQL.cpy", COPYSQL))
 
@@ -1130,6 +1202,19 @@ class TheShopKeepsSqlca(_Built):
             age_index(db)
             conn = query.connect(db)
             try:
+                # the copybook's own line says which statement it is
+                self.assertIn(PRECOMPILED_LINE, query.cmd_layout(conn, "SQLONE"))
+                self.assertIn("- `COPY SQLCA` at line 3: its bytes are NOT counted in the offsets above, so an item after "
+                              "it in the same record sits further on by SQLCA's length. An index built before ROADMAP "
+                              "re-parse item 27 leaves every nested copybook out of a copybook's own layout; `layout "
+                              "RECORD --program PGM` gives a program's view, which counts it\n",
+                              query.cmd_layout(conn, "COPYSQL"))
+                # without it (no search row of the line), both readings until the next build
+                for book in ("SQLONE", "COPYSQL"):
+                    mid = conn.execute("SELECT id FROM member WHERE name=?", (book,)).fetchone()[0]
+                    conn.execute("DELETE FROM src_fts WHERE member_id=?", (mid,))
+                    conn.execute("DELETE FROM fts_span WHERE member_id=?", (mid,))
+                conn.commit()
                 for book in ("SQLONE", "COPYSQL"):
                     page = query.cmd_layout(conn, book)
                     self.assertIn("- `SQLCA` at line 3: this index was built before ROADMAP re-parse item 27 and does "
@@ -1162,7 +1247,9 @@ class TheManifestAndIbmNames(_Built):
 class OsvsCopyNotExpanded(unittest.TestCase):
     """OS/VS `01 X` / `COPY Y.` on two lines with nothing expanded for Y (NOT FOUND, skipped, IBM-supplied): the
     program's `01 X` line was left live with no period and joined the next entry - `01 X 01 NEXT.`, NEXT's items under
-    X and NEXT lost; an FD's record was lost the same way in both forms (LESSONS 218)."""
+    X and NEXT lost; an FD's record was lost the same way in both forms (LESSONS 218). The fix dropped the 01, as the
+    one-line form always had: the items the program writes after the COPY joined the record before it. Now X stays,
+    closed, in both forms (LESSONS 219)."""
 
     def roots(self, rows, resolver=lambda n, l: None, supplied=frozenset()):
         text = "".join(f"       {r}\n" for r in rows)
@@ -1173,19 +1260,36 @@ class OsvsCopyNotExpanded(unittest.TestCase):
             return [(f.name, f.level, f.offset, f.length)] + [x for c in f.children for x in walk(c)]
         return exp, [x for r in roots for x in walk(r)]
 
-    def test_an_01_goes_as_in_the_one_line_form(self):
+    def test_an_01_stays_closed_in_both_forms(self):
         rows = ["01  OSP-REC", "    COPY OSPMISS.", "01  OSP-TAIL.", "    05  OSP-T    PIC X(03)."]
-        want = [("OSP-TAIL", 1, 0, 3), ("OSP-T", 5, 0, 3)]
+        want = [("OSP-REC", 1, 0, 0), ("OSP-TAIL", 1, 0, 3), ("OSP-T", 5, 0, 3)]
         exp, got = self.roots(rows)
         self.assertEqual(got, want)
         self.assertEqual(exp.warnings, ["L2: COPY OSPMISS NOT FOUND - fields/code from it are missing from this "
                                         "program's facts"])
-        self.assertEqual(self.roots(["01  OSP-REC COPY OSPMISS."] + rows[2:])[1], want, "the one-line form, as before")
+        self.assertEqual(self.roots(["01  OSP-REC COPY OSPMISS."] + rows[2:])[1], want, "the one-line form the same")
         self.assertEqual(self.roots(rows, supplied=frozenset({"OSPMISS"}))[1], want, "a supplied name the same")
+        self.assertEqual(self.roots(["77  OSP-CNT", "    COPY OSPMISS.", "77  OSP-TWO PIC X."])[1],
+                         [("OSP-CNT", 77, 0, 0), ("OSP-TWO", 77, 0, 1)], "a 77 the same")
         # found, the program's name is the library's record, as before
         found = lambda n, l: (9, lines_of("       01  LIB-REC.\n           05  LIB-A    PIC X(04).\n"), None)
         self.assertEqual(self.roots(rows, resolver=found)[1],
                          [("OSP-REC", 1, 0, 4), ("LIB-A", 5, 0, 4), ("OSP-TAIL", 1, 0, 3), ("OSP-T", 5, 0, 3)])
+
+    def test_the_items_after_the_copy_stay_the_01s(self):
+        # the program writes items of its own after the COPY: they are X's; a complete record before it keeps its length
+        # and offsets. With the 01 dropped they joined WS-P1 - 9 bytes with WS-A-EXTRA at 4 (LESSONS 219)
+        tail = ["01  WS-NEXT.", "    05  WS-N     PIC X."]
+        want = [("WS-P1", 1, 0, 4), ("WS-P1A", 5, 0, 4), ("WS-A", 1, 0, 2), ("WS-A-EXTRA", 5, 0, 2),
+                ("WS-NEXT", 1, 0, 1), ("WS-N", 5, 0, 1)]
+        head = ["01  WS-P1.", "    05  WS-P1A   PIC X(4)."]
+        exp, got = self.roots(head + ["01  WS-A", "    COPY KQMISS.", "    05  WS-A-EXTRA PIC X(2)."] + tail)
+        self.assertEqual(got, want, "two lines")
+        exp, got = self.roots(head + ["01  WS-A COPY KQMISS.", "    05  WS-A-EXTRA PIC X(2)."] + tail)
+        self.assertEqual(got, want, "one line")
+        # the kept entry is the COPY's line in the program: the line map says so
+        self.assertEqual([(ln.code.strip(), exp.origin(ln.no)[1]) for ln in exp.lines if "WS-A" in ln.code],
+                         [("01  WS-A COPY KQMISS.", 3), ("01  WS-A.", 3), ("05  WS-A-EXTRA PIC X(2).", 4)])
 
     def test_an_fd_keeps_its_record(self):
         def prog(fd):
@@ -1200,6 +1304,29 @@ class OsvsCopyNotExpanded(unittest.TestCase):
             exp = expand.expand(lines_of(prog(fd)), 1, lambda n, l: None)
             facts = cobol.parse_program(expand.expanded_text(exp))
             self.assertEqual([(f.select_name, f.fd_records) for f in facts.files], [("POL-FILE", ["POL-REC"])], fd)
+
+
+OSVPGM = program("OSVPGM", ["01  WS-P1.", "    05  WS-P1A       PIC X(4).", "01  WS-A", "    COPY OSVMISS.",
+                            "    05  WS-A-EXTRA   PIC X(2).", "01  WS-B COPY OSVMISS2.", "    05  WS-B-EXTRA   PIC X(3).",
+                            "01  WS-NEXT.", "    05  WS-N         PIC X."],
+                 ["0000-MAIN.", "    MOVE 'AB' TO WS-A-EXTRA", "    MOVE 'ABC' TO WS-B-EXTRA", "    GOBACK."])
+
+
+class OsvsCopyNotFoundInTheIndex(_Built):
+    """The same in a program in the index: WS-P1 keeps its 4 bytes, WS-A and WS-B are defined and hold the items
+    written after their COPY; the program is partial for the two copybooks not found (LESSONS 219)."""
+    files = (("GC/PROD.GC.SRC/OSVPGM.cbl", OSVPGM),)
+
+    def test_the_program_fields(self):
+        got = {n: (r, o, ln) for n, r, o, ln in self.q(
+            "SELECT f.name, (SELECT t.name FROM pfield t WHERE t.id = f.root_id), f.offset, f.length FROM pfield f "
+            "JOIN program p ON p.id = f.program_id WHERE p.program_id = 'OSVPGM'")}
+        self.assertEqual(got["WS-P1"], ("WS-P1", 0, 4))
+        self.assertEqual(got["WS-A-EXTRA"], ("WS-A", 0, 2))
+        self.assertEqual(got["WS-B-EXTRA"], ("WS-B", 0, 3))
+        self.assertEqual(self.q("SELECT parse_status FROM member WHERE name='OSVPGM'"), [("partial",)])
+        page = self.page(query.cmd_field, "WS-A")
+        self.assertNotIn("NOT DEFINED", page)
 
 
 # ===========================================================================
@@ -1293,6 +1420,13 @@ class TheDocsSayIt(unittest.TestCase):
         self.assertIn("Rule for me: a line kept open for text that may not come is closed on every path", lessons)
         self.assertIn("LESSONS 218", self.read("atlas", "expand.py"))
         self.assertIn("LESSONS 216", self.read("atlas", "query.py"))
+        # the verifier's second round (LESSONS 219)
+        self.assertIn("**The verifier's second round (LESSONS 219), before he ran it.**", roadmap)
+        self.assertIn("| 219 | Not seen on his estate - the verifier's second round on ROADMAP re-parse item 27", lessons)
+        self.assertIn("Rule for me: when a fix removes a line to stop a wrong fact, ask what the lines after it attach "
+                      "to once it is gone", lessons)
+        self.assertIn("LESSONS 219", self.read("atlas", "expand.py"))
+        self.assertIn("LESSONS 219", self.read("atlas", "query.py"))
         example = self.read("manifest.example.json")
         self.assertIn("exactly these: CICS DFHAID, DFHBMSCA, DFHEIBLK, DFHEIVAR, DFHMSRCA; MQ CMQV, CMQXV, CMQODV, "
                       "CMQODL, CMQMDV, CMQMDL, CMQGMOV, CMQGMOL, CMQPMOV, CMQPMOL. Any other MQ copy file", example)

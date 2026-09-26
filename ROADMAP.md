@@ -744,10 +744,22 @@ shipped alone and cost one such night; these still wait for the next one:
    copybook, not a library; `field DFHENTER` says the programs referencing it copy DFHAID, IBM-supplied and not in the
    estate, instead of 'check spelling'. Found on the way (LESSONS 218, expand.py): OS/VS `01 X` / `COPY Y.` on two
    lines with nothing expanded for Y left `01 X` open to join the next entry (`01 X 01 NEXT.` - NEXT's items under X,
-   NEXT lost), and `FD F` / `COPY Y.` lost the file's record in both forms: an 01 / 77 now goes as in the one-line
-   form, an FD / SD stays, closed. tests/test_copybook_expansion.py (NestedCopyLinesOnANewIndex,
-   NestedCopyLinesOnAnOlderIndex, TheShopKeepsSqlca, TheManifestAndIbmNames, OsvsCopyNotExpanded, and the coverage
-   asserts added to IbmSuppliedCopybooks, TheShopKeepsItsOwnCopy, TheManifestAddsNames, AnIndexBuiltBeforeTheItem).
+   NEXT lost), and `FD F` / `COPY Y.` lost the file's record in both forms: an 01 / 77 went as in the one-line
+   form (the second round keeps it instead, below), an FD / SD stays, closed. tests/test_copybook_expansion.py
+   (NestedCopyLinesOnANewIndex, NestedCopyLinesOnAnOlderIndex, TheShopKeepsSqlca, TheManifestAndIbmNames,
+   OsvsCopyNotExpanded, and the coverage asserts added to IbmSuppliedCopybooks, TheShopKeepsItsOwnCopy,
+   TheManifestAddsNames, AnIndexBuiltBeforeTheItem).
+   **The verifier's second round (LESSONS 219), before he ran it.** On an index built before the item, `layout` reads
+   a copybook's SQLCA / SQLDA row by the copybook's own line (`query.system_include_written`; without the line, by a
+   copier's note '(in COPY B) L3: COPY SQLCA NOT FOUND'): a `COPY SQLCA` that no member carries is NOT FOUND and in no
+   program's view, as `program` says of the same line - it was said to be the precompiler's `EXEC SQL INCLUDE SQLCA`;
+   one a member carries is counted in a program's view; both readings only when the index holds neither the line nor
+   the note. `field` says '1 of the 2 programs referencing it copies' and 'For the other program'. An OS/VS `01 X` /
+   `COPY Y.` (two lines or one) with nothing expanded for Y keeps `01 X.`, closed, as an FD / SD is kept: X stays
+   defined and the items the program writes after the COPY stay X's. Dropping the 01, as the first round did and the
+   one-line form always had, gave them to the record before it (a complete record of 4 bytes grew to 9, with no
+   warning of its own). tests/test_copybook_expansion.py (NestedCopyLinesOnAnOlderIndex, TheShopKeepsSqlca,
+   FieldSaysTheCountsInWords, OsvsCopyNotExpanded, OsvsCopyNotFoundInTheIndex).
 28. **Delivered in the batch - the words EXEC SQL / CICS / DLI inside a literal are text.** Found by the verifier in
    passing on item 27; on main since 3a27440 (LESSONS 217). `01 WS-ERR PIC X(30) VALUE 'EXEC CICS LINK FAILED'.`
    opened an EXEC block in `reader.cobol_statements` that no period closed: every later data item and paragraph was

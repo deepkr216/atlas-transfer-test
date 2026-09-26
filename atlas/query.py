@@ -1098,8 +1098,11 @@ def _not_defined(conn: sqlite3.Connection, name: str) -> str:
     if not books:
         return plain
     n = len(progs)
+    # the verbs agree with the counts: '1 of the 2 programs referencing it copies', 'For the other program' (it said
+    # 'copy' and 'programs', LESSONS 219)
     lead = ("the program referencing it copies" if n == 1 else "every program referencing it copies"
-            if len(books) == n else f"{len(books)} of the {n} programs referencing it copy")
+            if len(books) == n else f"{len(books)} of the {n} programs referencing it "
+                                    f"{'copies' if len(books) == 1 else 'copy'}")
     said = "; ".join(f"{p} copies {', '.join(bs)}" for p, bs in sorted(books.items())[:8]) \
         + (f"; +{len(books) - 8} more" if len(books) > 8 else "")
     first = next(iter(sorted(books.items())))[1][0]
@@ -1107,7 +1110,8 @@ def _not_defined(conn: sqlite3.Connection, name: str) -> str:
     return (f"**NOT DEFINED** in any indexed copybook or program - {lead} a copybook the compile reads from a product's "
             f"own library, not from the estate ({said}). The name is probably one of {whose} items, which the index "
             f"does not hold (`copybook {first}` says which product supplies it)"
-            + (f". For the other programs: {NOT_DEFINED_HINT}" if len(books) < n else "") + ".\n")
+            + (f". For the other program{'' if n - len(books) == 1 else 's'}: {NOT_DEFINED_HINT}"
+               if len(books) < n else "") + ".\n")
 
 
 def cmd_field(conn: sqlite3.Connection, name: str, show_all: bool = False,
@@ -4699,6 +4703,64 @@ def built_before_item_27(conn: sqlite3.Connection) -> bool:
     return not row or row[0] is None
 
 
+def _member_line(conn: sqlite3.Connection, member_id: int, line: int) -> Optional[str]:
+    """One line of a member's own text, from its search rows (every line of a
+    member is one), or None when the index holds no row of that line."""
+    try:
+        spans = _spans(conn, member_id)
+        if spans:
+            for lo, hi in spans:                      # a range read: fast whatever the size of the index
+                r = conn.execute("SELECT text FROM src_fts WHERE rowid BETWEEN ? AND ? AND line_no=? LIMIT 1",
+                                 (lo, hi, line)).fetchone()
+                if r:
+                    return str(r[0])
+            return None
+        r = conn.execute("SELECT text FROM src_fts WHERE member_id=? AND line_no=? LIMIT 1", (member_id, line)).fetchone()
+    except sqlite3.Error:
+        return None
+    return str(r[0]) if r else None
+
+
+# the words of `EXEC SQL INCLUDE X` as one line of it holds them: the whole statement, its first line
+# (`EXEC SQL`) or its INCLUDE line when written over three (tools/synth/repro/F05)
+_SQL_INCLUDE_LINE = re.compile(r"(?<![A-Z0-9\-])EXEC\s+SQL(?![A-Z0-9\-])|^\s*INCLUDE\s", re.I)
+
+
+def system_include_written(conn: sqlite3.Connection, member_id: int, book: str, line: int) -> Optional[str]:
+    """How the copybook `member_id` writes `book` (SQLCA / SQLDA) at `line`,
+    for an index built before ROADMAP re-parse item 27, whose row says neither:
+    'copy' (`COPY SQLCA` - a copybook like any other, NOT FOUND when no
+    member carries it), 'include' (`EXEC SQL INCLUDE SQLCA` - the
+    precompiler's), or None when nothing in the index says. The copybook's
+    own line first, read with the expander's own patterns; else the
+    programs copying it - that build wrote '(in COPY <copybook>) L<line>:
+    COPY SQLCA NOT FOUND' into a copier's notes for a COPY, and nothing for
+    an INCLUDE. With no member of the name, `layout` took every such row for
+    the precompiler's: a copybook's `COPY SQLCA` was said to be `EXEC SQL
+    INCLUDE SQLCA`, which moves nothing, while `program` said NOT FOUND for
+    the same line (LESSONS 219)."""
+    book = (book or "").upper()
+    me = conn.execute("SELECT name FROM member WHERE id = ?", (member_id,)).fetchone()
+    if not me:
+        return None
+    text = _member_line(conn, member_id, line)
+    if text is not None:
+        masked = expand._mask_literals(text)
+        m = expand.find_copy_start(text, masked)
+        if m and m.group(3).upper() == book:
+            return "copy"
+        if _SQL_INCLUDE_LINE.search(masked):
+            return "include"
+    try:
+        noted = conn.execute("""SELECT 1 FROM unresolved u WHERE u.kind = 'expand' AND instr(u.detail, ?) > 0
+                                AND u.member_id IN (SELECT c.member_id FROM copy_use c WHERE c.resolved_member_id = ?)
+                                LIMIT 1""", (f"(in COPY {str(me[0]).upper()}) L{line}: COPY {book} NOT FOUND",
+                                             member_id)).fetchone()
+    except sqlite3.Error:
+        noted = None
+    return "copy" if noted else None
+
+
 def nested_copy_lines(conn: sqlite3.Connection, member_id: int) -> List[str]:
     """Under a copybook's own layout, one line per COPY written in it. The
     build of ROADMAP re-parse item 27 computes the layout with the nested
@@ -4717,7 +4779,9 @@ def nested_copy_lines(conn: sqlite3.Connection, member_id: int) -> List[str]:
     member of its name is in the index. Before the verifier's round on the
     item, the SQLCA line and the IBM-supplied one said a program's view
     counts them, and a NOT FOUND two levels down was never shown (LESSONS
-    216)."""
+    216). On such an index a SQLCA / SQLDA row is read by the copybook's own
+    line (system_include_written): a `COPY SQLCA` no member carries is NOT
+    FOUND, as `program` says of it, not the precompiler's (LESSONS 219)."""
     rows = conn.execute("""SELECT c.copybook, c.line, c.resolved_member_id, r.path, r.norm_sha FROM copy_use c
                            LEFT JOIN member r ON r.id = c.resolved_member_id
                            WHERE c.member_id = ? ORDER BY c.line, c.id""", (member_id,)).fetchall()
@@ -4768,17 +4832,28 @@ def nested_copy_lines(conn: sqlite3.Connection, member_id: int) -> List[str]:
             supplied = recover.supplied_copybooks(conn)
         carried = conn.execute(f"SELECT 1 FROM member WHERE name = ? AND kind IN ({kinds}) LIMIT 1",
                                (book, *recover.RESOLVER_KINDS)).fetchone()
-        if book in expand._SYSTEM_INCLUDES and (not carried or not built_before_item_27(conn)):
+        # SQLCA / SQLDA with no member and no warning: on an index built by the item always `EXEC SQL INCLUDE` (a
+        # `COPY SQLCA` it found no member for has its warning); on one built before, the copybook's own line says,
+        # else a copier's note (system_include_written) - a `COPY SQLCA` no member carries was said to be the
+        # precompiler's beside `program`'s NOT FOUND (LESSONS 219)
+        how = None
+        if book in expand._SYSTEM_INCLUDES:
+            how = (system_include_written(conn, member_id, book, line) if built_before_item_27(conn)
+                   else "include")
+        if how == "include":
             # `EXEC SQL INCLUDE SQLCA`: recorded with no member and no warning on purpose (LESSONS 203); the
             # precompiler writes the area as an 01 of its own, inside no record of this copybook
             out.append(f"- At line {line}: {precompiler_cell(book)}. The precompiler writes it as a record of its own "
                        f"(`01 {book}`), so it moves no offset above\n")
-        elif book in expand._SYSTEM_INCLUDES:
+        elif book in expand._SYSTEM_INCLUDES and how is None:
+            copy_reading = (f"it is the copy in the index (`copybook {book}`), whose bytes are NOT counted above"
+                            if carried else f"no member of the index carries {book}, so its bytes are NOT counted "
+                                            "above nor in any program's view")
             out.append(f"- `{book}` at line {line}: this index was built before ROADMAP re-parse item 27 and does not say "
                        f"which statement names it. Written `EXEC SQL INCLUDE {book}`, the precompiler writes it as a "
-                       f"record of its own (`01 {book}`) and it moves no offset above; written `COPY {book}`, it is the "
-                       f"copy in the index (`copybook {book}`), whose bytes are NOT counted above - an item after it in "
-                       "the same record sits further on by its length. The next build says which\n")
+                       f"record of its own (`01 {book}`) and it moves no offset above; written `COPY {book}`, "
+                       f"{copy_reading} - an item after it in the same record sits further on by its length. The next "
+                       "build says which\n")
         elif book in supplied:
             product = supplied[book]
             out.append(f"- `COPY {book}` at line {line}: **{supplied_label(product)}** - {supplied_why(book, product)}. "
