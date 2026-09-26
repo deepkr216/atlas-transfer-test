@@ -786,7 +786,7 @@ shipped alone and cost one such night; these still wait for the next one:
 29. **Delivered in the batch - a PROC's card member named by a symbolic is the calling job's, and a (+1) named again
    later in the same job is read, not written again.** The synthetic estate's findings in the JCL parser
    (docs/SYNTH-findings-2026-09-25.md; the reproductions F09 and F10 under tools/synth/repro, which verify.py now
-   reports FIXED; LESSONS 222-228). (F10) The shared sort PROC's `//SYSIN DD DSN=PROD.CMN.PARMLIB(&CARDS)`, run with
+   reports FIXED; LESSONS 222-233). (F10) The shared sort PROC's `//SYSIN DD DSN=PROD.CMN.PARMLIB(&CARDS)`, run with
    `EXEC PROC=CMNSORT,...,CARDS=BILSORT1`: the effective step's DSN was the job's, but its card member, the member's
    text, the program read from the cards and the sort byte positions stayed the PROC default's (CMNSRT1, not in the
    estate) - `job` said 'card member NOT indexed' for a member the estate holds, coverage had a 'SORT with no cards'
@@ -800,8 +800,14 @@ shipped alone and cost one such night; these still wait for the next one:
    own rows only when no indexed job expands the PROC, and a job step's //PS.DD override once. On an index built
    before the item an expanded step's card_member and text can still be the PROC default's while its dataset names
    the job's member: the table and `program NAME` take the member from the dataset and ask whether a card member of
-   that name is in the index (LESSONS 227); `program NAME` says a member's text is loaded only when it is (LESSONS
-   228). (F09) JES resolves relative generation numbers
+   that name is in the index (LESSONS 227); `program NAME` says a member's text is loaded only where the build
+   loaded it - never for a copybook's stub named like the member - as coverage counts it (LESSONS 228, 230). A
+   card DD naming its dataset by a referback (`//SYSIN DD DSN=*.S1.SYSIN`) reads that dataset's cards, and every
+   step is read from its cards after its referbacks are resolved - a job step naming a PROC step's DD is read
+   again once the PROC is expanded (LESSONS 229); a PROC's USS file (`DD PATH=`) keeps its PATHOPTS direction in
+   the job (LESSONS 232); an override row is cited in the member that codes it (LESSONS 231), and `interfaces`
+   leaves out a PROC's own default rows when a job runs the PROC (LESSONS 233).
+   (F09) JES resolves relative generation numbers
    once per job: `jcl._same_job_generations` reads a (+n) an earlier step of the job wrote, named again by a DD that
    reads it (SORTIN, SYSUT1, an input of the sort / ICETOOL / JOINKEYS / Easytrieve cards, DISP=SHR or OLD on a DD
    whose name is not a writing one), as input 'gdg_same_job', not a second writer; the program's OPEN still decides
@@ -814,7 +820,9 @@ shipped alone and cost one such night; these still wait for the next one:
    facts matched and 11,393, none new; the one JCL finding left is `crud --job POLNIGHT` (the sorted extract absent),
    a query-side question of its own. The first build of this toolkit re-parses every member (jcl.py is a fact
    module). tests/test_jcl_generations_and_cards.py (SameJobGenerations, ProcCardMember, InTheIndex,
-   ProcInterfaceRows, ProcInterfaceRowsInTheIndex, AnIndexBuiltBeforeTheItem, TheReproductions).
+   ProcInterfaceRows, ProcInterfaceRowsInTheIndex, AnIndexBuiltBeforeTheItem, CardReferbacks,
+   CardReferbacksInTheIndex, StubNamedLikeACardMember, OverrideCites, ProcUssFiles, InterfacesOfExpandedSteps,
+   TheReproductions).
 
 ### flow: known limits (open after review)
 
@@ -840,6 +848,26 @@ tests/test_flow.py FlowKnownLimits). None needs a re-parse (atlas/flow.py only).
   REFERENCE.** Before the re-parse, a CALL whose text holds BY CONTENT anywhere carries the note on
   every hop through it, even on a position its own text shows is BY REFERENCE (noise, not a wrong
   answer).
+
+### JCL cites: known limits (open after review)
+
+Found while fixing LESSONS 231 and left open; none is a wrong fact in the index, each is a cite that names the
+wrong member or line.
+
+- **`interfaces` cites an expanded step's `interface_edge` row in the job with the PROC's line.** The build
+  writes the row of an FTP / Connect:Direct / USS step on the job's member with the step's line, which for an
+  expanded step is a line of the PROC. atlas/flow.py relies on that pair to tie the row to its step and cites
+  the PROC itself (`cite_iface`); the `interfaces` page prints the pair as it is. The *FTP* / *NDM* rows on the
+  same page are cited right. These rows are also the second row per FTP put of the synthetic finding F13
+  (tools/synth/repro/F13-interfaces-ftp-twice): leaving them out for a step whose *FTP* / *NDM* rows are
+  listed closes both. Next: that, or cite the row as flow.py does - query-side, no re-parse.
+- **A step of an instream PROC is cited under the PROC's name.** `// PROC ... // PEND` lives in the job's own
+  member, but the step and DD cites print `from_proc` - the PROC's name, which is no member. Next: cite the
+  job's member when `proc_def.instream` is set for that name in it - query-side.
+- **A step built for a system PROC that is not indexed (DLIBATCH, IMSBMP, DSNUPROC: `proc_synthesised`) is
+  cited as `DLIBATCH:line` with the job's line.** Its DDs are the job's overrides and are cited in the job
+  (LESSONS 231); the step's own cite is not. Next: cite the job's member for a step whose PROC has no
+  `proc_def` row - query-side.
 
 ## What the tool was not built for - scenario audit (2026-09-21)
 

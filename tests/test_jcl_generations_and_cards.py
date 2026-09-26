@@ -22,6 +22,13 @@ the JCL parser, and one found on the way.
       read the member from the row's dataset, tested on rows the older build
       really wrote; `program NAME` says a member's text is loaded only when it
       is indexed.
+  LESSONS 229-233 - the verifier's second round: a card DD naming its dataset by
+      a referback reads that dataset's cards, and a step is read from its cards
+      after its referbacks are resolved; `program NAME` decides 'its text is
+      loaded' row by row as coverage counts it (a copybook's stub is no card);
+      an override row is cited in the member that codes it; a PROC's USS file
+      keeps its PATHOPTS direction in the job; `interfaces` leaves out a PROC's
+      own default rows when a job runs the PROC.
 
 Every name here is fictional.
 """
@@ -891,10 +898,10 @@ class TheDocsSayIt(unittest.TestCase):
 
     def test_lessons_rows(self):
         text = self.read("LESSONS.md")
-        for n in (222, 223, 224, 225, 226, 227, 228):
+        for n in range(222, 234):
             row = next((ln for ln in text.splitlines() if ln.startswith(f"| {n} |")), "")
             self.assertIn("tests/test_jcl_generations_and_cards.py", row, n)
-            self.assertEqual(row.replace("\|", "").count("|") - 1, 5, n)      # number + four cells
+            self.assertEqual(row.replace("\\|", "").count("|") - 1, 5, n)     # number + four cells
 
     def test_roadmap_and_readme(self):
         self.assertIn("29. **Delivered in the batch - a PROC's card member named by a symbolic", self.read("ROADMAP.md"))
@@ -914,7 +921,21 @@ class TheDocsSayIt(unittest.TestCase):
             self.assertIn("dataset", text, where)
         item = self.read("ROADMAP.md").split("29. **Delivered in the batch")[1].split("\n\n")[0]
         self.assertIn("take the member from the dataset", item)
-        self.assertIn("LESSONS 222-228", item)
+        self.assertIn("LESSONS 222-233", item)
+
+    def test_the_loaded_sentence_says_what_the_code_does(self):
+        # LESSONS 230. Wrong words guarded: 'says a member's text is loaded only when it is' - a copybook's stub
+        # named like the member was taken as loaded
+        item = self.read("ROADMAP.md").split("29. **Delivered in the batch")[1].split("\n\n")[0]
+        self.assertNotIn("loaded only when it is", item)
+        self.assertIn("never for a copybook's stub", " ".join(item.split()))
+        row = next(ln for ln in self.read("LESSONS.md").splitlines() if ln.startswith("| 228 |"))
+        self.assertIn("row 230", row)
+        self.assertIn("card_text_missing", query.card_members_not_indexed.__doc__)
+        self.assertIn("stub", query.card_text_missing.__doc__)
+        readme = self.read("README.md")
+        self.assertIn("reads that dataset's cards, as if its DSN were coded there", readme)
+        self.assertIn("PATHOPTS direction, in a PROC's step as in the job's own", readme)
 
     def test_card_seq_assumed_says_what_the_row_records(self):
         # LESSONS 225. Wrong words guarded: 'a card deck with no sequence field; the order on disk was assumed'
@@ -930,6 +951,553 @@ class TheDocsSayIt(unittest.TestCase):
         for rid in ("F09-gdg-same-job", "F10-proc-card-member-symbolic"):
             self.assertIn("Fixed by ROADMAP re-parse item 29", self.read("tools", "synth", "repro", rid, "README.md"))
         self.assertIn("(ROADMAP re-parse item 29, LESSONS 222-224)", self.read("docs", "SYNTH-findings-2026-09-25.md"))
+
+
+# ===========================================================================
+# LESSONS 229 - a card DD named by a referback (DSN=*.S1.SYSIN) reads the
+# cards of the dataset it names, and its step is read from them
+# ===========================================================================
+
+REF_CARDS = {"KVRC01": "  SORT FIELDS=(1,8,CH,A)\n", "KVRDEF": "  SORT FIELDS=(20,4,CH,A)\n",
+             "KVRSEQ": "  SORT FIELDS=(5,5,CH,A)\n"}
+REF_PROC = """//KVRTWO   PROC CARDS=KVRDEF
+//SRT1     EXEC PGM=SORT
+//SORTIN   DD   DSN=PROD.KV.REF.IN,DISP=SHR
+//SORTOUT  DD   DSN=PROD.KV.REF.MID,DISP=(NEW,CATLG,DELETE)
+//SYSIN    DD   DSN=PROD.CMN.PARMLIB(&CARDS),DISP=SHR
+//SRT2     EXEC PGM=SORT
+//SORTIN   DD   DSN=PROD.KV.REF.MID,DISP=SHR
+//SORTOUT  DD   SYSOUT=*
+//SYSIN    DD   DSN=*.SRT1.SYSIN,DISP=SHR
+"""
+REF_PLAIN_JOB = """//KVRJOB2  JOB  (ACCT),'REFER PLAIN',CLASS=A
+//S1       EXEC PGM=SORT
+//SORTIN   DD   DSN=PROD.KV.REF.IN,DISP=SHR
+//SORTOUT  DD   DSN=PROD.KV.REF.MID2,DISP=(NEW,CATLG,DELETE)
+//SYSIN    DD   DSN=PROD.CMN.PARMLIB(KVRC01),DISP=SHR
+//S2       EXEC PGM=SORT
+//SORTIN   DD   DSN=PROD.KV.REF.MID2,DISP=SHR
+//SORTOUT  DD   SYSOUT=*
+//SYSIN    DD   DSN=*.S1.SYSIN,DISP=SHR
+//S3       EXEC PGM=IEFBR14
+//DEL      DD   DSN=*.S1.SORTOUT,DISP=(OLD,DELETE)
+//S4       EXEC PGM=SORT
+//SORTIN   DD   DSN=PROD.KV.REF.IN,DISP=SHR
+//SORTOUT  DD   SYSOUT=*
+//SYSIN    DD   DSN=PROD.CMN.CARDS.KVRSEQ,DISP=SHR
+//S5       EXEC PGM=SORT
+//SORTIN   DD   DSN=PROD.KV.REF.IN,DISP=SHR
+//SORTOUT  DD   SYSOUT=*
+//SYSIN    DD   DSN=*.S4.SYSIN,DISP=SHR
+//
+"""
+REF_PROC_JOB = """//KVRJOB1  JOB  (ACCT),'REFER PROC',CLASS=A
+//S1       EXEC KVRTWO,CARDS=KVRC01
+//S2       EXEC PGM=SORT
+//SORTIN   DD   DSN=PROD.KV.REF.MID,DISP=SHR
+//SORTOUT  DD   SYSOUT=*
+//SYSIN    DD   DSN=*.S1.SRT1.SYSIN,DISP=SHR
+//S3       EXEC PGM=IEFBR14
+//DEL      DD   DSN=*.S1.SRT1.SORTOUT,DISP=(OLD,DELETE)
+//S4       EXEC KVRTWO,CARDS=KVRC01
+//SRT1.SYSIN DD DUMMY
+//
+"""
+
+
+def _no_cards_rows(facts, step):
+    return [u for u in facts.unresolved if u[0] == "launcher_parm" and u[1].startswith(step + ":")]
+
+
+class CardReferbacks(unittest.TestCase):
+    """LESSONS 229. Wrong answer guarded: a card DD naming its dataset by a referback carried the card member and no
+    text - the step had no sort byte positions and a 'SORT/ICETOOL with no cards' row - and a step was read from its
+    cards before its referbacks were resolved."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.plain = jcl.parse_jcl(REF_PLAIN_JOB, member_lookup=REF_CARDS.get)
+        cls.job, cls.by = _expand(REF_PROC_JOB, {"KVRTWO": REF_PROC}, REF_CARDS)
+
+    def test_a_jobs_referback_reads_the_cards_it_names(self):
+        s1, s2 = self.plain.steps[0], self.plain.steps[1]
+        d = _dd(s2, "SYSIN")
+        self.assertEqual((d.dsn_resolved, d.card_member, d.sysin_text),
+                         ("PROD.CMN.PARMLIB(KVRC01)", "KVRC01", REF_CARDS["KVRC01"]))
+        self.assertEqual(_positions(s2), [("SORT", 1, 8)])
+        self.assertEqual(_positions(s2), _positions(s1))
+        self.assertIn("sort behaviour defined by control cards", s2.notes)
+        self.assertEqual(_no_cards_rows(self.plain, "S2"), [])
+
+    def test_a_procs_second_step_reads_the_jobs_member(self):
+        for name in ("S1.SRT1", "S1.SRT2"):
+            d = _dd(self.by[name], "SYSIN")
+            self.assertEqual((d.card_member, d.sysin_text), ("KVRC01", REF_CARDS["KVRC01"]), name)
+            self.assertEqual(_positions(self.by[name]), [("SORT", 1, 8)], name)
+            self.assertEqual(_no_cards_rows(self.job, name), [], name)
+
+    def test_a_job_step_referring_into_a_procs_step(self):
+        # read when the job was parsed, before the PROC's steps were known; read again once expand_job resolved it
+        s2 = self.by["S2"]
+        self.assertIs(s2, self.job.steps[1])
+        d = _dd(s2, "SYSIN")
+        self.assertEqual((d.dsn_resolved, d.card_member, d.sysin_text),
+                         ("PROD.CMN.PARMLIB(KVRC01)", "KVRC01", REF_CARDS["KVRC01"]))
+        self.assertEqual(_positions(s2), [("SORT", 1, 8)])
+        self.assertEqual((s2.effective_pgm, s2.notes), ("*SORT*", ["sort behaviour defined by control cards"]))
+        self.assertEqual(_no_cards_rows(self.job, "S2"), [])
+        self.assertIsNone(s2.first_reading)
+
+    def test_parsed_alone_the_job_keeps_its_first_reading(self):
+        job = jcl.parse_jcl(REF_PROC_JOB, member_lookup=REF_CARDS.get)
+        self.assertEqual(job.steps[1].effective_pgm, "*SORT*")
+        self.assertEqual(len(_no_cards_rows(job, "S2")), 1)
+        self.assertIsNotNone(job.steps[1].first_reading)
+
+    def test_an_iefbr14_deletes_what_its_referback_names(self):
+        # the step was read before its referback resolved, and the resolution put back 'unknown [undetermined]'
+        d = _dd(self.plain.steps[2], "DEL")
+        self.assertEqual((d.dsn_resolved,) + _dir(d), ("PROD.KV.REF.MID2", "delete", "iefbr14_disp"))
+        d = _dd(self.by["S3"], "DEL")
+        self.assertEqual((d.dsn_resolved,) + _dir(d), ("PROD.KV.REF.MID", "delete", "iefbr14_disp"))
+
+    def test_a_sequential_card_dataset_by_a_referback(self):
+        d = _dd(self.plain.steps[4], "SYSIN")
+        self.assertEqual((d.card_member, d.sysin_text), ("KVRSEQ", REF_CARDS["KVRSEQ"]))
+        self.assertEqual(_positions(self.plain.steps[4]), [("SORT", 5, 5)])
+        self.assertIn(("card_seq_assumed", "S5 SYSIN: cards taken from member KVRSEQ matching the last qualifier of "
+                                           "PROD.CMN.CARDS.KVRSEQ", 19), self.plain.unresolved)
+
+    def test_a_referback_to_a_dummy_reads_nothing_of_the_default(self):
+        # //SRT1.SYSIN DD DUMMY: SRT2's *.SRT1.SYSIN names no dataset in this job - never the PROC default KVRDEF's
+        d = _dd(self.by["S4.SRT2"], "SYSIN")
+        self.assertEqual((d.dsn_resolved, d.card_member, d.sysin_text), (None, None, None))
+        self.assertEqual(_positions(self.by["S4.SRT2"]), [])
+        self.assertTrue(any(u[0] == "referback" and u[1].startswith("S4.SRT2 SYSIN") for u in self.job.unresolved))
+
+    def test_the_procs_own_rows_keep_its_default(self):
+        own = jcl.parse_jcl(REF_PROC, member_lookup=REF_CARDS.get)
+        d = _dd(own.steps[1], "SYSIN")
+        self.assertEqual((d.dsn_resolved, d.card_member, d.sysin_text),
+                         ("PROD.CMN.PARMLIB(KVRDEF)", "KVRDEF", REF_CARDS["KVRDEF"]))
+
+
+def ref_estate(root):
+    _write(root, "SHARED/PROD.CMN.PROCLIB/KVRTWO.prc", REF_PROC)
+    _write(root, "SHARED/PROD.CMN.PARMLIB/KVRC01.ctl", REF_CARDS["KVRC01"])
+    _write(root, "SHARED/PROD.CMN.PARMLIB/KVRSEQ.ctl", REF_CARDS["KVRSEQ"])
+    _write(root, "POLICY/PROD.KV.JCLLIB/KVRJOB1.jcl", REF_PROC_JOB)
+    _write(root, "POLICY/PROD.KV.JCLLIB/KVRJOB2.jcl", REF_PLAIN_JOB)
+
+
+def age_referbacks(db):
+    """Rewrite the DDs of an index built by this code on ref_estate into what the build before LESSONS 229 wrote
+    (checked against a real build of f93c60c on ref_estate: all 30 dd rows of its jobs, every column): an expanded
+    PROC step's card DDs are age_to_before_item_29's - the PROC's own row's member and text, S4.SRT2's unresolved
+    referback too; a DD naming its dataset by a referback has no text, the direction its name and DISP give
+    (resolved after its step was read from its cards: an IEFBR14 delete was 'unknown [undetermined]'), and on a job
+    step the card member of the DD it names, as that build had it (KVRJOB1 S2: the PROC default KVRDEF)."""
+    age_to_before_item_29(db)
+    conn = sqlite3.connect(db)
+    try:
+        for dd_id, job_id, dd_name, dsn, res, disp, from_proc in conn.execute(
+                """SELECT d.id, s.job_id, d.dd_name, d.dsn, d.dsn_resolved, d.disp, s.from_proc FROM dd d
+                   JOIN step s ON s.id=d.step_id WHERE d.dsn LIKE '*.%' AND d.dsn_resolved IS NOT NULL""").fetchall():
+            mode, source = jcl._direction(dd_name, None, disp, f"DSN={res},DISP={disp or ''}")
+            conn.execute("UPDATE dd SET sysin_text=NULL, mode=?, mode_source=? WHERE id=?", (mode, source, dd_id))
+            path = dsn[2:].upper().rsplit(".", 1)
+            if from_proc is None and job_id is not None and len(path) == 2:
+                named = conn.execute("""SELECT d.card_member FROM dd d JOIN step s ON s.id=d.step_id
+                                        WHERE s.job_id=? AND UPPER(s.step_name)=? AND UPPER(d.dd_name)=?""",
+                                     (job_id, path[0], path[1])).fetchone()
+                if named is not None:
+                    conn.execute("UPDATE dd SET card_member=? WHERE id=?", (named[0], dd_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+class CardReferbacksInTheIndex(unittest.TestCase):
+    """LESSONS 229 in the reports, on an index built by this code and on one aged to what the older build wrote.
+    Wrong words guarded: `job` saying 'card member NOT indexed: this step's cards are unknown' for KVRC01 two lines
+    below the step that loaded it, and coverage listing KVRC01 as a member 'referenced by JCL but NOT indexed' with
+    the advice to fetch its library."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.td = tempfile.mkdtemp()
+        root = os.path.join(cls.td, "estate")
+        ref_estate(root)
+        cls.db = os.path.join(cls.td, "t.db")
+        _run_build(root, cls.db, "--rebuild")
+        cls.aged_db = os.path.join(cls.td, "aged.db")
+        shutil.copyfile(cls.db, cls.aged_db)
+        age_referbacks(cls.aged_db)
+        cls.conn = query.connect(cls.db)
+        cls.aged = query.connect(cls.aged_db)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.conn.close()
+        cls.aged.close()
+        shutil.rmtree(cls.td, ignore_errors=True)
+
+    def test_the_rows_hold_the_cards(self):
+        got = self.conn.execute("""SELECT j.job_name, s.step_name, d.card_member, d.sysin_text FROM dd d
+                                   JOIN step s ON s.id=d.step_id JOIN job j ON j.id=s.job_id
+                                   WHERE d.dd_name='SYSIN' AND d.dsn LIKE '*.%' ORDER BY 1, 2""").fetchall()
+        c01, seq = REF_CARDS["KVRC01"], REF_CARDS["KVRSEQ"]
+        self.assertEqual([tuple(r) for r in got], [("KVRJOB1", "S1.SRT2", "KVRC01", c01),
+                                                   ("KVRJOB1", "S2", "KVRC01", c01), ("KVRJOB1", "S4.SRT2", None, None),
+                                                   ("KVRJOB2", "S2", "KVRC01", c01), ("KVRJOB2", "S5", "KVRSEQ", seq)])
+        got = self.conn.execute("""SELECT j.job_name, s.step_name, c.pos, c.length FROM card_field_ref c
+                                   JOIN step s ON s.id=c.step_id JOIN job j ON j.id=s.job_id
+                                   ORDER BY 1, 2""").fetchall()
+        self.assertEqual([tuple(r) for r in got], [("KVRJOB1", "S1.SRT1", 1, 8), ("KVRJOB1", "S1.SRT2", 1, 8),
+                                                   ("KVRJOB1", "S2", 1, 8), ("KVRJOB2", "S1", 1, 8),
+                                                   ("KVRJOB2", "S2", 1, 8), ("KVRJOB2", "S4", 5, 5),
+                                                   ("KVRJOB2", "S5", 5, 5)])
+
+    def test_job_says_the_cards_are_loaded(self):
+        out = query.cmd_job(self.conn, "KVRJOB2")
+        self.assertIn("PROD.CMN.PARMLIB(KVRC01) (via *.S1.SYSIN) -> 1 card lines loaded from member", out)
+        self.assertIn("PROD.CMN.CARDS.KVRSEQ (via *.S4.SYSIN) -> 1 card lines loaded from member", out)
+        self.assertNotIn("card member NOT indexed", out)
+        out = query.cmd_job(self.conn, "KVRJOB1")
+        self.assertEqual(out.count("PROD.CMN.PARMLIB(KVRC01) (via *."), 2, out)
+        self.assertNotIn("card member NOT indexed", out)
+
+    def test_no_step_is_a_sort_with_no_cards_but_the_dummys(self):
+        got = self.conn.execute("""SELECT u.detail FROM unresolved u JOIN member m ON m.id=u.member_id
+                                   WHERE u.kind='launcher_parm' AND m.name LIKE 'KVRJOB%'""").fetchall()
+        self.assertEqual(sorted(r[0].split(":")[0] for r in got), ["S4.SRT1", "S4.SRT2"])
+
+    def test_coverage_and_program_say_the_same_on_both(self):
+        for conn in (self.conn, self.aged):
+            self.assertEqual(query.card_members_not_indexed(conn), [])
+            self.assertNotIn("### Control-card members referenced by JCL but NOT indexed", query.cmd_coverage(conn))
+            out = query.cmd_program(conn, "KVRC01")
+            section = out.split("### Used as control cards by")[1].split("###")[0]
+            self.assertEqual(sorted({ln.split("|")[2].strip() for ln in section.splitlines()
+                                     if ln.startswith("| KVRJOB")}), ["S1", "S1.SRT1", "S1.SRT2", "S2"])
+            self.assertIn("Its text is loaded as that step's cards", out)
+            self.assertNotIn("Not in the estate as control cards", out)
+
+    def test_the_aged_rows_are_the_older_builds(self):
+        rows = {(r[0], r[1]): tuple(r[2:]) for r in self.aged.execute(
+            """SELECT j.job_name, s.step_name, d.card_member, d.sysin_text IS NOT NULL FROM dd d
+               JOIN step s ON s.id=d.step_id JOIN job j ON j.id=s.job_id WHERE d.dd_name='SYSIN'""")}
+        self.assertEqual(rows[("KVRJOB2", "S2")], ("KVRC01", 0))
+        self.assertEqual(rows[("KVRJOB2", "S5")], ("KVRSEQ", 0))
+        self.assertEqual(rows[("KVRJOB1", "S1.SRT2")], ("KVRDEF", 0))
+        self.assertEqual(rows[("KVRJOB1", "S2")], ("KVRDEF", 0))            # its dataset names KVRC01
+        self.assertEqual(rows[("KVRJOB1", "S4.SRT2")], ("KVRDEF", 0))
+        mode = self.aged.execute("""SELECT d.mode FROM dd d JOIN step s ON s.id=d.step_id JOIN job j ON j.id=s.job_id
+                                    WHERE j.job_name='KVRJOB2' AND s.step_name='S3'""").fetchone()[0]
+        self.assertEqual(mode, "unknown")
+
+    def test_an_unresolved_referback_reads_no_member(self):
+        # the older build kept the PROC default KVRDEF on S4.SRT2, whose referback names no dataset in the job
+        self.assertIsNone(query.card_member_read("SYSIN", None, "KVRDEF"))
+        self.assertNotIn("KVRJOB1", query.cmd_program(self.aged, "KVRDEF"))
+
+
+# ===========================================================================
+# LESSONS 230 - a stub named like a card member: its text is loaded only
+# where the build read it
+# ===========================================================================
+
+STUB_NUMBERS = "".join(f"{n:07d}\n" for n in range(1000100, 1000900, 100))
+
+
+def _sort_job(name, *dsns):
+    steps = "".join(f"//S{i}       EXEC PGM=SORT\n//SORTIN   DD   DSN=PROD.KV.STB.IN,DISP=SHR\n"
+                    f"//SORTOUT  DD   SYSOUT=*\n//SYSIN    DD   DSN={dsn},DISP=SHR\n" for i, dsn in enumerate(dsns, 1))
+    return f"//{name:<8} JOB  (ACCT),'STUB CARDS',CLASS=A\n{steps}//\n"
+
+
+class StubNamedLikeACardMember(unittest.TestCase):
+    """LESSONS 230. Wrong words guarded: `program KVSTBC` - a copybook stub (only numbers, in a COPYLIB) named like the
+    member a job's SYSIN names - said 'Its text is loaded as that step's cards' while the build read none of it and
+    coverage listed KVSTBC as referenced by JCL but NOT indexed. A date card filed `stub` in a library with no hint
+    is read as the job's cards, and said so."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.td = tempfile.mkdtemp()
+        root = os.path.join(cls.td, "estate")
+        _write(root, "POLICY/PROD.KV.COPYLIB/KVSTBC.cpy", STUB_NUMBERS)
+        _write(root, "POLICY/PROD.KV.DATA/KVDATC.txt", "20260925\n")
+        _write(root, "POLICY/PROD.KV.PARMLIB/KVRDC1.ctl", "  SORT FIELDS=(1,4,CH,A)\n")
+        _write(root, "POLICY/PROD.KV.JCLLIB/KVSJOB1.jcl",
+               _sort_job("KVSJOB1", "PROD.KV.PARMLIB(KVSTBC)", "PROD.KV.DATA(KVDATC)", "PROD.KV.PARMLIB(KVRDC1)"))
+        _write(root, "POLICY/PROD.KV.JCLLIB/KVSJOB2.jcl", _sort_job("KVSJOB2", "PROD.KV.DATA(KVDATC)"))
+        cls.db = os.path.join(cls.td, "t.db")
+        _run_build(root, cls.db, "--rebuild")
+        cls.conn = query.connect(cls.db)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.conn.close()
+        shutil.rmtree(cls.td, ignore_errors=True)
+
+    def test_what_the_build_read(self):
+        kinds = dict(self.conn.execute("SELECT name, kind FROM member WHERE name IN ('KVSTBC','KVDATC','KVRDC1')"))
+        self.assertEqual(kinds, {"KVSTBC": "stub", "KVDATC": "stub", "KVRDC1": "ctlcard"})
+        got = self.conn.execute("""SELECT j.job_name, s.step_name, d.card_member, d.sysin_text FROM dd d
+                                   JOIN step s ON s.id=d.step_id JOIN job j ON j.id=s.job_id
+                                   WHERE d.dd_name='SYSIN' ORDER BY 1, 2""").fetchall()
+        self.assertEqual([(j, s, m, t is not None) for j, s, m, t in got],
+                         [("KVSJOB1", "S1", "KVSTBC", False), ("KVSJOB1", "S2", "KVDATC", True),
+                          ("KVSJOB1", "S3", "KVRDC1", True), ("KVSJOB2", "S1", "KVDATC", True)])
+        self.assertIn("20260925", got[1][3])
+
+    def test_the_state_of_a_name(self):
+        state = query.card_member_state
+        self.assertEqual([state(self.conn, n) for n in ("KVSTBC", "KVDATC", "KVRDC1", "KVNONE")],
+                         ["stub", "stub", "read", "absent"])
+        missing = query.card_text_missing
+        self.assertTrue(missing("stub", "KVSTBC", "KVSTBC", False))
+        self.assertFalse(missing("stub", "KVDATC", "KVDATC", True))
+        self.assertTrue(missing("stub", "KVDATC", "KVOTHER", True))     # the text is another member's
+        self.assertFalse(missing("read", "KVRDC1", "KVRDC1", False))    # an older build's row: the next build reads it
+        self.assertTrue(missing("absent", "KVNONE", "KVNONE", False))
+
+    def test_program_says_what_the_build_read(self):
+        out = query.cmd_program(self.conn, "KVSTBC")
+        self.assertIn("**Not a program**: indexed as a `stub` member", out)
+        self.assertIn("| KVSJOB1 | S1 | SYSIN | PROD.KV.PARMLIB(KVSTBC) | KVSJOB1:5 |", out)
+        self.assertIn("**Not in the estate as control cards**", out)
+        self.assertNotIn("Its text is loaded", out)
+        out = query.cmd_program(self.conn, "KVDATC")
+        self.assertIn("Its text is loaded as that step's cards", out)
+        self.assertNotIn("Not in the estate as control cards", out)
+
+    def test_coverage_lists_the_copybook_stub(self):
+        self.assertEqual(query.card_members_not_indexed(self.conn), [("KVSTBC", 1)])
+
+    def test_rows_read_apart(self):
+        # not written by one build: said row by row, as coverage counts them
+        db = os.path.join(self.td, "apart.db")
+        shutil.copyfile(self.db, db)
+        conn = sqlite3.connect(db)
+        conn.execute("""UPDATE dd SET sysin_text=NULL WHERE card_member='KVDATC' AND step_id IN
+                        (SELECT s.id FROM step s JOIN job j ON j.id=s.job_id WHERE j.job_name='KVSJOB2')""")
+        conn.commit()
+        conn.close()
+        apart = query.connect(db)
+        try:
+            out = query.cmd_program(apart, "KVDATC")
+            self.assertIn("Its text is loaded as the cards of the other steps listed; for KVSJOB2 S1 the index holds "
+                          "none of it: `job <JOB>` shows the cards each step was read with.", out)
+            self.assertEqual(query.card_members_not_indexed(apart), [("KVDATC", 1), ("KVSTBC", 1)])
+        finally:
+            apart.close()
+
+
+# ===========================================================================
+# LESSONS 231 - a //PS.DD override, an addition and a JOBLIB copy on an
+# expanded step are cited where they are coded
+# ===========================================================================
+
+CITE_PROC = """//KVCPRC   PROC
+//P1       EXEC PGM=KVWRT1
+//OUTF     DD   DSN=PROD.KV.CITE.OUT,DISP=(NEW,CATLG,DELETE)
+//SYSIN    DD   DSN=PROD.CMN.PARMLIB(KVCDEF),DISP=SHR
+"""
+CITE_OUTER = """//KVCOUT   PROC
+//O1       EXEC KVCPRC
+//P1.SYSIN DD   DSN=PROD.CMN.PARMLIB(KVCNST),DISP=SHR
+//O2       EXEC PGM=IEFBR14
+//DEL      DD   DSN=PROD.KV.CITE.OUT,DISP=(OLD,DELETE)
+"""
+CITE_JOB = """//KVCJ01   JOB  (ACCT),'CITES',CLASS=A
+//JOBLIB   DD   DSN=PROD.KV.CITE.LOADLIB,DISP=SHR
+//S1       EXEC KVCPRC
+//P1.OUTF  DD   DSN=PROD.KV.CITE.OUTJ,DISP=(NEW,CATLG,DELETE)
+//P1.EXTRA DD   DSN=PROD.KV.CITE.EXTRA,DISP=SHR
+//P1.SYSIN DD   DSN=PROD.CMN.PARMLIB(KVCJOB),DISP=SHR
+//S2       EXEC KVCOUT
+//
+"""
+COBOL_WRITER = COBOL_READER.replace("KVRDR01", "KVWRT1").replace("ASSIGN TO KVIN", "ASSIGN TO OUTF") \
+    .replace("OPEN INPUT KV-IN.\n           READ KV-IN.", "OPEN OUTPUT KV-IN.\n           WRITE KV-REC.") \
+    .replace("       PROCEDURE DIVISION.",
+             "       WORKING-STORAGE SECTION.\n       COPY KVCREC.\n       PROCEDURE DIVISION.")
+
+
+def _cells(out, *first):
+    """The last cell of the table row that starts with these cells."""
+    head = "| " + " | ".join(first) + " |"
+    rows = [ln for ln in out.splitlines() if ln.startswith(head)]
+    if len(rows) != 1:
+        raise AssertionError(f"{len(rows)} rows start with {head!r}:\n{out}")
+    return rows[0].rstrip(" |").rsplit("| ", 1)[1].strip()
+
+
+class OverrideCites(unittest.TestCase):
+    """LESSONS 231. Wrong cites guarded: an override row of an expanded step cited in the PROC with the job's line -
+    `KVCPRC:4` for KVCJ01's `//P1.OUTF` (KVCPRC line 4 is its SYSIN), `KVCPRC:6` past the PROC's end - and a JOBLIB
+    copy the same; a nested PROC's override cited in the inner PROC."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.td = tempfile.mkdtemp()
+        root = os.path.join(cls.td, "estate")
+        _write(root, "SHARED/PROD.CMN.PROCLIB/KVCPRC.prc", CITE_PROC)
+        _write(root, "SHARED/PROD.CMN.PROCLIB/KVCOUT.prc", CITE_OUTER)
+        _write(root, "POLICY/PROD.KV.JCLLIB/KVCJ01.jcl", CITE_JOB)
+        _write(root, "POLICY/PROD.KV.COBOL/KVWRT1.cbl", COBOL_WRITER)
+        _write(root, "POLICY/PROD.KV.COPYLIB/KVCREC.cpy", "       01  KV-CREC                PIC X(80).\n")
+        cls.db = os.path.join(cls.td, "t.db")
+        _run_build(root, cls.db, "--rebuild")
+        cls.conn = query.connect(cls.db)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.conn.close()
+        shutil.rmtree(cls.td, ignore_errors=True)
+
+    def test_dataset(self):
+        out = query.cmd_dataset(self.conn, "PROD.KV.CITE")
+
+        def cite(dsn, step):
+            return next(ln for ln in out.splitlines() if ln.startswith(f"| {dsn} |") and f"| {step} |" in ln) \
+                .rstrip(" |").rsplit("| ", 1)[1]
+        self.assertEqual(cite("PROD.KV.CITE.OUTJ", "S1.P1"), "KVCJ01:4")         # an override
+        self.assertEqual(cite("PROD.KV.CITE.EXTRA", "S1.P1"), "KVCJ01:5")        # an addition
+        self.assertEqual(cite("PROD.KV.CITE.LOADLIB", "S1.P1"), "KVCJ01:2")      # the JOBLIB, copied onto the step
+        self.assertEqual(cite("PROD.KV.CITE.LOADLIB", "S2.O2"), "KVCJ01:2")
+        self.assertEqual(cite("PROD.KV.CITE.OUT", "S2.O1.P1"), "KVCPRC:3")       # the PROC's own DD
+        self.assertEqual(cite("PROD.KV.CITE.OUT", "S2.O2"), "KVCOUT:5")
+        out = query.cmd_dataset(self.conn, "PROD.CMN.PARMLIB")
+        self.assertEqual(cite("PROD.CMN.PARMLIB(KVCJOB)", "S1.P1"), "KVCJ01:6")
+        self.assertEqual(cite("PROD.CMN.PARMLIB(KVCNST)", "S2.O1.P1"), "KVCOUT:3")   # the outer PROC's override
+
+    def test_program_cards(self):
+        self.assertEqual(_cells(query.cmd_program(self.conn, "KVCJOB"), "KVCJ01", "S1.P1", "SYSIN"), "KVCJ01:6")
+        self.assertEqual(_cells(query.cmd_program(self.conn, "KVCNST"), "KVCJ01", "S2.O1.P1", "SYSIN"), "KVCOUT:3")
+
+    def test_copybook_datasets_written(self):
+        # the programs copying KVCREC, the jobs running them, the datasets they write
+        out = query.cmd_copybook(self.conn, "KVCREC").split("### Datasets WRITTEN")[1].split("###")[0]
+        self.assertEqual(_cells(out, "PROD.KV.CITE.OUTJ"), "KVCJ01:4")
+        self.assertEqual(_cells(out, "PROD.KV.CITE.OUT"), "KVCPRC:3")
+
+    def test_the_cited_lines_hold_the_dd(self):
+        # every cite of the dataset page names a line that codes the DD it cites
+        root = os.path.join(self.td, "estate")
+        files = {"KVCJ01": "POLICY/PROD.KV.JCLLIB/KVCJ01.jcl", "KVCPRC": "SHARED/PROD.CMN.PROCLIB/KVCPRC.prc",
+                 "KVCOUT": "SHARED/PROD.CMN.PROCLIB/KVCOUT.prc"}
+        out = query.cmd_dataset(self.conn, "PROD.KV.CITE")
+        for ln in out.splitlines():
+            if not ln.startswith("| PROD.KV.CITE"):
+                continue
+            dsn = ln.split("|")[1].strip()
+            mem, n = ln.rstrip(" |").rsplit("| ", 1)[1].split(":")
+            with open(os.path.join(root, *files[mem].split("/")), encoding="utf-8") as fh:
+                self.assertIn(dsn, fh.read().splitlines()[int(n) - 1], ln)
+
+
+# ===========================================================================
+# LESSONS 232 / 233 - a PROC's USS file keeps its direction in the job, and
+# a PROC's own interface rows are its defaults'
+# ===========================================================================
+
+USS_PROC = """//KVUSS    PROC ENV=PROD
+//U010     EXEC PGM=BPXBATCH
+//STDOUT   DD   PATH='/u/&ENV/kv/out.txt',PATHOPTS=(OWRONLY,OCREAT)
+//STDIN    DD   PATH='/u/kv/in.txt',PATHOPTS=(ORDONLY)
+//STDERR   DD   DSN=PROD.KV.USS.ERRS,DISP=SHR
+//STDENV   DD   PATH='/u/kv/&RUNID/env.txt',PATHOPTS=(ORDONLY)
+"""
+USS_JOB = """//KVUJOB   JOB  (ACCT),'USS',CLASS=A
+//S1       EXEC KVUSS,ENV=TEST
+//S2       EXEC KVUSS
+//U010.STDERR DD PATH='/u/kv/err.txt',PATHOPTS=(OWRONLY,OCREAT)
+//U010.STDIN DD DSN=PROD.KV.USS.INFILE,DISP=SHR
+//
+"""
+LONE_FTP_PROC = FTP_PROC.replace("//KVFTP    PROC FT=KVFTPD", "//KVFTPL   PROC FT=KVFTPLD")
+FTP_JOB = "//KVFJOB   JOB  (ACCT),'FTP',CLASS=A\n//S1       EXEC KVFTP,FT=KVFTPJ\n//\n"
+
+
+def _uss(step, name):
+    d = _dd(step, name)
+    return (d.dsn_resolved, d.mode, d.mode_source, d.is_override)
+
+
+class ProcUssFiles(unittest.TestCase):
+    """LESSONS 232. Wrong answer guarded: a PROC's PATH DD in the job running it was 'unknown [undetermined]' - the
+    direction its PATHOPTS give lost - and so gone from `interfaces`; an override's PATH took the direction of the
+    PROC's DD."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.job, cls.by = _expand(USS_JOB, {"KVUSS": USS_PROC})
+
+    def test_the_procs_files_keep_their_direction(self):
+        s1 = self.by["S1.U010"]
+        self.assertEqual(_uss(s1, "STDOUT"), ("/u/TEST/kv/out.txt", "output", "pathopts", False))
+        self.assertEqual(_uss(s1, "STDIN"), ("/u/kv/in.txt", "input", "pathopts", False))
+        self.assertEqual(_uss(self.by["S2.U010"], "STDOUT"), ("/u/PROD/kv/out.txt", "output", "pathopts", False))
+
+    def test_an_override_brings_its_own(self):
+        s2 = self.by["S2.U010"]
+        self.assertEqual(_uss(s2, "STDERR"), ("/u/kv/err.txt", "output", "pathopts", True))      # a path for a DSN
+        self.assertEqual(_uss(s2, "STDIN")[:3], ("PROD.KV.USS.INFILE", "unknown", "undetermined"))  # a DSN for a path
+
+    def test_a_symbol_left_in_a_path_is_said(self):
+        self.assertEqual(_uss(self.by["S1.U010"], "STDENV")[:2], ("/u/kv/<VAR>/env.txt", "input"))
+        self.assertIn(("symbolic", "S1.U010 STDENV: &RUNID still unresolved in /u/kv/&RUNID/env.txt", 6),
+                      self.job.unresolved)
+
+    def test_a_path_is_no_card_member(self):
+        # the build's lookup takes a name in any case: the last 'qualifier' of the path is TXT
+        self.assertEqual(jcl._card_source("SYSIN", "/u/kv/cards.txt", None, lambda n: {"TXT": "x"}.get(n.upper())),
+                         (None, None, False))
+
+
+class InterfacesOfExpandedSteps(unittest.TestCase):
+    """LESSONS 231-233 on `interfaces` and `dataset`: the USS files of a PROC's step in the job running it, cited
+    where each is coded; and a PROC's own FTP step, read with its default card member, is not an interface of the
+    estate when a job runs the PROC with its own - it was listed with the default's file, and `dataset` of that file
+    said it crosses the mainframe boundary."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.td = tempfile.mkdtemp()
+        root = os.path.join(cls.td, "estate")
+        _write(root, "SHARED/PROD.CMN.PROCLIB/KVUSS.prc", USS_PROC)
+        _write(root, "POLICY/PROD.KV.JCLLIB/KVUJOB.jcl", USS_JOB)
+        _write(root, "SHARED/PROD.CMN.PROCLIB/KVFTP.prc", FTP_PROC)
+        _write(root, "SHARED/PROD.CMN.PROCLIB/KVFTPL.prc", LONE_FTP_PROC)
+        _write(root, "POLICY/PROD.KV.JCLLIB/KVFJOB.jcl", FTP_JOB)
+        _write(root, "SHARED/PROD.CMN.PARMLIB/KVFTPD.ctl", IFACE_CARDS["KVFTPD"])
+        _write(root, "SHARED/PROD.CMN.PARMLIB/KVFTPJ.ctl", IFACE_CARDS["KVFTPJ"])
+        _write(root, "SHARED/PROD.CMN.PARMLIB/KVFTPLD.ctl", "put 'PROD.KV.LONE.FILE' lone.txt\nquit\n")
+        cls.db = os.path.join(cls.td, "t.db")
+        _run_build(root, cls.db, "--rebuild")
+        cls.conn = query.connect(cls.db)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.conn.close()
+        shutil.rmtree(cls.td, ignore_errors=True)
+
+    def test_the_uss_files_with_their_cites(self):
+        out = query.cmd_interfaces(self.conn)
+        self.assertEqual(_cells(out, "uss", "output", "", "/u/TEST/kv/out.txt", "KVUJOB S1.U010"), "KVUSS:3")
+        self.assertEqual(_cells(out, "uss", "input", "", "/u/kv/in.txt", "KVUJOB S1.U010"), "KVUSS:4")
+        self.assertEqual(_cells(out, "uss", "output", "", "/u/kv/err.txt", "KVUJOB S2.U010"), "KVUJOB:4")
+
+    def test_a_procs_default_file_is_not_an_interface(self):
+        out = query.cmd_interfaces(self.conn)
+        self.assertNotIn("PROD.KV.DEFAULT.FILE", out)
+        self.assertIn("PROD.KV.JOB.FILE", out)
+        self.assertIn("PROD.KV.LONE.FILE", out)             # a PROC no job runs: its own rows are what it does
+        self.assertNotIn("Crosses the mainframe boundary", query.cmd_dataset(self.conn, "PROD.KV.DEFAULT.FILE"))
+        self.assertIn("Crosses the mainframe boundary", query.cmd_dataset(self.conn, "PROD.KV.JOB.FILE"))
 
 
 if __name__ == "__main__":

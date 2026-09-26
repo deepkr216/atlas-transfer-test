@@ -312,6 +312,8 @@ Three more shapes that production JCL has and toy JCL does not:
   followed to the dataset the earlier DD allocated, after PROC expansion, so
   lineage has no hole at the job's own intermediate files. A referback to a
   `(+1)` reads the generation just created - it is not a second writer. A
+  card DD that names its dataset by a referback (`//SYSIN DD DSN=*.S1.SYSIN`)
+  reads that dataset's cards, as if its DSN were coded there. A
   referback whose target does not exist is reported as `referback`.
 
 And the details that decide whether a job dossier is right or merely
@@ -340,7 +342,7 @@ then its department, then the manifest - two departments each owning a
 folder (`EXEC DLIBATCH,MBR=CLMPOST,PSB=CLMPSB`, IMSBMP, DBBBATCH,
 DSNUPROC) are synthesised from their overrides and reported as
 `proc_synthesised`; `SYSOUT=(A,INTRDR)` becomes a scheduler edge to the
-submitted job; `DD PATH='/u/...'` files carry their PATHOPTS direction;
+submitted job; `DD PATH='/u/...'` files carry their PATHOPTS direction, in a PROC's step as in the job's own;
 ICETOOL `TOOLIN`/`xxxxCNTL`, `OUTFIL FNAMES=`, `JOINKEYS F1=/F2=` and
 `SYMNAMES` symbols give sort steps their DD roles and byte positions
 (`c:p,l` items included); `LOAD ... INTO TABLE` / `UNLOAD` / DSNTIAUL SQL

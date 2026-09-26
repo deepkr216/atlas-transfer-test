@@ -439,7 +439,8 @@ def cmd_program(conn: sqlite3.Connection, name: str) -> str:
         # job's member.
         cards = [c for c in conn.execute("""
             SELECT j.job_name, s.step_name, s.from_proc, d.dd_name, d.dsn_resolved, d.card_member, m.name AS jm,
-                   d.line, pd.proc_name, d.is_override, s.job_id, s.parent_step
+                   d.line, pd.proc_name, d.is_override, s.job_id, s.parent_step,
+                   d.sysin_text IS NOT NULL AS has_text
             FROM dd d JOIN step s ON s.id=d.step_id LEFT JOIN job j ON j.id=s.job_id
             LEFT JOIN member m ON m.id=j.member_id LEFT JOIN proc_def pd ON pd.id=s.proc_id
             WHERE (UPPER(d.card_member)=? OR UPPER(d.dsn_resolved) LIKE ?)
@@ -470,17 +471,25 @@ def cmd_program(conn: sqlite3.Connection, name: str) -> str:
             out.append("\n### Used as control cards by\n")
             out.append(table(["job / PROC", "step", "DD", "library(member)", "cite"],
                              [(c["job_name"] or f"(PROC {c['proc_name']})", c["step_name"], c["dd_name"],
-                               c["dsn_resolved"], f"{c['from_proc'] or c['jm'] or c['proc_name']}:{c['line']}")
+                               c["dsn_resolved"], f"{dd_cite_member(conn, c, c['jm'] or c['proc_name'])}"
+                                                  f":{c['line']}")
                               for c in cards]))
-            if card_member_indexed(conn, n):
+            # Said row by row as coverage's table decides it (card_text_missing): the heading above says what the
+            # index holds of the name, and a member the card lookup does not read - a copybook, a program, a stub
+            # filed with them - is no step's cards (LESSONS 228, 230).
+            state = card_member_state(conn, n)
+            missing = [c for c in cards if card_text_missing(state, n, c["card_member"], bool(c["has_text"]))]
+            if not missing:
                 out.append("\nIts text is loaded as that step's cards: `job <JOB>` shows the resolved program / "
                            "sort fields.\n")
-            else:
-                # The heading above says what the index holds of the name; a member the card lookup never reads
-                # (a copybook, a program) is no step's cards either (LESSONS 228).
+            elif len(missing) == len(cards):
                 out.append("\n**Not in the estate as control cards**: no member of this name that a job's cards are "
                            "read from is indexed, so these steps' cards, the programs they run and their sort "
                            "fields are unknown. Fetch the library in the `library(member)` column, then build.\n")
+            else:
+                where = ", ".join(f"{c['job_name'] or c['proc_name']} {c['step_name']}" for c in missing)
+                out.append(f"\nIts text is loaded as the cards of the other steps listed; for {where} the index holds "
+                           f"none of it: `job <JOB>` shows the cards each step was read with.\n")
         if steps:
             out.append("\n### Runs in\n")
             out.append(table(["job", "step", "launcher", "cite"],
@@ -1427,12 +1436,16 @@ def card_member_read(dd_name: Optional[str], dsn_resolved: Optional[str],
     step's card_member is still the PROC's default (none, when the PROC
     statement gives the symbolic no default) while dsn_resolved names the
     member the calling job reads - `PROD.CMN.PARMLIB(BILSORT1)` beside
-    CMNSRT1 (LESSONS 222, 227)."""
-    if dsn_resolved:
-        m = jcl._MEMBER_REF.search(dsn_resolved)
-        if (m and not m.group(1)[0].isdigit()
-                and (dd_name or "").upper().split(".")[-1] not in jcl._NOT_CARD_DDS):
-            return m.group(1).upper()
+    CMNSRT1 (LESSONS 222, 227). A row with no dataset reads no member: that
+    build kept the PROC default's on a DD whose referback names no dataset
+    in the job (`DSN=*.SRT1.SYSIN` after `//SRT1.SYSIN DD DUMMY` - LESSONS
+    229); a build of the item writes none there."""
+    if not dsn_resolved:
+        return None
+    m = jcl._MEMBER_REF.search(dsn_resolved)
+    if (m and not m.group(1)[0].isdigit()
+            and (dd_name or "").upper().split(".")[-1] not in jcl._NOT_CARD_DDS):
+        return m.group(1).upper()
     return card_member.upper() if card_member else None
 
 
@@ -1456,11 +1469,41 @@ def card_member_of_row(conn: sqlite3.Connection, r: sqlite3.Row) -> Optional[str
     return name
 
 
-def card_member_indexed(conn: sqlite3.Connection, name: str) -> bool:
-    """Is a member of this name in the index, of a kind the jobs' card
-    lookup reads (CARD_KINDS)?"""
-    return conn.execute(f"SELECT 1 FROM member WHERE UPPER(name)=? AND kind IN ({','.join('?' * len(CARD_KINDS))}) "
-                        "LIMIT 1", (name.upper(), *CARD_KINDS)).fetchone() is not None
+def card_member_state(conn: sqlite3.Connection, name: str) -> str:
+    """What the index holds of a card member's name, as the jobs' card
+    lookup (build._member_text) reads it:
+      'read'   - a member of a card kind (CARD_KINDS) other than a stub:
+                 every job naming it is given its text;
+      'stub'   - only stubs of the name (a member holding only numbers,
+                 ROADMAP re-parse item 23): the lookup reads one where its
+                 classifier makes it a card, and never a copybook's or a
+                 program's (LESSONS 205) - which of the two, the job's own
+                 row says: the text, or none;
+      'absent' - no member of the name of a card kind."""
+    kinds = {str(r[0]) for r in conn.execute(
+        f"SELECT DISTINCT kind FROM member WHERE UPPER(name)=? AND kind IN ({','.join('?' * len(CARD_KINDS))})",
+        (name.upper(), *CARD_KINDS))}
+    if kinds - {"stub"}:
+        return "read"
+    return "stub" if kinds else "absent"
+
+
+def card_text_missing(state: str, name: str, card_member: Optional[str], has_text: bool) -> bool:
+    """Is card member `name` - in the state card_member_state gives - not
+    in the estate as the cards of a dd row naming it? Always when no member
+    of the name is of a card kind; for only stubs of the name, when the
+    row holds no text of it - the build's own answer (a copybook's stub is
+    never read as cards: LESSONS 230). Never for a member the lookup
+    reads: a build of ROADMAP re-parse item 29 puts its text on every row
+    naming it, and on an index built before, a row the older build read
+    without it (a card DD naming it by a referback, DSN=*.S1.SYSIN - LESSONS
+    229) or with the PROC default's cards (LESSONS 227) is read with it by
+    the next build: fetching a library does not help there."""
+    if state == "read":
+        return False
+    if state == "absent":
+        return True
+    return not ((card_member or "").upper() == name.upper() and has_text)
 
 
 def card_members_not_indexed(conn: sqlite3.Connection, limit: int = 30) -> List[Tuple[str, int]]:
@@ -1475,18 +1518,21 @@ def card_members_not_indexed(conn: sqlite3.Connection, limit: int = 30) -> List[
 
     The member is the one the row reads (card_member_of_row). It is not
     indexed when no member of that name is in the index as a kind the card
-    lookup reads (card_member_indexed), or when the row's card_member is
-    that member and its text is empty - the build's own answer. On an index
-    built before ROADMAP re-parse item 29 an expanded PROC step's
-    card_member and text can be the PROC default's while dsn_resolved names
-    the calling job's member, and a //PS.SYSIN override naming a member not
-    in the estate carries the default's text; the text is not read there,
-    so the table names the member each job reads when it is missing, and
-    never the PROC's default for a job that does not read it (LESSONS
-    227)."""
+    lookup reads, or when the only members of the name are stubs and the
+    row holds no text of it - the build's own answer (card_member_state,
+    card_text_missing; LESSONS 230). On an index built before ROADMAP
+    re-parse item 29 an expanded PROC step's card_member and text can be
+    the PROC default's while dsn_resolved names the calling job's member,
+    and a //PS.SYSIN override naming a member not in the estate carries the
+    default's text; the text is not read there, so the table names the
+    member each job reads when it is missing, and never the PROC's default
+    for a job that does not read it (LESSONS 227). A row that older build
+    read without the text of a member the estate holds - a card DD naming
+    it by a referback (LESSONS 229) - is not counted: the next build reads
+    it, as a build of the item does."""
     expanded = {str(r[0]).upper() for r in conn.execute(
         "SELECT DISTINCT from_proc FROM step WHERE from_proc IS NOT NULL")}
-    indexed: Dict[str, bool] = {}
+    states: Dict[str, str] = {}
     expands: Dict[Tuple[int, str], bool] = {}
     counts: Dict[str, int] = {}
     for r in conn.execute("""SELECT d.dd_name, d.dsn_resolved, d.card_member, d.sysin_text IS NULL AS no_text,
@@ -1506,17 +1552,53 @@ def card_members_not_indexed(conn: sqlite3.Connection, limit: int = 30) -> List[
         name = card_member_of_row(conn, r)
         if not name:
             continue
-        if name not in indexed:
-            indexed[name] = card_member_indexed(conn, name)
-        if indexed[name] and not ((r["card_member"] or "").upper() == name and r["no_text"]):
+        if name not in states:
+            states[name] = card_member_state(conn, name)
+        if not card_text_missing(states[name], name, r["card_member"], not r["no_text"]):
             continue
         counts[name] = counts.get(name, 0) + 1
     return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:limit]
 
 
+def dd_cite_member(conn: sqlite3.Connection, r, member: Optional[str]) -> Optional[str]:
+    """The member a dd row's line is in, for its cite `MEMBER:line`.
+    `member` is the job's member (a PROC's own row: the PROC). A row of an
+    expanded PROC step carries its line in the PROC (from_proc), except a
+    //PS.DD override or addition (is_override) and a JOBLIB copy (a JOBLIB
+    DD only a job codes): their line is the job's - or, for a step of a
+    PROC nested in a PROC, the line of the PROC holding the EXEC of the
+    nested one, where its DD overrides are coded. They were cited in the
+    PROC with the job's line, a line of another statement or past the
+    PROC's end (LESSONS 231). `r` holds from_proc, is_override, dd_name,
+    parent_step and job_id."""
+    fp = r["from_proc"]
+    if not fp:
+        return member
+    joblib = str(r["dd_name"] or "").upper() == "JOBLIB"
+    if not r["is_override"] and not joblib:
+        return fp
+    parent = str(r["parent_step"] or "")
+    if joblib or "." not in parent or r["job_id"] is None:
+        return member
+    outer = parent.rsplit(".", 1)[0]
+    got = (conn.execute("SELECT proc_called FROM step WHERE job_id=? AND step_name=? AND proc_called IS NOT NULL",
+                        (r["job_id"], outer)).fetchone()
+           or conn.execute("SELECT from_proc FROM step WHERE job_id=? AND parent_step=? AND from_proc IS NOT NULL "
+                           "LIMIT 1", (r["job_id"], outer)).fetchone())
+    return str(got[0]).upper() if got else member
+
+
 def cmd_dataset(conn: sqlite3.Connection, dsn: str) -> str:
-    rows = conn.execute("""SELECT * FROM v_dataset_flow WHERE UPPER(dsn) LIKE ? ORDER BY dsn, mode, job_name""",
-                        (f"%{dsn.upper()}%",)).fetchall()
+    # v_dataset_flow's columns and the two a row's cite needs (dd_cite_member), read from the tables: an index
+    # built before has the view without them
+    rows = conn.execute("""
+        SELECT d.dsn_resolved AS dsn, s.effective_pgm AS pgm, j.job_name, s.step_name, d.mode, d.mode_source,
+               d.gdg_rel, m.path, m.system, s.from_proc, s.proc_called, s.job_id, s.proc_id, pd.proc_name, d.is_temp,
+               d.dd_name, d.line AS dd_line, m.name AS member_name, d.is_override, s.parent_step
+        FROM dd d JOIN step s ON s.id=d.step_id LEFT JOIN job j ON j.id=s.job_id
+        LEFT JOIN proc_def pd ON pd.id=s.proc_id LEFT JOIN member m ON m.id=COALESCE(j.member_id, pd.member_id)
+        WHERE d.dsn_resolved IS NOT NULL AND UPPER(d.dsn_resolved) LIKE ?
+        ORDER BY dsn, mode, job_name""", (f"%{dsn.upper()}%",)).fetchall()
     out = [f"# Dataset {dsn.upper()}\n"]
     for a in conn.execute("""SELECT dsn, vsam_type, recordsize_max, key_len, key_off, gdg_limit, relates_to FROM dataset
                              WHERE UPPER(dsn) LIKE ? AND (vsam_type IS NOT NULL OR gdg_limit IS NOT NULL)""",
@@ -1567,7 +1649,8 @@ def cmd_dataset(conn: sqlite3.Connection, dsn: str) -> str:
               r["job_name"] or (f"(PROC {r['proc_name']} defaults - no indexed job runs it)"
                                 if r["proc_name"] else ""),
               r["step_name"], r["gdg_rel"] or "",
-              f"{r['from_proc'] or r['member_name'] or os.path.basename(r['path'] or '')}:{r['dd_line'] or '?'}")
+              f"{dd_cite_member(conn, r, r['member_name'] or os.path.basename(r['path'] or ''))}"
+              f":{r['dd_line'] or '?'}")
              for r in rows]
     # ONLINE access: the CSD names the dataset (FILE ... DSNAME), the program
     # names the FCT entry (EXEC CICS READ/REWRITE FILE). A VSAM master is
@@ -1996,7 +2079,8 @@ def cmd_copybook(conn: sqlite3.Connection, name: str) -> str:
         out.append(table(["job", "step", "program", "cite"],
                          [(s["job_name"], s["step_name"], s["effective_pgm"], f"{s['from_proc'] or s['mem']}:{s['line']}")
                           for s in steps]))
-        outs = conn.execute(f"""SELECT DISTINCT d.dsn_resolved, s.effective_pgm, d.mode, d.line, s.from_proc, m.name AS mem
+        outs = conn.execute(f"""SELECT DISTINCT d.dsn_resolved, s.effective_pgm, d.mode, d.line, s.from_proc, m.name AS mem,
+                                       d.is_override, d.dd_name, s.parent_step, s.job_id
                                 FROM dd d JOIN step s ON s.id=d.step_id LEFT JOIN job j ON j.id=s.job_id
                                 LEFT JOIN member m ON m.id=j.member_id
                                 WHERE UPPER(s.effective_pgm) IN ({q}) AND d.dsn_resolved IS NOT NULL
@@ -2009,7 +2093,7 @@ def cmd_copybook(conn: sqlite3.Connection, name: str) -> str:
                                    WHERE d.dsn_resolved=? AND d.mode IN ('input','both','unknown') AND UPPER(s.effective_pgm) NOT IN (%s)""" % q,
                                 (o["dsn_resolved"], *pnames)).fetchall()
             rows.append((o["dsn_resolved"], o["effective_pgm"], ", ".join(c["effective_pgm"] or "?" for c in cons) or "_none indexed_",
-                         f"{o['from_proc'] or o['mem']}:{o['line']}"))
+                         f"{dd_cite_member(conn, o, o['mem'])}:{o['line']}"))
         out.append(table(["dataset", "written by", "then read by", "cite"], rows))
         callers = set()
         for pn in pnames:
@@ -6368,16 +6452,25 @@ def _interface_rows(conn: sqlite3.Connection, system: Optional[str] = None,
     rows: List[Tuple] = []
     q = """SELECT i.kind, i.detail, i.direction, i.line, m.name AS mem, m.kind AS mkind, m.system,
                   (SELECT program_id FROM program p WHERE p.member_id=m.id LIMIT 1) AS pgm,
-                  (SELECT job_name FROM job j WHERE j.member_id=m.id LIMIT 1) AS job
+                  (SELECT job_name FROM job j WHERE j.member_id=m.id LIMIT 1) AS job,
+                  (SELECT UPPER(pd.proc_name) FROM proc_def pd WHERE pd.member_id=m.id AND pd.instream=0
+                   LIMIT 1) AS proc
            FROM interface_edge i JOIN member m ON m.id=i.member_id"""
+    # A cataloged PROC's own FTP / Connect:Direct / USS step was read with its DEFAULT symbolics - its default card
+    # member: shown only when no indexed job expands the PROC, as `dataset` shows a PROC's rows; each job's expanded
+    # step is listed with the files that job's cards name (LESSONS 233).
+    expanded = {str(r[0]).upper() for r in conn.execute(
+        "SELECT DISTINCT from_proc FROM step WHERE from_proc IS NOT NULL")}
     for r in conn.execute(q):
         if system and (r["system"] or "").upper() != system.upper():
+            continue
+        if r["proc"] and not r["job"] and r["proc"] in expanded:
             continue
         where = r["pgm"] or r["job"] or r["mem"]
         rows.append((r["kind"], r["direction"] or "?", "", r["detail"][:90], where, r["system"] or "?",
                      f"{r['mem']}:{r['line']}"))
     for r in conn.execute("""SELECT d.dd_name, d.dsn_resolved, d.mode, d.mode_source, d.line, s.step_name, s.from_proc,
-                                    j.job_name, m.name AS mem, m.system
+                                    j.job_name, m.name AS mem, m.system, d.is_override, s.parent_step, s.job_id
                              FROM dd d JOIN step s ON s.id=d.step_id JOIN job j ON j.id=s.job_id JOIN member m ON m.id=j.member_id
                              WHERE d.dd_name IN ('*FTP*','*NDM*') OR d.mode_source IN ('pathopts')"""):
         if system and (r["system"] or "").upper() != system.upper():
@@ -6387,7 +6480,7 @@ def _interface_rows(conn: sqlite3.Connection, system: Optional[str] = None,
         kind = {"*FTP*": "ftp", "*NDM*": "ndm"}.get(r["dd_name"], "uss")
         direction = "out" if r["mode"] == "input" and kind != "uss" else "in" if r["mode"] == "output" and kind != "uss" else r["mode"]
         rows.append((kind, direction, "", r["dsn_resolved"], f"{r['job_name']} {r['step_name']}", r["system"] or "?",
-                     f"{r['from_proc'] or r['mem']}:{r['line']}"))
+                     f"{dd_cite_member(conn, r, r['mem'])}:{r['line']}"))
     for r in conn.execute("SELECT tran_code, program, detail, member_id, line FROM transaction_def WHERE system='cics_web' "
                           "OR detail LIKE 'REMOTESYSTEM%'"):
         rows.append(("web" if r["detail"] and r["detail"].startswith("URIMAP") else "remote-region", "in", "",

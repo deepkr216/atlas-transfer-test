@@ -174,6 +174,11 @@ class StepFact:
     guard: Optional[str] = None          # enclosing // IF (...) THEN / ELSE: the step runs only when true
     also_runs: List[str] = dc_field(default_factory=list)            # 2nd.. RUN PROGRAM() in one SYSTSIN
     submits: List[str] = dc_field(default_factory=list)              # jobs written to SYSOUT=(x,INTRDR)
+    # A job step with a DD referring back into a PROC's step (DSN=*.S1.SRT010.SYSIN) is read from its cards when the
+    # job is parsed, before the PROC's steps are known: the step as it was before that reading and the unresolved
+    # rows the reading added, for expand_job to read it again once the referback is resolved (_read_again).
+    first_reading: Optional[Tuple["StepFact", List[Tuple[str, str, int]]]] = dc_field(default=None, repr=False,
+                                                                                     compare=False)
 
 
 @dataclass
@@ -296,6 +301,8 @@ def _parse_statements(stmts: List[JclStatement], extra_symbols: Optional[Dict[st
 
         elif st.op == "PEND":
             if inproc is not None:
+                # referbacks first: a card DD's DSN=*.S1.SYSIN brings the cards the step is read from
+                _resolve_referbacks(inproc.steps, inproc, report=False, member_lookup=member_lookup)
                 for step in inproc.steps:
                     _resolve_effective_pgm(step, inproc, member_lookup)
                 inproc = None
@@ -336,17 +343,29 @@ def _parse_statements(stmts: List[JclStatement], extra_symbols: Optional[Dict[st
             if m:
                 job.unresolved.append(("include_member", _unquote(m), st.start))
 
-    # Second pass: now that every DD is attached, unwrap the launchers and
-    # resolve referbacks that point at earlier steps of this member.
+    # Second pass: now that every DD is attached, resolve the referbacks that
+    # point at earlier steps of this member, then unwrap the launchers - in
+    # that order: `//SYSIN DD DSN=*.S1.SYSIN` reads the cards S1's SYSIN
+    # names, and the step is read from them (LESSONS 229). A referback into a
+    # step of a PROC the job runs is resolved by expand_job, which reads the
+    # step again then (first_reading).
+    _resolve_referbacks(job.steps, job, report=not any(s.proc_called for s in job.steps),
+                        member_lookup=member_lookup)
+    expands = not job.is_proc and any(s.proc_called for s in job.steps)
     for step in job.steps:
-        _resolve_effective_pgm(step, job, member_lookup)
+        if expands and any(d.referback and not d.dsn_resolved for d in step.dds):
+            before = replace(step, dds=list(step.dds), notes=list(step.notes), submits=list(step.submits),
+                             also_runs=list(step.also_runs))
+            n = len(job.unresolved)
+            _resolve_effective_pgm(step, job, member_lookup)
+            step.first_reading = (before, job.unresolved[n:])
+        else:
+            _resolve_effective_pgm(step, job, member_lookup)
     _apply_joblib(job.steps, job.job_dds)
-    _resolve_referbacks(job.steps, job, report=not any(s.proc_called for s in job.steps))
     # A PROC's steps run inside one job too: its own rows (default symbolics)
     # read a (+1) its earlier step wrote, as the expanded steps do.
     _same_job_generations(job.steps)
     for p in job.instream_procs.values():
-        _resolve_referbacks(p.steps, p, report=False)
         _same_job_generations(p.steps)
     return job
 
@@ -513,6 +532,8 @@ def _card_source(dd_name: str, resolved: str, gdg: Optional[str],
     by the last qualifier - matched by that name, and said so by the caller,
     because it is an assumption."""
     base = dd_name.upper().split(".")[-1]
+    if resolved.startswith("/"):
+        return None, None, False             # a USS path (PATH=, a referback to one) is no card member
     m = _MEMBER_REF.search(resolved)
     if m and not m.group(1)[0].isdigit() and base not in _NOT_CARD_DDS:
         name = m.group(1).upper()
@@ -1192,7 +1213,8 @@ def _splice_includes(text: str, data: bytes, enc: str,
 
 def expand_job(job: JclFacts, proc_lookup: Callable[[str], Optional["JclFacts"]],
                depth: int = 0, max_depth: int = 5,
-               member_lookup: Optional[Callable[[str], Optional[str]]] = None) -> List[StepFact]:
+               member_lookup: Optional[Callable[[str], Optional[str]]] = None,
+               _unread: Optional[List[StepFact]] = None) -> List[StepFact]:
     """Effective steps of a job: every EXEC PROC= replaced by the PROC's steps,
     with symbolics resolved in JCL precedence (EXEC overrides > instream SET >
     PROC defaults) and //PROCSTEP.DDNAME overrides and additions applied.
@@ -1200,7 +1222,14 @@ def expand_job(job: JclFacts, proc_lookup: Callable[[str], Optional["JclFacts"]]
     Without this, a DSN coded in a PROC as &HLQ..MASTER stays unresolved and
     the job's real datasets are invisible - and in most shops the PROC is
     where the datasets are. Unresolved symbolics are reported, not hidden.
+
+    The effective steps are read from their cards (_resolve_effective_pgm)
+    once every step of the job is known and its referbacks resolved: a card
+    DD's DSN=*.SRT010.SYSIN brings the cards it names (LESSONS 229). `_unread`
+    collects them through a nested PROC's expansion; callers leave it out.
     """
+    top = _unread is None
+    unread: List[StepFact] = [] if _unread is None else _unread
     out: List[StepFact] = []
     proc_names_seen = set()
     for s in job.steps:
@@ -1302,6 +1331,13 @@ def expand_job(job: JclFacts, proc_lookup: Callable[[str], Optional["JclFacts"]]
                         nd = replace(d, dsn=None, dsn_resolved=None, gdg_rel=None, disp=o.disp,
                                      sysin_text=o.sysin_text, card_member=None, referback=None, is_temp=False,
                                      mode=o.mode, mode_source=o.mode_source, is_override=True, line=o.line)
+                    elif o.dsn and o.dsn.startswith("/"):
+                        # //PS.DD DD PATH=...: a USS file replaces the PROC's
+                        # DD, read or written as the PATHOPTS it codes say
+                        # (LESSONS 232).
+                        nd = replace(d, dsn=o.dsn, dsn_resolved=None, gdg_rel=None, disp=o.disp,
+                                     sysin_text=o.sysin_text, card_member=None, referback=None, is_temp=False,
+                                     mode=o.mode, mode_source=o.mode_source, is_override=True, line=o.line)
                     else:
                         # An override naming a dataset brings its own cards (or
                         # none, when its member is not indexed), never the
@@ -1337,18 +1373,60 @@ def expand_job(job: JclFacts, proc_lookup: Callable[[str], Optional["JclFacts"]]
                                proc_name=None, symbolics=dict(symbols), set_symbols=dict(job.set_symbols),
                                instream_procs=job.instream_procs, job_dds=job.job_dds)
                 sub.steps = [eff]
-                out.extend(expand_job(sub, proc_lookup, depth + 1, max_depth, member_lookup))
+                out.extend(expand_job(sub, proc_lookup, depth + 1, max_depth, member_lookup, unread))
                 job.unresolved.extend(sub.unresolved)
                 continue
-            _resolve_effective_pgm(eff, job, member_lookup)
+            unread.append(eff)
             out.append(eff)
-    if depth == 0:
+    if top:
         # Every step is now known, PROC steps included: DSN=*.STEP.DD can be
-        # followed to the dataset it names, and a (+1) named again after an
-        # earlier step wrote it is read (gdg_same_job).
-        _resolve_referbacks(out, job, report=True)
+        # followed to the dataset it names - and to its cards, for a card DD;
+        # then each effective step is read from its cards, a job step whose
+        # referback reached into a PROC's step is read again (_read_again),
+        # and a (+1) named again after an earlier step wrote it is read
+        # (gdg_same_job).
+        _resolve_referbacks(out, job, report=True, member_lookup=member_lookup)
+        for eff in unread:
+            _resolve_effective_pgm(eff, job, member_lookup)
+        for s in out:
+            _read_again(s, job, member_lookup)
         _same_job_generations(out)
     return out
+
+
+def _read_again(step: StepFact, facts: JclFacts,
+                member_lookup: Optional[Callable[[str], Optional[str]]] = None) -> None:
+    """A job step with a DD referring back into a PROC's step
+    (`//SYSIN DD DSN=*.S1.SRT010.SYSIN` after `//S1 EXEC KVSORT`) was read
+    from its cards when the job was parsed, without that DD's dataset - the
+    PROC's steps were not known yet - and expand_job has now resolved the
+    referback: the step is read again from what it was before the first
+    reading (step.first_reading), with the DDs expand_job resolved, and the
+    rows the first reading added to the job's unresolved list go ('SORT/
+    ICETOOL with no cards' among them). The first reading stands when none of
+    those referbacks resolved (LESSONS 229)."""
+    first = step.first_reading
+    if first is None:
+        return
+    step.first_reading = None
+    before, rows = first
+    dds = list(before.dds)
+    resolved = False
+    for i, d in enumerate(before.dds):
+        # the first reading replaces DDs in place and appends its own after them: index i is the same DD
+        if d.referback and not d.dsn_resolved and step.dds[i].dsn_resolved:
+            dds[i] = step.dds[i]
+            resolved = True
+    if not resolved:
+        return
+    for row in rows:
+        if row in facts.unresolved:
+            facts.unresolved.remove(row)
+    step.dds, step.notes = dds, list(before.notes)
+    step.effective_pgm, step.launcher = before.effective_pgm, before.launcher
+    step.submits, step.also_runs = list(before.submits), list(before.also_runs)
+    _resolve_effective_pgm(step, facts, member_lookup)
+    _apply_joblib([step], facts.job_dds)
 
 
 def _resolve_dd(d: DdFact, symbols: Dict[str, str], job: JclFacts, step: StepFact,
@@ -1362,7 +1440,21 @@ def _resolve_dd(d: DdFact, symbols: Dict[str, str], job: JclFacts, step: StepFac
     if not d.dsn:
         return d
     if d.dsn.startswith("*."):
-        return replace(d, referback=d.dsn, dsn_resolved=None, gdg_rel=None, is_temp=False)
+        # Followed again by _resolve_referbacks over the job's steps: the dataset, the cards and the direction the
+        # PROC member's own reading gave are its defaults' (LESSONS 229).
+        mode, src = _direction(d.dd_name, None, d.disp, f"DSN={d.dsn},DISP={d.disp or ''}")
+        return replace(d, referback=d.dsn, dsn_resolved=None, gdg_rel=None, is_temp=False, card_member=None,
+                       sysin_text=None, mode=mode, mode_source=src)
+    if d.dsn.startswith("/"):
+        # A USS file (PATH=, read by _build_dd): no generation and no card
+        # member, and its direction is the PATHOPTS the DD codes
+        # ('pathopts') - _direction reads none from a name, and every PROC's
+        # PATH DD was 'unknown [undetermined]' in the jobs running it, gone
+        # from `interfaces` (LESSONS 232).
+        path, found = _variables(substitute_symbols(d.dsn, symbols))
+        for kind, tok in found:
+            job.unresolved.append((kind, f"{step.step_name} {d.dd_name}: {tok} still unresolved in {d.dsn}", d.line))
+        return replace(d, dsn_resolved=path, gdg_rel=None, is_temp=False, referback=None, card_member=None)
     resolved = substitute_symbols(d.dsn, symbols)
     resolved, found = _variables(resolved)
     for kind, tok in found:
@@ -1383,7 +1475,8 @@ def _resolve_dd(d: DdFact, symbols: Dict[str, str], job: JclFacts, step: StepFac
                    is_temp=resolved.startswith("&&"), referback=None, card_member=member, sysin_text=text)
 
 
-def _resolve_referbacks(steps: List[StepFact], facts: JclFacts, report: bool = True) -> None:
+def _resolve_referbacks(steps: List[StepFact], facts: JclFacts, report: bool = True,
+                        member_lookup: Optional[Callable[[str], Optional[str]]] = None) -> None:
     """Follow DSN=*.STEP.DD (also *.DD in the same step, *.STEP.PROCSTEP.DD)
     to the dataset the earlier DD allocated.
 
@@ -1393,6 +1486,13 @@ def _resolve_referbacks(steps: List[StepFact], facts: JclFacts, report: bool = T
     where the job's own intermediate file is. The referring DD's own DISP
     decides direction (the source DD's (+1) is NOT inherited: the referback
     reads what was created).
+
+    The referring DD reads that dataset as if its DSN were coded on it: a
+    card DD (`//SYSIN DD DSN=*.S1.SYSIN`) gets the card member and the
+    member's text by the rule _build_dd reads a DSN with (_card_source) - it
+    got the member alone, the step had no cards, and `job` said 'card
+    member NOT indexed' for the member the step above it loaded (LESSONS
+    229). Run before the steps are read from their cards.
     """
     dd_index: Dict[int, Dict[str, list]] = {}
     for idx, s in enumerate(steps):
@@ -1435,8 +1535,14 @@ def _resolve_referbacks(steps: List[StepFact], facts: JclFacts, report: bool = T
                     facts.unresolved.append(entry)
                 continue
             mode, msrc = _direction(d.dd_name, None, d.disp, f"DSN={src.dsn_resolved},DISP={d.disp or ''}")
+            member, text, by_last = _card_source(d.dd_name, src.dsn_resolved, src.gdg_rel, member_lookup)
+            if by_last:
+                entry = ("card_seq_assumed", f"{s.step_name} {d.dd_name}: cards taken from member {member} "
+                                             f"matching the last qualifier of {src.dsn_resolved}", d.line)
+                if entry not in facts.unresolved:
+                    facts.unresolved.append(entry)
             s.dds[i] = replace(d, dsn_resolved=src.dsn_resolved, is_temp=src.is_temp,
-                               card_member=src.card_member, mode=mode, mode_source=msrc)
+                               card_member=member, sysin_text=text, mode=mode, mode_source=msrc)
 
 
 def _new_generation(d: DdFact) -> Optional[int]:
