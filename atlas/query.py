@@ -577,23 +577,38 @@ def cmd_program(conn: sqlite3.Connection, name: str) -> str:
                            (c["replacing"] or "")[:40], f"{p['member_name']}:{c['line']}") for c in cps]))
 
         # files
+        # A PROC's own step carries its DEFAULT symbolics (TEST.BIL.MASTER): shown only when no indexed job
+        # expands that PROC, as in 'Runs in' above and in `dataset` (README; LESSONS 236). The DD is the
+        # file's own name - a DD whose name only ends with it (BILMAST for MAST) is another file.
+        expanded = expanded_procs(conn)
         files = conn.execute("SELECT * FROM file_decl WHERE program_id=?", (pid,)).fetchall()
         frows = []
+        proc_hidden = 0
         for f in files:
+            ddn = (f["assign_dd"] or "").upper()
             dsns = conn.execute("""
-                SELECT DISTINCT d.dsn_resolved, d.mode, d.mode_source, j.job_name
+                SELECT DISTINCT d.dsn_resolved, d.mode, d.mode_source, j.job_name, pd.proc_name
                 FROM dd d JOIN step s ON s.id = d.step_id LEFT JOIN job j ON j.id = s.job_id
-                WHERE UPPER(s.effective_pgm)=? AND UPPER(d.dd_name) LIKE ?""",
-                (p["program_id"].upper(), f"%{(f['assign_dd'] or '').upper()}")).fetchall()
+                LEFT JOIN proc_def pd ON pd.id = s.proc_id
+                WHERE UPPER(s.effective_pgm)=? AND (UPPER(d.dd_name)=? OR UPPER(d.dd_name) LIKE ?)""",
+                (p["program_id"].upper(), ddn, f"%.{ddn}")).fetchall()
+            shown = [d for d in dsns
+                     if not (d["job_name"] is None and d["proc_name"] and d["proc_name"].upper() in expanded)]
+            proc_hidden += len(dsns) - len(shown)
             opens = conn.execute("SELECT DISTINCT op FROM io_op WHERE program_id=? AND target=?",
                                  (pid, f["select_name"])).fetchall()
             frows.append((f["select_name"], f["assign_dd"], f["organization"] or "",
                           ", ".join(o["op"] for o in opens),
-                          "; ".join(f"{d['dsn_resolved']} [{d['mode']}/{d['mode_source']}] {d['job_name'] or ''}"
-                                    for d in dsns) or "_no JCL found_",
+                          "; ".join(f"{d['dsn_resolved']} [{d['mode']}/{d['mode_source']}] "
+                                    + (d["job_name"] or (f"(PROC {d['proc_name']} defaults - no indexed job runs it)"
+                                                         if d["proc_name"] else ""))
+                                    for d in shown) or "_no JCL found_",
                           cite(conn, pid, f["line"])))
         out.append("\n### Files (SELECT/ASSIGN -> JCL DD -> dataset)\n")
         out.append(table(["file", "DD", "org", "ops", "datasets via JCL", "cite"], frows))
+        if proc_hidden:
+            out.append(f"\n> {proc_hidden} row(s) from PROC members' default symbolics hidden: the jobs that "
+                       f"expand those PROCs are listed with the real names.\n")
 
         # EXEC CICS READ FILE('X') names an FCT entry; the CSD says which dataset.
         cf = conn.execute("""
@@ -1426,6 +1441,15 @@ def cmd_literal(conn: sqlite3.Connection, value: str, field: Optional[str] = Non
 CARD_KINDS = ("ctlcard", "unknown", "stub", "sql", "jcl", "proc")
 
 
+def expanded_procs(conn: sqlite3.Connection) -> set:
+    """The PROC names (upper case) an indexed job expands. A PROC's own
+    steps were read with its DEFAULT symbolics and card members
+    (TEST.CLM.MASTER): a report shows them only when no indexed job expands
+    that PROC - each job's expanded step carries what the job runs (README,
+    `dataset`, `program`, `values`, `flow`)."""
+    return {str(r[0]).upper() for r in conn.execute("SELECT DISTINCT from_proc FROM step WHERE from_proc IS NOT NULL")}
+
+
 def card_member_read(dd_name: Optional[str], dsn_resolved: Optional[str],
                      card_member: Optional[str]) -> Optional[str]:
     """The control-card member a dd row names: the member in its dataset's
@@ -1643,7 +1667,7 @@ def cmd_dataset(conn: sqlite3.Connection, dsn: str) -> str:
     # only when no indexed job expands that PROC. A job step's own
     # //PS.DD override is shown once, on the effective step, not also on the
     # EXEC PROC= step itself.
-    expanded = {r[0].upper() for r in conn.execute("SELECT DISTINCT from_proc FROM step WHERE from_proc IS NOT NULL")}
+    expanded = expanded_procs(conn)
     kept, proc_hidden, ov_hidden = [], 0, 0
     for r in rows:
         if r["job_name"] is None and r["proc_name"] and r["proc_name"].upper() in expanded:
@@ -4120,6 +4144,95 @@ def _cond88_map(conn: sqlite3.Connection, name: str) -> Dict[str, List[Tuple[str
     return out
 
 
+# A sort card's tokens: a character or hex constant (a doubled quote inside it), a number, a name, a parenthesis.
+_CARD_TOKEN = re.compile(r"[CX]'(?:[^']|'')*'|[+-]?\d+|[A-Z@#$_][A-Z0-9@#$_\-]*|[()]", re.IGNORECASE)
+_CARD_RELOPS = ("EQ", "NE", "GT", "GE", "LT", "LE")
+# SYMNAMES: `ACTIVE,C'AC'` - a symbol standing for a constant (jcl.sort_symbols reads the positional ones)
+_SYM_CONSTANT = re.compile(r"^([A-Z@#$_][A-Z0-9@#$_\-]*),([CX]'(?:[^']|'')*'|[+-]?\d+)\s*$", re.IGNORECASE)
+
+
+def sort_card_compares(text: str) -> List[Tuple[str, int, int, str, str]]:
+    """(card kind, position, length, format, constant) for every condition
+    of a sort deck that compares bytes with a constant - INCLUDE / OMIT
+    COND=, OUTFIL INCLUDE= / OMIT=, IFTHEN WHEN=. Only the comparand after
+    the relational operator is a value: the position, the length and the
+    format before it never are (the length token 2 of `(13,2,CH,EQ,C'AC')`
+    was reported as a value of the field - LESSONS 235). The cards are read
+    as jcl.sort_card_fields reads them - comments and SYMNAMES lines left
+    out, a card ending in a comma continued - with the symbols put in, and
+    whole (the stored `raw` keeps 120 characters). A comparison with other
+    bytes (`(1,2,CH,EQ,5,2,CH)`), a hex constant and a date keyword give no
+    value; a substring search `(13,2,SS,EQ,C'AC,IN')` gives each code of
+    its list."""
+    if not text:
+        return []
+    symbols = {k: v.split(",") for k, v in jcl.sort_symbols(text).items()}
+    constants: Dict[str, str] = {}
+    cards: List[str] = []
+    buf = ""
+    for line in text.splitlines():
+        s = line[:71].rstrip()
+        mc = _SYM_CONSTANT.match(s.strip()) if not buf else None
+        if mc:
+            constants[mc.group(1).upper()] = mc.group(2)
+            continue
+        if not s.strip() or s.lstrip().startswith("*") or jcl._SYMNAME.match(s.strip()):
+            continue
+        buf = (buf + " " + s.strip()) if buf else s.strip()
+        if not buf.endswith(","):
+            cards.append(buf)
+            buf = ""
+    if buf:
+        cards.append(buf)
+    out: List[Tuple[str, int, int, str, str]] = []
+    for card in cards:
+        mk = jcl._SORT_CARD.search(card)
+        if not mk:
+            continue
+        kind = mk.group(1).upper()
+        mf = jcl._CARD_FORMAT.search(card)
+        fmt_default = mf.group(1).upper() if mf else ""
+        toks: List[str] = []
+        for t in _CARD_TOKEN.findall(card):
+            u = t.upper()
+            if u in symbols and not u.startswith(("C'", "X'")):
+                toks.extend(symbols[u])            # POL-STATUS -> 13, 2, CH
+            elif u in constants:
+                toks.append(constants[u])          # ACTIVE -> C'AC'
+            else:
+                toks.append(t)
+        for i, t in enumerate(toks):
+            if t.upper() not in _CARD_RELOPS or i + 1 >= len(toks):
+                continue
+            if i >= 3 and toks[i - 3].isdigit() and toks[i - 2].isdigit() and toks[i - 1][:1].isalpha():
+                pos, ln, fmt = int(toks[i - 3]), int(toks[i - 2]), toks[i - 1].upper()
+            elif i >= 2 and toks[i - 2].isdigit() and toks[i - 1].isdigit():
+                pos, ln, fmt = int(toks[i - 2]), int(toks[i - 1]), fmt_default
+            else:
+                continue                            # a name no SYMNAMES defines: its bytes are unknown
+            rhs = toks[i + 1]
+            if rhs[:2].upper() == "C'":
+                vals = [rhs[2:-1].replace("''", "'")]
+                if fmt == "SS" and len(vals[0]) > ln and "," in vals[0]:
+                    vals = [v for v in vals[0].split(",") if v]
+            elif re.fullmatch(r"[+-]?\d+", rhs):
+                if i + 2 < len(toks) and toks[i + 2].isdigit():
+                    continue                        # (p1,l1,f1,EQ,p2,l2,f2): other bytes, not a constant
+                vals = [rhs]
+            else:
+                continue                            # X'..', DATE1, a name: no value the code spells
+            for v in vals:
+                out.append((kind, pos, ln, fmt, v))
+    return out
+
+
+def _step_deck(conn: sqlite3.Connection, step_id: int) -> str:
+    """The control-card text of a step as the build joined it for
+    card_field_ref: every DD's cards in the order the step lists them."""
+    return "\n".join(r[0] for r in conn.execute(
+        "SELECT sysin_text FROM dd WHERE step_id=? AND sysin_text IS NOT NULL ORDER BY id", (step_id,)))
+
+
 def _column_aliases(name: str) -> List[str]:
     """COBOL field -> plausible DB2 column names (DCLGEN style, prefixes dropped)."""
     n = name.upper().replace("-", "_")
@@ -4161,17 +4274,33 @@ def cmd_values(conn: sqlite3.Connection, name: str) -> str:
                 uses[v][f"via 88 {c88} ({r['mode']})"].append(
                     f"via 88 {c88} {r['program_id']}@{cite(conn, r['pid'], r['line'])}")
 
-    # Sort/INCLUDE cards comparing these bytes to constants.
+    # Sort cards comparing these bytes with a constant: the comparand of each such condition, never a position
+    # or a length (LESSONS 235). A PROC's own step reads its DEFAULT cards: counted only when no indexed job
+    # expands the PROC, as `dataset` and `program` show a PROC's rows.
+    expanded = expanded_procs(conn)
+    decks: Dict[int, List[Tuple[str, int, int, str, str]]] = {}
+    counted = set()
     for d in defs:
         if d["kind"] != "copybook":
             continue
         lo, hi = d["offset"] + 1, d["offset"] + d["length"]
-        for c in conn.execute("""SELECT c.raw, c.card_kind, j.job_name, s.step_name FROM card_field_ref c
+        for c in conn.execute("""SELECT DISTINCT c.step_id, j.job_name, s.step_name, pd.proc_name FROM card_field_ref c
                                  JOIN step s ON s.id=c.step_id LEFT JOIN job j ON j.id=s.job_id
-                                 WHERE c.pos<=? AND c.pos+c.length-1>=? AND c.card_kind IN ('INCLUDE','OMIT')""", (hi, lo)):
-            for m in re.finditer(r"C'([^']*)'|(?<=,)(\d+)(?=[,)])", c["raw"]):
-                val = m.group(1) if m.group(1) is not None else m.group(2)
-                uses[_norm_val(val)]["sort_card"].append(f"{c['job_name']}.{c['step_name']} {c['card_kind']}")
+                                 LEFT JOIN proc_def pd ON pd.id=s.proc_id
+                                 WHERE c.pos<=? AND c.pos+c.length-1>=?""", (hi, lo)):
+            if c["job_name"] is None and c["proc_name"] and c["proc_name"].upper() in expanded:
+                continue
+            if c["step_id"] not in decks:
+                deck = _step_deck(conn, c["step_id"]) or "\n".join(dict.fromkeys(
+                    r[0] for r in conn.execute("SELECT raw FROM card_field_ref WHERE step_id=? ORDER BY id",
+                                               (c["step_id"],)) if r[0]))
+                decks[c["step_id"]] = sort_card_compares(deck)
+            where = (f"{c['job_name']}.{c['step_name']}" if c["job_name"]
+                     else f"PROC {c['proc_name'] or '?'} {c['step_name']}")
+            for k, (kind, pos, ln, _fmt, val) in enumerate(decks[c["step_id"]]):
+                if pos <= hi and pos + ln - 1 >= lo and (c["step_id"], k) not in counted:
+                    counted.add((c["step_id"], k))
+                    uses[_norm_val(val)]["sort_card"].append(f"{where} {kind}")
 
     all_vals = sorted(set(documented) | set(uses),
                       key=lambda v: (not v.split(" ")[0].lstrip("+-").isdigit(), v))
@@ -5234,40 +5363,69 @@ def cmd_layout(conn: sqlite3.Connection, name: str, program: Optional[str] = Non
 # crud / conditions / paragraph - the small analysis questions
 # --------------------------------------------------------------------------
 
-def _crud_of(conn: sqlite3.Connection, pid: int) -> Dict[Tuple[str, str], Dict[str, str]]:
+def _file_datasets(conn: sqlite3.Connection, pid: int, job: Optional[str] = None) -> Dict[str, List[str]]:
+    """{SELECT name: [dataset cell, ...]} - the datasets the JCL gives each
+    file's DD. With `job` and a step of that job running the program: that
+    job's steps only. Otherwise every indexed job's; when they give a file
+    different datasets, each dataset is its own cell with the jobs (or, in
+    one job, the steps) that give it - never the first one found (LESSONS
+    238). A DD no job gives a dataset (DUMMY, SYSOUT, no job indexed) is
+    `DD NAME`."""
+    prog = conn.execute("SELECT program_id FROM program WHERE id=?", (pid,)).fetchone()[0].upper()
+    in_job = bool(job) and conn.execute(
+        """SELECT 1 FROM step s JOIN job j ON j.id=s.job_id WHERE UPPER(s.effective_pgm)=? AND UPPER(j.job_name)=?
+           LIMIT 1""", (prog, job.upper())).fetchone() is not None
+    rows = conn.execute("""SELECT UPPER(d.dd_name) AS dd, d.dsn_resolved, j.job_name, s.step_name FROM dd d
+                           JOIN step s ON s.id=d.step_id JOIN job j ON j.id=s.job_id
+                           WHERE UPPER(s.effective_pgm)=? AND d.dsn_resolved IS NOT NULL
+                             AND (? = 0 OR UPPER(j.job_name)=?)
+                           ORDER BY j.job_name, s.ordinal, d.concat_seq, d.id""",
+                        (prog, int(in_job), (job or "").upper())).fetchall()
+    out: Dict[str, List[str]] = {}
+    for f in conn.execute("SELECT select_name, assign_dd FROM file_decl WHERE program_id=?", (pid,)):
+        ddn = (f["assign_dd"] or "").upper()
+        places: Dict[str, List[str]] = {}
+        for r in rows:
+            if r["dd"] == ddn:
+                place = r["step_name"] if in_job else r["job_name"]
+                places.setdefault(r["dsn_resolved"], [])
+                if place not in places[r["dsn_resolved"]]:
+                    places[r["dsn_resolved"]].append(place)
+        if not places:
+            out[f["select_name"]] = [f"DD {f['assign_dd'] or '?'}"]
+        elif len(places) == 1 or len({tuple(p) for p in places.values()}) == 1:
+            out[f["select_name"]] = list(places)          # one dataset, or a concatenation every place reads whole
+        else:
+            word = "step" if in_job else "job"
+            out[f["select_name"]] = [
+                f"{d} ({word}{'s' if len(p) > 1 else ''} {', '.join(p[:3])}{f' +{len(p) - 3} more' if len(p) > 3 else ''})"
+                for d, p in places.items()]
+    return out
+
+
+def _crud_of(conn: sqlite3.Connection, pid: int, job: Optional[str] = None) -> Dict[Tuple[str, str], Dict[str, str]]:
     """{(kind, target): {'C'|'R'|'U'|'D': first cite}} for one program from
     file OPEN modes + WRITE/REWRITE/DELETE, SQL verbs, DL/I functions (with
-    the resolved database) and CICS file verbs."""
+    the resolved database) and CICS file verbs. A file's target is each
+    dataset _file_datasets gives it (`job`: that job's)."""
     out: Dict[Tuple[str, str], Dict[str, str]] = defaultdict(dict)
 
     def mark(key: Tuple[str, str], letters: str, line: int) -> None:
         for c in letters:
             out[key].setdefault(c, cite(conn, pid, line))
 
-    # files: the SELECT -> DD -> dataset name when a job is indexed, else the DD
-    dsn_by_sel: Dict[str, str] = {}
-    for f in conn.execute("SELECT select_name, assign_dd FROM file_decl WHERE program_id=?", (pid,)):
-        d = conn.execute("""SELECT d.dsn_resolved FROM dd d JOIN step s ON s.id=d.step_id
-                            WHERE UPPER(d.dd_name)=? AND s.effective_pgm=(SELECT program_id FROM program WHERE id=?)
-                              AND d.dsn_resolved IS NOT NULL AND s.job_id IS NOT NULL LIMIT 1""",
-                         ((f["assign_dd"] or "").upper(), pid)).fetchone()
-        dsn_by_sel[f["select_name"]] = d[0] if d else f"DD {f['assign_dd'] or '?'}"
+    # files: the SELECT -> DD -> dataset name(s) when a job is indexed, else the DD
+    dsn_by_sel = _file_datasets(conn, pid, job)
     for o in conn.execute("SELECT target, target_kind, op, line FROM io_op WHERE program_id=? ORDER BY line", (pid,)):
         t, k, op = o["target"], o["target_kind"], o["op"].upper()
         if k == "file":
-            key = ("file", dsn_by_sel.get(t, t))
-            if op.startswith("OPEN INPUT") or op in ("READ", "START", "SORT READ", "RETURN"):
-                mark(key, "R", o["line"])
-            elif op.startswith("OPEN OUTPUT") or op in ("WRITE", "SORT WRITE", "RELEASE"):
-                mark(key, "C", o["line"])
-            elif op.startswith("OPEN EXTEND"):
-                mark(key, "C", o["line"])
-            elif op.startswith("OPEN I-O"):
-                mark(key, "RU", o["line"])
-            elif op == "REWRITE":
-                mark(key, "U", o["line"])
-            elif op == "DELETE":
-                mark(key, "D", o["line"])
+            letters = ("R" if op.startswith("OPEN INPUT") or op in ("READ", "START", "SORT READ", "RETURN")
+                       else "C" if op.startswith(("OPEN OUTPUT", "OPEN EXTEND")) or op in ("WRITE", "SORT WRITE", "RELEASE")
+                       else "RU" if op.startswith("OPEN I-O")
+                       else "U" if op == "REWRITE"
+                       else "D" if op == "DELETE" else "")
+            for target in dsn_by_sel.get(t, [t]):
+                mark(("file", target), letters, o["line"])
         elif k == "db2":
             key = ("db2", t)
             mark(key, {"SELECT": "R", "DECLARE": "R", "FETCH": "R", "OPEN": "R", "INSERT": "C", "UPDATE": "U",
@@ -5309,14 +5467,19 @@ def cmd_crud(conn: sqlite3.Connection, programs: List[str], job: Optional[str] =
         if not progs:
             rows.append((n, "-", "-", "**not in index**", ""))
             continue
-        for (kind, target), cells in sorted(_crud_of(conn, progs[0]["id"]).items()):
+        for (kind, target), cells in sorted(_crud_of(conn, progs[0]["id"], job).items()):
             letters = "".join(c for c in "CRUDX" if c in cells)
             rows.append((n, kind, target, letters, "; ".join(f"{c}@{cells[c]}" for c in letters)))
     out.append(table(["program", "kind", "file / table / database", "CRUD", "cites"], rows))
     out.append("\n> C = creates rows/records (INSERT, WRITE, OPEN OUTPUT/EXTEND, ISRT), R = reads, U = updates "
                "(UPDATE, REWRITE, REPL, OPEN I-O), D = deletes, X = stored-procedure call. A file shows its dataset "
-               "name only when an indexed job runs the program; otherwise the DD name. IMS rows need the PSB "
-               "(see `program`).\n")
+               "name only when an indexed job runs the program; otherwise the DD name. "
+               + (f"The datasets are the ones {job.upper()}'s own steps give each file, and two steps giving a file "
+                  f"different datasets make a row each with the steps named; a program {job.upper()} does not run "
+                  f"shows every job's. " if job else
+                  "When the jobs running a program give one of its files different datasets, each dataset is a row "
+                  "of its own with the jobs that give it; `crud --job JOB` shows one job's. ")
+               + "IMS rows need the PSB (see `program`).\n")
     return "".join(out)
 
 
@@ -6460,6 +6623,33 @@ def _coverage_extras(conn: sqlite3.Connection) -> str:
 # interfaces - the mainframe / non-mainframe boundary
 # --------------------------------------------------------------------------
 
+_FTP_HOST = re.compile(r"\bFTP host ([^\s;]+)")
+_NDM_NODE = re.compile(r"\bConnect:Direct SNODE ([^\s;]+)")
+_FTP_MVS = re.compile(r"\bFTP (\w+) (\S+) (?:->|<-) (\S+) \((out|in)\)")
+_FTP_PATH = re.compile(r"\bFTP (\w+) (\S+) \((out|in)\)")
+_NDM_COPY = re.compile(r"\bConnect:Direct (sends|receives) (\S+) \((out|in)\)")
+_NDM_PARM = re.compile(r"\bConnect:Direct process parameter &DSN=(\S+) \(direction in the process\)")
+
+
+def _transfer_notes(detail: str) -> Tuple[str, List[Tuple[str, str, str, str]]]:
+    """The peer and the transfers an FTP / Connect:Direct step's notes name
+    (jcl._resolve_effective_pgm writes them): (host, [(verb, name, direction,
+    peer)]). The host is the FTP PARM's first word or the SNODE; a transfer
+    whose notes say `peer` names no host."""
+    m = _FTP_HOST.search(detail) or _NDM_NODE.search(detail)
+    host = m.group(1) if m else ""
+    out: List[Tuple[str, str, str, str]] = []
+    for m in _FTP_MVS.finditer(detail):
+        out.append((m.group(1), m.group(2), m.group(4), "" if m.group(3) == "peer" else m.group(3)))
+    for m in _FTP_PATH.finditer(detail):
+        out.append((m.group(1), m.group(2), m.group(3), ""))
+    for m in _NDM_COPY.finditer(detail):
+        out.append((m.group(1), m.group(2), m.group(3), ""))
+    for m in _NDM_PARM.finditer(detail):
+        out.append(("&DSN=", m.group(1), "?", ""))
+    return host, out
+
+
 def _interface_rows(conn: sqlite3.Connection, system: Optional[str] = None,
                     dsn: Optional[str] = None) -> List[Tuple]:
     """(kind, direction, peer, what, where, system, cite) from every source:
@@ -6467,7 +6657,7 @@ def _interface_rows(conn: sqlite3.Connection, system: Optional[str] = None,
     URIMAP web entry points, REMOTESYSTEM transactions, and the manifest's
     declared external_interfaces."""
     rows: List[Tuple] = []
-    q = """SELECT i.kind, i.detail, i.direction, i.line, m.name AS mem, m.kind AS mkind, m.system,
+    q = """SELECT i.member_id, i.kind, i.detail, i.direction, i.line, m.name AS mem, m.kind AS mkind, m.system,
                   (SELECT program_id FROM program p WHERE p.member_id=m.id LIMIT 1) AS pgm,
                   (SELECT job_name FROM job j WHERE j.member_id=m.id LIMIT 1) AS job,
                   (SELECT UPPER(pd.proc_name) FROM proc_def pd WHERE pd.member_id=m.id AND pd.instream=0
@@ -6476,27 +6666,76 @@ def _interface_rows(conn: sqlite3.Connection, system: Optional[str] = None,
     # A cataloged PROC's own FTP / Connect:Direct / USS step was read with its DEFAULT symbolics - its default card
     # member: shown only when no indexed job expands the PROC, as `dataset` shows a PROC's rows; each job's expanded
     # step is listed with the files that job's cards name (LESSONS 233).
-    expanded = {str(r[0]).upper() for r in conn.execute(
-        "SELECT DISTINCT from_proc FROM step WHERE from_proc IS NOT NULL")}
+    expanded = expanded_procs(conn)
+    # An FTP / Connect:Direct step is stored twice: an interface_edge row on the job's member at the step's line
+    # (its notes: the host, each transfer) and one pseudo-DD per MVS dataset it sends or receives. One row per
+    # transfer: the pseudo-DD's, with the peer the notes name; the notes give a row of their own only for a
+    # transfer no pseudo-DD holds (a USS path, a bare PROC's step) or, naming none, for the step itself (LESSONS 237).
+    pseudo = conn.execute("""SELECT d.dd_name, d.dsn_resolved, d.mode, d.mode_source, d.line, s.id AS step_id, s.step_name,
+                                    s.from_proc, j.job_name, m.id AS mem_id, m.name AS mem, m.system, d.is_override,
+                                    s.parent_step, s.job_id
+                             FROM dd d JOIN step s ON s.id=d.step_id JOIN job j ON j.id=s.job_id JOIN member m ON m.id=j.member_id
+                             WHERE d.dd_name IN ('*FTP*','*NDM*') OR d.mode_source IN ('pathopts')""").fetchall()
+    # an index built before ROADMAP re-parse item 29 kept, on a PROC's step expanded into a job, the PROC's own
+    # reading as a second pseudo-DD `unknown [undetermined]` beside the job's (LESSONS 226): the determined one is the fact
+    determined = {(r["step_id"], r["dd_name"]) for r in pseudo
+                  if r["dd_name"].startswith("*") and r["mode_source"] != "undetermined"}
+    pseudo = [r for r in pseudo if not (r["dd_name"].startswith("*") and r["mode_source"] == "undetermined"
+                                        and (r["step_id"], r["dd_name"]) in determined)]
+    at_step: Dict[Tuple[int, int], List[sqlite3.Row]] = defaultdict(list)
+    for r in pseudo:
+        if r["dd_name"] in ("*FTP*", "*NDM*"):
+            at_step[(r["mem_id"], r["line"])].append(r)
+    peer_of: Dict[Tuple[int, int, str], str] = {}
     for r in conn.execute(q):
         if system and (r["system"] or "").upper() != system.upper():
             continue
         if r["proc"] and not r["job"] and r["proc"] in expanded:
             continue
         where = r["pgm"] or r["job"] or r["mem"]
-        rows.append((r["kind"], r["direction"] or "?", "", r["detail"][:90], where, r["system"] or "?",
-                     f"{r['mem']}:{r['line']}"))
-    for r in conn.execute("""SELECT d.dd_name, d.dsn_resolved, d.mode, d.mode_source, d.line, s.step_name, s.from_proc,
-                                    j.job_name, m.name AS mem, m.system, d.is_override, s.parent_step, s.job_id
-                             FROM dd d JOIN step s ON s.id=d.step_id JOIN job j ON j.id=s.job_id JOIN member m ON m.id=j.member_id
-                             WHERE d.dd_name IN ('*FTP*','*NDM*') OR d.mode_source IN ('pathopts')"""):
+        if r["kind"] not in ("ftp", "ndm", "usssh"):
+            rows.append((r["kind"], r["direction"] or "?", "", r["detail"][:90], where, r["system"] or "?",
+                         f"{r['mem']}:{r['line']}"))
+            continue
+        # the step the row stands for: an expanded PROC step's row sits on the job with the PROC's line - cited in
+        # the PROC, as its pseudo-DDs are (dd_cite_member) and as flow's cite_iface does
+        step = conn.execute("""SELECT s.step_name, s.from_proc FROM step s LEFT JOIN job j ON j.id=s.job_id
+                               LEFT JOIN proc_def pd ON pd.id=s.proc_id
+                               WHERE COALESCE(j.member_id, pd.member_id)=? AND s.line=? AND s.effective_pgm=?""",
+                            (r["member_id"], r["line"], f"*{r['kind'].upper()}*")).fetchall()
+        where_step = f"{where} {step[0][0]}" if len(step) == 1 else where
+        procs = {s[1] for s in step}
+        at = f"{(procs.pop() if len(procs) == 1 and step[0][1] else r['mem'])}:{r['line']}"
+        if r["kind"] == "usssh":
+            rows.append((r["kind"], r["direction"] or "?", "", r["detail"][:90], where_step, r["system"] or "?", at))
+            continue
+        host, transfers = _transfer_notes(r["detail"] or "")
+        key = (r["member_id"], r["line"])
+        held = {(d["dsn_resolved"] or "").upper() for d in at_step.get(key, [])}
+        peer_of[key + ("",)] = host
+        for (_verb, name, _dir, peer) in transfers:
+            peer_of[key + (name.upper(),)] = peer or host
+        rest = [t for t in transfers if t[1].upper() not in held]
+        if not rest and key in at_step:
+            continue
+        if not rest:
+            # no transfer in its notes (no cards indexed, only a host): the step itself is the interface
+            rows.append((r["kind"], r["direction"] or "?", host, r["detail"][:90], where_step, r["system"] or "?", at))
+            continue
+        for (verb, name, direction, peer) in rest:
+            mvs = "." in name and "/" not in name
+            rows.append((r["kind"], direction, peer or host, name if mvs else f"{verb} {name}", where_step,
+                         r["system"] or "?", at))
+    for r in pseudo:
         if system and (r["system"] or "").upper() != system.upper():
             continue
         if dsn and dsn.upper() not in (r["dsn_resolved"] or "").upper():
             continue
         kind = {"*FTP*": "ftp", "*NDM*": "ndm"}.get(r["dd_name"], "uss")
         direction = "out" if r["mode"] == "input" and kind != "uss" else "in" if r["mode"] == "output" and kind != "uss" else r["mode"]
-        rows.append((kind, direction, "", r["dsn_resolved"], f"{r['job_name']} {r['step_name']}", r["system"] or "?",
+        peer = (peer_of.get((r["mem_id"], r["line"], (r["dsn_resolved"] or "").upper()))
+                or peer_of.get((r["mem_id"], r["line"], ""), "")) if kind != "uss" else ""
+        rows.append((kind, direction, peer, r["dsn_resolved"], f"{r['job_name']} {r['step_name']}", r["system"] or "?",
                      f"{dd_cite_member(conn, r, r['mem'])}:{r['line']}"))
     for r in conn.execute("SELECT tran_code, program, detail, member_id, line FROM transaction_def WHERE system='cics_web' "
                           "OR detail LIKE 'REMOTESYSTEM%'"):

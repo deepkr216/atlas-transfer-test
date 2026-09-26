@@ -221,7 +221,7 @@ python -m atlas.query --db atlas.db job      CLMNIGHT
 python -m atlas.query --db atlas.db field    PM-POLICY-STATUS
 python -m atlas.query --db atlas.db flow     WS-STATUS --program CLMPOST   # where the VALUE goes: file, CALL USING, DB2 (--up: where it comes from)
 python -m atlas.query --db atlas.db literal  E001               # where is this code set / tested / shown
-python -m atlas.query --db atlas.db values   WS-GENDER-CD       # every value the code assumes (incl. undocumented)
+python -m atlas.query --db atlas.db values   WS-GENDER-CD       # every value the code assumes (incl. undocumented; a sort card's compared constant, never its position or length)
 python -m atlas.query --db atlas.db pair     WS-REL-CD WS-GENDER-CD   # cross-field rules (son must be male)
 python -m atlas.query --db atlas.db messages GENDER             # message texts naming a rule
 python -m atlas.query --db atlas.db screen   MEMMAP             # BMS map / MFS MID-MOD: fields, defaults, validating programs
@@ -355,7 +355,9 @@ read it (`NIGHTJOB NIGHT.PS010`, direction with its source), not just a PROC
 with `&HLQ` in it. IDCAMS steps add `create` / `delete` / `input` / `output`
 rows from their `DEFINE`, `DELETE` and `REPRO` cards, so a VSAM file's
 lineage starts where it is defined. `program X` shows the job-level rows and
-falls back to the bare PROC only when no indexed job expands it.
+falls back to the bare PROC only when no indexed job expands it - in its
+'Runs in' and in its Files table alike; `flow` follows no branch into a PROC's
+own step and `values` counts no card of one while a job expands that PROC.
 
 ## Fields, columns and messages
 
@@ -382,7 +384,11 @@ falls back to the bare PROC only when no indexed job expands it.
   REPLACING. This is what test data and interface contracts are built from.
 - `crud PGM… | --job JOB | --copybook X | --system S` — one matrix: programs ×
   datasets / DB2 tables / IMS databases / CICS files with C/R/U/D and a cite
-  per cell (the design-document table).
+  per cell (the design-document table). A file's dataset is the one the JCL
+  gives its DD: with `--job`, that job's own steps' (two steps giving different
+  datasets: a row each, with the step); otherwise every job's, and when the
+  jobs give a file different datasets each is a row of its own with the jobs
+  that give it.
 - `conditions PGM` — every IF/WHEN/UNTIL with the field and literal or 88 name
   it tests (88s expanded), per paragraph, plus one negative case per field.
 - `paragraph PGM NAME|line` — who reaches a paragraph and how (PERFORM, GO TO,
@@ -411,7 +417,9 @@ falls back to the bare PROC only when no indexed job expands it.
 - `callers X --args` — every call site with its full USING list against the
   callee's LINKAGE; a count mismatch is flagged (the S0C4 check).
 - `interfaces [--system S] [--dsn X]` — what leaves and enters the
-  mainframe: FTP / Connect:Direct steps with the dataset, MQ queues with the
+  mainframe: FTP / Connect:Direct steps, one row per file sent or received,
+  with the peer the step names (the FTP PARM's host, the Connect:Direct SNODE)
+  - a step whose cards name no file is one row of its own; MQ queues with the
   message layout, IMS message switches, CICS TD queues and web entry points,
   and the peers you declare in the manifest (`"external_interfaces":
   [{"kind":"ndm","peer":"REINSURER-X","direction":"out","dataset":"PROD.POLICY.EXTRACT"}]`)

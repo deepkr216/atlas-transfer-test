@@ -7,7 +7,18 @@
     "values",
     "R12-STATUS"
    ],
-   "symptom_has": "| 2 | (none) |"
+   "count": "| 2 | (none) |",
+   "truth": 0,
+   "symptom": 1
+  },
+  {
+   "query": [
+    "values",
+    "R12-STATUS"
+   ],
+   "count": "USED BUT NOT DOCUMENTED",
+   "truth": 0,
+   "symptom": 1
   }
  ]
 }

@@ -675,7 +675,8 @@ class ProcInterfaceRowsInTheIndex(unittest.TestCase):
     def test_the_jobs_file_crosses_the_boundary_at_its_step(self):
         out = query.cmd_dataset(self.conn, "PROD.KV.JOB.FILE")
         self.assertIn("| PROD.KV.JOB.FILE | input [ftp_put] |", out)
-        self.assertIn("ftp out (KVIFJOB S1.F010)", out)
+        # the peer the step's notes name rides on the pseudo-DD's row (LESSONS 237)
+        self.assertIn("ftp out to/from kvhost.example (KVIFJOB S1.F010)", out)
         self.assertNotIn("ftp unknown", out)
         job = query.cmd_job(self.conn, "KVIFJOB")
         self.assertNotIn("PROD.KV.DEFAULT.FILE", job)

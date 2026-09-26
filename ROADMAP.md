@@ -855,13 +855,13 @@ tests/test_flow.py FlowKnownLimits). None needs a re-parse (atlas/flow.py only).
 Found while fixing LESSONS 231 and left open; none is a wrong fact in the index, each is a cite that names the
 wrong member or line.
 
-- **`interfaces` cites an expanded step's `interface_edge` row in the job with the PROC's line.** The build
-  writes the row of an FTP / Connect:Direct / USS step on the job's member with the step's line, which for an
-  expanded step is a line of the PROC. atlas/flow.py relies on that pair to tie the row to its step and cites
-  the PROC itself (`cite_iface`); the `interfaces` page prints the pair as it is. The *FTP* / *NDM* rows on the
-  same page are cited right. These rows are also the second row per FTP put of the synthetic finding F13
-  (tools/synth/repro/F13-interfaces-ftp-twice): leaving them out for a step whose *FTP* / *NDM* rows are
-  listed closes both. Next: that, or cite the row as flow.py does - query-side, no re-parse.
+- **Closed (LESSONS 237) - `interfaces` cited an expanded step's `interface_edge` row in the job with the PROC's
+  line.** The build writes the row of an FTP / Connect:Direct / USS step on the job's member with the step's
+  line, which for an expanded step is a line of the PROC. `interfaces` now gives one row per transfer - the
+  *FTP* / *NDM* pseudo-DD's, cited right, with the peer the step's notes name - and keeps the step's own row
+  only for a transfer no pseudo-DD holds (a USS path) or a step whose notes name none (its cards not indexed);
+  such a row of an expanded step - and a USS (BPXBATCH) step's row - is cited in the PROC, as flow.py's
+  `cite_iface` does, with the step named when one step of the job stands at that line. Query-side, no re-parse.
 - **A step of an instream PROC is cited under the PROC's name.** `// PROC ... // PEND` lives in the job's own
   member, but the step and DD cites print `from_proc` - the PROC's name, which is no member. Next: cite the
   job's member when `proc_def.instream` is set for that name in it - query-side.

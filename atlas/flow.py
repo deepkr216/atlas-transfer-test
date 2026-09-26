@@ -1090,8 +1090,16 @@ class _Walker(_Report):
         d_last = d.split(".")[-1]
         return a == d or a == d_last or a.endswith("-" + d_last) or d_last.endswith("-" + a)
 
+    def jcl_rows(self, rows: List[sqlite3.Row]) -> List[sqlite3.Row]:
+        """A PROC's own step was read with its DEFAULT symbolics (TEST.POL.EXTRACT): no branch while an indexed
+        job expands that PROC - the job's expanded step carries the dataset it runs (README; LESSONS 236)."""
+        exp = getattr(self, "_expanded", None)
+        if exp is None:
+            exp = self._expanded = Q.expanded_procs(self.conn)
+        return [r for r in rows if not (r["job_name"] is None and r["proc_name"] and r["proc_name"].upper() in exp)]
+
     def steps_of(self, pname: str) -> List[sqlite3.Row]:
-        return self.conn.execute("""SELECT d.id AS dd_id, d.dd_name, d.dsn_resolved, d.mode, d.mode_source, d.gdg_rel,
+        return _Walker.jcl_rows(self, self.conn.execute("""SELECT d.id AS dd_id, d.dd_name, d.dsn_resolved, d.mode, d.mode_source, d.gdg_rel,
                                            d.is_temp, d.line AS dd_line, s.id AS step_id, s.step_name, s.effective_pgm AS pgm,
                                            s.launcher, s.job_id, s.proc_id, j.job_name, pd.proc_name, m.name AS owner_name,
                                            """ + _DD_MEMBER + """ AS member_name
@@ -1099,10 +1107,10 @@ class _Walker(_Report):
                                     LEFT JOIN proc_def pd ON pd.id=s.proc_id
                                     LEFT JOIN member m ON m.id=COALESCE(j.member_id, pd.member_id)
                                     WHERE UPPER(s.effective_pgm)=? AND d.dsn_resolved IS NOT NULL
-                                    ORDER BY j.job_name, s.ordinal, d.line""", (pname.upper(),)).fetchall()
+                                    ORDER BY j.job_name, s.ordinal, d.line""", (pname.upper(),)).fetchall())
 
     def dds_on(self, dsn: str) -> List[sqlite3.Row]:
-        return self.conn.execute("""SELECT d.id AS dd_id, d.dd_name, d.dsn_resolved, d.mode, d.mode_source, d.gdg_rel,
+        return _Walker.jcl_rows(self, self.conn.execute("""SELECT d.id AS dd_id, d.dd_name, d.dsn_resolved, d.mode, d.mode_source, d.gdg_rel,
                                            d.is_temp, d.line AS dd_line, s.id AS step_id, s.step_name, s.effective_pgm AS pgm,
                                            s.launcher, s.job_id, s.proc_id, j.job_name, pd.proc_name, m.name AS owner_name,
                                            """ + _DD_MEMBER + """ AS member_name
@@ -1110,7 +1118,7 @@ class _Walker(_Report):
                                     LEFT JOIN proc_def pd ON pd.id=s.proc_id
                                     LEFT JOIN member m ON m.id=COALESCE(j.member_id, pd.member_id)
                                     WHERE d.dsn_resolved=? ORDER BY j.job_name, pd.proc_name, s.ordinal, d.line""",
-                                 (dsn,)).fetchall()
+                                 (dsn,)).fetchall())
 
     def file_edges(self, node: _Node, r) -> List[_Edge]:
         """WRITE of the record root -> the DD -> the DSN, one hop that then
