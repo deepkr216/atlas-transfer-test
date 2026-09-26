@@ -222,6 +222,11 @@ class LogicalLine:
     # ELSE MOVE ... END-IF); this is what lets each MOVE be cited to ITS line
     # rather than to the line the IF started on.
     charmap: Optional[List[int]] = None
+    # (SQL | CICS | DLI, the line of its EXEC keyword) when cobol_statements
+    # closed this statement at an END-EXEC with no period after it outside the
+    # PROCEDURE DIVISION - a compile error the parser reports, not a reason to
+    # let the EXEC block swallow the entries and the division header after it
+    no_period: Optional[Tuple[str, int]] = None
 
     def line_at(self, offset: int) -> int:
         if self.charmap and 0 <= offset < len(self.charmap):
@@ -555,6 +560,19 @@ def cobol_statements(logical: Sequence[LogicalLine]) -> Iterator[LogicalLine]:
     So the text is accumulated into a buffer with a character-to-line map, and
     statements are carved out wherever a genuine terminator appears. Line
     numbers stay exact, because every citation depends on them.
+
+    One place the text lacks its period and the statement ends anyway: an
+    EXEC SQL / CICS / DLI block outside the PROCEDURE DIVISION (a DECLARE
+    CURSOR or an INCLUDE in WORKING-STORAGE) whose END-EXEC has no period
+    after it. The compiler rejects the member; read as one sentence, the
+    block swallowed the data entries after it and the PROCEDURE DIVISION
+    header, and the program lost every paragraph while it read `parse: ok`
+    (the synthetic reproduction F15). The statement is closed at the END-EXEC
+    - before the PROCEDURE DIVISION header, or, with no division header yet
+    (a copybook read alone), when the next line starts a data entry with its
+    level number - and carries `no_period` for the parser's note. Inside the
+    PROCEDURE DIVISION an END-EXEC without a period is ordinary: several
+    statements make one sentence.
     """
     buf = ""
     lmap: List[int] = []          # line number for each character in buf
@@ -567,6 +585,7 @@ def cobol_statements(logical: Sequence[LogicalLine]) -> Iterator[LogicalLine]:
     in_q: Optional[str] = None
     exec_open = False
     exec_pos = 0
+    division: Optional[str] = None  # the division the statements yielded so far have entered
 
     def compact(cut: int) -> None:
         nonlocal buf, lmap, scan_pos, exec_pos
@@ -576,6 +595,23 @@ def cobol_statements(logical: Sequence[LogicalLine]) -> Iterator[LogicalLine]:
         exec_pos = max(0, exec_pos - cut)
 
     for ll in logical:
+        if (division != "PROCEDURE" and in_q is None and buf and not ll.text.startswith(".")
+                and (division is not None or _LEVEL_START.match(ll.text))
+                and _ENDS_AT_END_EXEC.search(buf[-40:])):          # the tail only: a long sentence stays linear
+            opened = None
+            for opened in _EXEC_KIND.finditer(buf):
+                pass
+            if opened is not None:
+                # END-EXEC with no period after it, before the PROCEDURE DIVISION:
+                # the statement ends here all the same (see the docstring)
+                lead = len(buf) - len(buf.lstrip())
+                end = len(buf.rstrip())
+                yield LogicalLine(text=buf.strip(), start=lmap[lead], end=lmap[end - 1],
+                                  lines=sorted(set(lmap[:end])), area_a=area_a, charmap=lmap[lead:end],
+                                  no_period=(opened.group(1).upper(), lmap[opened.start()]))
+                buf, lmap, fresh = "", [], True
+                scan_pos = exec_pos = 0
+                in_q, exec_open = None, False
         if buf and not buf.endswith(" "):
             buf += " "
             lmap.append(lmap[-1] if lmap else ll.start)
@@ -602,6 +638,7 @@ def cobol_statements(logical: Sequence[LogicalLine]) -> Iterator[LogicalLine]:
             raw_stmt = buf[:idx + 1]
             text = raw_stmt.strip()
             if text:
+                division = _division_entered(text, division)
                 lead = len(raw_stmt) - len(raw_stmt.lstrip())
                 s_line = lmap[lead] if lmap and lead < len(lmap) else ll.start
                 e_line = lmap[min(idx, len(lmap) - 1)] if lmap else ll.end
@@ -628,6 +665,27 @@ def cobol_statements(logical: Sequence[LogicalLine]) -> Iterator[LogicalLine]:
 _DECIMAL_DOT = re.compile(r"\d\.\d")
 _EXEC_OPEN = re.compile(r"\bEXEC\s+(?:SQL|CICS|DLI)\b", re.IGNORECASE)
 _EXEC_TOKEN = re.compile(r"\bEXEC\s+(?:SQL|CICS|DLI)\b|END-EXEC", re.IGNORECASE)
+_EXEC_KIND = re.compile(r"(?<![A-Z0-9\-])EXEC\s+(SQL|CICS|DLI)(?![A-Z0-9\-])", re.IGNORECASE)
+_ENDS_AT_END_EXEC = re.compile(r"(?<![A-Z0-9\-])END-EXEC\s*$", re.IGNORECASE)
+# a data entry starts with its level number: 01, 05, 77, 88 (`05.` is a bare group level)
+_LEVEL_START = re.compile(r"^\d{1,2}(?:\s|\.|$)")
+_STATEMENT_DIVISION = re.compile(r"^(IDENTIFICATION|ID|ENVIRONMENT|DATA|PROCEDURE)\s+DIVISION(?![A-Z0-9\-])",
+                                 re.IGNORECASE)
+_PROCEDURE_DIVISION = re.compile(r"(?<![A-Z0-9\-])PROCEDURE\s+DIVISION(?![A-Z0-9\-])", re.IGNORECASE)
+_LITERALS = re.compile(r"'(?:[^']|'')*'|\"(?:[^\"]|\"\")*\"")
+
+
+def _division_entered(text: str, division: Optional[str]) -> Optional[str]:
+    """The division after a statement: its own header's, PROCEDURE when the
+    words PROCEDURE DIVISION sit anywhere in it outside a literal (a data
+    entry that ran on into the header - the division is entered all the
+    same, so nothing after it is taken for WORKING-STORAGE), else unchanged."""
+    m = _STATEMENT_DIVISION.match(text)
+    if m:
+        return "IDENTIFICATION" if m.group(1).upper() == "ID" else m.group(1).upper()
+    if division != "PROCEDURE" and _PROCEDURE_DIVISION.search(_LITERALS.sub(" ", text)):
+        return "PROCEDURE"
+    return division
 
 
 def _inside_exec(buf: str, idx: int) -> bool:

@@ -2204,6 +2204,13 @@ def index_cobol(ctx: Ctx, mem: Mem) -> None:
         if "SYNC" in w or "not compile" in w:
             notes.append(("layout_warning", w, 0))
     for (kind, detail, ln) in facts.unresolved:
+        if kind == "exec_no_period":
+            # the parser counted the expanded text's lines: the sentence names the member's own line, or the
+            # copybook's line and name when the EXEC block came from a COPY
+            run = exp.run_at(ln)
+            if run is not None:
+                detail = cobol.exec_no_period_note(detail.split()[1], run.src_start + (ln - run.exp_start),
+                                                   run.via_copy if run.depth else None)
         notes.append((kind, detail, ln))
     for w in exp.warnings:          # each one a gap: a COPY NOT FOUND, or skipped (recursive, nested too deep)
         notes.append(("expand", w, 0))
@@ -2218,8 +2225,10 @@ def index_cobol(ctx: Ctx, mem: Mem) -> None:
             fh.write(exp_text)
 
     # 'partial' only for a gap the expander reported; a copybook chosen among several is its own
-    # 'ambiguous_copybook' row and leaves the program 'ok' (ROADMAP re-parse item 18)
-    status = "partial" if any(k in ("expand",) for (k, _d, _l) in notes) else "ok"
+    # 'ambiguous_copybook' row and leaves the program 'ok' (ROADMAP re-parse item 18). An EXEC block whose
+    # END-EXEC lacks its period outside the PROCEDURE DIVISION makes it partial too: the source in the estate
+    # is not the one that compiled, and the facts after it rest on the period the reader supplied
+    status = "partial" if any(k in ("expand", "exec_no_period") for (k, _d, _l) in notes) else "ok"
     conn.execute("UPDATE member SET parse_status=? WHERE id=?", (status, mem.id))
 
 

@@ -44,6 +44,26 @@ ID = r"[A-Z0-9][A-Z0-9\-_]*"
 # to a program named TO. These lookarounds are used on every verb pattern.
 B = r"(?<![A-Z0-9\-])"
 E = r"(?![A-Z0-9\-])"
+# The scope terminators, word for word. `END-[A-Z]+` also matched END-DATE,
+# END-TIME, END-BALANCE - everyday data names in insurance code - and cut the
+# statement there: `IF END-DATE < START-DATE` lost both references,
+# `MOVE WS-PURGE-DATE TO END-DATE` its write and its read, `CALL END-PGM` the
+# call (the synthetic reproduction F04). A name beginning with END- is a data
+# name or a paragraph name unless it is one of these.
+SCOPE_TERMINATORS = ("END-ACCEPT", "END-ADD", "END-CALL", "END-COMPUTE", "END-DELETE", "END-DISPLAY",
+                     "END-DIVIDE", "END-EVALUATE", "END-EXEC", "END-IF", "END-INVOKE", "END-JSON",
+                     "END-MULTIPLY", "END-PERFORM", "END-READ", "END-RECEIVE", "END-RETURN", "END-REWRITE",
+                     "END-SEARCH", "END-START", "END-STRING", "END-SUBTRACT", "END-UNSTRING", "END-WRITE",
+                     "END-XML")
+_END = "(?:" + "|".join(sorted(SCOPE_TERMINATORS, key=len, reverse=True)) + ")"
+# Every verb that starts a statement (WHEN and ELSE with them: each opens a fragment). A list of names - the files
+# after OPEN / CLOSE / SORT USING, the targets of a MOVE - ends at the next one: with a partial list `OPEN OUTPUT
+# OUT-FILE` then `COMPUTE X = ...` in one sentence opened COMPUTE, X and every name after it as files, a DISPLAY after
+# a MOVE 'lit' became a target given the literal, and `GIVING OUT-FILE GOBACK.` sorted into a file called GOBACK
+_STATEMENT_VERBS = ("MOVE|COMPUTE|ADD|SUBTRACT|MULTIPLY|DIVIDE|STRING|UNSTRING|INITIALIZE|SET|"
+                    "ACCEPT|READ|WRITE|REWRITE|RETURN|RELEASE|INSPECT|DISPLAY|CALL|PERFORM|IF|"
+                    "EVALUATE|WHEN|ELSE|SEARCH|EXEC|GO|GOBACK|STOP|OPEN|CLOSE|DELETE|START|"
+                    "CONTINUE|EXIT|SORT|MERGE|CANCEL|ALTER|ENTRY")
 
 _PROGRAM_ID = re.compile(rf"\bPROGRAM-ID\s*\.?\s+({ID})", re.IGNORECASE)
 _DIVISION = re.compile(rf"\b({ID})\s+DIVISION\b", re.IGNORECASE)
@@ -53,7 +73,7 @@ _PARAGRAPH = re.compile(rf"^({ID})\s*\.\s*$", re.IGNORECASE)
 _CALL_LIT = re.compile(B + r"CALL\s+(['\"])([^'\"]+)\1", re.IGNORECASE)
 _CALL_VAR = re.compile(B + rf"CALL\s+({ID})" + E, re.IGNORECASE)
 _CANCEL = re.compile(B + r"CANCEL\s+(['\"])([^'\"]+)\1", re.IGNORECASE)
-_USING = re.compile(r"\bUSING\b(.*?)(?:\bRETURNING\b|\bON\s+EXCEPTION\b|$)",
+_USING = re.compile(B + r"USING" + E + r"(.*?)(?:" + B + r"RETURNING" + E + r"|" + B + r"ON\s+EXCEPTION" + E + r"|$)",
                     re.IGNORECASE | re.DOTALL)
 
 # the text-name may be a literal: COPY 'NAME' and COPY "NAME" OF 'LIB' are legal and some shops
@@ -86,8 +106,7 @@ _DATA_SECTION = re.compile(r"^(FILE|WORKING-STORAGE|LOCAL-STORAGE|LINKAGE)\s+SEC
 #   OPEN INPUT POLICY-IN CLAIM-IN OUTPUT REPORT-OUT
 _FILE_OP = re.compile(
     B + rf"(READ|WRITE|REWRITE|DELETE|START|RELEASE|RETURN)\s+({ID})", re.IGNORECASE)
-_OPEN_CLOSE = re.compile(B + r"(OPEN|CLOSE)\s+((?:\S|(?=(?P<ws>\s+))(?P=ws))*?)(?=\s*(?:$|\.|" + B + r"(?:END-|ELSE|WHEN|IF|MOVE|PERFORM|"
-                         r"READ|WRITE|OPEN|CLOSE|CALL|DISPLAY|GO|GOBACK|STOP)" + E + "))",
+_OPEN_CLOSE = re.compile(B + r"(OPEN|CLOSE)\s+((?:\S|(?=(?P<ws>\s+))(?P=ws))*?)(?=\s*(?:$|\.|" + B + r"(?:" + _END + r"|" + _STATEMENT_VERBS + r")" + E + "))",
                          re.IGNORECASE | re.DOTALL)
 _OPEN_MODE = re.compile(r"\b(INPUT|OUTPUT|I-O|EXTEND)\b", re.IGNORECASE)
 
@@ -100,9 +119,10 @@ _CICS_PROG = re.compile(r"\b(LINK|XCTL)\b.*?\bPROGRAM\s*\(\s*([^)]*?)\s*\)",
 _CICS_VERB = re.compile(r"^\s*([A-Z-]+)", re.IGNORECASE)
 _CICS_FILE = re.compile(r"\b(?:FILE|DATASET)\s*\(([^)]*)\)", re.IGNORECASE)          # value stripped by the caller
 
-_DLI_CALL = re.compile(
-    rf"\bCALL\s+(['\"])(CBLTDLI|AIBTDLI|PLITDLI)\1\s+USING\b(.*)",
-    re.IGNORECASE | re.DOTALL)
+_DLI_INTERFACES = ("CBLTDLI", "AIBTDLI", "PLITDLI")
+# the text after the CALL verb of a DL/I call: the interface literal and USING
+_DLI_TARGET = re.compile(r"\s*(['\"])(CBLTDLI|AIBTDLI|PLITDLI)\1\s+USING" + E, re.IGNORECASE)
+_MQ_NAME = re.compile(r"MQ[A-Z0-9]+", re.IGNORECASE)
 _MQ_CALL = re.compile(r"\bCALL\s+['\"](MQ[A-Z0-9]+)['\"]", re.IGNORECASE)
 
 _MOVE_LIT = re.compile(B + rf"MOVE\s+(['\"])([^'\"]*)\1\s+TO\s+([A-Z0-9\-_,\s]+)",
@@ -114,13 +134,13 @@ _SET_TRUE = re.compile(B + rf"SET\s+({ID})\s+TO\s+TRUE" + E, re.IGNORECASE)
 # target lists are identifiers separated by whitespace or a comma: with an
 # optional separator one word could be split at every character and an
 # unterminated `GO TO name MOVE ...` backtracked exponentially (LESSONS 146)
-_GO_TO = re.compile(B + r"GO\s+TO\s+(" + ID + r"(?:[\s,]+" + ID + r")*?)(?:[\s,]+DEPENDING\s+(?:ON\s+)?(" + ID + r"))?(?=\s*(?:$|\.|" + B + r"(?:END-|ELSE|WHEN)))",
+_GO_TO = re.compile(B + r"GO\s+TO\s+(" + ID + r"(?:[\s,]+" + ID + r")*?)(?:[\s,]+DEPENDING\s+(?:ON\s+)?(" + ID + r"))?(?=\s*(?:$|\.|" + B + r"(?:" + _END + r"|ELSE|WHEN)" + E + "))",
                     re.IGNORECASE)
 MAX_RESOLVED = 40                         # candidate targets kept per dynamic CALL
 _ALTER = re.compile(B + rf"ALTER\s+({ID})\s+TO\s+(?:PROCEED\s+TO\s+)?({ID})", re.IGNORECASE)
 _SORT_PROC = re.compile(B + rf"(INPUT|OUTPUT)\s+PROCEDURE\s+(?:IS\s+)?({ID})(?:\s+(?:THRU|THROUGH)\s+({ID}))?",
                         re.IGNORECASE)
-_SORT_USING = re.compile(B + r"(USING|GIVING)\s+(" + ID + r"(?:[\s,]+" + ID + r")*?)(?=\s*(?:$|\.|" + B + r"(?:USING|GIVING|INPUT|OUTPUT|ON|WITH|COLLATING|END-)))",
+_SORT_USING = re.compile(B + r"(USING|GIVING)\s+(" + ID + r"(?:[\s,]+" + ID + r")*?)(?=\s*(?:$|\.|" + B + r"(?:USING|GIVING|INPUT|OUTPUT|ON|WITH|COLLATING|" + _END + r"|" + _STATEMENT_VERBS + r")" + E + "))",
                          re.IGNORECASE)
 _SECTION_HDR = re.compile(rf"^({ID})\s+SECTION(?:\s+\d{{1,2}})?\s*\.", re.IGNORECASE)
 
@@ -351,6 +371,16 @@ class ProgramFacts:
     returning: Optional[str] = None                                    # PROCEDURE DIVISION ... RETURNING y
 
 
+def exec_no_period_note(kind: str, line: int, copybook: Optional[str] = None) -> str:
+    """The note of an EXEC block outside the PROCEDURE DIVISION whose END-EXEC
+    has no period after it (reader.cobol_statements closes it there): `kind`
+    SQL / CICS / DLI, `line` the line of its EXEC keyword - in the copybook
+    named, when the block came from one."""
+    where = f"line {line}" + (f" of copybook {copybook}" if copybook else "")
+    return (f"EXEC {kind} at {where} ends without its period - the compiler would reject it; "
+            "the facts after it were read as if the period were there")
+
+
 # --------------------------------------------------------------------------
 # main entry
 # --------------------------------------------------------------------------
@@ -384,6 +414,10 @@ def parse_program(text: str, data: bytes = b"", enc: str = "utf-8") -> ProgramFa
     for st in stmts:
         up = st.upper
         body = st.text.strip()
+        if st.no_period:
+            # the reader closed an EXEC block at its END-EXEC although no period followed (the synthetic
+            # reproduction F15): said, and the member is partial - the source is not what compiled
+            f.unresolved.append(("exec_no_period", exec_no_period_note(*st.no_period), st.no_period[1]))
 
         # `PROGRAM-ID. MULTILN.` on one line, or `PROGRAM-ID.` with the name
         # on the following line - both are common. The second form splits into
@@ -487,6 +521,11 @@ def parse_program(text: str, data: bytes = b"", enc: str = "utf-8") -> ProgramFa
             if ends:
                 sec.end_line = max(ends)
     _fallthrough_edges(f, last_stmt)
+    # a SELECT / FD file name is never a data item, whatever statement named it (a file and a data item cannot
+    # share a name): no field reference, so `field IN-FILE` and `walk` do not count the file among the fields
+    files = {fd.select_name for fd in f.files}
+    if files:
+        f.field_refs = [r for r in f.field_refs if r[0] not in files]
 
     f.uses_sql = bool(f.sql)
     f.uses_cics = bool(f.cics)
@@ -535,11 +574,20 @@ def _build_literal_map(stmts: Sequence[LogicalLine]) -> Dict[str, Set[str]]:
             if c:
                 out.setdefault(c[0], set()).update(c[1])
 
-        for m in _MOVE_LIT.finditer(body):
+        pos = 0
+        while True:
+            m = _MOVE_LIT.search(body, pos)
+            if not m:
+                break
+            # the target list below ran on over the next statement - the next MOVE 'X' of the sentence among
+            # it, which finditer then never saw (`MOVE 'PGMA' TO A` then `MOVE 'PGMB' TO B`: B lost PGMB)
+            pos = m.start() + 4
             lit = m.group(2).strip().upper()
             targets = m.group(3)
-            # Stop at the first COBOL keyword; MOVE targets are a name list.
-            targets = re.split(r"(?<![\w-])(?:OF|IN|WHEN|END-|IF|ELSE|PERFORM|MOVE|CALL)\b",
+            # Stop at the first COBOL keyword - a qualifier, a scope terminator or any verb; MOVE targets are a name
+            # list (a hyphenated name is one word: IN-PGM-NAME, IF-FLAG and END-PGM are targets; a DISPLAY after
+            # the MOVE is not one, nor the name it displays)
+            targets = re.split(B + r"(?:OF|IN|" + _END + r"|" + _STATEMENT_VERBS + r")" + E,
                                targets, maxsplit=1, flags=re.IGNORECASE)[0]
             for t in re.split(r"[,\s]+", targets):
                 t = t.strip().rstrip(".").upper()
@@ -555,19 +603,19 @@ def _extract_calls(f: ProgramFacts, st: LogicalLine,
     # stored-procedure call (recorded by _extract_sql), not a dynamic CALL.
     body = _EXEC_ANY.sub(lambda m: " " * len(m.group(0)), st.text)
 
-    # DL/I and MQ calls are CALLs syntactically but are handled elsewhere.
-    if _DLI_CALL.search(body) or _MQ_CALL.search(body):
-        return
-
     # One sentence may hold several CALLs (IF ... CALL 'A' ... ELSE CALL WS-B
     # ... END-IF): every fragment is its own call with its own USING list.
     for verb, frag, off in _split_verbs(body):
         if verb != "CALL":
             continue
         line = st.line_at(off)
+        ml = re.match(r"\s*(['\"])([^'\"]+)\1", frag)
+        if ml and (ml.group(2).strip().upper() in _DLI_INTERFACES or _MQ_NAME.fullmatch(ml.group(2).strip())):
+            # a DL/I or MQ call is a CALL syntactically, recorded by _extract_dli / _extract_mq; the other
+            # CALLs of the same sentence are still calls (the whole sentence used to be skipped)
+            continue
         using = _parse_using("CALL " + frag)
         args, returning = _parse_using_detail("CALL " + frag)
-        ml = re.match(r"\s*(['\"])([^'\"]+)\1", frag)
         if ml:
             target = ml.group(2).strip().upper()
             f.calls.append(CallFact(kind="static", target=target, via_var=None,
@@ -601,9 +649,12 @@ def _extract_calls(f: ProgramFacts, st: LogicalLine,
                                 resolution="literal", using_args=[], line=st.start))
 
 
-_USING_STOP = re.compile(r"\bEND-[A-Z]+\b|\bELSE\b|\bWHEN\b|\bON\s+(?:EXCEPTION|OVERFLOW|SIZE)\b|"
-                         r"\bNOT\s+ON\b|\bRETURNING\b|\bGIVING\b|" + B + r"(?:MOVE|PERFORM|IF|CALL|GO|DISPLAY|"
-                         r"COMPUTE|ADD|SUBTRACT|EVALUATE|SET|READ|WRITE|OPEN|CLOSE|GOBACK|STOP|EXIT|CONTINUE)" + E,
+# a USING list ends at a scope terminator, an ELSE / WHEN, an ON EXCEPTION phrase, RETURNING / GIVING or the next
+# verb - each a whole word: WS-END-DATE, WS-ELSE-SW and WS-GIVING-AMT are arguments (`\bEND-[A-Z]+\b` cut
+# `USING WS-END-DATE` to an argument named `WS-`)
+_USING_STOP = re.compile(B + r"(?:" + _END + r"|ELSE|WHEN|ON\s+(?:EXCEPTION|OVERFLOW|SIZE)|NOT\s+ON|RETURNING|GIVING|"
+                         r"MOVE|PERFORM|IF|CALL|GO|DISPLAY|COMPUTE|ADD|SUBTRACT|EVALUATE|SET|READ|WRITE|OPEN|CLOSE|"
+                         r"GOBACK|STOP|EXIT|CONTINUE)" + E,
                          re.IGNORECASE)
 
 
@@ -616,7 +667,7 @@ def _parse_using(body: str) -> List[str]:
     if not m:
         return []
     raw = m.group(1)
-    raw = re.split(r"\bEND-CALL\b|\.(?=\s|$)", raw)[0]
+    raw = re.split(B + r"END-CALL" + E + r"|\.(?=\s|$)", raw, flags=re.IGNORECASE)[0]
     ms = _USING_STOP.search(raw)
     if ms:
         raw = raw[:ms.start()]
@@ -653,7 +704,7 @@ def _parse_using_detail(body: str) -> Tuple[List[ArgFact], Optional[str]]:
     if not m:
         return [], _returning_of(body)
     raw = m.group(1)
-    raw = re.split(r"\bEND-CALL\b|\.(?=\s|$)", raw)[0]
+    raw = re.split(B + r"END-CALL" + E + r"|\.(?=\s|$)", raw, flags=re.IGNORECASE)[0]
     ms = _USING_STOP.search(raw)
     if ms:
         raw = raw[:ms.start()]
@@ -1083,6 +1134,10 @@ def _parse_declared_columns(body: str) -> List[Tuple[str, str]]:
 
 def _extract_sql(f: ProgramFacts, st: LogicalLine) -> None:
     for m in _EXEC_SQL.finditer(st.text):
+        # each statement at its own EXEC SQL line, its host variables with it: several EXEC SQL blocks make
+        # one sentence in the PROCEDURE DIVISION, and every one of them was cited at the sentence's first
+        # line (the synthetic reproduction F02)
+        ln = st.line_at(m.start())
         inner = " ".join(m.group(1).split())
         verb = next((v for v in _SQL_VERBS
                      if re.match(rf"^{v}\b", inner, re.IGNORECASE)), "OTHER")
@@ -1107,26 +1162,26 @@ def _extract_sql(f: ProgramFacts, st: LogicalLine) -> None:
                 f.calls.append(CallFact(kind="sql_call", target=proc, via_var=None, resolved=[proc],
                                         resolution="literal",
                                         using_args=[h.upper() for h in _SQL_HOSTVAR.findall(inner)],
-                                        line=st.start))
-                f.io_ops.append((proc, "db2", "CALL", st.start))
+                                        line=ln))
+                f.io_ops.append((proc, "db2", "CALL", ln))
                 tables = []
         hvars = sorted({h.upper() for h in _SQL_HOSTVAR.findall(inner)})
-        _sql_host_modes(f, inner, st.start)
-        _sql_literals(f, inner, verb.upper(), st.start)
-        _sql_columns(f, inner, verb.upper(), st.start)
+        _sql_host_modes(f, inner, ln)
+        _sql_literals(f, inner, verb.upper(), ln)
+        _sql_columns(f, inner, verb.upper(), ln)
         dynamic = bool(re.search(r"\b(PREPARE|EXECUTE\s+IMMEDIATE)\b", inner, re.IGNORECASE))
         f.sql.append(SqlFact(stmt_type=verb.upper(),
                              cursor_name=cur.group(1).upper() if cur else None,
                              tables=tables, host_vars=hvars, is_dynamic=dynamic,
-                             start_line=st.start, end_line=st.end, text=inner))
+                             start_line=ln, end_line=st.line_at(m.end() - 1), text=inner))
         for t in tables:
-            f.io_ops.append((t, "db2", verb.upper(), st.start))
+            f.io_ops.append((t, "db2", verb.upper(), ln))
         if dynamic:
             f.unresolved.append((
                 "dynamic_sql",
                 "dynamic SQL (PREPARE/EXECUTE IMMEDIATE) - the tables touched "
                 "are not statically determinable from this source",
-                st.start))
+                ln))
 
 
 def _cics_value(arg: str, literal_map: Dict[str, Set[str]]) -> Tuple[Optional[str], List[str], str]:
@@ -1283,12 +1338,19 @@ def _dli_flow(f: ProgramFacts, ln: int, verb: str, func: Optional[str], io_area:
 def _extract_dli(f: ProgramFacts, st: LogicalLine, literal_map: Optional[Dict[str, Set[str]]] = None,
                  guards: Optional[List[Tuple[int, Optional[str]]]] = None) -> None:
     literal_map = literal_map or {}
-    m = _DLI_CALL.search(st.text)
-    if m:
-        iface = m.group(2).upper()
-        args = _split_call_args(m.group(3))
-        _record_dli(f, st, iface, args, literal_map, _guard_at(guards, m.start()))
-        return
+    # Every CALL 'CBLTDLI' of the sentence, each at its own line with its own USING list: an IMS program
+    # writes GU, then CHKP, then GN without a period between them, and only the first was kept - cited at
+    # the sentence's first line, the rest of the sentence read as its SSAs (the synthetic reproduction F01)
+    body = _EXEC_ANY.sub(lambda mm: " " * len(mm.group(0)), st.text)
+    for verb, frag, off in _split_verbs(body):
+        if verb != "CALL":
+            continue
+        m = _DLI_TARGET.match(frag)
+        if m:
+            raw = frag[m.end():]
+            ms = _USING_STOP.search(raw)
+            _record_dli(f, st, m.group(2).upper(), _split_call_args(raw[:ms.start()] if ms else raw), literal_map,
+                        _guard_at(guards, off), st.line_at(off))
 
     for m2 in _EXEC_DLI.finditer(st.text):
         # EXEC DLI GHU USING PCB(2) SEGMENT(POLICY) INTO(WS-AREA) WHERE(...)
@@ -1319,7 +1381,8 @@ def _is_dli_func(tok: str, literal_map: Dict[str, Set[str]]) -> bool:
 
 
 def _record_dli(f: ProgramFacts, st: LogicalLine, iface: str,
-                args: List[str], literal_map: Dict[str, Set[str]], guard: Optional[str] = None) -> None:
+                args: List[str], literal_map: Dict[str, Set[str]], guard: Optional[str] = None,
+                line: Optional[int] = None) -> None:
     """CALL 'CBLTDLI' USING [parmcount] func, pcb, io-area, ssa...
 
     The PCB argument is positional in the PSB, which is why it is captured
@@ -1327,7 +1390,9 @@ def _record_dli(f: ProgramFacts, st: LogicalLine, iface: str,
     guessing is how an analysis ends up naming the wrong IMS database.
     The function is usually a VALUE-initialised field (`05 DLI-GU PIC X(4)
     VALUE 'GU  '`): resolved through the literal map like a dynamic CALL.
+    `line` is the CALL's own line: a sentence may hold several calls.
     """
+    ln = st.start if line is None else line
     func = None
     pcb = None
     io_area = None
@@ -1365,7 +1430,7 @@ def _record_dli(f: ProgramFacts, st: LogicalLine, iface: str,
                     + (f"candidates {', '.join(cands)}" if cands else
                        "never assigned a literal in this program; the operation (read vs update) "
                        "cannot be determined statically"),
-                    st.start))
+                    ln))
     if len(args) > 1:
         pcb = args[1].strip().upper()
     if len(args) > 2:
@@ -1381,21 +1446,21 @@ def _record_dli(f: ProgramFacts, st: LogicalLine, iface: str,
         dest = cands[0] if len(cands) == 1 else None
         f.calls.append(CallFact(kind="ims_switch", target=dest, via_var=None if dest else io_area,
                                 resolved=cands, resolution="move_literal" if dest else ("move_literal" if cands else "unresolved"),
-                                using_args=[], line=st.start))
+                                using_args=[], line=ln))
         if not cands:
             f.unresolved.append(("ims_switch", f"CHNG destination in {io_area} never assigned a literal - "
-                                               f"the transaction switched to is unknown", st.start))
+                                               f"the transaction switched to is unknown", ln))
 
     f.dli.append(DliFact(interface=iface, func=func, pcb_arg=pcb,
-                         ssa_args=ssas, io_area=io_area, line=st.start,
+                         ssa_args=ssas, io_area=io_area, line=ln,
                          resolution=resolution, dest=dest or (f"*{io_area}*" if func == "CHNG" else None)))
     if pcb:
-        f.io_ops.append((pcb, "ims", func or "?", st.start))
-    _dli_flow(f, st.start, "CALL-" + iface, func, io_area, guard)
+        f.io_ops.append((pcb, "ims", func or "?", ln))
+    _dli_flow(f, ln, "CALL-" + iface, func, io_area, guard)
 
 
 def _split_call_args(raw: str) -> List[str]:
-    raw = re.split(r"\bEND-CALL\b", raw, flags=re.IGNORECASE)[0]
+    raw = re.split(B + r"END-CALL" + E, raw, flags=re.IGNORECASE)[0]
     raw = raw.rstrip().rstrip(".")
     out = []
     for tok in re.split(r"[,\s]+", raw):
@@ -1449,13 +1514,14 @@ def _extract_mq(f: ProgramFacts, st: LogicalLine, literal_map: Optional[Dict[str
             queue = _mq_queue(od, literal_map)
             layout = args[5] if len(args) > 5 else None
             direction = "out" if call == "MQPUT" else "in"
-        f.mq.append((call, queue, direction, layout, st.start))
+        ln = st.line_at(m.start())                  # the CALL's own line: a sentence may hold several
+        f.mq.append((call, queue, direction, layout, ln))
         if direction and layout:
             # the BUFFER argument carries the message: MQPUT/MQPUT1 send it (mq_out), MQGET fills it (mq_in)
             op = _operands(layout)[:1]
             if op and op[0].name:
                 kind = "mq_out" if direction == "out" else "mq_in"
-                f.flows.append(_flow(st.start, "CALL-" + call, kind,
+                f.flows.append(_flow(ln, "CALL-" + call, kind,
                                      src=op[0] if kind == "mq_out" else None, dst=op[0] if kind == "mq_in" else None,
                                      note=f"queue {queue}" if queue else "(queue not resolvable)",
                                      guard=_guard_at(guards, m.start())))
@@ -1585,10 +1651,12 @@ CHARACTERS INITIAL ALPHANUMERIC NO KEY WHILE EXTEND RELEASE PREVIOUS DOWN UP
 """.split())
 
 _TOKEN = re.compile(r"'(?:[^']|'')*'|\"(?:[^\"]|\"\")*\"|[A-Z0-9][A-Z0-9\-]*(?:\([^)]*\))?", re.I)
-_VERBS = ("MOVE|COMPUTE|ADD|SUBTRACT|MULTIPLY|DIVIDE|STRING|UNSTRING|INITIALIZE|SET|"
-          "ACCEPT|READ|WRITE|REWRITE|RETURN|RELEASE|INSPECT|DISPLAY|CALL|PERFORM|IF|"
-          "EVALUATE|WHEN|ELSE|SEARCH|EXEC|GO|GOBACK|STOP|OPEN|CLOSE|DELETE|START|"
-          "CONTINUE|EXIT|END-[A-Z]+")
+# Every verb that starts a statement, and the scope terminators word for word (END-DATE is a data name, not a
+# verb - the synthetic reproduction F04). A verb missing here runs the fragment before it on: `MOVE A TO B` then
+# `SORT SD-FILE ... USING IN-FILE` in one sentence made SORT, SD-FILE and IN-FILE targets of the MOVE, and
+# `CANCEL WS-PGM` after it one more. SORT / MERGE / CANCEL / ALTER / ENTRY fragments name files, programs and
+# paragraphs: no field reference of their own, as when such a statement starts its sentence
+_VERBS = _STATEMENT_VERBS + "|" + _END[3:-1]
 _SPLIT = re.compile(r"'(?:[^']|'')*'|\"(?:[^\"]|\"\")*\"|" + B + "(" + _VERBS + ")" + E, re.I)
 
 _MOVE_TO = re.compile(r"^(?:CORR(?:ESPONDING)?\s+)?(.+?)\s+" + B + "TO" + E + r"\s+(.+)$", re.I | re.S)
@@ -1629,20 +1697,26 @@ def _idents(text: str) -> List[str]:
     # second reference.
     # (?<![\w-]): the IN of WS-Q-IN is part of the name, not a qualifier
     text = re.sub(r"(?<![\w-])(?:OF|IN)\s+[A-Z0-9][A-Z0-9\-]*", " ", text or "", flags=re.IGNORECASE)
+    function = False                      # the token before was the word FUNCTION
     for m in _TOKEN.finditer(text):
         t = m.group(0)
         if t[0] in ("'", '"'):
+            function = False
             continue
         base = t.split("(")[0].upper()
-        if base in _RESERVED or re.fullmatch(r"[+\-\d.]+", base):
-            continue
-        if not re.fullmatch(ID, base, re.I):
-            continue
-        out.append(base)
+        # FUNCTION INTEGER-OF-DATE(WS-DATE): the intrinsic function's name is not a data item - its
+        # arguments are (the synthetic reproduction F14); a nested FUNCTION inside the parentheses too
+        after_function, function = function, base == "FUNCTION"
+        if not after_function:
+            if base in _RESERVED or re.fullmatch(r"[+\-\d.]+", base):
+                continue
+            if not re.fullmatch(ID, base, re.I):
+                continue
+            out.append(base)
         if "(" in t:
-            for s in re.findall(r"[A-Z][A-Z0-9\-]*", t[t.index("(") + 1:], re.I):
-                if s.upper() not in _RESERVED:
-                    out.append(s.upper())
+            for s in re.finditer(r"(FUNCTION\s+)?([A-Z][A-Z0-9\-]*)", t[t.index("(") + 1:], re.I):
+                if not s.group(1) and s.group(2).upper() not in _RESERVED:
+                    out.append(s.group(2).upper())
     return out
 
 
@@ -2194,10 +2268,16 @@ def _extract_field_and_literal_refs(f: ProgramFacts, st: LogicalLine) -> List[Tu
                     for s in _operands(mvr.group(2))[:1]:
                         f.flows.append(_flow(ln, verb, "set", src=s, dst=d, guard=g))
 
-        elif verb in ("SEARCH", "START", "DELETE", "OPEN", "CLOSE"):
+        elif verb == "SEARCH":
             _refs(f, _idents(frag), "read", verb, ln)
-            if verb == "SEARCH":
-                stack.append(["eval", None, False])
+            stack.append(["eval", None, False])
+
+        elif verb in ("START", "DELETE"):
+            # START file KEY IS >= key / DELETE file RECORD: the file is not a data item (the synthetic
+            # reproduction F14 - `field IN-FILE` answered with references); the KEY field is read
+            _refs(f, _idents(frag)[1:], "read", verb, ln)
+
+        # OPEN / CLOSE name files only: no field reference (io_op records them)
 
         guards.append((off, guard()))
     return guards

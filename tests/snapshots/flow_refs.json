@@ -294,12 +294,6 @@
     "read",
     "CALL-USING",
     37
-   ],
-   [
-    "POLICY-MASTER",
-    "read",
-    "OPEN",
-    40
    ]
   ],
   "literal_refs": [

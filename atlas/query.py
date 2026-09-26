@@ -341,6 +341,16 @@ def unlinked_ok_clause(stale: Dict[int, Tuple[str, List[str]]]) -> str:
             "each copybook with what to do.\n")
 
 
+def call_target_cell(target: Optional[str], via_var: Optional[str], resolved: Sequence[str]) -> str:
+    """`program`'s Calls cell: the program called, or - for a CALL / LINK / XCTL / START that names a variable -
+    the variable with the targets it resolves to (`WS-NEXT-PGM -> BILONL02`). A variable holding one literal
+    resolves to a target of its own, and the cell printed that target alone: the variable a reader greps
+    for was not on the page (the synthetic estate's BILONL01, `EXEC CICS XCTL PROGRAM(WS-NEXT-PGM)`)."""
+    if via_var:
+        return f"{via_var} -> {', '.join(resolved) or target or 'UNRESOLVED'}"
+    return target or "UNRESOLVED"
+
+
 def unresolved_for(conn: sqlite3.Connection, member_ids: Sequence[int], limit: int = 40) -> str:
     if not member_ids:
         return ""
@@ -480,7 +490,7 @@ def cmd_program(conn: sqlite3.Connection, name: str) -> str:
         calls = conn.execute("SELECT * FROM call_edge WHERE program_id=? ORDER BY line", (pid,)).fetchall()
         out.append("\n### Calls\n")
         out.append(table(["kind", "target", "resolution", "using", "cite"],
-                         [(c["kind"], c["target"] or f"{c['via_var']} -> {', '.join(_jl(c['resolved'])) or 'UNRESOLVED'}",
+                         [(c["kind"], call_target_cell(c["target"], c["via_var"], _jl(c["resolved"])),
                            c["resolution"], ", ".join(_jl(c["using_args"]))[:50], cite(conn, pid, c["line"]))
                           for c in calls]))
 
@@ -1895,6 +1905,12 @@ UNRESOLVED_MEANING = {
     "scheduler_symbol": ("a dataset name holding a scheduler symbol (%%ODATE, #JI, &DATE) that is only filled in at run "
                          "time, so the real name is not known",
                          "read the scheduler's own definition of that symbol; the index keeps the name with <VAR> in it"),
+    "exec_no_period": ("an EXEC SQL / CICS / DLI block before the PROCEDURE DIVISION whose END-EXEC has no period "
+                       "after it: the compiler rejects the member as written, so the source in the estate is not the "
+                       "one that compiled; the index read it as if the period were there",
+                       "look at the member at the line the note names - a period lost in an edit, or a copy that "
+                       "never compiled: the facts after that line are right only if the period was all that was "
+                       "missing"),
     "no_program_id": ("a program with no PROGRAM-ID paragraph the parser could read - the member name stands in for it",
                       "check the member: a copybook or a card deck filed in a source library, or a PROGRAM-ID written "
                       "in a form the parser does not read (report the shape)"),
