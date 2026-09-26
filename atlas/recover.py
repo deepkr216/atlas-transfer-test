@@ -124,7 +124,10 @@ fetch for, the ones chosen among several, the rest), how many programs'
 listings name it, and whether the index already holds it (the `library`
 table, or a folder named after the dataset). A copybook the build has read
 as a recovered copy is no longer missing, but its library stays on the list,
-the copybook shown as a recovered copy, until the real member arrives. The
+the copybook shown as a recovered copy, until the real member arrives - also
+where a program expands its own system's recovered copy (or SHARED's) while
+only another system holds a real member: the library its listing names is
+the one to fetch, and the check of that choice says so (NOT HELD). The
 report tables it, datasets with copybooks to fetch for first, and
 work\fetch-list.txt holds the not-fetched ones one per line - datasets only,
 never a member name - to paste into the UI's Bulk add or give to zowe. Once

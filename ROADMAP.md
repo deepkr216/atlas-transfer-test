@@ -165,48 +165,70 @@ shipped alone and cost one such night; these still wait for the next one:
     in the program's own system it beat a real copy under SHARED ('same system'), in a folder that sorts
     first it beat one that sorts after ('first found') - and a recovered copy with a different text made the
     choice 'among several', an 'ambiguous_copybook' row for a stand-in; coverage warned until recover
-    removed it (LESSONS 168). Now `make_resolver` drops a member whose folder is `RECOVERED-COPYBOOKS`
+    removed it (LESSONS 168). Now `make_resolver` drops every member whose folder is `RECOVERED-COPYBOOKS`
     (`build.RECOVERED_FOLDER`, `build.is_recovered`) once a real member of the name sits in the program's
-    own system, in SHARED (or has no system), or in the system the copy was written for
-    (`build.recovered_gives_way`): the real copybook is expanded at the build it arrives in (item 21 parses
-    its copiers again), and the chain, the listing's pick and the 'N copies of X with different content'
-    count read the real members alone, so no 'ambiguous_copybook' row is written for a stand-in a real
-    member replaced. A real member that only another system holds is that system's copy, not the
-    program's: a GC program whose own copy is still the recovered one keeps it in the choice, the chain
-    takes it ('same system') and the row says '2 copies' - rather than expanding GC-TEST's layout with
-    nothing said anywhere, which the first delivery did (LESSONS 209). Among recovered copies alone the
-    chain decides as before (a program takes its own system's). On an index this toolkit built, coverage's
-    'still expand a recovered copybook' (`query._recovered_shadowing`, the same test made of the index)
-    finds nothing, and `atlas.recover` removes a recovered copy only once no program copying its name would
-    still expand it (`recover.replaced`: a real member in SHARED or in the system it was written for, or one
-    in the own system of every program copying it), marking only the programs whose COPY row resolves to
-    it (`recover.expanding_programs`) - none there: it says 'no program expands them, so none is marked'
-    and 'next: run your usual build command - it drops the removed copies from the index'. A program that
-    copies a copybook of its own name never expands itself, so its own member is not the real member its
-    recovered copy waits for (`recover.real_copies`, and the warning's test): the copy stays - before,
-    recover removed it, the build said NOT FOUND and the next run wrote it again, every run, and coverage
-    warned on a new index. On an index built before the item both still work: the warning names the
-    copybooks a real member replaced, and the programs that expanded such a copy are marked (before, every
-    program copying the name was, and said to have expanded it). A copy written with `--out` into a folder
-    of another name is not known to the build as recovered. A dry run's report says 'would be removed'
-    from its first lines.
+    own system or in SHARED (or has no system) (`build.recovered_gives_way`): the real copybook is expanded
+    at the build it arrives in (item 21 parses its copiers again), and the chain, the listing's pick and the
+    'N copies of X with different content' count read the real members alone, so no 'ambiguous_copybook'
+    row is written for a stand-in a real member replaced. A real member that only another system holds is
+    that system's copy, not the program's: one stand-in stays in the choice beside it - the program's own
+    system's recovered copy, else SHARED's - and the chain takes it before another system's real member,
+    whatever order the folders sort in ('same system', then 'the estate's recovered copy - no real one in
+    the program's system or SHARED', `build.ESTATE_COPY_HOW`: COPY..OF > same system > the estate's
+    recovered copy > authoritative > same folder > first); the row says '2 copies'. Another system's
+    recovered copy gives way to any real member. The first delivery expanded GC-TEST's layout for a GC
+    program with nothing said (LESSONS 209); the second left the pick between SHARED's copy and POLICY's
+    real member to where the folders sort, 'FIRST FOUND' either way (LESSONS 210). Among recovered copies
+    alone the chain decides as before (a program takes its own system's). A program is never a copybook: a
+    member of kind cobol whose own lines hold a PROGRAM-ID or a DIVISION header (`build.holds_program`, the
+    test the build makes before it writes a program row) is a candidate only when no other member of the
+    name is - a callee whose parameter copybook has its own name (`COPY QACALC20` in QACALC20's LINKAGE)
+    was taken over the recovered copy, or by 'same system' over the real copybook, and the whole callee was
+    expanded into its caller, 'skipped - recursive' (LESSONS 210). On an index this toolkit built,
+    coverage's 'still expand a recovered copybook' (`query._recovered_shadowing`, the same test made of the
+    index) finds nothing, and `atlas.recover` removes a recovered copy once no program copying its name
+    would still expand it (`recover.replaced`: a real member in SHARED or in the system it was written for;
+    a system's own copy once no program of that system copies the name; SHARED's once every program
+    copying the name has a real member or a recovered copy of its own system; a program whose every COPY of
+    the name names a library holding a real member is never counted - `recover.copier_homes`), marking only
+    the programs whose COPY row resolves to it (`recover.expanding_programs`) - none there: it says 'no
+    program expands them, so none is marked' and 'next: run your usual build command - it drops the removed
+    copies from the index'. A copy kept for a program that follows its current listing to a held copy is
+    not expanded meanwhile; it goes once the rule above lets it. A program is never counted as the real
+    member of its name (`recover.real_copies`, and the warning's test: kind cobol, any status but
+    'skipped'): a program copying its own name keeps its recovered copy - before, recover removed it, the
+    build said NOT FOUND and the next run wrote it again, every run - and a callee's source never replaces
+    its callers' copy. Where the copy used is a recovered one and the program's listing names a library the
+    estate does not hold, the check of choices says NOT HELD with the library to fetch (not UNKNOWN with
+    advice about a `library` row), the fetch list names the copybook to fetch for, and coverage's
+    'ambiguous_copybook (a recovered copy used)' row says to fetch the program's own library and not to
+    remove the copy by hand. On an index built before the item both still work: the warning names the
+    copybooks the build would no longer expand for their programs, and the programs that expanded such a
+    copy are marked (before, every program copying the name was, and said to have expanded it). A copy
+    written with `--out` into a folder of another name is not known to the build as recovered. A dry run's
+    report says 'would be removed' from its first lines.
     tests/test_recovered_rank_last.py (TheResolverRanksARecoveredCopyLast, AnIndexBuiltBeforeTheItem,
     ExpandingPrograms, ARecoveredCopyStandsForItsOwnSystem, AnIndexBuiltBeforeTheItemWithAnotherSystemsRealCopy,
-    RecoveredGivesWay, RealCopiesAndCopiers), tests/test_recover.py EndToEnd
+    TheEstatesCopyBesideASystemSortingBeforeShared, TheEstatesCopyBesideASystemSortingAfterShared,
+    ACalleeOfTheNameWithTheCopyInTheCallersSystem, ACalleeOfTheNameWithTheCopyUnderShared,
+    AStandInTheListingNames, RecoveredGivesWay, RealCopiesAndCopiers), tests/test_recover.py EndToEnd
     (test_the_real_member_beats_a_recovered_copy_the_moment_it_arrives,
     test_coverage_warns_while_a_recovered_copy_shadows_the_real_member_on_an_older_index,
     test_missing_copybooks_are_recovered_and_the_programs_become_whole), tests/test_arrived_copybooks.py
-    RemovedCopiesAreNotNothingToReport, LESSONS 207, 209.
+    RemovedCopiesAreNotNothingToReport, tests/test_copy_sources.py FetchListFromTheListings, LESSONS 207,
+    209, 210.
 12. **Delivered in the batch - the trimmed-name lookups use an index.** A file named `PLAN .docx` is member
     `PLAN `, and nobody types the space: the gate (for every cited name no document carries), `doc`,
     `images` and `diff` look a name up again with `UPPER(TRIM(name))` (LESSONS 156, 158), and QUERY_INDEXES
     held an index on `UPPER(name)` only, so each such lookup scanned the member table. Now
     `ix_q_member_utname` on `UPPER(TRIM(name))` sits beside `ix_q_member_uname`, and every one of those
     lookups searches it: their query plans are pinned as the commands run them, with the values bound, for
-    a name with an extension too. `doc` writes `+kind` when the index is there, so the planner, which has
-    no statistics, does not take the kind index (every document) over the name's - the first delivery's test
-    read the plan of the traced SQL, values written in, which SQLite folds to one equality for `doc PLAN`,
-    while `doc` itself read the kind index (LESSONS 209). `ensure_query_indexes` checked that a table has
+    a name with an extension too. `doc` writes `+kind` in both its name statements when the name's index is
+    there - the trimmed one when `ix_q_member_utname` is, the exact one when `ix_q_member_uname` is - so the
+    planner, which has no statistics, does not take the kind index (every document) over the name's: the
+    first delivery's test read the plan of the traced SQL, values written in, which SQLite folds to one
+    equality for `doc PLAN`, while `doc` itself read the kind index (LESSONS 209), and its exact-name
+    statement still did after the second (LESSONS 210). `ensure_query_indexes` checked that a table has
     the columns an expression reads by taking `UPPER(` off, which read `TRIM(name` for the new expression
     and would have skipped it without a word; `build.index_columns` reads every name that is not a
     function's (in any case, literals and SQL words left out), and an entry skipped on a table that exists
@@ -214,8 +236,8 @@ shipped alone and cost one such night; these still wait for the next one:
     and `images` by a scan, `doc` and a `diff` of one kind by the kind index - and its next build adds the
     index, once. The OCR
     pass's `--member` lookup reads the kind index - once per run, over the documents only.
-    tests/test_query_indexes.py (IndexColumns, TheLookupsUseTheIndex, AnIndexBuiltBeforeTheItem), LESSONS 208,
-    209.
+    tests/test_query_indexes.py (IndexColumns, TheLookupsUseTheIndex, DocsExactNameLookup,
+    AnIndexBuiltBeforeTheItem), LESSONS 208, 209, 210.
 13. Parser reach (from his coverage tables): dynamic CALL targets across
     members, `sql_cursor` declared in another member, INTRDR-submitted JCL
     through a card member, the MFS macros in his estate.

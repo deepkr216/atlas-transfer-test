@@ -151,15 +151,19 @@ everything else:
   CLAIMS copy, never POLICY's: candidates are ranked `COPY … OF lib` › same
   department in its **declared order** › same department › authoritative ›
   same folder › first found — and the choice is written into the
-  `ambiguous_copybook` note either way. A copy `atlas.recover` wrote under a
+  `ambiguous_copybook` note either way. A program is never a copybook: a
+  member holding a PROGRAM-ID or a DIVISION header is a candidate only when
+  no other member of the name is (a callee whose parameter copybook has its
+  own name is not that copybook). A copy `atlas.recover` wrote under a
   `RECOVERED-COPYBOOKS` folder stands in for its system's missing member
   (SHARED's for the estate): it gives way to a real member of its name in
-  the program's own system, in SHARED, or in the system it was written for,
-  so the real copybook is expanded at the build it arrives in, and a
-  stand-in it replaced is never counted as a second library in that note.
-  A real member that only another system holds does not replace it: the
-  program keeps its own system's recovered copy and the note says it had
-  two to choose from. Where `atlas.recover` has stored the
+  the program's own system or in SHARED, so the real copybook is expanded
+  at the build it arrives in, and a stand-in it replaced is never counted
+  as a second library in that note. A real member that only another system
+  holds does not replace it: the program takes its own system's recovered
+  copy, else SHARED's, before that system's copy - whatever order the
+  folders sort in - and the note says it had two to choose from; another
+  system's recovered copy gives way to it. Where `atlas.recover` has stored the
   program's compiler listing's copybook-source table (`listing_copy_source`),
   the build reads it too, and a **current** listing (its source is the
   program as indexed) changes the chain's pick only where the copy it names
@@ -605,12 +609,20 @@ built, those copybooks resolve - the build expands a real member over a
 recovered copy at once - and the next recover run removes the recovered
 copies no program copying the name would still expand (a system's own
 recovered copy stays while a program of that system has no real member
-of its own, even when another system's has arrived; a program copying a
-copybook of its own name keeps its recovered copy). It marks for the next
-build only a program whose COPY row still resolves to a removed copy (on
-an index built before the batch, a build could keep one after the real
-member arrived); otherwise it says 'no program expands them, so none is
-marked' and that the next build drops them from the index.
+of its own, even when another system's has arrived; SHARED's stays while
+a program copying the name has neither a real member nor a recovered copy
+of its own system; a program is never the real member, so one copying a
+copybook of its own name keeps its recovered copy; a program whose
+`COPY ... OF` names a library holding a real member is not counted). It
+marks for the next build only a program whose COPY row still resolves to
+a removed copy (on an index built before the batch, a build could keep
+one after the real member arrived); otherwise it says 'no program expands
+them, so none is marked' and that the next build drops them from the
+index. A copybook a program expands from its recovered copy while only
+another system holds a real member is on the fetch list too, under the
+library the program's listing names; the check of that choice says the
+library is not held and is the one to fetch, and `coverage` says not to
+remove the copy by hand.
 
 **Pictures are read, not just counted.** `OCR images` (UI) or
 `python -m atlas.ocr --db atlas.db --out out/images` pulls every image out of
