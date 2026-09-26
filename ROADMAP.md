@@ -727,6 +727,40 @@ shipped alone and cost one such night; these still wait for the next one:
    IbmSuppliedCopybooks, TheStandInsFindNothingToDo, TheShopKeepsItsOwnCopy, FiledAsAnotherKind,
    TheManifestAddsNames, AnIndexBuiltBeforeTheItem, ANestedCopybookChanges, TheReproductions, TheDocsSayIt);
    tests/test_arrived_copybooks.py (the three nested-copybook cases: a copybook's own row names the member).
+   **The verifier's first round (LESSONS 216, 218), before he ran it.** `layout` under a copybook's table now says
+   what the offsets count for every COPY in it: the precompiler's `EXEC SQL INCLUDE SQLCA` (one line or three) is
+   'supplied by the DB2 precompiler ... a record of its own, so it moves no offset above' - it read as an older
+   index's row whose bytes a program's view counts; a COPY found whose own nested COPY was not ('(in COPY B) L2: COPY
+   C NOT FOUND ...', a recursion A -> B -> A, an IBM-supplied one) says 'counted ... all but those of the COPY in it
+   said below' with the build's warning under it - it said only 'counted'; the warning of an OS/VS `01 X` / `COPY
+   Y.` is found by name when its line is the COPY's and the row's the 01's. On an index built before the item
+   (`query.built_before_item_27`: the last build recorded no system_includes) an IBM-supplied nested COPY is in no
+   view, a name no member carries is in no program's view either, a copybook copying itself is skipped in every view,
+   and SQLCA with a SQLCA member in the index is said both ways until the next build tells them apart. Coverage's
+   IBM-supplied table: 'no program is parsed only in part for one' only when none is (the index he has counts them),
+   DFHENTER named only beside DFHAID, the libraries of the products listed, and a name of the manifest's
+   `system_includes` never headed 'IBM-supplied'. manifest.example.json and F16's README list exactly the names the
+   build knows and say that any other MQ copy file goes in `system_includes`. `copybook` says the manifest names the
+   copybook, not a library; `field DFHENTER` says the programs referencing it copy DFHAID, IBM-supplied and not in the
+   estate, instead of 'check spelling'. Found on the way (LESSONS 218, expand.py): OS/VS `01 X` / `COPY Y.` on two
+   lines with nothing expanded for Y left `01 X` open to join the next entry (`01 X 01 NEXT.` - NEXT's items under X,
+   NEXT lost), and `FD F` / `COPY Y.` lost the file's record in both forms: an 01 / 77 now goes as in the one-line
+   form, an FD / SD stays, closed. tests/test_copybook_expansion.py (NestedCopyLinesOnANewIndex,
+   NestedCopyLinesOnAnOlderIndex, TheShopKeepsSqlca, TheManifestAndIbmNames, OsvsCopyNotExpanded, and the coverage
+   asserts added to IbmSuppliedCopybooks, TheShopKeepsItsOwnCopy, TheManifestAddsNames, AnIndexBuiltBeforeTheItem).
+28. **Delivered in the batch - the words EXEC SQL / CICS / DLI inside a literal are text.** Found by the verifier in
+   passing on item 27; on main since 3a27440 (LESSONS 217). `01 WS-ERR PIC X(30) VALUE 'EXEC CICS LINK FAILED'.`
+   opened an EXEC block in `reader.cobol_statements` that no period closed: every later data item and paragraph was
+   lost while the member read `parse: ok` ('0 paragraphs'). `VALUE 'EXEC SQL'` also set `read_cobol_lines`' SQL
+   comment state, so a later literal holding ' --' was cut there and ate the program; and in the PROCEDURE DIVISION
+   `MOVE 'EXEC SQL FAILED' TO WS-MSG` before a real `EXEC SQL ROLLBACK END-EXEC` in one sentence made one block of
+   both (the SQL statement "FAILED' TO WS-MSG ...", a CICS RETURN recorded as a LINK, the MOVE's write and flow
+   lost), and `DISPLAY 'EXEC SQL INCLUDE X'` a copy row. Error-message literals like these are common in CICS and DB2
+   programs. The reader's EXEC scan runs over the text with its literals blanked (`reader.blank_literals`), the SQL
+   comment state reads the line's own words (`reader.code_outside_literals`), and every EXEC pattern of cobol.py is
+   searched outside literals and matched back over the text as written (`cobol.exec_blocks`, `cobol.blank_exec`: a
+   block's own literals are kept). A program holding such a literal gets its paragraphs, items and statements back
+   on the re-parse night. tests/test_exec_in_literal.py (TheStatements, TheProgramFacts, InTheIndex, TheDocsSayIt).
 
 ### flow: known limits (open after review)
 

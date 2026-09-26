@@ -186,6 +186,33 @@ _SQL_CALL = re.compile(r"^\s*CALL\s+(?:([A-Z0-9_$#@]+)\.)?([A-Z0-9_$#@]+)\s*(?:\
 _SQL_DECLARE_TABLE = re.compile(r"\bDECLARE\s+([A-Z0-9_$#@]+(?:\.[A-Z0-9_$#@]+)?)\s+TABLE\s*\((.*)\)\s*$",
                                 re.IGNORECASE | re.DOTALL)
 _EXEC_ANY = re.compile(r"\bEXEC\s+(CICS|DLI|SQL)\b(.*?)\bEND-EXEC\b", re.IGNORECASE | re.DOTALL)
+_EXEC_WORD = re.compile(r"EXEC", re.IGNORECASE)
+
+
+def exec_blocks(rx: "re.Pattern[str]", text: str) -> List["re.Match[str]"]:
+    """The EXEC ... END-EXEC blocks `rx` finds in `text` whose words stand
+    outside a literal, each a match over `text` itself (its groups hold the
+    block's own literals). Searched on the raw text, `MOVE 'EXEC SQL FAILED'
+    TO WS-MSG` before `EXEC SQL ROLLBACK END-EXEC` in one sentence was one
+    block from the literal on: the SQL statement read "FAILED' TO WS-MSG
+    ...", a CICS RETURN became a LINK, and the MOVE was blanked with the
+    block - its write and its flow lost (LESSONS 217)."""
+    if not _EXEC_WORD.search(text):
+        return []
+    masked = _LIT_MASK.sub(lambda mm: " " * len(mm.group(0)), text)
+    # the same span over the text as written: its EXEC and END-EXEC are outside literals, so they are the same words
+    return [rx.fullmatch(text, m.start(), m.end()) or m for m in rx.finditer(masked)]
+
+
+def blank_exec(text: str) -> str:
+    """`text` with every EXEC SQL / CICS / DLI block outside a literal
+    blanked, same length: the COBOL around it keeps its offsets and lines."""
+    out, last = [], 0
+    for m in exec_blocks(_EXEC_ANY, text):
+        out.append(text[last:m.start()])
+        out.append(" " * (m.end() - m.start()))
+        last = m.end()
+    return "".join(out) + text[last:] if out else text
 _CICS_OPT = re.compile(r"\b([A-Z][A-Z0-9]*)\s*\(([^()]*)\)", re.IGNORECASE)          # value stripped by the callers
 # SET(ADDRESS OF x): locate mode - x is the area the command fills. ADDRESS
 # is reserved and OF would eat x as a qualifier, so _operands saw nothing.
@@ -623,7 +650,7 @@ def _extract_calls(f: ProgramFacts, st: LogicalLine,
     sorted_cands: Dict[str, List[str]] = {}
     # EXEC SQL/CICS/DLI text is not COBOL: `EXEC SQL CALL PROC(:X)` is a
     # stored-procedure call (recorded by _extract_sql), not a dynamic CALL.
-    body = _EXEC_ANY.sub(lambda m: " " * len(m.group(0)), st.text)
+    body = blank_exec(st.text)
 
     # One sentence may hold several CALLs (IF ... CALL 'A' ... ELSE CALL WS-B
     # ... END-IF): every fragment is its own call with its own USING list.
@@ -781,11 +808,12 @@ _LIT_MASK = re.compile(r"'(?:[^']|'')*'|\"(?:[^\"]|\"\")*\"")
 
 
 def _extract_copy(f: ProgramFacts, st: LogicalLine) -> None:
-    for m in _SQL_INCLUDE.finditer(st.text):
-        f.copies.append((m.group(1).upper(), None, None, st.start))
     # literals blanked, same length: DISPLAY 'COPY FAILED' is text, not a COPY - but the name itself may be a
-    # literal (COPY 'NAME'), so the statement is matched on the text and checked against the mask
+    # literal (COPY 'NAME'), so the statement is matched on the text and checked against the mask. An INCLUDE's
+    # name is never a literal: `DISPLAY 'EXEC SQL INCLUDE X'` is text (LESSONS 217)
     masked = _LIT_MASK.sub(lambda mm: " " * len(mm.group(0)), st.text)
+    for m in _SQL_INCLUDE.finditer(masked):
+        f.copies.append((m.group(1).upper(), None, None, st.start))
     pos = 0
     while True:
         m = _COPY.search(st.text, pos)
@@ -894,7 +922,7 @@ def _record_of(f: ProgramFacts, name: str) -> Optional[FileDeclFact]:
 
 
 def _extract_file_ops(f: ProgramFacts, st: LogicalLine) -> None:
-    body = _EXEC_ANY.sub(lambda m: " " * len(m.group(0)), st.text)
+    body = blank_exec(st.text)
     for m in _OPEN_CLOSE.finditer(body):
         verb = m.group(1).upper()
         mode = None
@@ -1155,7 +1183,7 @@ def _parse_declared_columns(body: str) -> List[Tuple[str, str]]:
 
 
 def _extract_sql(f: ProgramFacts, st: LogicalLine) -> None:
-    for m in _EXEC_SQL.finditer(st.text):
+    for m in exec_blocks(_EXEC_SQL, st.text):
         # each statement at its own EXEC SQL line, its host variables with it: several EXEC SQL blocks make
         # one sentence in the PROCEDURE DIVISION, and every one of them was cited at the sentence's first
         # line (the synthetic reproduction F02)
@@ -1223,7 +1251,7 @@ def _cics_value(arg: str, literal_map: Dict[str, Set[str]]) -> Tuple[Optional[st
 def _extract_cics(f: ProgramFacts, st: LogicalLine,
                   literal_map: Dict[str, Set[str]],
                   guards: Optional[List[Tuple[int, Optional[str]]]] = None) -> None:
-    for m in _EXEC_CICS.finditer(st.text):
+    for m in exec_blocks(_EXEC_CICS, st.text):
         inner = " ".join(m.group(1).split())
         ln = st.line_at(m.start())
         guard = _guard_at(guards, m.start())
@@ -1367,7 +1395,7 @@ def _extract_dli(f: ProgramFacts, st: LogicalLine, literal_map: Optional[Dict[st
     # Every CALL 'CBLTDLI' of the sentence, each at its own line with its own USING list: an IMS program
     # writes GU, then CHKP, then GN without a period between them, and only the first was kept - cited at
     # the sentence's first line, the rest of the sentence read as its SSAs (the synthetic reproduction F01)
-    body = _EXEC_ANY.sub(lambda mm: " " * len(mm.group(0)), st.text)
+    body = blank_exec(st.text)
     for verb, frag, off in _split_verbs(body):
         if verb != "CALL":
             continue
@@ -1378,7 +1406,7 @@ def _extract_dli(f: ProgramFacts, st: LogicalLine, literal_map: Optional[Dict[st
             _record_dli(f, st, m.group(2).upper(), _split_call_args(raw[:ms.start()] if ms else raw), literal_map,
                         _guard_at(guards, off), st.line_at(off))
 
-    for m2 in _EXEC_DLI.finditer(st.text):
+    for m2 in exec_blocks(_EXEC_DLI, st.text):
         # EXEC DLI GHU USING PCB(2) SEGMENT(POLICY) INTO(WS-AREA) WHERE(...)
         inner = " ".join(m2.group(1).split())
         verb = _CICS_VERB.match(inner)
@@ -1568,7 +1596,7 @@ def _extract_entry(f: ProgramFacts, st: LogicalLine) -> None:
 def _extract_performs(f: ProgramFacts, st: LogicalLine, here: str) -> None:
     if st.area_a and _PARAGRAPH.match(st.text.strip()):
         return
-    body = _EXEC_ANY.sub(lambda m: " " * len(m.group(0)), st.text)
+    body = blank_exec(st.text)
     for m in _PERFORM.finditer(body):
         to = m.group(1).upper()
         thru = m.group(3).upper() if m.group(3) else None
@@ -1637,7 +1665,7 @@ def _leaves(sentence: str) -> bool:
     hid dead code (LESSONS 213). NEXT SENTENCE and EXIT PARAGRAPH / SECTION
     may skip what follows them. A GO TO in both branches of an IF ... ELSE is
     still read as one that may not run."""
-    body = _EXEC_ANY.sub(lambda m: " " * len(m.group(0)), sentence.strip().rstrip("."))
+    body = blank_exec(sentence.strip().rstrip("."))
     body = _LITERAL.sub(lambda m: " " * len(m.group(0)), body)
     if not _LEAVING_WORD.search(body):
         return False
@@ -2137,9 +2165,9 @@ def _extract_field_and_literal_refs(f: ProgramFacts, st: LogicalLine) -> List[Tu
     # COBOL READ, WHERE(POLNO = K) is not a WHEN. Their host fields are taken
     # by _exec_refs; the span is blanked (same length) so line attribution
     # of everything else is unchanged.
-    for m in _EXEC_ANY.finditer(body):
+    for m in exec_blocks(_EXEC_ANY, body):
         _exec_refs(f, m.group(1).upper(), " ".join(m.group(2).split()), st.line_at(m.start()))
-    body = _EXEC_ANY.sub(lambda m: " " * len(m.group(0)), body)
+    body = blank_exec(body)
     # the flow rows need the operands as written (`WS-Q OF REC-A` is not `WS-Q
     # OF REC-B`): this text is kept, the refs go on reading the blanked one
     body_raw = body

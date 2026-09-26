@@ -22,9 +22,9 @@ tagged name is a data name now, in the copybook parser and in the expander's ali
 
 F16 - `COPY DFHAID` (CICS supplies it from SDFHCOB, which no shop keeps among its copybooks) made every CICS program
 `partial` and coverage sent him to fetch a library the estate never holds. The copybooks IBM supplies (CICS DFHAID,
-DFHBMSCA, DFHEIBLK, DFHEIVAR, DFHMSRCA; MQ CMQV, CMQXV and the CMQ*V / CMQ*L structures), and the names the
-manifest's `system_includes` adds, are 'IBM-supplied, not in the estate' when no member carries the name: no gap, no
-fetch, their own table in coverage. A shop that keeps one has it expanded like any copybook.
+DFHBMSCA, DFHEIBLK, DFHEIVAR, DFHMSRCA; MQ CMQV, CMQXV, CMQODV/L, CMQMDV/L, CMQGMOV/L, CMQPMOV/L), and the names the
+manifest's `system_includes` adds, are 'not in the estate' when no member carries the name: no gap, no fetch, their
+own table in coverage. A shop that keeps one has it expanded like any copybook.
 
 Found while writing F07 (LESSONS 215): `OCCURS 1 TO 10 DEPENDING ON WS-CNT` without TIMES was read as a fixed table - the
 clause after the number was never tried.
@@ -598,8 +598,11 @@ class IbmSuppliedCopybooks(_Built):
         self.assertIn("| DFHAID | 0 | 1 | CICS (SDFHCOB) |", ibm)
         self.assertIn("| DFHBMSCA | 0 | 1 | CICS (SDFHCOB) |", ibm)
         self.assertIn("| CMQV | 0 | 1 | MQ (SCSQCOBC) |", ibm)
-        self.assertIn("nothing is to fetch, and no program is parsed only in part for one", ibm)
+        self.assertIn("> The compile reads these from the product's own library (CICS: SDFHCOB; MQ: SCSQCOBC), which a "
+                      "shop does not keep among its own copybooks: nothing is to fetch, and no program is parsed only in "
+                      "part for one. Their items (DFHAID's DFHENTER, for one) are not in the index", ibm)
         self.assertNotIn("still say", ibm)
+        self.assertNotIn("system_includes", ibm, "no name of the manifest's in the table")
         part = cov.split("### Members parsed only in part")[1].split("\n### ")[0]
         self.assertNotIn("CICSPGM", part)
         self.assertNotIn("MQPGM", part)
@@ -685,8 +688,12 @@ class TheShopKeepsItsOwnCopy(_Built):
         ibm = cov.split("### IBM-supplied copybooks, not in the estate")[1].split("\n### ")[0]
         self.assertIn("| DFHBMSCA | 0 | 1 | CICS (SDFHCOB) |", ibm)
         self.assertNotIn("DFHAID", ibm)
+        self.assertNotIn("DFHENTER", ibm, "the shop's DFHAID is in the index, and `field DFHENTER` finds its item")
+        self.assertIn("(CICS: SDFHCOB), which a shop does not keep among its own copybooks", ibm)
+        self.assertIn("Their items are not in the index, so `field` finds none of them", ibm)
         page = self.page(query.cmd_program, "CICSPGM")
         self.assertIn("| DFHAID | DFHAID |", page)
+        self.assertIn("| DFHAID | copybook |", self.page(query.cmd_field, "DFHENTER"))
 
 
 class FiledAsAnotherKind(_Built):
@@ -736,9 +743,19 @@ class TheManifestAddsNames(_Built):
             conn.close()
         cov = self.page(query.cmd_coverage)
         self.assertIn("| VNDRBOOK | 0 | 1 | the manifest's system_includes |", cov)
+        # a table of the manifest's names only is not headed 'IBM-supplied', and its note names no IBM library
+        self.assertNotIn("### IBM-supplied", cov)
+        mine = cov.split("### Copybooks the manifest's `system_includes` names, not in the estate\n")[1].split("\n### ")[0]
+        self.assertIn("| VNDRBOOK | 0 | 1 | the manifest's system_includes |", mine)
+        self.assertIn("(a name the manifest's `system_includes` adds: the product library the shop's compile names)", mine)
+        self.assertNotIn("SDFHCOB", mine)
         page = self.page(query.cmd_program, "VNDPGM")
+        # the manifest names the copybook, not a library
         self.assertIn("| VNDRBOOK | **supplied by a product library (the manifest's system_includes), not in the estate** "
-                      "- `COPY VNDRBOOK` is read by the compile from a product library the manifest names", page)
+                      "- `COPY VNDRBOOK` is read by the compile from a product's own library (the manifest's "
+                      "`system_includes` names the copybook), not from the shop's copybook libraries", page)
+        self.assertNotIn("a product library the manifest names", page)
+        self.assertNotIn("a product library the manifest names", self.page(query.cmd_copybook, "VNDRBOOK"))
 
     def test_the_loader(self):
         mem = sqlite3.connect(":memory:")
@@ -815,6 +832,9 @@ class AnIndexBuiltBeforeTheItem(_Built):
         self.assertIn("> 2 programs copying them still say NOT FOUND for one and are in 'Members parsed only in part' "
                       "above: the build that made this index counted it as not found and marked them partial for it; the "
                       "next build parses every program again (the toolkit changed) and does not.", ibm)
+        # the note above the table does not say the opposite of the table (LESSONS 216)
+        self.assertIn("which a shop does not keep among its own copybooks: nothing is to fetch. Their items", ibm)
+        self.assertNotIn("no program is parsed only in part for one", ibm)
         page = self.page(query.cmd_program, "CICSPGM")
         self.assertIn("parse: partial", page)
         self.assertIn("its items are not in the index; the build that made this index counted it as not found and marked "
@@ -905,6 +925,284 @@ class ANestedCopybookChanges(unittest.TestCase):
 
 
 # ===========================================================================
+# the verifier's round on item 27 (LESSONS 216, 218)
+# ===========================================================================
+
+# a data copybook holding the precompiler's SQLCA between two records, on one line and over three
+SQLONE = ("       01  SQO-COMMON.\n"
+          "           05  SQO-A              PIC X(04).\n"
+          "           EXEC SQL INCLUDE SQLCA END-EXEC.\n"
+          "       01  SQO-TAIL.\n"
+          "           05  SQO-T              PIC X(02).\n")
+SQLTHR = ("       01  SQT-COMMON.\n"
+          "           05  SQT-A              PIC X(04).\n"
+          "           EXEC SQL\n"
+          "               INCLUDE SQLCA\n"
+          "           END-EXEC.\n"
+          "       01  SQT-TAIL.\n"
+          "           05  SQT-T              PIC X(02).\n")
+# a COPY not found two levels down: DEEPTOP copies DEEPMID, which copies DEEPNONE (not in the estate)
+DEEPTOP = ("       05  DPT-A                  PIC X(02).\n"
+           "           COPY DEEPMID.\n"
+           "       05  DPT-B                  PIC X(02).\n")
+DEEPMID = ("       05  DPM-A                  PIC X(03).\n"
+           "           COPY DEEPNONE.\n"
+           "       05  DPM-B                  PIC X(02).\n")
+# A copies B, B copies A
+CYCONE = ("       05  CY1-A                  PIC X(02).\n"
+          "           COPY CYCTWO.\n"
+          "       05  CY1-B                  PIC X(02).\n")
+CYCTWO = ("       05  CY2-A                  PIC X(02).\n"
+          "           COPY CYCONE.\n"
+          "       05  CY2-B                  PIC X(02).\n")
+# copies NSTIBM, which copies the IBM-supplied DFHBMSCA
+IBMTOP = ("       05  IBT-A                  PIC X(01).\n"
+          "           COPY NSTIBM.\n"
+          "       05  IBT-B                  PIC X(01).\n")
+# OS/VS `01 X` / `COPY Y.` on two lines, Y not in the estate
+OSVGAP = ("      * TWO RECORDS\n"
+          "       01  OSG-REC\n"
+          "           COPY OSGMISS.\n"
+          "       01  OSG-TAIL.\n"
+          "           05  OSG-T    PIC X(03).\n")
+# a program referencing DFHENTER without copying DFHAID (a name the index cannot place)
+ENTPGM = program("ENTPGM", ["01  WS-KEY           PIC X."], ["0000-MAIN.", "    IF WS-KEY = DFHENTER",
+                                                                "        DISPLAY 'ENTER'", "    END-IF", "    GOBACK."])
+ROUND = (("GC/PROD.GC.COPYLIB/SQLONE.cpy", SQLONE), ("GC/PROD.GC.COPYLIB/SQLTHR.cpy", SQLTHR),
+         ("GC/PROD.GC.COPYLIB/DEEPTOP.cpy", DEEPTOP), ("GC/PROD.GC.COPYLIB/DEEPMID.cpy", DEEPMID),
+         ("GC/PROD.GC.COPYLIB/CYCONE.cpy", CYCONE), ("GC/PROD.GC.COPYLIB/CYCTWO.cpy", CYCTWO),
+         ("GC/PROD.GC.COPYLIB/IBMTOP.cpy", IBMTOP), ("GC/PROD.GC.COPYLIB/NSTIBM.cpy", NSTIBM),
+         ("GC/PROD.GC.COPYLIB/NSTGAP.cpy", NSTGAP), ("GC/PROD.GC.COPYLIB/NSTSELF.cpy", NSTSELF),
+         ("GC/PROD.GC.COPYLIB/OSVGAP.cpy", OSVGAP),
+         ("GC/PROD.GC.SRC/CICSPGM.cbl", CICSPGM), ("GC/PROD.GC.SRC/MQPGM.cbl", MQPGM),
+         ("GC/PROD.GC.SRC/ENTPGM.cbl", ENTPGM))
+PRECOMPILED_LINE = ("- At line 3: **supplied by the DB2 precompiler** - `EXEC SQL INCLUDE SQLCA` is written into the program "
+                    "by the precompiler, not copied from a library: no member is expanded for it and none is missing. The "
+                    "precompiler writes it as a record of its own (`01 SQLCA`), so it moves no offset above\n")
+NOT_HERE = "its bytes are not in this layout: an item after it in the same record sits further on by its length"
+
+
+class NestedCopyLinesOnANewIndex(_Built):
+    """`layout COPYBOOK` on an index built by the batch says of each COPY in the copybook what the offsets count - the
+    precompiler's SQLCA, a COPY not found or skipped two levels down, an OS/VS COPY on two lines (LESSONS 216)."""
+    files = ROUND
+
+    def test_an_include_of_sqlca_in_a_copybook(self):
+        for book in ("SQLONE", "SQLTHR"):
+            self.assertEqual(self.copy_row(book, "SQLCA"), [(None,)], book)
+            self.assertEqual(self.warnings(book), [], book)
+            page = self.page(query.cmd_layout, book)
+            self.assertIn(PRECOMPILED_LINE, page, book)
+            self.assertNotIn("NOT counted", page, book)
+            self.assertNotIn("An index built before", page, book)
+            self.assertNotIn("which counts it", page, book)
+        self.assertEqual([r[:3] for r in self.rows("SQLTHR")], [("SQT-COMMON", 1, 0), ("SQT-A", 5, 0),
+                                                                  ("SQT-TAIL", 1, 0), ("SQT-T", 5, 0)])
+
+    def test_a_copy_not_found_two_levels_down(self):
+        self.assertEqual(self.rows("DEEPTOP"), [("DPT-A", 5, 0, 2, 0, 1), ("DPT-B", 5, 7, 2, 0, 3)])
+        warning = f"(in COPY DEEPMID) L2: COPY DEEPNONE NOT FOUND - {NOT_HERE}"
+        self.assertEqual(self.warnings("DEEPTOP"), [(warning, None)])
+        page = self.page(query.cmd_layout, "DEEPTOP")
+        self.assertIn("- `COPY DEEPMID` at line 2: its bytes are counted in the offsets above, all but those of the COPY "
+                      "in it said below; its items are DEEPMID's own rows, not listed here (`layout DEEPMID`)\n"
+                      f"  - {warning}\n", page)
+        self.assertNotIn("its bytes are counted in the offsets above;", page)
+        self.assertEqual(page.count("DEEPNONE"), 1)
+        # DEEPMID's own layout says its own COPY, as before
+        self.assertIn(f"- L2: COPY DEEPNONE NOT FOUND - {NOT_HERE}\n", self.page(query.cmd_layout, "DEEPMID"))
+
+    def test_a_recursion_and_an_ibm_copybook_one_level_down(self):
+        page = self.page(query.cmd_layout, "CYCONE")
+        self.assertIn("- `COPY CYCTWO` at line 2: its bytes are counted in the offsets above, all but those of the COPY "
+                      "in it said below; its items are CYCTWO's own rows, not listed here (`layout CYCTWO`)\n"
+                      f"  - (in COPY CYCTWO) L2: COPY CYCONE skipped - recursive - {NOT_HERE}\n", page)
+        page = self.page(query.cmd_layout, "IBMTOP")
+        self.assertIn("- `COPY NSTIBM` at line 2: its bytes are counted in the offsets above, all but those of the COPY "
+                      "in it said below; its items are NSTIBM's own rows, not listed here (`layout NSTIBM`)\n"
+                      "  - (in COPY NSTIBM) L2: COPY DFHBMSCA is IBM-supplied (CICS), not in the estate - "
+                      f"{NOT_HERE}\n", page)
+
+    def test_an_osvs_copy_on_two_lines_not_found(self):
+        # the record OSG-REC is OSGMISS's text, which is not here: gone, as in the one-line form; OSG-TAIL keeps its item
+        self.assertEqual(self.rows("OSVGAP"), [("OSG-TAIL", 1, 0, 3, 1, 4), ("OSG-T", 5, 0, 3, 0, 5)])
+        self.assertEqual(self.q("SELECT c.line FROM copy_use c JOIN member m ON m.id = c.member_id WHERE m.name='OSVGAP'"),
+                         [(2,)])
+        page = self.page(query.cmd_layout, "OSVGAP")
+        self.assertIn(f"- L3: COPY OSGMISS NOT FOUND - {NOT_HERE}\n", page, "the warning of line 3 for the row of line 2")
+        self.assertNotIn("An index built before", page)
+
+    def test_field_says_which_supplied_copybook_the_name_is_probably_in(self):
+        page = self.page(query.cmd_field, "DFHENTER")
+        self.assertIn("**NOT DEFINED** in any indexed copybook or program - 1 of the 2 programs referencing it copy a "
+                      "copybook the compile reads from a product's own library, not from the estate (CICSPGM copies "
+                      "DFHAID, DFHBMSCA). The name is probably one of their items, which the index does not hold "
+                      "(`copybook DFHAID` says which product supplies it). For the other programs: check spelling, "
+                      "REPLACING renames, or an 88-level name - try `literal`.\n", page)
+        self.assertIn("CICSPGM IF", page)
+        self.assertIn("ENTPGM IF", page)
+        # a name only a program copying nothing supplied references: the advice as before
+        self.assertIn("**NOT DEFINED** in any indexed copybook or program (check spelling, REPLACING renames, or an "
+                      "88-level name - try `literal`).\n", self.page(query.cmd_field, "WS-NO-SUCH-NAME"))
+
+
+class NestedCopyLinesOnAnOlderIndex(_Built):
+    """The same copybooks on an index built before the item (age_index): a nested COPY the index holds is counted in a
+    program's view, one it does not hold - IBM-supplied or not found - in no view, the precompiler's SQLCA moves
+    nothing (LESSONS 216)."""
+    files = ROUND
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        age_index(cls.db)
+
+    def test_what_each_line_says(self):
+        self.assertTrue(self.page(query.built_before_item_27))
+        page = self.page(query.cmd_layout, "NSTIBM")
+        self.assertIn("- `COPY DFHBMSCA` at line 2: **IBM-supplied, not in the estate** - `COPY DFHBMSCA` is read by the "
+                      "compile from CICS's own library (SDFHCOB), not from the shop's copybook libraries: nothing is to "
+                      "fetch, and its items are not in the index. Its bytes are not in this layout nor in any program's "
+                      "view, so an item after it in the same record sits further on by its length\n", page)
+        self.assertNotIn("which counts it", page)
+        page = self.page(query.cmd_layout, "NSTGAP")
+        self.assertIn("- `COPY NSTMISS` at line 2: its bytes are NOT counted in the offsets above, so an item after it in "
+                      "the same record sits further on by NSTMISS's length. No member of the index carries NSTMISS, so no "
+                      "program's view counts it either (`copybook NSTMISS` says what to fetch)\n", page)
+        self.assertNotIn("which counts it", page)
+        page = self.page(query.cmd_layout, "NSTSELF")
+        self.assertIn("- `COPY NSTSELF` at line 2: the copybook copies itself - the expander skips such a COPY as "
+                      "recursive in every view, so its bytes are in none of them\n", page)
+        self.assertIn(PRECOMPILED_LINE, self.page(query.cmd_layout, "SQLONE"), "no member of the name: the precompiler's")
+        page = self.page(query.cmd_layout, "DEEPTOP")
+        self.assertIn("- `COPY DEEPMID` at line 2: its bytes are NOT counted in the offsets above, so an item after it in "
+                      "the same record sits further on by DEEPMID's length. An index built before ROADMAP re-parse item "
+                      "27 leaves every nested copybook out of a copybook's own layout; `layout RECORD --program PGM` "
+                      "gives a program's view, which counts it\n", page)
+
+    def test_a_new_index_is_not_older(self):
+        td = tempfile.mkdtemp()
+        try:
+            db = os.path.join(td, "t.db")
+            shutil.copy(self.db, db)
+            run_build(self.root, db)
+            conn = query.connect(db)
+            try:
+                self.assertFalse(query.built_before_item_27(conn))
+                self.assertIn(f"  - (in COPY DEEPMID) L2: COPY DEEPNONE NOT FOUND - {NOT_HERE}\n",
+                              query.cmd_layout(conn, "DEEPTOP"))
+            finally:
+                conn.close()
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
+        conn = sqlite3.connect(":memory:")
+        try:
+            self.assertTrue(query.built_before_item_27(conn), "no build_run table: nothing says the item's build ran")
+        finally:
+            conn.close()
+
+
+SQLCA_COPY = ("       01  SQLCA.\n"
+              "           05  SQLCAID            PIC X(08).\n"
+              "           05  SQLCODE            PIC S9(9) COMP.\n")
+COPYSQL = ("       01  CPS-HEAD.\n"
+           "           05  CPS-A              PIC X(02).\n"
+           "           COPY SQLCA.\n"
+           "       01  CPS-TAIL.\n"
+           "           05  CPS-T              PIC X(02).\n")
+
+
+class TheShopKeepsSqlca(_Built):
+    """A SQLCA copybook in the shop's COPYLIB: `COPY SQLCA` expands it, `EXEC SQL INCLUDE SQLCA` is the precompiler's
+    on an index built by the batch; on one built before, whose rows say neither, `layout` says both and that the next
+    build tells them apart (LESSONS 216)."""
+    files = (("GC/PROD.GC.COPYLIB/SQLONE.cpy", SQLONE), ("GC/PROD.GC.COPYLIB/SQLCA.cpy", SQLCA_COPY),
+             ("GC/PROD.GC.COPYLIB/COPYSQL.cpy", COPYSQL))
+
+    def test_new_and_older(self):
+        self.assertIn(PRECOMPILED_LINE, self.page(query.cmd_layout, "SQLONE"))
+        self.assertIn("- `COPY SQLCA` at line 3: its bytes are counted in the offsets above; its items are SQLCA's own "
+                      "rows, not listed here (`layout SQLCA`)\n", self.page(query.cmd_layout, "COPYSQL"))
+        td = tempfile.mkdtemp()
+        try:
+            db = os.path.join(td, "t.db")
+            shutil.copy(self.db, db)
+            age_index(db)
+            conn = query.connect(db)
+            try:
+                for book in ("SQLONE", "COPYSQL"):
+                    page = query.cmd_layout(conn, book)
+                    self.assertIn("- `SQLCA` at line 3: this index was built before ROADMAP re-parse item 27 and does "
+                                  "not say which statement names it. Written `EXEC SQL INCLUDE SQLCA`, the precompiler "
+                                  "writes it as a record of its own (`01 SQLCA`) and it moves no offset above; written "
+                                  "`COPY SQLCA`, it is the copy in the index (`copybook SQLCA`), whose bytes are NOT "
+                                  "counted above - an item after it in the same record sits further on by its length. The "
+                                  "next build says which\n", page, book)
+            finally:
+                conn.close()
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
+
+
+class TheManifestAndIbmNames(_Built):
+    """A table holding IBM's copybooks and one the manifest adds says both in its heading, and both libraries."""
+    files = (("GC/PROD.GC.SRC/VNDPGM.cbl", VNDPGM), ("GC/PROD.GC.SRC/CICSPGM.cbl", CICSPGM))
+    manifest = {"system_includes": ["VNDRBOOK"]}
+
+    def test_the_heading_and_the_note(self):
+        cov = self.page(query.cmd_coverage)
+        sect = cov.split("### IBM-supplied copybooks, not in the estate, and those the manifest's `system_includes` "
+                         "names\n")[1].split("\n### ")[0]
+        self.assertIn("| DFHAID | 0 | 1 | CICS (SDFHCOB) |", sect)
+        self.assertIn("| VNDRBOOK | 0 | 1 | the manifest's system_includes |", sect)
+        self.assertIn("(CICS: SDFHCOB; a name the manifest's `system_includes` adds: the product library the shop's "
+                      "compile names)", sect)
+
+
+class OsvsCopyNotExpanded(unittest.TestCase):
+    """OS/VS `01 X` / `COPY Y.` on two lines with nothing expanded for Y (NOT FOUND, skipped, IBM-supplied): the
+    program's `01 X` line was left live with no period and joined the next entry - `01 X 01 NEXT.`, NEXT's items under
+    X and NEXT lost; an FD's record was lost the same way in both forms (LESSONS 218)."""
+
+    def roots(self, rows, resolver=lambda n, l: None, supplied=frozenset()):
+        text = "".join(f"       {r}\n" for r in rows)
+        exp = expand.expand(lines_of(text), 1, resolver, supplied=supplied)
+        roots, _w = copybook.parse_data_division(reader.join_cobol_continuations(exp.lines))
+
+        def walk(f):
+            return [(f.name, f.level, f.offset, f.length)] + [x for c in f.children for x in walk(c)]
+        return exp, [x for r in roots for x in walk(r)]
+
+    def test_an_01_goes_as_in_the_one_line_form(self):
+        rows = ["01  OSP-REC", "    COPY OSPMISS.", "01  OSP-TAIL.", "    05  OSP-T    PIC X(03)."]
+        want = [("OSP-TAIL", 1, 0, 3), ("OSP-T", 5, 0, 3)]
+        exp, got = self.roots(rows)
+        self.assertEqual(got, want)
+        self.assertEqual(exp.warnings, ["L2: COPY OSPMISS NOT FOUND - fields/code from it are missing from this "
+                                        "program's facts"])
+        self.assertEqual(self.roots(["01  OSP-REC COPY OSPMISS."] + rows[2:])[1], want, "the one-line form, as before")
+        self.assertEqual(self.roots(rows, supplied=frozenset({"OSPMISS"}))[1], want, "a supplied name the same")
+        # found, the program's name is the library's record, as before
+        found = lambda n, l: (9, lines_of("       01  LIB-REC.\n           05  LIB-A    PIC X(04).\n"), None)
+        self.assertEqual(self.roots(rows, resolver=found)[1],
+                         [("OSP-REC", 1, 0, 4), ("LIB-A", 5, 0, 4), ("OSP-TAIL", 1, 0, 3), ("OSP-T", 5, 0, 3)])
+
+    def test_an_fd_keeps_its_record(self):
+        def prog(fd):
+            return ("       IDENTIFICATION DIVISION.\n       PROGRAM-ID. OSVFD.\n       ENVIRONMENT DIVISION.\n"
+                    "       INPUT-OUTPUT SECTION.\n       FILE-CONTROL.\n           SELECT POL-FILE ASSIGN TO POLIN.\n"
+                    "       DATA DIVISION.\n       FILE SECTION.\n" + "".join(f"       {r}\n" for r in fd)
+                    + "       WORKING-STORAGE SECTION.\n       01  WS-A PIC X.\n       PROCEDURE DIVISION.\n"
+                    "       0000-MAIN.\n           READ POL-FILE.\n           GOBACK.\n")
+        from atlas import cobol
+        for fd in (["FD  POL-FILE", "    COPY FDMISS.", "01  POL-REC.", "    05  POL-KEY PIC X(8)."],
+                   ["FD  POL-FILE COPY FDMISS.", "01  POL-REC.", "    05  POL-KEY PIC X(8)."]):
+            exp = expand.expand(lines_of(prog(fd)), 1, lambda n, l: None)
+            facts = cobol.parse_program(expand.expanded_text(exp))
+            self.assertEqual([(f.select_name, f.fd_records) for f in facts.files], [("POL-FILE", ["POL-REC"])], fd)
+
+
+# ===========================================================================
 # the reproductions
 # ===========================================================================
 
@@ -986,9 +1284,30 @@ class TheDocsSayIt(unittest.TestCase):
         self.assertIn("Rule for me: a copybook is read the way the compiler reads it", lessons)
         self.assertIn("| 215 | Not seen on his estate - found while writing row 214's tests", lessons)
         self.assertIn("Rule for me: an optional group behind a greedy blank never runs", lessons)
+        # the verifier's first round (LESSONS 216, 218)
+        self.assertIn("**The verifier's first round (LESSONS 216, 218), before he ran it.**", roadmap)
+        self.assertIn("| 216 | Not seen on his estate - the verifier's first round on ROADMAP re-parse item 27", lessons)
+        self.assertIn("Rule for me: a sentence printed beside a table is checked against every row the table can hold",
+                      lessons)
+        self.assertIn("| 218 | Not seen on his estate - found while writing row 216's tests", lessons)
+        self.assertIn("Rule for me: a line kept open for text that may not come is closed on every path", lessons)
+        self.assertIn("LESSONS 218", self.read("atlas", "expand.py"))
+        self.assertIn("LESSONS 216", self.read("atlas", "query.py"))
+        example = self.read("manifest.example.json")
+        self.assertIn("exactly these: CICS DFHAID, DFHBMSCA, DFHEIBLK, DFHEIVAR, DFHMSRCA; MQ CMQV, CMQXV, CMQODV, "
+                      "CMQODL, CMQMDV, CMQMDL, CMQGMOV, CMQGMOL, CMQPMOV, CMQPMOL. Any other MQ copy file", example)
+        self.assertNotIn("CMQ*", example)
+        f16 = self.read("tools", "synth", "repro", "F16-dfhaid-missing", "README.md")
+        self.assertNotIn("CMQ*", f16)
+        self.assertIn("any other MQ copy file a program copies goes there", f16)
+        # the lists the docs give are the build's own
+        for name in expand.IBM_COPYBOOKS:
+            self.assertIn(name, example)
+            self.assertIn(name, f16)
         readme = self.read("README.md")
         self.assertIn("a copybook that COPYs another is laid out with the nested copybook in place", readme)
-        self.assertIn("is 'IBM-supplied, not in the estate' - never a gap", readme)
+        self.assertIn("that no member carries is 'IBM-supplied, not in the estate', one the manifest's `system_includes` "
+                      "names 'supplied by a product library, not in the estate' - never a gap", readme)
         self.assertIn('"system_includes": []', self.read("manifest.example.json"))
         for rid in ("F05-include-three-lines", "F06-nested-copy-offsets", "F07-tag-copybook-no-rows", "F16-dfhaid-missing"):
             self.assertIn("Fixed by ROADMAP re-parse item 27 (LESSONS 214)", self.read("tools", "synth", "repro", rid,

@@ -386,9 +386,13 @@ def read_cobol_lines(text: str, fixed: Optional[bool] = None,
             elif " --" in code:
                 code = code.split(" --", 1)[0].rstrip()
         if indicator == " ":
-            if "EXEC SQL" in up and "END-EXEC" not in up:
+            # the words outside literals: `VALUE 'EXEC SQL'` opens no block - read as one, every later line holding
+            # ' --' (a heading literal `' -- END -- '`) was cut there as an SQL comment, the literal left open ate
+            # the rest of the program (LESSONS 217)
+            words = code_outside_literals(up)
+            if "EXEC SQL" in words and "END-EXEC" not in words:
                 in_sql = True
-            elif "END-EXEC" in up:
+            elif "END-EXEC" in words:
                 in_sql = False
         # IDENTIFICATION DIVISION comment-entries (AUTHOR. PAT O'BRIEN.) are
         # free text: an apostrophe there is not a literal, and left as code it
@@ -600,7 +604,7 @@ def cobol_statements(logical: Sequence[LogicalLine]) -> Iterator[LogicalLine]:
                 and (division is not None or _LEVEL_START.match(ll.text))
                 and _ENDS_AT_END_EXEC.search(buf[-40:])):          # the tail only: a long sentence stays linear
             opened = None
-            for opened in _EXEC_KIND.finditer(buf):
+            for opened in _EXEC_KIND.finditer(blank_literals(buf)):     # not the words of a literal (LESSONS 217)
                 pass
             if opened is not None:
                 # END-EXEC with no period after it, before the PROCEDURE DIVISION:
@@ -627,9 +631,14 @@ def cobol_statements(logical: Sequence[LogicalLine]) -> Iterator[LogicalLine]:
             if idx < 0:
                 scan_pos = len(buf)
                 break
-            # EXEC state up to this period, advanced incrementally
-            for m in _EXEC_TOKEN.finditer(buf, exec_pos, idx + 1):
-                exec_open = not m.group(0).upper().startswith("END")
+            # EXEC state up to this period, advanced incrementally - over the text outside literals: the words of
+            # `VALUE 'EXEC CICS LINK FAILED'` opened a block no period closed, and every data item and paragraph
+            # after it was lost while the member read `parse: ok` (LESSONS 217). exec_pos is always just after a
+            # period outside a literal (or the buffer's start), so no literal is open where the slice starts
+            seg = buf[exec_pos:idx + 1]
+            if _EXEC_TOKEN.search(seg):                                  # most statements hold no EXEC word at all
+                for m in _EXEC_TOKEN.finditer(blank_literals(seg)):
+                    exec_open = not m.group(0).upper().startswith("END")
             exec_pos = idx + 1
             if exec_open:
                 # `-- get the policy.` inside EXEC SQL ... END-EXEC is SQL
@@ -674,6 +683,22 @@ _STATEMENT_DIVISION = re.compile(r"^(IDENTIFICATION|ID|ENVIRONMENT|DATA|PROCEDUR
                                  re.IGNORECASE)
 _PROCEDURE_DIVISION = re.compile(r"(?<![A-Z0-9\-])PROCEDURE\s+DIVISION(?![A-Z0-9\-])", re.IGNORECASE)
 _LITERALS = re.compile(r"'(?:[^']|'')*'|\"(?:[^\"]|\"\")*\"")
+
+
+def blank_literals(text: str) -> str:
+    """`text` with every closed alphanumeric literal blanked, quotes and all,
+    to the same length: a scan for keywords sees only the code, and a
+    position found in it is the same position in `text`."""
+    return _LITERALS.sub(lambda m: " " * len(m.group(0)), text)
+
+
+def code_outside_literals(line: str) -> str:
+    """One source line's code with its literals blanked, and cut where a
+    literal opens that the line does not close (it goes on, on a
+    continuation line): what is left is the line's own words."""
+    t = blank_literals(line)
+    cut = [i for i in (t.find("'"), t.find('"')) if i >= 0]
+    return t[:min(cut)] if cut else t
 
 
 def _division_entered(text: str, division: Optional[str]) -> Optional[str]:

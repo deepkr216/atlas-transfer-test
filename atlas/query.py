@@ -1065,6 +1065,51 @@ def _file_not_field(conn: sqlite3.Connection, name: str, files: Sequence[sqlite3
     return "".join(out)
 
 
+NOT_DEFINED_HINT = "check spelling, REPLACING renames, or an 88-level name - try `literal`"
+
+
+def _not_defined(conn: sqlite3.Connection, name: str) -> str:
+    """`field` for a name no indexed copybook or program defines, no 88 and
+    no file. When programs referencing it copy a copybook the compile reads
+    from a product's own library and the estate does not hold
+    (recover.supplied_copybooks: DFHAID, CMQV, a name of the manifest's
+    system_includes), the name is most likely one of its items: said so,
+    with the copybook. `field DFHENTER` sent him to check a spelling that
+    was right (LESSONS 216)."""
+    nm = name.upper()
+    progs = {int(r[0]): str(r[1]) for r in conn.execute(
+        "SELECT DISTINCT p.member_id, p.program_id FROM field_ref r JOIN program p ON p.id = r.program_id "
+        "WHERE UPPER(r.name) = ?", (nm,))}
+    plain = f"**NOT DEFINED** in any indexed copybook or program ({NOT_DEFINED_HINT}).\n"
+    if not progs:
+        return plain
+    from . import recover
+    supplied = recover.supplied_copybooks(conn)
+    books: Dict[str, List[str]] = defaultdict(list)                 # program -> the supplied copybooks it copies
+    ids = sorted(progs)
+    for k in range(0, len(ids), 500):
+        part = ids[k:k + 500]
+        for mid, book in conn.execute(
+                f"SELECT DISTINCT member_id, UPPER(copybook) FROM copy_use WHERE resolved_member_id IS NULL "
+                f"AND member_id IN ({','.join('?' * len(part))}) ORDER BY member_id, id", part):
+            if book in supplied and book not in books[progs[int(mid)]]:
+                books[progs[int(mid)]].append(book)
+    books = {p: bs for p, bs in books.items() if bs}
+    if not books:
+        return plain
+    n = len(progs)
+    lead = ("the program referencing it copies" if n == 1 else "every program referencing it copies"
+            if len(books) == n else f"{len(books)} of the {n} programs referencing it copy")
+    said = "; ".join(f"{p} copies {', '.join(bs)}" for p, bs in sorted(books.items())[:8]) \
+        + (f"; +{len(books) - 8} more" if len(books) > 8 else "")
+    first = next(iter(sorted(books.items())))[1][0]
+    whose = "its" if len({b for bs in books.values() for b in bs}) == 1 else "their"
+    return (f"**NOT DEFINED** in any indexed copybook or program - {lead} a copybook the compile reads from a product's "
+            f"own library, not from the estate ({said}). The name is probably one of {whose} items, which the index "
+            f"does not hold (`copybook {first}` says which product supplies it)"
+            + (f". For the other programs: {NOT_DEFINED_HINT}" if len(books) < n else "") + ".\n")
+
+
 def cmd_field(conn: sqlite3.Connection, name: str, show_all: bool = False,
               program: Optional[str] = None) -> str:
     defs = _field_defs(conn, name)
@@ -1094,8 +1139,7 @@ def cmd_field(conn: sqlite3.Connection, name: str, show_all: bool = False,
                 file_uses = _file_name_uses(conn, name, files)
                 out.append(_file_not_field(conn, name, files, file_uses))
             else:
-                out.append("**NOT DEFINED** in any indexed copybook or program (check spelling, REPLACING renames, "
-                           "or an 88-level name - try `literal`).\n")
+                out.append(_not_defined(conn, name))
     # COPY ... REPLACING renamed it in some programs: their references are
     # indexed under the new name.
     for a in conn.execute("SELECT DISTINCT new_name FROM field_alias WHERE UPPER(orig_name)=?", (name.upper(),)):
@@ -2571,10 +2615,11 @@ def supplied_label(product: str) -> str:
 
 
 def supplied_why(copybook: str, product: str) -> str:
-    """What supplied_cell says after its bold words; `copybook` says it too."""
+    """What supplied_cell says after its bold words; `copybook` says it too.
+    The manifest names the copybook, never the library it comes from."""
     lib = expand.IBM_LIBRARY.get(product)
-    where = ("a product library the manifest names" if product == expand.MANIFEST_PRODUCT
-             else f"{product}'s own library" + (f" ({lib})" if lib else ""))
+    where = ("a product's own library (the manifest's `system_includes` names the copybook)"
+             if product == expand.MANIFEST_PRODUCT else f"{product}'s own library" + (f" ({lib})" if lib else ""))
     return (f"`COPY {copybook.upper()}` is read by the compile from {where}, not from the shop's copybook libraries: "
             "nothing is to fetch, and its items are not in the index")
 
@@ -2846,12 +2891,25 @@ def _supplied_table(conn: sqlite3.Connection, supplied: Dict[str, str], copiers:
         part = {i for i in copiers[book] if (i, book) in noted}
         before |= part
         rows.append((book, len(part), len(copiers[book]), recover.supplied_where(supplied[book])))
-    out = ["\n### IBM-supplied copybooks, not in the estate\n",
+    # the words follow what the table holds (LESSONS 216): the heading names IBM only for IBM's copybooks, the
+    # libraries only of the products listed, DFHENTER only beside DFHAID, and 'no program is parsed only in part'
+    # only when none is - on the index he has, built before ROADMAP re-parse item 27, the table counts them
+    products = {supplied[b] for b in copiers}
+    ibm = products - {expand.MANIFEST_PRODUCT}
+    manifest = expand.MANIFEST_PRODUCT in products
+    heading = ("IBM-supplied copybooks, not in the estate" + (", and those the manifest's `system_includes` names"
+                                                               if manifest else "")
+               if ibm else "Copybooks the manifest's `system_includes` names, not in the estate")
+    libs = [f"{p}: {expand.IBM_LIBRARY[p]}" for p in sorted(ibm) if p in expand.IBM_LIBRARY]
+    if manifest:
+        libs.append("a name the manifest's `system_includes` adds: the product library the shop's compile names")
+    items = "Their items (DFHAID's DFHENTER, for one)" if "DFHAID" in copiers else "Their items"
+    out = [f"\n### {heading}\n",
            table(["copybook", "programs parsed only in part for it", "programs copying it", "supplied with"], rows),
-           "\n> The compile reads these from the product's own library (CICS: SDFHCOB; MQ: SCSQCOBC; a name the "
-           "manifest's `system_includes` adds: the library the shop's compile names), which a shop does not keep among "
-           "its own copybooks: nothing is to fetch, and no program is parsed only in part for one. Their items (DFHENTER, "
-           "the MQ constants) are not in the index, so `field` finds none of them. A copy the shop keeps in its own "
+           f"\n> The compile reads these from the product's own library ({'; '.join(libs)}), which a shop does not "
+           "keep among its own copybooks: nothing is to fetch"
+           + ("" if before else ", and no program is parsed only in part for one")
+           + f". {items} are not in the index, so `field` finds none of them. A copy the shop keeps in its own "
            "COPYLIB is expanded like any copybook, and is not in this table.\n"]
     if before:
         one = len(before) == 1
@@ -4627,42 +4685,119 @@ def _osvs_library_root(conn: sqlite3.Connection, mid: int,
     return None
 
 
+def built_before_item_27(conn: sqlite3.Connection) -> bool:
+    """True for an index whose last build ran before ROADMAP re-parse item 27:
+    it recorded no system_includes (the item's build records the manifest's,
+    '[]' for none). Such a build left a copybook's own COPY rows unresolved
+    and wrote no 'layout_warning' for a nested COPY."""
+    try:
+        if "system_includes" not in {r[1] for r in conn.execute("PRAGMA table_info(build_run)")}:
+            return True
+        row = conn.execute("SELECT system_includes FROM build_run ORDER BY id DESC LIMIT 1").fetchone()
+    except sqlite3.Error:
+        return True
+    return not row or row[0] is None
+
+
 def nested_copy_lines(conn: sqlite3.Connection, member_id: int) -> List[str]:
     """Under a copybook's own layout, one line per COPY written in it. The
     build of ROADMAP re-parse item 27 computes the layout with the nested
     copybook in place: its bytes are counted in the offsets, its items are
     its own member's rows (cited there, not listed here), and the copy_use
     row names the member expanded. A COPY whose text is not in the layout
-    carries the copybook's 'layout_warning' row, said as it is. A row with
-    neither is one an index built before the item holds - every nested
-    COPY was left out of a copybook's own layout and each item after it sat
-    that many bytes too early (tools/synth/repro/F06)."""
+    carries the copybook's 'layout_warning' row, said as it is - one of the
+    copybook's own lines ('L2: COPY X NOT FOUND ...') or one deeper, in the
+    copybook it copies ('(in COPY B) L2: COPY C NOT FOUND ...'), said under
+    B's line: B's bytes are counted then, all but C's. `EXEC SQL INCLUDE
+    SQLCA` / `SQLDA` has neither by design - the precompiler writes it, a
+    record of its own. A row with neither is one an index built before the
+    item holds - every nested COPY was left out of a copybook's own layout
+    and each item after it sat that many bytes too early
+    (tools/synth/repro/F06); a program's view counts the copy only when a
+    member of its name is in the index. Before the verifier's round on the
+    item, the SQLCA line and the IBM-supplied one said a program's view
+    counts them, and a NOT FOUND two levels down was never shown (LESSONS
+    216)."""
     rows = conn.execute("""SELECT c.copybook, c.line, c.resolved_member_id, r.path, r.norm_sha FROM copy_use c
                            LEFT JOIN member r ON r.id = c.resolved_member_id
                            WHERE c.member_id = ? ORDER BY c.line, c.id""", (member_id,)).fetchall()
     if not rows:
         return []
-    warned = [str(r[0]) for r in conn.execute(
-        "SELECT detail FROM unresolved WHERE member_id = ? AND kind = 'layout_warning'", (member_id,))]
+    from . import build as _build, recover          # local imports: build imports nothing from query
+    # the warnings of a COPY whose text is not in the layout, in the order the build wrote them (a SYNC or a
+    # REDEFINES warning is another kind of row)
+    nested = [str(r[0]) for r in conn.execute(
+        "SELECT detail FROM unresolved WHERE member_id = ? AND kind = 'layout_warning' ORDER BY id", (member_id,))
+        if _build.NESTED_NOT_COUNTED in str(r[0])]
+    used: Set[str] = set()
+    me = conn.execute("SELECT name FROM member WHERE id = ?", (member_id,)).fetchone()
+    own_name = str(me[0]).upper() if me else ""
+    supplied: Optional[Dict[str, str]] = None
+    kinds = ",".join("?" * len(recover.RESOLVER_KINDS))
     out = []
     for c in rows:
         book = str(c["copybook"]).upper()
+        line = c["line"]
         if c["resolved_member_id"]:
             texts = conn.execute("SELECT COUNT(DISTINCT norm_sha) FROM member WHERE name = ? AND kind IN "
                                  "('copybook', 'cobol', 'sql', 'unknown')", (book,)).fetchone()[0]
             chosen = (f" - the copy in `{c['path']}`, one of {texts} texts of the name (`copybook {book}`)"
                       if texts > 1 else "")
-            out.append(f"- `COPY {book}` at line {c['line']}: its bytes are counted in the offsets above; its items are "
-                       f"{book}'s own rows, not listed here (`layout {book}`){chosen}\n")
+            # a COPY inside it whose text is not here (NOT FOUND, recursive, IBM-supplied): its warning, under this line
+            deeper = list(dict.fromkeys(w for w in nested if w.startswith(f"(in COPY {book}) ")))
+            used.update(deeper)
+            if deeper:
+                out.append(f"- `COPY {book}` at line {line}: its bytes are counted in the offsets above, all but those of "
+                           f"the COPY{'' if len(deeper) == 1 else 's'} in it said below; its items are {book}'s own rows, "
+                           f"not listed here (`layout {book}`){chosen}\n")
+                out.extend(f"  - {w}\n" for w in deeper)
+            else:
+                out.append(f"- `COPY {book}` at line {line}: its bytes are counted in the offsets above; its items are "
+                           f"{book}'s own rows, not listed here (`layout {book}`){chosen}\n")
             continue
-        said = next((w for w in warned if re.match(rf"L{c['line']}: COPY {re.escape(book)}[ :]", w)), None)
+        head = re.compile(rf"L\d+: COPY {re.escape(book)}[ :]")
+        # the warning at this line; else the one of the name not said yet (an `01 X` / `COPY Y.` statement starts on
+        # the line before the COPY: the parser's line and the expander's may differ)
+        said = (next((w for w in nested if w not in used and w.startswith(f"L{line}: ") and head.match(w)), None)
+                or next((w for w in nested if w not in used and head.match(w)), None))
         if said:
+            used.add(said)
             out.append(f"- {said}\n")
+            continue
+        if supplied is None:
+            supplied = recover.supplied_copybooks(conn)
+        carried = conn.execute(f"SELECT 1 FROM member WHERE name = ? AND kind IN ({kinds}) LIMIT 1",
+                               (book, *recover.RESOLVER_KINDS)).fetchone()
+        if book in expand._SYSTEM_INCLUDES and (not carried or not built_before_item_27(conn)):
+            # `EXEC SQL INCLUDE SQLCA`: recorded with no member and no warning on purpose (LESSONS 203); the
+            # precompiler writes the area as an 01 of its own, inside no record of this copybook
+            out.append(f"- At line {line}: {precompiler_cell(book)}. The precompiler writes it as a record of its own "
+                       f"(`01 {book}`), so it moves no offset above\n")
+        elif book in expand._SYSTEM_INCLUDES:
+            out.append(f"- `{book}` at line {line}: this index was built before ROADMAP re-parse item 27 and does not say "
+                       f"which statement names it. Written `EXEC SQL INCLUDE {book}`, the precompiler writes it as a "
+                       f"record of its own (`01 {book}`) and it moves no offset above; written `COPY {book}`, it is the "
+                       f"copy in the index (`copybook {book}`), whose bytes are NOT counted above - an item after it in "
+                       "the same record sits further on by its length. The next build says which\n")
+        elif book in supplied:
+            product = supplied[book]
+            out.append(f"- `COPY {book}` at line {line}: **{supplied_label(product)}** - {supplied_why(book, product)}. "
+                       "Its bytes are not in this layout nor in any program's view, so an item after it in the same "
+                       "record sits further on by its length\n")
+        elif book == own_name:
+            out.append(f"- `COPY {book}` at line {line}: the copybook copies itself - the expander skips such a COPY as "
+                       "recursive in every view, so its bytes are in none of them\n")
+        elif not carried:
+            out.append(f"- `COPY {book}` at line {line}: its bytes are NOT counted in the offsets above, so an item after "
+                       f"it in the same record sits further on by {book}'s length. No member of the index carries {book}, "
+                       f"so no program's view counts it either (`copybook {book}` says what to fetch)\n")
         else:
-            out.append(f"- `COPY {book}` at line {c['line']}: its bytes are NOT counted in the offsets above, so an item "
+            out.append(f"- `COPY {book}` at line {line}: its bytes are NOT counted in the offsets above, so an item "
                        f"after it in the same record sits further on by {book}'s length. An index built before ROADMAP "
                        "re-parse item 27 leaves every nested copybook out of a copybook's own layout; `layout RECORD "
                        "--program PGM` gives a program's view, which counts it\n")
+    # a warning no row above holds (its COPY row spells the name otherwise): said as it is, never dropped
+    out.extend(f"- {w}\n" for w in dict.fromkeys(w for w in nested if w not in used))
     return out
 
 

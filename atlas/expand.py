@@ -495,10 +495,28 @@ def expand(lines: Sequence[Line], member_id: int, resolver: Resolver,
             i = j + 1
             continue
 
+        def osvs_not_expanded() -> None:
+            # "01 X" / "COPY Y." with nothing expanded for Y: the program's "01 X" line stayed live with no period
+            # and joined the next entry into one wrong one - `01 X 01 NEXT.`, NEXT's items under X and NEXT lost
+            # (LESSONS 218). An 01 / 77 goes as in the one-line form "01 X COPY Y.", whose line is the COPY's
+            # comment: its text is Y's, which is not here. An FD / SD stays, closed: its record entries follow it
+            if not osvs:
+                return
+            kind, _pname, prev, head = osvs
+            if kind in ("FD", "SD"):
+                if prev is not None:
+                    out[prev].code = out[prev].code.rstrip() + "."
+                else:
+                    emit(ln, head + ".", member_id, ln.no, depth, indicator=" ")
+            elif prev is not None:
+                pl = out[prev]
+                pl.indicator, pl.is_comment, pl.is_blank = "*", True, False
+
         if depth >= MAX_DEPTH or name in stack:
             warnings.append(f"L{ln.no}: COPY {name} skipped - "
                             + ("recursive" if name in stack else f"nesting deeper than {MAX_DEPTH}"))
             copied((name, lib, rep_text, ln.no, None))
+            osvs_not_expanded()
             i = j + 1
             continue
 
@@ -508,12 +526,14 @@ def expand(lines: Sequence[Line], member_id: int, resolver: Resolver,
             # own library - no member, no warning, never a gap in this program (ROADMAP re-parse item 27)
             supplied_out.append(f"L{ln.no}: COPY {name}")
             copied((name, lib, rep_text, ln.no, None))
+            osvs_not_expanded()
             i = j + 1
             continue
         if not resolved:
             warnings.append(f"L{ln.no}: COPY {name} NOT FOUND - fields/code from it are missing "
                             f"from this program's facts")
             copied((name, lib, rep_text, ln.no, None))
+            osvs_not_expanded()
             i = j + 1
             continue
 
@@ -523,6 +543,7 @@ def expand(lines: Sequence[Line], member_id: int, resolver: Resolver,
             # program's own lines stay as they are
             warnings.append(f"L{ln.no}: COPY {name}: {note or 'no member to expand'}")
             copied((name, lib, rep_text, ln.no, None))
+            osvs_not_expanded()
             i = j + 1
             continue
         if note:
