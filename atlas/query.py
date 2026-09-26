@@ -1810,6 +1810,13 @@ UNRESOLVED_MEANING = {
         "two copies of one copybook with different content; system and library order picked one, and the program's "
         "compiler listing names a library whose copy has the same text (compiled against staging, promoted unchanged)",
         "nothing - the compiler's own record agrees with the copy expanded; nothing to declare"),
+    "ambiguous_copybook (a recovered copy used)": (
+        "two copies of one copybook with different content; the copy expanded is a recovered one - a stand-in "
+        "atlas.recover wrote from the compiler listings for a member the estate did not hold",
+        "fetch the program's own copybook library - the one its compiler listing names (`python -m atlas.recover --db "
+        "atlas.db` writes it to work/fetch-list.txt) - and build: the real member replaces the recovered copy. Do not "
+        "remove the recovered copy by hand: the build would expand the other copy instead. Where this report warns "
+        "above that a real member has arrived for such a copy, run recover and the build first"),
     "include_member": ("a JCL `INCLUDE MEMBER=` whose member is not in the index",
                        "fetch the JCLLIB / PARMLIB holding it: its DDs, symbols and steps are missing from the job"),
     "card_member": ("a SYSIN DD naming a control-card member that is not in the index",
@@ -2111,6 +2118,10 @@ def _listing_says(conn: sqlite3.Connection, member_id: int) -> str:
         elif v["verdict"] == "OLDER":
             line += (f" - an older listing names {v['named']} (its source differs from this program as indexed; the text "
                      "differs from the copy used)")
+        elif v["verdict"] == "NOT HELD" and v.get("recovered"):
+            # the copy used is one atlas.recover wrote: the library the listing names is the one to fetch (LESSONS 210)
+            line += (f" - names {v['named']} ({v['index_has']}); the build used a recovered copy, a stand-in written from "
+                     "the listings: fetch the real member from there and build - it replaces the recovered copy")
         elif v["verdict"] == "NOT HELD":
             line += f" - names {v['named']}, a library the index does not hold - the copy the build used stands"
         elif v["verdict"] == recover.STUB_NAMED:
@@ -2519,20 +2530,27 @@ def _top_reason(rows: List[sqlite3.Row]) -> str:
 
 
 def _recovered_shadowing(conn: sqlite3.Connection) -> str:
-    """COPY statements that expand a recovered copybook (atlas.recover) while
-    the estate now holds the real member that replaces it: one in the
-    program's own system, in SHARED (or with no system), or in the system
-    the recovered copy was written for - not the copying program itself,
-    which the build never expands into itself. A build before ROADMAP
+    """COPY statements that expand a recovered copybook (atlas.recover) which
+    the build of this toolkit would not expand for that program: a real
+    member of the name sits in the program's own system or in SHARED (or
+    has no system), or the copy was written for another system and a real
+    member is held anywhere (build.recovered_gives_way). A program is never
+    the real member - a member of kind cobol the build parsed as one, any
+    status but 'skipped' (build.holds_program): the copying program itself,
+    which the build never expands into itself, and a callee whose parameter
+    copybook has its own name (LESSONS 209, 210). A build before ROADMAP
     re-parse item 11 ranked the recovered copy like any library (the same
     folder, first found), so until the recovered one is removed a program
     may carry the recovered layout. The build of this toolkit drops a
-    recovered copy on exactly this test (build.recovered_gives_way) and
-    parses the copying programs again when the real member arrives: on an
-    index it built this finds nothing. A real member only another system
-    holds is that system's copy, not this program's: atlas.recover keeps the
-    recovered copy then, and this says nothing of it (LESSONS 209)."""
-    rows = conn.execute("""
+    recovered copy on exactly this test and parses the copying programs
+    again when the real member arrives: on an index it built this finds
+    nothing. A real member only another system holds is that system's copy:
+    a program's own system's recovered copy, and SHARED's, stay while it is
+    the only one (atlas.recover keeps them), and this says nothing of them
+    (LESSONS 209)."""
+    home = "(CASE WHEN UPPER(COALESCE({0}.system, '')) = 'SHARED' THEN '' ELSE UPPER(COALESCE({0}.system, '')) END)"
+    m, p, r = home.format("m"), home.format("p"), home.format("r")
+    rows = conn.execute(f"""
         SELECT r.name, COUNT(*) FROM copy_use c
         JOIN member r ON r.id = c.resolved_member_id
         JOIN member p ON p.id = c.member_id
@@ -2540,9 +2558,9 @@ def _recovered_shadowing(conn: sqlite3.Connection) -> str:
           AND EXISTS (SELECT 1 FROM member m WHERE UPPER(m.name) = UPPER(r.name) AND m.id != r.id
                       AND m.id != c.member_id
                       AND m.kind IN ('copybook', 'cobol', 'sql', 'unknown')
+                      AND NOT (m.kind = 'cobol' AND COALESCE(m.parse_status, '') != 'skipped')
                       AND UPPER(COALESCE(m.library, '')) != 'RECOVERED-COPYBOOKS'
-                      AND UPPER(COALESCE(m.system, '')) IN ('', 'SHARED', UPPER(COALESCE(r.system, '')),
-                                                            UPPER(COALESCE(p.system, ''))))
+                      AND ({m} IN ('', {p}) OR {r} NOT IN ('', {p})))
         GROUP BY r.name ORDER BY 2 DESC""").fetchall()
     if not rows:
         return ""
@@ -2698,16 +2716,23 @@ def cmd_coverage(conn: sqlite3.Connection, everything: bool = False) -> str:
     # in the note) or confirmed through a same-text copy (build.LISTING_SAME) apart again: those have nothing to declare.
     # An 'expand' note repeating a choice comes only from a build before ROADMAP re-parse item 18, and no such build read
     # the listing (item 19 ships with item 18): it is always the chain's choice
-    from .build import LISTING_HOW, LISTING_SAME
+    # a choice whose copy used is a recovered one (a RECOVERED-COPYBOOKS folder in the path the note names) apart too:
+    # it is kept on purpose - the program's own system and SHARED hold no real member - and removing the copy would
+    # hand the program the other library's layout (LESSONS 210)
+    from .build import LISTING_HOW, LISTING_SAME, RECOVERED_FOLDER
     rows = conn.execute("""SELECT CASE WHEN kind = 'expand' AND instr(COALESCE(detail, ''), ?) > 0
                                        THEN 'expand (copybook chosen among several)'
                                        WHEN kind = 'ambiguous_copybook' AND instr(COALESCE(detail, ''), ?) > 0
                                        THEN 'ambiguous_copybook (decided by the listing)'
                                        WHEN kind = 'ambiguous_copybook' AND instr(COALESCE(detail, ''), ?) > 0
                                        THEN 'ambiguous_copybook (confirmed by the listing)'
+                                       WHEN kind = 'ambiguous_copybook' AND (instr(UPPER(COALESCE(detail, '')), ?) > 0
+                                                                          OR instr(UPPER(COALESCE(detail, '')), ?) > 0)
+                                       THEN 'ambiguous_copybook (a recovered copy used)'
                                        ELSE kind END AS k, COUNT(*)
                            FROM unresolved GROUP BY 1 ORDER BY 2 DESC""",
-                        (AMBIGUOUS_PICK, LISTING_HOW, LISTING_SAME)).fetchall()
+                        (AMBIGUOUS_PICK, LISTING_HOW, LISTING_SAME, f"\\{RECOVERED_FOLDER}\\",
+                         f"/{RECOVERED_FOLDER}/")).fetchall()
     out.append(table(["kind", "count", "what it means", "what closes it"],
                      [(k, n, *UNRESOLVED_MEANING.get(k, ("(see the members below)", "send this kind's name for a fix")))
                       for k, n in rows]))
@@ -3052,6 +3077,7 @@ def cmd_docs(conn: sqlite3.Connection, term: str) -> str:
 
 # build.QUERY_INDEXES' index on UPPER(TRIM(name)) (ROADMAP re-parse item 12)
 TRIMMED_NAME_INDEX = "ix_q_member_utname"
+NAME_INDEX = "ix_q_member_uname"
 
 
 def _has_index(conn: sqlite3.Connection, name: str) -> bool:
@@ -3061,7 +3087,10 @@ def _has_index(conn: sqlite3.Connection, name: str) -> bool:
 def _doc_members(conn: sqlite3.Connection, name: str) -> List[sqlite3.Row]:
     n = name.upper()
     stem = os.path.splitext(n)[0]
-    rows = conn.execute("SELECT id, name, path FROM member WHERE kind='doc' AND (UPPER(name)=? OR UPPER(name)=?) "
+    # `+kind` when the name's index is there: with no statistics the planner took the kind index (every document) over
+    # the name's for this OR of two names too (LESSONS 210)
+    kind = "+kind" if _has_index(conn, NAME_INDEX) else "kind"
+    rows = conn.execute(f"SELECT id, name, path FROM member WHERE {kind}='doc' AND (UPPER(name)=? OR UPPER(name)=?) "
                         "ORDER BY path", (n, stem)).fetchall()
     # a file named `PLAN .docx` is member `PLAN ` - nobody types the trailing space; shown after
     # an exact PLAN.docx, never instead of it. `+kind`: with no statistics the planner took the kind index (every

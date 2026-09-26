@@ -229,6 +229,46 @@ class TheLookupsUseTheIndex(_Built):
                              (label, sql, args, plan))
 
 
+class DocsExactNameLookup(_Built):
+    """`doc`'s first statement looks the name up as typed (UPPER(name), the name or its stem). It read the kind index
+    (every document) with its values bound, although the name's index was there; it writes +kind when that index is
+    there, as the trimmed statement does (LESSONS 210)."""
+
+    def exact_plans(self, conn):
+        out = []
+        for name in ("PLAN", "PLAN.txt"):
+            rec = Recording(conn)
+            self.assertEqual([r["name"] for r in query._doc_members(rec, name)], ["PLAN "])
+            out += [(name, sql, args, plan_of(conn, sql, args)) for sql, args in rec.ran
+                    if "UPPER(NAME)=" in sql.upper().replace(" ", "") and "TRIM(" not in sql.upper()]
+        self.assertEqual(len(out), 2, out)
+        return out
+
+    def test_it_searches_the_names_index(self):
+        conn = query.connect(self.db)
+        try:
+            for name, sql, args, plan in self.exact_plans(conn):
+                self.assertTrue(any(query.NAME_INDEX in step for step in plan), (name, sql, args, plan))
+                self.assertFalse(any("ix_member_kind" in step for step in plan), (name, sql, args, plan))
+        finally:
+            conn.close()
+
+    def test_without_the_names_index_it_reads_the_kind_index_as_before(self):
+        conn = sqlite3.connect(self.db)
+        try:
+            conn.execute(f"DROP INDEX {query.NAME_INDEX}")
+            conn.execute(f"DROP INDEX {TRIMMED}")
+            conn.commit()
+        finally:
+            conn.close()
+        conn = query.connect(self.db)
+        try:
+            for name, sql, args, plan in self.exact_plans(conn):
+                self.assertTrue(any("ix_member_kind" in step for step in plan), (name, sql, args, plan))
+        finally:
+            conn.close()
+
+
 class AnIndexBuiltBeforeTheItem(_Built):
     """The index as a build before the item left it - no trimmed-name index: it opens, every lookup answers as
     before (the gate and images scanning the member table, doc and a diff of one kind reading the kind index),

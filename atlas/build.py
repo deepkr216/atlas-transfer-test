@@ -302,8 +302,10 @@ STUB_KIND = "stub"
 COPY_KINDS = RESOLVER_KINDS + (STUB_KIND,)
 # the folder atlas.recover writes a copybook it rebuilt from the compiler listings into (recover.FOLDER: under SHARED,
 # or under a system when the systems' texts differ). Such a copy stands in for its system's missing member (SHARED's:
-# the estate's): make_resolver drops it once a real member of the name sits in the program's own system, in SHARED, or
-# in the system the copy was written for (recovered_gives_way; ROADMAP re-parse item 11)
+# the estate's): make_resolver drops it once a real member of the name sits in the program's own system or in SHARED;
+# beside another system's real member only the program's own system's copy, else SHARED's, stays, and the chain takes
+# it first (recovered_gives_way, _chain_pick; ROADMAP re-parse item 11). A program (holds_program) is never a
+# copybook, nor the real member a copy stands in for
 RECOVERED_FOLDER = "RECOVERED-COPYBOOKS"
 # the folder of the estate every system shares (estate\SHARED\...: derive_systems names its members' system so)
 SHARED_SYSTEM = "SHARED"
@@ -401,6 +403,7 @@ class Ctx:
         self.folder_dataset: Dict[str, Optional[str]] = {}
         self.stub_lines: Dict[int, Optional[int]] = {}  # member id -> lines holding numbers, for a stub a COPY names
         self.stub_kinds: Dict[int, str] = {}            # member id -> the classifier's kind of a stub a job names
+        self.program_text: Dict[int, bool] = {}         # member id -> its own lines hold a program (holds_program)
 
     def problem(self, kind: str, path: str, detail: str, line: Optional[str] = None) -> None:
         """A member or file that could not be indexed: shown now (with the time),
@@ -1720,22 +1723,36 @@ def folder_dataset(ctx: Ctx, path: str) -> Optional[str]:
     return ctx.folder_dataset[key]
 
 
+# the how of a pick the chain made for the estate's recovered copy (SHARED's RECOVERED-COPYBOOKS): it stands in for
+# the program's missing member while neither its own system nor SHARED holds a real one (_chain_pick)
+ESTATE_COPY_HOW = "the estate's recovered copy - no real one in the program's system or SHARED"
+
+
 def _chain_pick(ctx: Ctx, prog: Mem, cands: List[Mem], lib: Optional[str]) -> Tuple[Mem, str]:
     """The precedence chain over same-named candidates: COPY x OF lib > the
     program's own department in its declared SYSLIB order > same department
-    > authoritative > same folder > first. A CLAIMS program must never
-    silently expand a POLICY department's copy of a same-named copybook.
-    Returns the pick and how it was picked."""
+    > the estate's recovered copy > authoritative > same folder > first. A
+    CLAIMS program must never silently expand a POLICY department's copy of
+    a same-named copybook. A recovered copy is a candidate only while it
+    stands in for this program (recovered_gives_way): its own system's
+    copy is 'same system', and SHARED's - written when the programs'
+    listings across the systems showed one text - comes next, before
+    another department's real member, however the folders sort: before
+    it, 'first found' took POLICY's layout for a GC program when POLICY
+    sorted before SHARED and the recovered copy when it sorted after
+    (LESSONS 210). Returns the pick and how it was picked."""
     by_lib = [c for c in cands if lib and c.library.upper() == lib.upper()]
     same_sys = [c for c in cands if prog.system and c.system == prog.system]
     order = ctx.copylib_order.get(prog.system, [])
     if order and same_sys:
         same_sys.sort(key=lambda c: order.index(c.library.upper()) if c.library.upper() in order else 999)
+    estate = [c for c in cands if is_recovered(c) and recovered_home(c.system) == ""]
     auth = [c for c in cands if c.authoritative]
     same_lib = [c for c in cands if c.library == prog.library]
     how = ("COPY ... OF" if by_lib else "same system" + (" + declared order" if order and same_sys else "")
-           if same_sys else "authoritative" if auth else "same folder" if same_lib else "FIRST FOUND")
-    return (by_lib or same_sys or auth or same_lib or cands)[0], how
+           if same_sys else ESTATE_COPY_HOW if estate else "authoritative" if auth else "same folder" if same_lib
+           else "FIRST FOUND")
+    return (by_lib or same_sys or estate or auth or same_lib or cands)[0], how
 
 
 def listing_pick(ctx: Ctx, prog: Mem, cands: List[Mem], lib: Optional[str], pick: Mem, how: str,
@@ -1807,25 +1824,67 @@ def recovered_home(system: Optional[str]) -> str:
     return "" if s == SHARED_SYSTEM else s
 
 
+# a DIVISION header: with a PROGRAM-ID paragraph, what makes a member a program (index_cobol, holds_program)
+_DIVISION_HEADER = re.compile(r"\b(?:IDENTIFICATION|ID|DATA|PROCEDURE)\s+DIVISION\b", re.IGNORECASE)
+
+
+def holds_program(lines: Sequence[Line]) -> bool:
+    """Whether a member's own code lines (comments left out) hold a program:
+    a PROGRAM-ID paragraph or a DIVISION header - the test index_cobol
+    makes before it writes a program row; a member of kind cobol with
+    neither is 'skipped' as not a program (a copybook filed in a source
+    library). atlas.recover and query._recovered_shadowing read the same
+    fact from the index: a member of kind cobol not 'skipped' (one not
+    parsed to the end - failed, pending - is taken for a program there)."""
+    text = "\n".join(ln.code for ln in lines if not ln.is_comment)
+    return bool(cobol._PROGRAM_ID.search(text) or _DIVISION_HEADER.search(text))
+
+
+def _holds_program(ctx: Ctx, mem: Mem) -> bool:
+    """holds_program for a candidate of kind cobol, read once per build
+    (make_resolver reads it only where a name has several candidates);
+    False for any other kind and for a file that cannot be read now."""
+    if mem.kind != "cobol":
+        return False
+    if mem.id not in ctx.program_text:
+        try:
+            ctx.program_text[mem.id] = holds_program(ctx.lines_for(mem))
+        except OSError:
+            ctx.program_text[mem.id] = False
+    return ctx.program_text[mem.id]
+
+
 def recovered_gives_way(cands: List[Mem], prog: Mem) -> List[Mem]:
-    """`cands` without the recovered copies a real member has replaced. A
-    recovered copy stands in for the member of the system it was written
-    for (SHARED's for the estate) and gives way to a real candidate of the
-    name in the program's own system, in SHARED, or in that system - the
-    test query._recovered_shadowing makes of an index; atlas.recover
-    removes the copy once no program copying the name would still expand it
-    (recover.replaced). A real member that only
-    another system holds is that system's copy: a program whose own system's
-    copy is still a recovered one keeps it in the choice, and the chain
-    takes it ('same system') - a CLAIMS program never silently expands
-    POLICY's layout because POLICY's arrived first (LESSONS 209)."""
-    real = [c for c in cands if not is_recovered(c)]
-    if not real or len(real) == len(cands):
+    """`cands` without the recovered copies that do not stand in for this
+    program. A recovered copy stands in for the member of the system it was
+    written for (SHARED's: the estate's). Once a real candidate of the name
+    sits in the program's own system or in SHARED (or has no system), every
+    recovered copy gives way. While none does, one recovered copy stays in
+    the choice beside another system's real member: the program's own
+    system's, else SHARED's - and the chain takes it first ('same system',
+    then the estate's copy - _chain_pick): a CLAIMS program never silently
+    expands POLICY's layout because POLICY's arrived first (LESSONS 209),
+    whatever order the folders sort in (LESSONS 210). Another system's
+    recovered copy stands in for that system's programs, not this one's,
+    and SHARED's gives way to the program's own: both leave the choice, so
+    the 'N copies' count is the stand-in and the real members. Among
+    recovered copies alone nothing gives way: the chain decides as before.
+    A program is never the real member a copy stands in for: make_resolver
+    leaves the programs out before this whenever another candidate is there
+    (holds_program). query._recovered_shadowing makes the same test of an
+    index, and atlas.recover removes a copy once no program copying the
+    name would still expand it (recover.replaced)."""
+    if not any(is_recovered(c) for c in cands):
         return cands
-    homes = {recovered_home(c.system) for c in real}
-    if "" in homes or recovered_home(prog.system) in homes:
+    real = [c for c in cands if not is_recovered(c)]
+    if not real:
+        return cands
+    home = recovered_home(prog.system)
+    if any(recovered_home(c.system) in (home, "") for c in real):
         return real
-    return [c for c in cands if not is_recovered(c) or recovered_home(c.system) not in homes]
+    own = [c for c in cands if is_recovered(c) and recovered_home(c.system) == home]
+    stand = own or [c for c in cands if is_recovered(c) and recovered_home(c.system) == ""]
+    return [c for c in cands if not is_recovered(c) or c in stand]
 
 
 def make_resolver(ctx: Ctx, prog: Mem, notes: List[Tuple[str, str, int]]):
@@ -1840,14 +1899,24 @@ def make_resolver(ctx: Ctx, prog: Mem, notes: List[Tuple[str, str, int]]):
             if stubs:
                 return None, [], expand.stub_note([(c.library, _stub_lines(ctx, c)) for c in stubs])
             return None
+        # A program is never a copybook: a member of kind cobol whose own lines hold a PROGRAM-ID or a DIVISION
+        # header (holds_program) is a candidate only when no other member of the name is. A callee whose parameter
+        # copybook has its own name (COPY QACALC20 in QACALC20's LINKAGE) is not that copybook: the chain's 'same
+        # system' or 'first found' took it over the copybook or a recovered copy, and the whole callee was expanded
+        # into its caller, 'skipped - recursive' at its own COPY (LESSONS 210). The only member of the name is still
+        # taken, as before
+        if len(cands) > 1 and any(c.kind == "cobol" for c in cands):
+            copies = [c for c in cands if not _holds_program(ctx, c)]
+            if copies:
+                cands = copies
         # A copy atlas.recover rebuilt from the listings stands in for a missing member: once a real member of the
-        # name sits in the program's own system, in SHARED, or in the system the copy was written for, the copy is
-        # no candidate - the real copybook is expanded the moment it arrives, whatever the chain below would say
-        # (the same folder, first found), and a stand-in replaced is never counted as a second library in a choice
-        # among several. Before, the chain could keep the recovered copy until atlas.recover removed it, and
-        # coverage warned meanwhile (ROADMAP re-parse item 11, LESSONS 168). A real member only another system
-        # holds does not replace the program's own system's recovered copy: both stay, and the chain decides and
-        # records the choice, as it does among recovered copies alone (LESSONS 209).
+        # name sits in the program's own system or in SHARED, the copy is no candidate - the real copybook is
+        # expanded the moment it arrives, whatever the chain below would say (the same folder, first found), and a
+        # stand-in replaced is never counted as a second library in a choice among several. Before, the chain could
+        # keep the recovered copy until atlas.recover removed it, and coverage warned meanwhile (ROADMAP re-parse
+        # item 11, LESSONS 168). A real member only another system holds replaces neither the program's own
+        # system's recovered copy nor SHARED's: they stay, the chain takes them first and records the choice
+        # (LESSONS 209, 210); a copy written for another system gives way to it
         cands = recovered_gives_way(cands, prog)
         pick = cands[0]
         if len(cands) > 1:
@@ -1896,8 +1965,7 @@ def index_cobol(ctx: Ctx, mem: Mem) -> None:
     exp_text = expand.expanded_text(exp)
     facts = cobol.parse_program(exp_text)
 
-    if facts.program_id is None and not re.search(r"\b(?:IDENTIFICATION|ID|DATA|PROCEDURE)\s+DIVISION\b",
-                                                   exp_text, re.IGNORECASE):
+    if facts.program_id is None and not _DIVISION_HEADER.search(exp_text):
         # Not a program at all (a copybook or a card deck filed in the source
         # library): no program row, and the member says why.
         conn.execute("UPDATE member SET parse_status='skipped', parse_error=? WHERE id=?",

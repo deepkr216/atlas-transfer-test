@@ -40,15 +40,16 @@ written only when the copybook parser reads it as data items, procedure
 code, or comments, and the build would file it as a copybook. When the
 real copybook later arrives in the estate, the build expands it at once (a
 recovered copy gives way to a real member of its name in the program's own
-system, in SHARED, or in the system it was written for - ROADMAP re-parse
-item 11), and the next run removes the recovered one once no program
-copying its name would still expand it (a real member in SHARED or in the
-system it was written for, or one in the own system of every program that
-copies it); a program whose COPY row still resolves to it (an index built
-before the item) is marked for the next build. A real member only another
-system holds leaves a system's own recovered copy in place: that system's
-programs keep its layout, and the build records the choice. A program that
-copies its own name never expands itself, so its recovered copy stays.
+system or in SHARED - ROADMAP re-parse item 11), and the next run removes
+the recovered one once no program copying its name would still expand it
+(recover.replaced); a program whose COPY row still resolves to it (an index
+built before the item) is marked for the next build. A real member only
+another system holds leaves a system's own recovered copy in place, and
+SHARED's: a program takes its own system's copy, else SHARED's, before
+another system's real member, and the build records the choice. A program
+is never the real member of its name - one that copies its own name never
+expands itself, and a callee whose parameter copybook has its own name is
+not that copybook - so its recovered copy stays.
 
 Every recovered copybook says in its first lines where it came from; it is
 the copybook's text as one program saw it, not the library copy, and the
@@ -147,7 +148,7 @@ from typing import AbstractSet, Callable, Dict, List, Optional, Sequence, Set, T
 
 from . import classify, copybook, expand, reader
 
-FOLDER = "RECOVERED-COPYBOOKS"                                      # build.RECOVERED_FOLDER: the build ranks such a copy last
+FOLDER = "RECOVERED-COPYBOOKS"          # build.RECOVERED_FOLDER: gives way to the real member it stands in for (build.recovered_gives_way)
 # the removal line when no program's COPY row resolves to a removed copy - on an index built by the toolkit of ROADMAP
 # re-parse item 11 always so: the build expands the real member the moment it arrives
 REMOVED_NONE_EXPANDS = "no program expands them, so none is marked"
@@ -1343,6 +1344,26 @@ NOT_IN_INDEX_TO_DATE = "the program itself is not in the index to date the listi
 NOT_HELD_WHY = ("the build could only choose among the copies it has: the copy it used stands; the listing names the "
                 "library the program was compiled against (a staging library, or one gone from the host) - if it still "
                 "exists and matters, the fetch list names it")
+# the copy the build used is one this tool wrote (a RECOVERED-COPYBOOKS folder): not a library's member, so no library
+# dataset is known for it - the listing names the library to fetch (LESSONS 210)
+RECOVERED_USED = "a recovered copy"
+
+
+def is_recovered_path(path: str) -> bool:
+    """Whether a member's path sits in a RECOVERED-COPYBOOKS folder - a copy
+    this tool wrote from the listings (build.is_recovered reads the same
+    folder name)."""
+    return os.path.basename(os.path.dirname(str(path))).upper() == FOLDER
+
+
+def recovered_not_held_why(dsn: str, copybook: str, no_member: bool) -> str:
+    """The why of a NOT HELD verdict where the copy the build used is a
+    recovered copy: the library the listing names is the one to fetch."""
+    where = (f"which the index holds without {copybook} in it - fetch that member" if no_member else
+             "a library the index does not hold - fetch it (work\\fetch-list.txt names it)")
+    return (f"the copy the build used is a recovered copy - a stand-in this tool wrote from the listings, not a library's "
+            f"member; the listing names {dsn}, {where}, then build: the real member replaces the recovered copy. Do not "
+            "remove the recovered copy by hand: the build would then take another system's copy, if one is held")
 # the listing names a library the index holds whose member of the name is only a stub (numbers - ROADMAP re-parse item
 # 23): not 'a library the index does not hold' - the program was compiled against a text that library no longer holds,
 # and the listing prints it (LESSONS 206)
@@ -1448,11 +1469,13 @@ def check_choices(conn: sqlite3.Connection, sources: Optional[Dict[str, List[Cop
         naming = [r for r in read if r[0] == copybook]                  # every listing read's rows for this copybook
         rows = rows_of_system(naming, system, systems, twins)          # the ones that speak for THIS program - the
         said = sorted({r[2] for r in rows if r[2]})                    # rows the resolver read for this (program, copybook)
+        stand_in = used_dsn is None and is_recovered_path(used)        # a copy this tool wrote: no dataset of its own
         v: Dict[str, object] = {"program": program, "copybook": copybook, "used": used, "used_dataset": used_dsn,
                                 "how": how, "member_id": mid, "system": system, "listing_datasets": said,
                                 "ddnames": sorted({r[1] for r in rows if r[1]}),
                                 "listings": sorted({r[3] for r in rows if r[3]}), "index_has": "",
-                                "current": None, "matched": None, "dated": "", "named": "", "marked": ""}
+                                "current": None, "matched": None, "dated": "", "named": "", "marked": "",
+                                "recovered": stand_in}
         if program not in srcs:
             v.update(verdict="UNKNOWN", why="no listing of the program was read")
         elif twins and not rows:
@@ -1469,7 +1492,7 @@ def check_choices(conn: sqlite3.Connection, sources: Optional[Dict[str, List[Cop
                      f"none of the {n_read} listings read has a row for {copybook} in its table")
         elif not said:
             v.update(verdict="UNKNOWN", why=f"the listing's table names no library for {copybook}")
-        elif used_dsn is None:
+        elif used_dsn is None and not stand_in:
             v.update(verdict="UNKNOWN", why="the chosen member's library dataset is not known (no `library` row for its "
                                             "folder, and the folder is not named after a dataset)")
         elif said == [used_dsn]:
@@ -1544,7 +1567,8 @@ def check_choices(conn: sqlite3.Connection, sources: Optional[Dict[str, List[Cop
             else:
                 have = (f"the index holds that library ({_tail(str(p))}) but no {copybook} in it" if what == "no member"
                         else "not a library the index holds")
-                v.update(verdict="NOT HELD", why=NOT_HELD_WHY, index_has=have, current=cur, matched=matched, named=d)
+                why = recovered_not_held_why(d, copybook, what == "no member") if stand_in else NOT_HELD_WHY
+                v.update(verdict="NOT HELD", why=why, index_has=have, current=cur, matched=matched, named=d)
         out.append(v)
     return out
 
@@ -1738,7 +1762,7 @@ def choice_report(checks: Sequence[Dict[str, object]], root: Optional[str]) -> L
     lines.append("\n| program | copybook | the index used | the listing says | listing current? | verdict | why |\n"
                  "|---|---|---|---|---|---|---|\n")
     for v in shown:
-        used = f"{v['used_dataset']} ({_tail(str(v['used']))}; {v['how']})"
+        used = f"{RECOVERED_USED if v.get('recovered') else v['used_dataset']} ({_tail(str(v['used']))}; {v['how']})"
         says = (", ".join(str(d) for d in v["listing_datasets"]) + (f" ({', '.join(str(d) for d in v['ddnames'])})" if v["ddnames"] else "")
                 + (f" - {v['index_has']}" if v["index_has"] else ""))
         dated = dated_cell(v["current"], v["matched"])                 # type: ignore[arg-type]
@@ -3545,20 +3569,25 @@ def real_copies(conn: sqlite3.Connection, roots: Sequence[str]) -> Dict[str, Set
     """{NAME: the systems holding a real member of the name} for every name
     the estate holds outside the recovered folders: a member of a resolver
     kind, its system as build.recovered_home reads it ('' for SHARED and for
-    none). A program (kind cobol) that copies its own name is not counted
-    for that name: the build never expands a program into itself, so its own
-    COPY takes the recovered copy, and removing that copy made the COPY NOT
-    FOUND on the next build and the copy written again on the run after -
-    every run (LESSONS 209)."""
+    none). A program is never the real member of its name: a member of kind
+    cobol the build parsed as one - any status but 'skipped', which it gives
+    a member with no PROGRAM-ID and no DIVISION header (a copybook filed in a
+    source library); one not parsed to the end (failed, pending) is taken
+    for a program - the build's own test (build.holds_program), which leaves
+    a program out of the candidates whenever another member of the name is
+    one. A program copying a copybook of its own name never expands itself
+    (LESSONS 209), and a callee whose parameter copybook has its own name is
+    not that copybook (LESSONS 210): counting either as the real member
+    removed a recovered copy the programs still expanded, or kept one the
+    build no longer read."""
     from . import build as _build
     rec = [os.path.normcase(os.path.abspath(r)) + os.sep for r in roots]
-    itself = {int(r[0]) for r in conn.execute("SELECT DISTINCT c.member_id FROM copy_use c JOIN member m ON m.id = c.member_id "
-                                              "WHERE m.kind = 'cobol' AND UPPER(c.copybook) = UPPER(m.name)")}
     names: Dict[str, Set[str]] = {}
-    for mid, name, path, system in conn.execute(f"SELECT id, name, path, system FROM member WHERE kind IN "
-                                                f"({','.join('?' * len(RESOLVER_KINDS))})", RESOLVER_KINDS):
-        if int(mid) in itself:
-            continue
+    for name, path, system, kind, status in conn.execute(
+            f"SELECT name, path, system, kind, parse_status FROM member WHERE kind IN "
+            f"({','.join('?' * len(RESOLVER_KINDS))})", RESOLVER_KINDS):
+        if kind == "cobol" and status != "skipped":
+            continue                                                    # a program
         p = os.path.normcase(os.path.abspath(path))
         if not any(p.startswith(r) for r in rec) and FOLDER.lower() not in p.lower():
             names.setdefault(name.upper(), set()).add(_build.recovered_home(system))
@@ -3578,35 +3607,62 @@ def copier_homes(conn: sqlite3.Connection, names: Sequence[str]) -> Dict[str, Se
     """{NAME: the systems of the programs copying it} (build.recovered_home:
     '' for SHARED and for none) - programs only, nested copies included (a
     program's copy_use rows hold them); a copybook's own COPY rows are never
-    resolved."""
+    resolved. A program whose every COPY of the name names a library (COPY
+    ... OF) holding a real member of it takes that member - the chain's
+    first rule (build._chain_pick) - and never a recovered copy: it is left
+    out (LESSONS 210). A program is not a real member (real_copies)."""
     from . import build as _build
     out: Dict[str, Set[str]] = {}
     wanted = sorted({n.upper() for n in names})
+    kinds = ",".join("?" * len(RESOLVER_KINDS))
     for k in range(0, len(wanted), 500):
         chunk = wanted[k:k + 500]
-        for name, system in conn.execute(f"SELECT DISTINCT UPPER(c.copybook), m.system FROM copy_use c JOIN member m "
-                                         f"ON m.id = c.member_id WHERE m.kind = 'cobol' AND UPPER(c.copybook) IN "
-                                         f"({','.join('?' * len(chunk))})", tuple(chunk)):
-            out.setdefault(str(name), set()).add(_build.recovered_home(system))
+        marks = ",".join("?" * len(chunk))
+        libs: Dict[str, Set[str]] = defaultdict(set)                   # name -> the libraries holding a real member
+        for name, lib in conn.execute(f"SELECT UPPER(name), UPPER(COALESCE(library, '')) FROM member WHERE UPPER(name) IN "
+                                      f"({marks}) AND kind IN ({kinds}) AND NOT (kind = 'cobol' AND "
+                                      f"COALESCE(parse_status, '') != 'skipped') AND UPPER(COALESCE(library, '')) != ?",
+                                      (*chunk, *RESOLVER_KINDS, FOLDER)):
+            libs[str(name)].add(str(lib))
+        takes: Dict[Tuple[str, int], Tuple[Optional[str], bool]] = {}   # (name, program) -> (system, may take a copy)
+        for name, mid, system, of in conn.execute(f"SELECT UPPER(c.copybook), c.member_id, m.system, c.of_library FROM "
+                                                  f"copy_use c JOIN member m ON m.id = c.member_id WHERE m.kind = 'cobol' "
+                                                  f"AND UPPER(c.copybook) IN ({marks})", tuple(chunk)):
+            passes = bool(of) and str(of).strip().upper() in libs.get(str(name), ())
+            key = (str(name), int(mid))
+            takes[key] = (system, takes.get(key, (system, False))[1] or not passes)
+        for (name, _mid), (system, may) in takes.items():
+            if may:
+                out.setdefault(name, set()).add(_build.recovered_home(system))
     return out
 
 
-def replaced(homes: Optional[AbstractSet[str]], home: str, copiers: AbstractSet[str] = frozenset()) -> bool:
+def replaced(homes: Optional[AbstractSet[str]], home: str, copiers: AbstractSet[str] = frozenset(),
+             stand_ins: AbstractSet[str] = frozenset()) -> bool:
     """Whether the real members held in `homes` (a real_copies value)
     replace a recovered copy written for `home` (folder_home), so the copy
     can go: no program copying the name (`copiers`: their systems,
-    copier_homes) would still expand it. The build drops the copy for a
-    program once a real member sits in SHARED, in the system the copy was
-    written for, or in the program's own system (build.recovered_gives_way):
-    so one in SHARED or in `home` replaces it for every program, and one in
-    each copier's own system does too. A real member that only another
-    system holds leaves the copy in place while a program of a system
-    without one copies the name - it still expands the copy, and removing
-    it handed that program the other system's layout with nothing said
-    (LESSONS 209)."""
+    copier_homes) would still expand it - the build's rule
+    (build.recovered_gives_way, then the chain's order, build._chain_pick)
+    made over every copier. A real member in SHARED or in `home` replaces it
+    for every program. Otherwise a system's own copy is expanded by that
+    system's programs alone - for a program of another system it gives way
+    to any real member - so it goes once no program of `home` copies the
+    name. The estate's copy (`home` '') is expanded by a program whose own
+    system holds neither a real member nor a recovered copy of its own
+    (`stand_ins`: the systems holding one), and by a program of SHARED or of
+    no system: it goes once every copier's system holds one or the other.
+    With no real member anywhere nothing replaces it. A program that names
+    another library (COPY ... OF) or follows its current listing to a held
+    copy may expand another copy while this one is kept: kept, never removed
+    while a program expands it (LESSONS 209, 210)."""
     if not homes:
         return False
-    return "" in homes or home in homes or all(h in homes for h in copiers)
+    if "" in homes or home in homes:
+        return True
+    if home:
+        return home not in copiers
+    return all(h in homes or (h and h in stand_ins) for h in copiers)
 
 
 def recovered_only(conn: sqlite3.Connection, roots: Sequence[str], real: AbstractSet[str]) -> Dict[str, int]:
@@ -3970,16 +4026,21 @@ def fetch_list(conn: sqlite3.Connection, sources: Dict[str, List[CopySource]], m
     the ones it holds only as a recovered copy. Each entry: dataset, held (a
     folder the index holds it as, or None), programs (whose listings name
     it), and the copybooks that came from it in four lists - missing (the
-    index lacks them), recovered (held only as a recovered copy: still to
-    fetch for), chosen (the build chose among several and this listing says
-    this dataset), other. Datasets with copybooks to fetch for first, then
-    the most programs first: the order to fetch in."""
+    index lacks them), recovered (held only as a recovered copy, or held for
+    real only by another system while the program whose listing names this
+    dataset expands its recovered copy: still to fetch for), chosen (the
+    build chose among several and this listing says this dataset), other.
+    Datasets with copybooks to fetch for first, then the most programs
+    first: the order to fetch in."""
     holders = held_datasets(conn, library_datasets(conn))
     rec = {n.upper() for n in recovered}
     chosen_at: Dict[str, Set[str]] = defaultdict(set)                  # dataset -> copybooks chosen among several
-    for v in checks:
+    stand_in_at: Dict[str, Set[str]] = defaultdict(set)                # dataset -> copybooks a program's recovered copy
+    for v in checks:                                                    # stands in for (LESSONS 210)
         for d in v["listing_datasets"]:                                 # type: ignore[union-attr]
             chosen_at[str(d)].add(str(v["copybook"]))
+            if v.get("recovered"):
+                stand_in_at[str(d)].add(str(v["copybook"]))
     per: Dict[str, Dict[str, object]] = {}
     named: Set[str] = set()
     for program, rows in sources.items():
@@ -3992,7 +4053,7 @@ def fetch_list(conn: sqlite3.Connection, sources: Dict[str, List[CopySource]], m
                                      "chosen": set(), "other": set()})
             e["programs"].add(program)                                  # type: ignore[union-attr]
             bucket = ("recovered" if cb in rec else "missing") if cb in missing else \
-                     "chosen" if cb in chosen_at.get(dsn, ()) else "other"
+                     "recovered" if cb in stand_in_at.get(dsn, ()) else "chosen" if cb in chosen_at.get(dsn, ()) else "other"
             e[bucket].add(cb)                                           # type: ignore[union-attr]
     out: List[Dict[str, object]] = []
     for dsn, e in per.items():
@@ -4028,12 +4089,13 @@ def fetch_report(fetch: Sequence[Dict[str, object]], unnamed: Sequence[str], roo
     table names."""
     lines = ["\n## Libraries the listings name (fetch list)\n\n"
              "After the source, a compiler listing names the library dataset each copybook was read from. A dataset "
-             "that holds a copybook to fetch for - one the index lacks, or holds only as a recovered copy (the build "
-             "has read the copy this tool wrote, so the copybook is no longer missing, but the real member is still on "
-             "the host) - and is not fetched yet is the one to fetch: its members, once in the estate, make the "
-             "recovered copies unnecessary.\n\n"]
+             "that holds a copybook to fetch for - one the index lacks, or one a program expands from a recovered copy "
+             "(the index holds it only as one, or another system alone holds a real member: the build has read the copy "
+             "this tool wrote, so the copybook is no longer missing, but the program's own member is still on the host) "
+             "- and is not fetched yet is the one to fetch: its members, once in the estate, make the recovered copies "
+             "unnecessary.\n\n"]
     if fetch:
-        lines.append("| dataset | held? | copybooks to fetch for (missing, or held only as a recovered copy) | "
+        lines.append("| dataset | held? | copybooks to fetch for (missing, or expanded from a recovered copy) | "
                      "copybooks the build chose among several | programs |\n|---|---|---|---|---|\n")
         for e in fetch:
             held = f"held as {_tail(str(e['held']), 2)}" if e["held"] else "not fetched"
@@ -4141,6 +4203,12 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
         # a copy goes only when none of them would still expand it (replaced)
         held = {n for d in roots_out for n in set(_load_marker(d)) | set(_on_disk(d))}
         copiers_of = copier_homes(conn, [n for n in held if n in real])
+        # the systems holding a recovered copy of each name: a program of such a system takes its own copy, never
+        # the estate's (build._chain_pick)
+        stand_ins: Dict[str, Set[str]] = defaultdict(set)
+        for d in roots_out:
+            for n in _on_disk(d):
+                stand_ins[n].add(folder_home(d, root))
         # held only as a recovered copy: no longer missing to the build, still to fetch for - the listings of the
         # programs copying them are read too, so the fetch list keeps naming their libraries after the build has run
         recovered = recovered_only(conn, roots_out, real)
@@ -4157,7 +4225,7 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
         disk = _on_disk(d)
         home = folder_home(d, root)                                     # the system this folder's copies stand in for
         for name in sorted(set(ents) | set(disk)):
-            if replaced(real.get(name), home, copiers_of.get(name, set())):
+            if replaced(real.get(name), home, copiers_of.get(name, set()), stand_ins.get(name, set())):
                 if not dry_run:
                     try:
                         os.remove(os.path.join(d, name + ".cpy"))

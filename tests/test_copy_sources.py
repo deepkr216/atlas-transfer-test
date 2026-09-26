@@ -1024,7 +1024,7 @@ class FetchListFromTheListings(unittest.TestCase):
             "| PROD.OTHER.COPYLIB | not fetched | - | - | 1 |",
             "| PROD.POLICY.COPYLIB2 | held as POLICY/POLCOPY2 | - | DUPREC | 1 |",
         ])
-        self.assertIn("| dataset | held? | copybooks to fetch for (missing, or held only as a recovered copy) | "
+        self.assertIn("| dataset | held? | copybooks to fetch for (missing, or expanded from a recovered copy) | "
                       "copybooks the build chose among several | programs |", sec)
         self.assertIn("Fetch a dataset with the UI's Bulk add (paste the dataset names) or your zowe command; then run the build; "
                       "the missing copybooks it holds resolve, and the recovered copies of them are removed on the next recover run.", sec)

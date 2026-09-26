@@ -30,8 +30,10 @@ import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
+sys.path.insert(0, HERE)
 
 from atlas import build, query, recover  # noqa: E402
+from test_recover import ibm_listing  # noqa: E402
 
 PROGRAM = """       IDENTIFICATION DIVISION.
        PROGRAM-ID. {name}.
@@ -380,12 +382,17 @@ class ARecoveredCopyStandsForItsOwnSystem(_OwnSystem):
         self.assertEqual(self.status_in("GC-TEST", "XSPGM1"), "ok")
 
     def test_the_estates_recovered_copy_stays_a_choice_beside_another_systems_real_one(self):
-        # POLICY's program takes POLICY's real member; for the GC program both stay candidates and the choice is said
+        # POLICY's program takes POLICY's real member; for the GC program both stay candidates, the chain takes the
+        # estate's recovered copy - never POLICY's layout because POLICY's folder sorts first - and the choice is said
         self.assertEqual(self.where("POLICY", "XSPGM3", "XSONE"),
                          ("PROD.POLICY.COPYLIB", "POLICY/PROD.POLICY.COPYLIB/XSONE.cpy"))
         self.assertEqual(self.rows_in("POLICY", "XSPGM3"), [])
+        self.assertEqual(self.where("GC", "XSPGM2", "XSONE"), (recover.FOLDER, "SHARED/RECOVERED-COPYBOOKS/XSONE.cpy"))
+        self.assertIn("XS-SHR-FIELD", self.fields_in("GC", "XSPGM2"))
+        self.assertNotIn("XS-POL-FIELD", self.fields_in("GC", "XSPGM2"))
         (row,) = self.rows_in("GC", "XSPGM2")
         self.assertTrue(row.startswith("2 copies of XSONE with different content; used "), row)
+        self.assertTrue(row.endswith(f"({build.ESTATE_COPY_HOW})"), row)
 
     def test_a_program_copying_its_own_name_expands_the_recovered_copy(self):
         self.assertEqual(self.where("GC", "XSSELF", "XSSELF"), (recover.FOLDER, "GC/RECOVERED-COPYBOOKS/XSSELF.cpy"))
@@ -467,6 +474,307 @@ class AnIndexBuiltBeforeTheItemWithAnotherSystemsRealCopy(_OwnSystem):
         self.assertEqual(query._recovered_shadowing(self.conn), "")
 
 
+# ---------------------------------------------------------------------------
+# The verifier's second round on item 11 (LESSONS 210). (1) Where neither the program's own system nor SHARED held a
+# real member, 'first found' chose between the estate's recovered copy and another system's real member by where their
+# folders sort: a GC program took POLICY's layout when POLICY sorted before SHARED, and the recovered copy when the
+# other system sorted after it, both 'FIRST FOUND'. The program's own system's recovered copy, else SHARED's, is now
+# taken before another system's real member, and that is the one stand-in left in the choice. (2) A program of the
+# name - a callee whose parameter copybook has its own name - was counted as the real member for every other program
+# copying the name: the recovered copy gave way to the callee's source, the whole callee was expanded into the
+# caller's WORKING-STORAGE ('skipped - recursive'), and atlas.recover kept the copy by its own test, so nothing ever
+# changed. A program is never a copybook: it is a candidate only when no other member of the name is.
+
+def stand_in_files(other):
+    """OTHER is a system holding real members only; it sorts before SHARED or after it."""
+    return {
+        # the estate's recovered copy and a real member only OTHER holds, copied by a GC program and an OTHER program
+        "GC/PROD.GC.SRC/SIPGM1.cbl": program("SIPGM1", "SIBOOK1", "SI-SHR-F1", "SI-OTH-F1"),
+        f"{other}/{other}.SRC/SIPGM1T.cbl": program("SIPGM1T", "SIBOOK1", "SI-SHR-F1", "SI-OTH-F1"),
+        "SHARED/RECOVERED-COPYBOOKS/SIBOOK1.cpy": RECOVERED_HEAD + book("SI-SHR-F1"),
+        f"{other}/{other}.COPYLIB/SIBOOK1.cpy": book("SI-OTH-F1"),
+        # GC's own recovered copy, the estate's and OTHER's real member: GC's own, counted beside OTHER's alone
+        "GC/PROD.GC.SRC/SIPGM2.cbl": program("SIPGM2", "SIBOOK2", "SI-GC-F2", "SI-SHR-F2", "SI-OTH-F2"),
+        "GC/RECOVERED-COPYBOOKS/SIBOOK2.cpy": RECOVERED_HEAD + book("SI-GC-F2"),
+        "SHARED/RECOVERED-COPYBOOKS/SIBOOK2.cpy": RECOVERED_HEAD + book("SI-SHR-F2"),
+        f"{other}/{other}.COPYLIB/SIBOOK2.cpy": book("SI-OTH-F2"),
+        # a third system's recovered copy and OTHER's real member: the GC program takes the real member
+        "GC/PROD.GC.SRC/SIPGM3.cbl": program("SIPGM3", "SIBOOK3", "SI-QX-F3", "SI-OTH-F3"),
+        "QX/RECOVERED-COPYBOOKS/SIBOOK3.cpy": RECOVERED_HEAD + book("SI-QX-F3"),
+        f"{other}/{other}.COPYLIB/SIBOOK3.cpy": book("SI-OTH-F3"),
+        # COPY ... OF the library holding OTHER's real member: GC's own recovered copy is passed by
+        "GC/PROD.GC.SRC/SIPGM4.cbl": program("SIPGM4", "SIBOOK4", "SI-GC-F4", "SI-OTH-F4").replace(
+            "COPY SIBOOK4.", f"COPY SIBOOK4 OF {other}LIB."),
+        "GC/RECOVERED-COPYBOOKS/SIBOOK4.cpy": RECOVERED_HEAD + book("SI-GC-F4"),
+        f"{other}/{other}LIB/SIBOOK4.cpy": book("SI-OTH-F4"),
+    }
+
+
+class _StandIn:
+    """The checks, for each OTHER (a mixin: the classes below run them)."""
+    other = "APOL"
+
+    @property
+    def files(self):
+        return stand_in_files(self.other)
+
+    def check_picks(self, recovered=False):
+        """`recovered`: after atlas.recover removed the copies no program expands."""
+        o = self.other
+        # the estate's copy for the GC program, OTHER's real member for OTHER's - whatever order the folders sort in
+        self.assertEqual(self.where("GC", "SIPGM1", "SIBOOK1"), (recover.FOLDER, "SHARED/RECOVERED-COPYBOOKS/SIBOOK1.cpy"))
+        self.assertEqual(self.fields_in("GC", "SIPGM1") & {"SI-SHR-F1", "SI-OTH-F1"}, {"SI-SHR-F1"})
+        (row,) = self.rows_in("GC", "SIPGM1")
+        self.assertTrue(row.startswith("2 copies of SIBOOK1 with different content; used "), row)
+        self.assertTrue(row.endswith(f"({build.ESTATE_COPY_HOW})"), row)
+        self.assertNotIn("FIRST FOUND", row)
+        self.assertEqual(self.where(o, "SIPGM1T", "SIBOOK1"), (f"{o}.COPYLIB", f"{o}/{o}.COPYLIB/SIBOOK1.cpy"))
+        self.assertEqual(self.rows_in(o, "SIPGM1T"), [])
+        # GC's own copy; the estate's is not counted beside it
+        self.assertEqual(self.where("GC", "SIPGM2", "SIBOOK2"), (recover.FOLDER, "GC/RECOVERED-COPYBOOKS/SIBOOK2.cpy"))
+        self.assertEqual(self.fields_in("GC", "SIPGM2") & {"SI-GC-F2", "SI-SHR-F2", "SI-OTH-F2"}, {"SI-GC-F2"})
+        (row,) = self.rows_in("GC", "SIPGM2")
+        self.assertTrue(row.startswith("2 copies of SIBOOK2 with different content; used "), row)
+        self.assertTrue(row.endswith("(same system)"), row)
+        # QX's copy stands in for QX's programs: the GC program takes OTHER's real member, with nothing to choose
+        self.assertEqual(self.where("GC", "SIPGM3", "SIBOOK3"), (f"{o}.COPYLIB", f"{o}/{o}.COPYLIB/SIBOOK3.cpy"))
+        self.assertEqual(self.rows_in("GC", "SIPGM3"), [])
+        # the library the COPY names, GC's own copy beside it until recover removes it - no program expands it
+        self.assertEqual(self.where("GC", "SIPGM4", "SIBOOK4"), (f"{o}LIB", f"{o}/{o}LIB/SIBOOK4.cpy"))
+        rows = self.rows_in("GC", "SIPGM4")
+        self.assertTrue(rows == [] if recovered else rows[0].endswith("(COPY ... OF)"), rows)
+        for prog in ("SIPGM1", "SIPGM2", "SIPGM3", "SIPGM4"):
+            self.assertEqual(self.status_in("GC", prog), "ok", prog)
+
+    def test_the_program_takes_its_stand_in_before_another_systems_real_member(self):
+        self.check_picks()
+        self.assertEqual(query._recovered_shadowing(self.conn), "")
+
+    def test_recover_removes_the_copies_no_program_expands_and_keeps_the_rest(self):
+        stats, said = self.recover_run()
+        # SHARED's SIBOOK2 (the one GC program copying it has its own), QX's SIBOOK3 (no QX program copies it) and
+        # GC's SIBOOK4 (its one GC program names the library holding the real member)
+        self.assertEqual((stats["removed"], stats["marked"]), (3, 0), said)
+        self.assertIn("  3 recovered copybook(s) removed - the estate now holds the real member: SIBOOK2, SIBOOK3, SIBOOK4",
+                      said)
+        self.assertIn("  " + recover.REMOVED_NONE_EXPANDS, said)
+        for gone in ("SHARED/RECOVERED-COPYBOOKS/SIBOOK2.cpy", "QX/RECOVERED-COPYBOOKS/SIBOOK3.cpy",
+                     "GC/RECOVERED-COPYBOOKS/SIBOOK4.cpy"):
+            self.assertFalse(self.on_disk(gone), gone)
+        for kept in ("SHARED/RECOVERED-COPYBOOKS/SIBOOK1.cpy", "GC/RECOVERED-COPYBOOKS/SIBOOK2.cpy"):
+            self.assertTrue(self.on_disk(kept), kept)
+        for _round in range(2):
+            self.rebuild()
+            self.check_picks(recovered=True)
+            self.assertEqual(query._recovered_shadowing(self.conn), "")
+            stats, said = self.recover_run()
+            self.assertEqual((stats["removed"], stats["marked"]), (0, 0), said)
+
+    def test_on_an_index_built_before_another_systems_copy_is_warned_of_and_healed(self):
+        # what a build before the item could leave ('first found' where QX sorts first): the GC program expanded QX's
+        # recovered copy although OTHER's real member was in the index
+        rec = self.conn.execute("SELECT id FROM member WHERE name='SIBOOK3' AND system='QX'").fetchone()[0]
+        self.conn.execute("UPDATE copy_use SET resolved_member_id=? WHERE copybook='SIBOOK3' AND member_id=(SELECT id "
+                          "FROM member WHERE name='SIPGM3' AND kind='cobol')", (rec,))
+        self.conn.commit()
+        self.assertIn("**1 COPY statement(s) still expand a recovered copybook although the estate now holds the real "
+                      "member** (1 copybook(s): SIBOOK3)", query._recovered_shadowing(self.conn))
+        stats, said = self.recover_run()
+        self.assertEqual((stats["removed"], stats["marked"]), (3, 1), said)
+        self.assertEqual(self.status_in("GC", "SIPGM3"), "pending")
+        self.rebuild()
+        self.check_picks(recovered=True)
+        self.assertEqual(query._recovered_shadowing(self.conn), "")
+
+
+class TheEstatesCopyBesideASystemSortingBeforeShared(_StandIn, _OwnSystem):
+    other = "APOL"
+
+
+class TheEstatesCopyBesideASystemSortingAfterShared(_StandIn, _OwnSystem):
+    other = "TPOL"
+
+
+CALLEE = """       IDENTIFICATION DIVISION.
+       PROGRAM-ID. {name}.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01  WS-X                PIC X(5).
+       LINKAGE SECTION.
+       01  LK-PARM.
+           COPY {name}.
+       PROCEDURE DIVISION USING LK-PARM.
+           MOVE {field} TO WS-X.
+           GOBACK.
+"""
+
+
+def callee_files(where):
+    """A callee whose parameter copybook has its own name, in SHARED's source library; its recovered copy under
+    WHERE (the caller's system, or SHARED)."""
+    return {
+        "QA/QA.PROD.SRC/QAPGM20.cbl": program("QAPGM20", "QACALC20", "QA-C-F20"),
+        f"{where}/RECOVERED-COPYBOOKS/QACALC20.cpy": RECOVERED_HEAD + book("QA-C-F20"),
+        "SHARED/SH.PROD.SRC/QACALC20.cbl": CALLEE.format(name="QACALC20", field="QA-C-F20"),
+        # a program copying its own name, and another program of its system copying that name: the estate's copy
+        "QD/QD.PROD.SRC/QDPGM05.cbl": program("QDPGM05", "QDPGM05", "QD-OWN-F5"),
+        "QD/QD.PROD.SRC/QDPGM5B.cbl": program("QDPGM5B", "QDPGM05", "QD-OWN-F5"),
+        "SHARED/RECOVERED-COPYBOOKS/QDPGM05.cpy": RECOVERED_HEAD + book("QD-OWN-F5"),
+        # no recovered copy at all: the callee in the caller's own system, its copybook under SHARED
+        "GC/PROD.GC.SRC/GCPGM30.cbl": program("GCPGM30", "GCCALC30", "GC-C-F30"),
+        "GC/PROD.GC.SRC/GCCALC30.cbl": CALLEE.format(name="GCCALC30", field="GC-C-F30"),
+        "SHARED/SH.PROD.COPYLIB/GCCALC30.cpy": book("GC-C-F30"),
+    }
+
+
+class _Callee:
+    """The checks, for each folder of the copy (a mixin: the classes below run them)."""
+    copy_in = "QA"
+
+    @property
+    def files(self):
+        return callee_files(self.copy_in)
+
+    def check_picks(self):
+        rel = f"{self.copy_in}/RECOVERED-COPYBOOKS/QACALC20.cpy"
+        # the caller expands the recovered copy, never the callee's source: ok, nothing skipped, no choice
+        self.assertEqual(self.where("QA", "QAPGM20", "QACALC20"), (recover.FOLDER, rel))
+        self.assertIn("QA-C-F20", self.fields_in("QA", "QAPGM20"))
+        self.assertEqual(self.status_in("QA", "QAPGM20"), "ok")
+        self.assertEqual(self.notes("QAPGM20"), [])
+        # the callee's own COPY takes it too
+        self.assertEqual(self.where("SHARED", "QACALC20", "QACALC20"), (recover.FOLDER, rel))
+        self.assertEqual(self.status_in("SHARED", "QACALC20"), "ok")
+        # a program of the name in the caller's own system is not a copy of it either
+        for prog in ("QDPGM05", "QDPGM5B"):
+            self.assertEqual(self.where("QD", prog, "QDPGM05"),
+                             (recover.FOLDER, "SHARED/RECOVERED-COPYBOOKS/QDPGM05.cpy"), prog)
+            self.assertEqual(self.status_in("QD", prog), "ok", prog)
+            self.assertEqual(self.notes(prog), [], prog)
+        # no recovered copy: the copybook, not the callee in the caller's own system ('same system' took it before)
+        self.assertEqual(self.where("GC", "GCPGM30", "GCCALC30"), ("SH.PROD.COPYLIB", "SHARED/SH.PROD.COPYLIB/GCCALC30.cpy"))
+        self.assertEqual(self.status_in("GC", "GCPGM30"), "ok")
+        self.assertEqual(self.notes("GCPGM30"), [])
+        self.assertEqual(self.where("GC", "GCCALC30", "GCCALC30")[1], "SHARED/SH.PROD.COPYLIB/GCCALC30.cpy")
+
+    def notes(self, prog):
+        return [r[0] for r in self.conn.execute("SELECT u.kind || ': ' || u.detail FROM unresolved u JOIN member m "
+                                                "ON m.id=u.member_id WHERE m.name=? AND m.kind='cobol' AND u.kind IN "
+                                                "('expand', 'ambiguous_copybook')", (prog,))]
+
+    def test_the_callers_expand_the_recovered_copy(self):
+        self.check_picks()
+        self.assertEqual(query._recovered_shadowing(self.conn), "")
+        self.assertNotIn("still expand a recovered copybook", query.cmd_coverage(self.conn))
+
+    def test_recover_keeps_it_and_nothing_loops(self):
+        for _round in range(2):
+            stats, said = self.recover_run()
+            self.assertEqual((stats["missing"], stats["removed"], stats["marked"]), (0, 0, 0), said)
+            self.assertTrue(self.on_disk(f"{self.copy_in}/RECOVERED-COPYBOOKS/QACALC20.cpy"))
+            self.assertTrue(self.on_disk("SHARED/RECOVERED-COPYBOOKS/QDPGM05.cpy"))
+            self.rebuild()
+            self.check_picks()
+            self.assertEqual(query._recovered_shadowing(self.conn), "")
+
+
+class ACalleeOfTheNameWithTheCopyInTheCallersSystem(_Callee, _OwnSystem):
+    copy_in = "QA"
+
+
+class ACalleeOfTheNameWithTheCopyUnderShared(_Callee, _OwnSystem):
+    copy_in = "SHARED"
+
+
+def listing_rows(*fields):
+    return [f"           05  {f:<16}PIC X(5)." for f in fields]
+
+
+LISTED_FILES = {
+    # QA and QA-TEST each hold QAPGM11 copying QABOOK11, each system its own recovered copy, QA-TEST's real library
+    # arrived; QA's listing names the staging library QA was compiled against, which the estate does not hold
+    "QA/QA.PROD.SRC/QAPGM11.cbl": program("QAPGM11", "QABOOK11", "QA-PROD-F11", "QA-TEST-F11"),
+    "QA-TEST/QA-TEST.SRC/QAPGM11.cbl": program("QAPGM11", "QABOOK11", "QA-PROD-F11", "QA-TEST-F11"),
+    "QA/RECOVERED-COPYBOOKS/QABOOK11.cpy": RECOVERED_HEAD + book("QA-PROD-F11"),
+    "QA-TEST/RECOVERED-COPYBOOKS/QABOOK11.cpy": RECOVERED_HEAD + book("QA-TEST-F11"),
+    "QA-TEST/QA-TEST.COPYLIB/QABOOK11.cpy": book("QA-TEST-F11"),
+    "QA/QA.PROD.LISTING/QAPGM11.lst": ibm_listing(
+        program("QAPGM11", "QABOOK11", "QA-PROD-F11", "QA-TEST-F11").splitlines(),
+        {"QABOOK11": listing_rows("QA-PROD-F11")}, copy_table=[("QABOOK11", "SYSLIB", "QA.STAGE.COPYLIB")]),
+    "QA-TEST/QA-TEST.LISTING/QAPGM11.lst": ibm_listing(
+        program("QAPGM11", "QABOOK11", "QA-PROD-F11", "QA-TEST-F11").splitlines(),
+        {"QABOOK11": listing_rows("QA-TEST-F11")}, copy_table=[("QABOOK11", "SYSLIB", "QA-TEST.COPYLIB")]),
+}
+
+
+class AStandInTheListingNames(_OwnSystem):
+    """QA's program expands QA's recovered copy on purpose (only QA-TEST's real member has arrived), and its listing
+    names QA.STAGE.COPYLIB. The check of choices said UNKNOWN with advice about a `library` row and the folder name,
+    the fetch list put the library under 'chosen among several' with nothing to fetch for, and coverage advised
+    removing the copy - which would give QA's program QA-TEST's layout (LESSONS 210)."""
+    files = LISTED_FILES
+
+    def setUp(self):
+        super().setUp()
+        self.stats, self.said = self.recover_run()
+        with open(os.path.join(self.td, "work", "recover.md"), encoding="utf-8") as fh:
+            self.report = fh.read()
+
+    def qa_check(self):
+        (v,) = [v for v in recover.check_choices(self.conn) if v["system"] == "QA"]
+        return v
+
+    def test_the_build_keeps_the_stand_in_and_says_the_choice(self):
+        self.assertEqual(self.where("QA", "QAPGM11", "QABOOK11"), (recover.FOLDER, "QA/RECOVERED-COPYBOOKS/QABOOK11.cpy"))
+        self.assertTrue(self.rows_in("QA", "QAPGM11")[0].endswith("(same system)"))
+        self.assertEqual(self.stats["removed"], 1, self.said)                # QA-TEST's copy: its real member arrived
+        self.assertTrue(self.on_disk("QA/RECOVERED-COPYBOOKS/QABOOK11.cpy"))
+
+    def test_the_check_names_the_library_to_fetch(self):
+        v = self.qa_check()
+        self.assertEqual((v["verdict"], v["recovered"], v["named"]), ("NOT HELD", True, "QA.STAGE.COPYLIB"))
+        self.assertIn("the copy the build used is a recovered copy", v["why"])
+        self.assertIn("QA.STAGE.COPYLIB, a library the index does not hold - fetch it", v["why"])
+        self.assertNotIn("`library` row", v["why"])
+        self.assertIn("copybook choices checked against the listings: 0 confirmed, 0 contradicted by a current listing, "
+                      "0 named by an older listing, 1 name a library the index does not hold, 0 unknown", self.said)
+        self.assertIn("| QAPGM11 | QABOOK11 | a recovered copy (QA/RECOVERED-COPYBOOKS/QABOOK11.cpy; same system) | "
+                      "QA.STAGE.COPYLIB (SYSLIB) - not a library the index holds | yes | NOT HELD | the copy the build "
+                      "used is a recovered copy", self.report)
+        self.assertNotIn("library dataset is not known", self.report)
+
+    def test_the_fetch_list_has_it_to_fetch_for(self):
+        self.assertIn("| QA.STAGE.COPYLIB | not fetched | recovered copy: QABOOK11 | - | 1 |", self.report)
+        self.assertIn("| dataset | held? | copybooks to fetch for (missing, or expanded from a recovered copy) |", self.report)
+        with open(os.path.join(self.td, "work", recover.FETCH_LIST), encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "QA.STAGE.COPYLIB\n")
+
+    def test_coverage_and_program_say_to_fetch_it_not_to_remove_the_copy(self):
+        cov = query.cmd_coverage(self.conn)
+        self.assertIn("| ambiguous_copybook (a recovered copy used) | 1 |", cov)
+        self.assertIn("Do not remove the recovered copy by hand", cov)
+        self.assertNotIn("or remove the stale copy", cov)
+        self.assertIn("1 name a library the index does not hold", cov)
+        mid = self.conn.execute("SELECT id FROM member WHERE name='QAPGM11' AND system='QA' AND kind='cobol'").fetchone()[0]
+        says = query._listing_says(self.conn, mid)
+        self.assertIn("- listing says: QABOOK11 came from QA.STAGE.COPYLIB (SYSLIB) - names QA.STAGE.COPYLIB (not a "
+                      "library the index holds); the build used a recovered copy, a stand-in written from the listings: "
+                      "fetch the real member from there and build - it replaces the recovered copy", says)
+
+    def test_the_real_member_arriving_replaces_the_copy(self):
+        p = os.path.join(self.root, "QA", "QA.STAGE.COPYLIB", "QABOOK11.cpy")
+        os.makedirs(os.path.dirname(p))
+        with open(p, "w", encoding="utf-8") as fh:
+            fh.write(book("QA-PROD-F11"))
+        self.rebuild()
+        self.assertEqual(self.where("QA", "QAPGM11", "QABOOK11"), ("QA.STAGE.COPYLIB", "QA/QA.STAGE.COPYLIB/QABOOK11.cpy"))
+        self.assertEqual(self.qa_check()["verdict"], "CONFIRMED")
+        stats, said = self.recover_run()
+        self.assertEqual(stats["removed"], 1, said)
+        self.assertFalse(self.on_disk("QA/RECOVERED-COPYBOOKS/QABOOK11.cpy"))
+        self.assertNotIn("ambiguous_copybook (a recovered copy used)", query.cmd_coverage(self.conn))
+
+
 def _mem(i, system, recovered=False, kind="copybook"):
     return build.Mem(id=i, path=f"{system}/{i}", name="BK", kind=kind, norm_sha=str(i), system=system,
                      library=build.RECOVERED_FOLDER if recovered else f"{system or 'NONE'}.COPYLIB")
@@ -497,11 +805,19 @@ class RecoveredGivesWay(unittest.TestCase):
         # the estate's recovered copy beside a real member POLICY alone holds: both stay for a GC program
         self.assertEqual(self.ids("GC", shr_rec, pol_real), [4, 6])
         self.assertEqual(self.ids("POLICY", shr_rec, pol_real), [6])
-        # a program with no system: SHARED's rule
-        self.assertEqual(self.ids("", gc_rec, pol_real), [1, 6])
+        # a program with no system: SHARED's rule; GC's recovered copy stands in for GC's programs, not for it
+        self.assertEqual(self.ids("", gc_rec, pol_real), [6])
+        self.assertEqual(self.ids("", shr_rec, gc_rec, pol_real), [4, 6])
         self.assertEqual(self.ids("", shr_rec, none_real), [7])
+        # beside another system's real member one stand-in stays: the program's own system's, else SHARED's; another
+        # system's recovered copy gives way to any real member (LESSONS 210)
+        self.assertEqual(self.ids("GC", gc_rec, shr_rec, pol_real), [1, 6])
+        self.assertEqual(self.ids("GC", test_rec, pol_real), [6])
+        self.assertEqual(self.ids("GC", test_rec, shr_rec, pol_real), [4, 6])
+        self.assertEqual(self.ids("SHARED", gc_rec, shr_rec, pol_real), [4, 6])
         # recovered copies alone, or real members alone: as they are
         self.assertEqual(self.ids("GC", gc_rec, shr_rec), [1, 4])
+        self.assertEqual(self.ids("GC", test_rec, gc_rec), [2, 1])
         self.assertEqual(self.ids("GC", test_real, pol_real), [3, 6])
 
     def test_recovers_rule(self):
@@ -514,6 +830,14 @@ class RecoveredGivesWay(unittest.TestCase):
         self.assertFalse(recover.replaced({"POLICY"}, "", {"GC", "POLICY"}))  # the estate's copy: a GC program
         self.assertTrue(recover.replaced({"GC", "POLICY"}, "", {"GC", "POLICY"}))   # every copier has its own
         self.assertTrue(recover.replaced({"POLICY"}, "GC"))                  # no program copies the name
+        # another system's copy stands in for that system's programs alone (LESSONS 210)
+        self.assertTrue(recover.replaced({"POLICY"}, "QX", {"GC"}))           # a GC program takes POLICY's real member
+        self.assertFalse(recover.replaced({"POLICY"}, "QX", {"GC", "QX"}))
+        # the estate's copy: a program whose system holds a recovered copy of its own takes that one
+        self.assertTrue(recover.replaced({"POLICY"}, "", {"GC"}, {"GC", ""}))
+        self.assertFalse(recover.replaced({"POLICY"}, "", {"GC", "QX"}, {"GC", ""}))
+        self.assertFalse(recover.replaced({"POLICY"}, "", {""}, {"GC", ""}))   # a SHARED program takes SHARED's copy
+        self.assertFalse(recover.replaced(set(), "", {"GC"}, {"GC"}))         # no real member anywhere
 
     def test_folder_home(self):
         root = os.path.join(os.sep + "e", "estate")
@@ -531,25 +855,39 @@ class RealCopiesAndCopiers(unittest.TestCase):
         conn = sqlite3.connect(":memory:")
         self.addCleanup(conn.close)
         conn.executescript("""
-            CREATE TABLE member(id INTEGER PRIMARY KEY, name TEXT, kind TEXT, path TEXT, library TEXT, system TEXT);
-            CREATE TABLE copy_use(member_id INTEGER, copybook TEXT, resolved_member_id INTEGER);""")
+            CREATE TABLE member(id INTEGER PRIMARY KEY, name TEXT, kind TEXT, path TEXT, library TEXT, system TEXT,
+                                parse_status TEXT);
+            CREATE TABLE copy_use(member_id INTEGER, copybook TEXT, resolved_member_id INTEGER, of_library TEXT);""")
         e = os.path.join(os.sep + "e", "estate")
-        conn.executemany("INSERT INTO member VALUES(?,?,?,?,?,?)", [
-            (1, "BK", "copybook", os.path.join(e, "GC-TEST", "TEST.GC.COPYLIB", "BK.cpy"), "TEST.GC.COPYLIB", "GC-TEST"),
-            (2, "BK", "copybook", os.path.join(e, "GC", recover.FOLDER, "BK.cpy"), recover.FOLDER, "GC"),
-            (3, "SH", "copybook", os.path.join(e, "SHARED", "COPYLIB", "SH.cpy"), "COPYLIB", "SHARED"),
-            (4, "NO", "copybook", os.path.join(e, "COPYLIB", "NO.cpy"), "COPYLIB", None),
-            (5, "SELF", "cobol", os.path.join(e, "GC", "SRC", "SELF.cbl"), "SRC", "GC"),
-            (6, "LOOP", "copybook", os.path.join(e, "GC", "COPYLIB", "LOOP.cpy"), "COPYLIB", "GC"),
-            (7, "PGM", "cobol", os.path.join(e, "POLICY", "SRC", "PGM.cbl"), "SRC", "POLICY"),
-            (8, "BK", "stub", os.path.join(e, "GC", "COPYLIB", "BK.cpy"), "COPYLIB", "GC")])
-        conn.executemany("INSERT INTO copy_use VALUES(?,?,?)", [
-            (5, "self", 2), (6, "LOOP", None), (7, "BK", 1), (5, "BK", 2)])
+        conn.executemany("INSERT INTO member VALUES(?,?,?,?,?,?,?)", [
+            (1, "BK", "copybook", os.path.join(e, "GC-TEST", "TEST.GC.COPYLIB", "BK.cpy"), "TEST.GC.COPYLIB", "GC-TEST", "ok"),
+            (2, "BK", "copybook", os.path.join(e, "GC", recover.FOLDER, "BK.cpy"), recover.FOLDER, "GC", "ok"),
+            (3, "SH", "copybook", os.path.join(e, "SHARED", "COPYLIB", "SH.cpy"), "COPYLIB", "SHARED", "ok"),
+            (4, "NO", "copybook", os.path.join(e, "COPYLIB", "NO.cpy"), "COPYLIB", None, "ok"),
+            (5, "SELF", "cobol", os.path.join(e, "GC", "SRC", "SELF.cbl"), "SRC", "GC", "ok"),
+            (6, "LOOP", "copybook", os.path.join(e, "GC", "COPYLIB", "LOOP.cpy"), "COPYLIB", "GC", "ok"),
+            (7, "PGM", "cobol", os.path.join(e, "POLICY", "SRC", "PGM.cbl"), "SRC", "POLICY", "partial"),
+            (8, "BK", "stub", os.path.join(e, "GC", "COPYLIB", "BK.cpy"), "COPYLIB", "GC", "skipped"),
+            # a copybook filed in a source library: kind cobol, 'skipped' as not a program - a real member
+            (9, "INSRC", "cobol", os.path.join(e, "QA", "SRC", "INSRC.cbl"), "SRC", "QA", "skipped"),
+            # a program not parsed to the end is taken for a program
+            (10, "HALF", "cobol", os.path.join(e, "QA", "SRC", "HALF.cbl"), "SRC", "QA", "failed"),
+            (11, "WAIT", "cobol", os.path.join(e, "QA", "SRC", "WAIT.cbl"), "SRC", "QA", "pending"),
+            # COPY BK OF the library holding the real member; OF a library holding none; one of each
+            (12, "OFPGM1", "cobol", os.path.join(e, "QB", "SRC", "OFPGM1.cbl"), "SRC", "QB", "ok"),
+            (13, "OFPGM2", "cobol", os.path.join(e, "QC", "SRC", "OFPGM2.cbl"), "SRC", "QC", "ok"),
+            (14, "OFPGM3", "cobol", os.path.join(e, "QD", "SRC", "OFPGM3.cbl"), "SRC", "QD", "ok")])
+        conn.executemany("INSERT INTO copy_use VALUES(?,?,?,?)", [
+            (5, "self", 2, None), (6, "LOOP", None, None), (7, "BK", 1, None), (5, "BK", 2, None),
+            (12, "BK", 1, "test.gc.copylib"), (13, "BK", 2, "NOLIB"), (14, "BK", 1, "TEST.GC.COPYLIB"), (14, "BK", 2, None)])
         real = recover.real_copies(conn, [os.path.join(e, "SHARED", recover.FOLDER)])
-        # SELF copies its own name: not the real member of it. LOOP, a copybook copying itself, is (LESSONS 185);
-        # a stub never is
-        self.assertEqual(real, {"BK": {"GC-TEST"}, "SH": {""}, "NO": {""}, "LOOP": {"GC"}, "PGM": {"POLICY"}})
-        self.assertEqual(recover.copier_homes(conn, ["bk", "SELF", "LOOP", "NONE"]), {"BK": {"GC", "POLICY"}, "SELF": {"GC"}})
+        # a program is never the real member of its name - SELF, which copies its own name, and PGM, which does not
+        # (LESSONS 209, 210); LOOP, a copybook copying itself, is (LESSONS 185); a stub never is
+        self.assertEqual(real, {"BK": {"GC-TEST"}, "SH": {""}, "NO": {""}, "LOOP": {"GC"}, "INSRC": {"QA"}})
+        # OFPGM1 names the library holding the real member for its one COPY BK: it never takes a recovered copy
+        # (LESSONS 210); OFPGM2 names a library holding none, OFPGM3 copies BK a second time without OF
+        self.assertEqual(recover.copier_homes(conn, ["bk", "SELF", "LOOP", "NONE"]),
+                         {"BK": {"GC", "POLICY", "QC", "QD"}, "SELF": {"GC"}})
 
 
 if __name__ == "__main__":
