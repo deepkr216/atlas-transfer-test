@@ -305,7 +305,7 @@ class BuildLevel(unittest.TestCase):
         self.assertIn("POLNIGHT", out)
         self.assertNotIn("CLMNIGHT", out)
         self.assertNotIn("T.POL.MASTER", out)                       # PROC default hidden
-        self.assertIn("PROC members' default symbolics hidden", out)
+        self.assertIn("row(s) of PROC members' own steps (read with the PROC's defaults) hidden", out)
 
     def test_job_dossier_shows_joblib_guard_and_cond(self):
         out = query.cmd_job(self.conn, "CLMNIGHT")

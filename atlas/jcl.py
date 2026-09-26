@@ -1073,6 +1073,12 @@ _CARD_TRIPLE = re.compile(
     r"(?<![\d.])(\d{1,5}),(\d{1,5})(?:,([A-Z][A-Z0-9]{0,3}))?(?=[,)\s]|$)", re.IGNORECASE)
 _CARD_FORMAT = re.compile(r"\bFORMAT=([A-Z0-9]{1,4})\b", re.IGNORECASE)
 _NEEDS_FMT = {"SORT", "MERGE", "INCLUDE", "OMIT", "SUM"}
+# A word after (pos,len) that is no format: a relational operator (`INCLUDE COND=(13,2,NE,C'CN'),FORMAT=CH` - the
+# FORMAT= gives it), AND / OR after the second field of a comparison (`(1,2,EQ,5,2,OR,...)`), and in a reformatting
+# list the blank and binary-zero separators (`BUILD=(1,10,X,11,5)`) - LESSONS 244. A field an operator or a
+# connective follows is still compared: it stays a field reference.
+_REL_OPS = {"EQ", "NE", "GT", "GE", "LT", "LE"}
+_NOT_A_FORMAT = _REL_OPS | {"AND", "OR", "X", "Z"}
 # SYMNAMES: `POL-STATUS,45,1,CH` - a symbol used in the cards instead of the bytes.
 _SYMNAME = re.compile(r"^([A-Z@#$_][A-Z0-9@#$_\-]*),(\d{1,5}),(\d{1,5})(?:,([A-Z][A-Z0-9]{0,3}))?\s*$", re.IGNORECASE)
 
@@ -1139,10 +1145,13 @@ def sort_card_fields(text: str) -> List[Tuple[str, int, int, str, str]]:
         for m in _CARD_TRIPLE.finditer(card):
             pos, ln = int(m.group(1)), int(m.group(2))
             fmt = (m.group(3) or "").upper()
+            compared = fmt in _REL_OPS or fmt in ("AND", "OR")
+            if fmt in _NOT_A_FORMAT:
+                fmt = ""
             # With FORMAT=xx the triple is (pos,len,order) and 'fmt' is A/D.
             if fmt in ("A", "D", "") and fmt_default:
                 fmt = fmt_default
-            if not fmt and kind in _NEEDS_FMT:
+            if not fmt and not compared and kind in _NEEDS_FMT:
                 continue          # a bare pair in a SORT/INCLUDE list is not a field ref
             key = (pos, ln)
             if key in seen or pos == 0 or ln == 0:

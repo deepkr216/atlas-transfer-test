@@ -599,7 +599,7 @@ def cmd_program(conn: sqlite3.Connection, name: str) -> str:
                                  (pid, f["select_name"])).fetchall()
             frows.append((f["select_name"], f["assign_dd"], f["organization"] or "",
                           ", ".join(o["op"] for o in opens),
-                          "; ".join(f"{d['dsn_resolved']} [{d['mode']}/{d['mode_source']}] "
+                          "; ".join(f"{d['dsn_resolved'] or NO_DSN} [{d['mode']}/{d['mode_source']}] "
                                     + (d["job_name"] or (f"(PROC {d['proc_name']} defaults - no indexed job runs it)"
                                                          if d["proc_name"] else ""))
                                     for d in shown) or "_no JCL found_",
@@ -607,8 +607,7 @@ def cmd_program(conn: sqlite3.Connection, name: str) -> str:
         out.append("\n### Files (SELECT/ASSIGN -> JCL DD -> dataset)\n")
         out.append(table(["file", "DD", "org", "ops", "datasets via JCL", "cite"], frows))
         if proc_hidden:
-            out.append(f"\n> {proc_hidden} row(s) from PROC members' default symbolics hidden: the jobs that "
-                       f"expand those PROCs are listed with the real names.\n")
+            out.append("\n" + proc_rows_hidden(proc_hidden))
 
         # EXEC CICS READ FILE('X') names an FCT entry; the CSD says which dataset.
         cf = conn.execute("""
@@ -798,8 +797,13 @@ def cmd_job(conn: sqlite3.Connection, name: str) -> str:
         cards = conn.execute("SELECT card_kind, pos, length, fmt FROM card_field_ref WHERE step_id=? ORDER BY pos",
                              (s["id"],)).fetchall()
         if cards:
+            # an index built before LESSONS 244 holds the word after (pos,len) as its format even when it is none - an
+            # operator (`(13,2,NE,C'CN'),FORMAT=CH` gave NE), OR / AND, a BUILD list's X: not said; the format of such
+            # a row is FORMAT='s or none, which only a re-parse reads
             out.append("- sort card byte positions: " + ", ".join(
-                f"{c['card_kind']} {c['pos']}-{c['pos'] + c['length'] - 1} {c['fmt'] or ''}" for c in cards) + "\n")
+                f"{c['card_kind']} {c['pos']}-{c['pos'] + c['length'] - 1} "
+                f"{'' if (c['fmt'] or '').upper() in jcl._NOT_A_FORMAT else c['fmt'] or ''}".rstrip() for c in cards)
+                + "\n")
         if s["proc_called"]:
             kids = conn.execute(
                 "SELECT * FROM step WHERE job_id=? AND parent_step=? AND from_proc IS NOT NULL ORDER BY ordinal",
@@ -1302,20 +1306,34 @@ def cmd_field(conn: sqlite3.Connection, name: str, show_all: bool = False,
 
     out.append(_screen_section(conn, name.upper()))
 
-    # sort cards overlapping this field's bytes (for copybook definitions)
+    # sort cards overlapping this field's bytes (for copybook definitions). A PROC's own step was read with its
+    # default card member: listed only when no indexed job expands the PROC, as `values` and `flow` read the cards
+    # (LESSONS 236, 243)
     hits = []
+    expanded = expanded_procs(conn)
+    card_hidden, seen_hits = set(), set()
     for d in defs:
         if d["kind"] != "copybook":
             continue
         lo, hi = d["offset"] + 1, d["offset"] + d["length"]
-        rows = conn.execute("""SELECT DISTINCT j.job_name, s.step_name, c.card_kind, c.pos, c.length
+        rows = conn.execute("""SELECT DISTINCT c.id, j.job_name, s.step_name, c.card_kind, c.pos, c.length, pd.proc_name
             FROM card_field_ref c JOIN step s ON s.id=c.step_id LEFT JOIN job j ON j.id=s.job_id
+            LEFT JOIN proc_def pd ON pd.id=s.proc_id
             WHERE c.pos<=? AND c.pos+c.length-1>=?""", (hi, lo)).fetchall()
         for r in rows:
-            hits.append((d["member_name"], f"{lo}-{hi}", r["job_name"], r["step_name"], r["card_kind"], f"{r['pos']}-{r['pos']+r['length']-1}"))
+            if r["job_name"] is None and r["proc_name"] and r["proc_name"].upper() in expanded:
+                card_hidden.add(r["id"])
+                continue
+            job = r["job_name"] or (f"(PROC {r['proc_name']} defaults - no indexed job runs it)" if r["proc_name"] else "")
+            hit = (d["member_name"], f"{lo}-{hi}", job, r["step_name"], r["card_kind"], f"{r['pos']}-{r['pos']+r['length']-1}")
+            if hit not in seen_hits:
+                seen_hits.add(hit)
+                hits.append(hit)
     if hits:
         out.append("\n### Sort/control cards addressing these bytes (any dataset - verify the record type matches)\n")
         out.append(table(["copybook", "field bytes", "job", "step", "card", "card bytes"], hits[:40]))
+    if card_hidden:
+        out.append("\n" + proc_rows_hidden(len(card_hidden)))
     out.append(_docs_section(conn, name.upper()))
     return "".join(out)
 
@@ -1439,6 +1457,18 @@ def cmd_literal(conn: sqlite3.Connection, value: str, field: Optional[str] = Non
 # The member kinds a job's card lookup reads (build.CARD_KINDS - a test pins
 # the two equal; this module does not import the build).
 CARD_KINDS = ("ctlcard", "unknown", "stub", "sql", "jcl", "proc")
+
+
+# a DD row with no dataset name - DUMMY, SYSOUT, instream cards: the program's OPEN may have given it a direction
+NO_DSN = "(no DSN: DUMMY, SYSOUT or instream)"
+
+
+def proc_rows_hidden(n: int) -> str:
+    """The sentence under a table that left out n rows of PROC members' own
+    steps (expanded_procs): every row of such a step - a literal DSN, a
+    DUMMY, a card - not only the ones a default symbolic names (LESSONS 242)."""
+    return (f"> {n} row(s) of PROC members' own steps (read with the PROC's defaults) hidden: the jobs that expand "
+            f"those PROCs are listed with the real names.\n")
 
 
 def expanded_procs(conn: sqlite3.Connection) -> set:
@@ -1681,8 +1711,7 @@ def cmd_dataset(conn: sqlite3.Connection, dsn: str) -> str:
         kept.append(r)
     rows = kept
     if proc_hidden:
-        out.append(f"> {proc_hidden} row(s) from PROC members' default symbolics hidden: the jobs that "
-                   f"expand those PROCs are listed with the real names.\n")
+        out.append(proc_rows_hidden(proc_hidden))
     # Every row carries the DD line it comes from: "job X writes DSN Y" is a
     # claim about one JCL/PROC line, and the gate needs that line.
     trows = [(r["dsn"], f"{r['mode']} [{r['mode_source'] or ''}]".replace(" []", ""),
@@ -2146,14 +2175,19 @@ def cmd_copybook(conn: sqlite3.Connection, name: str) -> str:
                                WHERE UPPER(p.program_id) IN ({q}) AND c.resolution='unresolved'""", pnames).fetchone()[0]
         if dyn:
             out.append(f"\n**{dyn} unresolved dynamic CALL(s) inside these programs** - their targets may also carry the record.\n")
-        cards = conn.execute(f"""SELECT COUNT(*) FROM card_field_ref c JOIN step s ON s.id=c.step_id WHERE UPPER(s.effective_pgm) IN ({q})""", pnames).fetchone()[0]
+        # a PROC's own step (its default cards) counts only when no indexed job expands the PROC - expanded_procs()
+        # in SQL (LESSONS 243)
+        own = """NOT (s.job_id IS NULL AND EXISTS (SELECT 1 FROM proc_def pd WHERE pd.id=s.proc_id AND UPPER(pd.proc_name)
+                      IN (SELECT UPPER(x.from_proc) FROM step x WHERE x.from_proc IS NOT NULL)))"""
+        cards = conn.execute(f"""SELECT COUNT(*) FROM card_field_ref c JOIN step s ON s.id=c.step_id
+                                 WHERE UPPER(s.effective_pgm) IN ({q}) AND {own}""", pnames).fetchone()[0]
         cards2 = 0
         dsn_list = [o["dsn_resolved"] for o in outs]
         if dsn_list:
             qd = ",".join("?" * len(dsn_list))
             cards2 = conn.execute(f"""SELECT COUNT(DISTINCT c.id) FROM card_field_ref c JOIN step s ON s.id=c.step_id
                                       JOIN dd d ON d.step_id=s.id
-                                      WHERE d.dsn_resolved IN ({qd}) AND d.mode IN ('input','both','unknown')""",
+                                      WHERE d.dsn_resolved IN ({qd}) AND d.mode IN ('input','both','unknown') AND {own}""",
                                   dsn_list).fetchone()[0]
         out.append(f"\nSort-card byte references: {cards} on these steps, **{cards2} on steps that consume the "
                    f"datasets written above** (see `job <name>` for positions; any field-length change moves them).\n")
@@ -6650,6 +6684,45 @@ def _transfer_notes(detail: str) -> Tuple[str, List[Tuple[str, str, str, str]]]:
     return host, out
 
 
+def interface_edge_steps(conn: sqlite3.Connection) -> Dict[int, sqlite3.Row]:
+    """interface_edge id -> the step it stands for (id, step_name,
+    from_proc, job_name), for every FTP / Connect:Direct / USS-shell row.
+    build.insert_step writes the row right after the step: on the member
+    the step belongs to (the job's for a PROC step expanded into it), at
+    the step's line (the PROC's line for such a step), its detail the notes
+    the step's parm also ends with (' /* notes */', cut at 300). Several
+    steps of one member can share that line - one PROC run twice by a job,
+    two PROCs whose FTP step is on the same line, a job's own step beside an
+    expanded one: the notes decide (the host, the files), and steps whose
+    notes are the same pair in the order the build wrote them. A row no
+    step answers is left out: its reader keeps the member and the line."""
+    steps: Dict[Tuple[int, int, str], List[sqlite3.Row]] = defaultdict(list)
+    for s in conn.execute("""SELECT s.id, s.step_name, s.from_proc, s.parm, s.line, s.effective_pgm, j.job_name,
+                                    COALESCE(j.member_id, pd.member_id) AS mem_id
+                             FROM step s LEFT JOIN job j ON j.id=s.job_id LEFT JOIN proc_def pd ON pd.id=s.proc_id
+                             WHERE s.effective_pgm IN ('*FTP*','*NDM*','*USSSH*') ORDER BY s.id"""):
+        steps[(s["mem_id"], s["line"], s["effective_pgm"])].append(s)
+    edges: Dict[Tuple[int, int, str], List[sqlite3.Row]] = defaultdict(list)
+    for e in conn.execute("""SELECT id, member_id, kind, line, detail FROM interface_edge
+                             WHERE kind IN ('ftp','ndm','usssh') ORDER BY id"""):
+        edges[(e["member_id"], e["line"], f"*{e['kind'].upper()}*")].append(e)
+    out: Dict[int, sqlite3.Row] = {}
+    for key, rows in edges.items():
+        free = list(steps.get(key, []))
+        left = []
+        for e in rows:
+            tail = f" /* {(e['detail'] or '')[:300]} */"
+            s = next((s for s in free if (s["parm"] or "").endswith(tail)), None)
+            if s is None:
+                left.append(e)
+                continue
+            free.remove(s)
+            out[e["id"]] = s
+        for e, s in zip(left, free):
+            out[e["id"]] = s
+    return out
+
+
 def _interface_rows(conn: sqlite3.Connection, system: Optional[str] = None,
                     dsn: Optional[str] = None) -> List[Tuple]:
     """(kind, direction, peer, what, where, system, cite) from every source:
@@ -6657,7 +6730,7 @@ def _interface_rows(conn: sqlite3.Connection, system: Optional[str] = None,
     URIMAP web entry points, REMOTESYSTEM transactions, and the manifest's
     declared external_interfaces."""
     rows: List[Tuple] = []
-    q = """SELECT i.member_id, i.kind, i.detail, i.direction, i.line, m.name AS mem, m.kind AS mkind, m.system,
+    q = """SELECT i.id, i.member_id, i.kind, i.detail, i.direction, i.line, m.name AS mem, m.kind AS mkind, m.system,
                   (SELECT program_id FROM program p WHERE p.member_id=m.id LIMIT 1) AS pgm,
                   (SELECT job_name FROM job j WHERE j.member_id=m.id LIMIT 1) AS job,
                   (SELECT UPPER(pd.proc_name) FROM proc_def pd WHERE pd.member_id=m.id AND pd.instream=0
@@ -6671,6 +6744,9 @@ def _interface_rows(conn: sqlite3.Connection, system: Optional[str] = None,
     # (its notes: the host, each transfer) and one pseudo-DD per MVS dataset it sends or receives. One row per
     # transfer: the pseudo-DD's, with the peer the notes name; the notes give a row of their own only for a
     # transfer no pseudo-DD holds (a USS path, a bare PROC's step) or, naming none, for the step itself (LESSONS 237).
+    # Both are read per STEP (interface_edge_steps): an expanded step's row sits at the PROC's line, which every
+    # step of the job expanded from that line - or from another PROC's step on the same line, or the job's own
+    # step there - shares (LESSONS 240, 241).
     pseudo = conn.execute("""SELECT d.dd_name, d.dsn_resolved, d.mode, d.mode_source, d.line, s.id AS step_id, s.step_name,
                                     s.from_proc, j.job_name, m.id AS mem_id, m.name AS mem, m.system, d.is_override,
                                     s.parent_step, s.job_id
@@ -6682,11 +6758,12 @@ def _interface_rows(conn: sqlite3.Connection, system: Optional[str] = None,
                   if r["dd_name"].startswith("*") and r["mode_source"] != "undetermined"}
     pseudo = [r for r in pseudo if not (r["dd_name"].startswith("*") and r["mode_source"] == "undetermined"
                                         and (r["step_id"], r["dd_name"]) in determined)]
-    at_step: Dict[Tuple[int, int], List[sqlite3.Row]] = defaultdict(list)
+    at_step: Dict[int, List[sqlite3.Row]] = defaultdict(list)
     for r in pseudo:
         if r["dd_name"] in ("*FTP*", "*NDM*"):
-            at_step[(r["mem_id"], r["line"])].append(r)
-    peer_of: Dict[Tuple[int, int, str], str] = {}
+            at_step[r["step_id"]].append(r)
+    tied = interface_edge_steps(conn)
+    peer_of: Dict[Tuple[int, str], str] = {}
     for r in conn.execute(q):
         if system and (r["system"] or "").upper() != system.upper():
             continue
@@ -6699,24 +6776,20 @@ def _interface_rows(conn: sqlite3.Connection, system: Optional[str] = None,
             continue
         # the step the row stands for: an expanded PROC step's row sits on the job with the PROC's line - cited in
         # the PROC, as its pseudo-DDs are (dd_cite_member) and as flow's cite_iface does
-        step = conn.execute("""SELECT s.step_name, s.from_proc FROM step s LEFT JOIN job j ON j.id=s.job_id
-                               LEFT JOIN proc_def pd ON pd.id=s.proc_id
-                               WHERE COALESCE(j.member_id, pd.member_id)=? AND s.line=? AND s.effective_pgm=?""",
-                            (r["member_id"], r["line"], f"*{r['kind'].upper()}*")).fetchall()
-        where_step = f"{where} {step[0][0]}" if len(step) == 1 else where
-        procs = {s[1] for s in step}
-        at = f"{(procs.pop() if len(procs) == 1 and step[0][1] else r['mem'])}:{r['line']}"
+        st = tied.get(r["id"])
+        where_step = f"{st['job_name'] or where} {st['step_name']}" if st else where
+        at = f"{st['from_proc'] if st and st['from_proc'] else r['mem']}:{r['line']}"
         if r["kind"] == "usssh":
             rows.append((r["kind"], r["direction"] or "?", "", r["detail"][:90], where_step, r["system"] or "?", at))
             continue
         host, transfers = _transfer_notes(r["detail"] or "")
-        key = (r["member_id"], r["line"])
-        held = {(d["dsn_resolved"] or "").upper() for d in at_step.get(key, [])}
-        peer_of[key + ("",)] = host
-        for (_verb, name, _dir, peer) in transfers:
-            peer_of[key + (name.upper(),)] = peer or host
+        held = {(d["dsn_resolved"] or "").upper() for d in at_step.get(st["id"], [])} if st else set()
+        if st:
+            peer_of[(st["id"], "")] = host
+            for (_verb, name, _dir, peer) in transfers:
+                peer_of[(st["id"], name.upper())] = peer or host
         rest = [t for t in transfers if t[1].upper() not in held]
-        if not rest and key in at_step:
+        if not rest and held:
             continue
         if not rest:
             # no transfer in its notes (no cards indexed, only a host): the step itself is the interface
@@ -6733,8 +6806,8 @@ def _interface_rows(conn: sqlite3.Connection, system: Optional[str] = None,
             continue
         kind = {"*FTP*": "ftp", "*NDM*": "ndm"}.get(r["dd_name"], "uss")
         direction = "out" if r["mode"] == "input" and kind != "uss" else "in" if r["mode"] == "output" and kind != "uss" else r["mode"]
-        peer = (peer_of.get((r["mem_id"], r["line"], (r["dsn_resolved"] or "").upper()))
-                or peer_of.get((r["mem_id"], r["line"], ""), "")) if kind != "uss" else ""
+        peer = (peer_of.get((r["step_id"], (r["dsn_resolved"] or "").upper()))
+                or peer_of.get((r["step_id"], ""), "")) if kind != "uss" else ""
         rows.append((kind, direction, peer, r["dsn_resolved"], f"{r['job_name']} {r['step_name']}", r["system"] or "?",
                      f"{dd_cite_member(conn, r, r['mem'])}:{r['line']}"))
     for r in conn.execute("SELECT tran_code, program, detail, member_id, line FROM transaction_def WHERE system='cics_web' "

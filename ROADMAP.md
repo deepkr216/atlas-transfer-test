@@ -824,6 +824,13 @@ shipped alone and cost one such night; these still wait for the next one:
    ProcInterfaceRows, ProcInterfaceRowsInTheIndex, AnIndexBuiltBeforeTheItem, CardReferbacks,
    CardReferbacksInTheIndex, StubNamedLikeACardMember, OverrideCites, ProcUssFiles, InterfacesOfExpandedSteps,
    SequentialCardsOnAnOlderIndex, TheReproductions).
+30. **Delivered in the batch - a condition's operator is no sort-card format.** Found by the verifier in passing on
+   the query side's synthetic findings (LESSONS 244): `INCLUDE COND=(13,2,NE,C'CN'),FORMAT=CH` stored
+   card_field_ref.fmt = 'NE', because `jcl._CARD_TRIPLE` takes the word after (pos,len) as the format. OR / AND after
+   a comparison's second field and a BUILD list's X / Z separators were stored the same way. None of them is a
+   format now: FORMAT= gives it, or there is none, and a compared field stays a field reference. The positions are
+   the same, so selfcheck's counts and the synthetic harness are too. On an index built before the item, `job`
+   leaves such a word out of its positions line. tests/test_synth_query_findings.py RelationalOperatorIsNoFormat.
 
 ### flow: known limits (open after review)
 
@@ -861,7 +868,10 @@ wrong member or line.
   *FTP* / *NDM* pseudo-DD's, cited right, with the peer the step's notes name - and keeps the step's own row
   only for a transfer no pseudo-DD holds (a USS path) or a step whose notes name none (its cards not indexed);
   such a row of an expanded step - and a USS (BPXBATCH) step's row - is cited in the PROC, as flow.py's
-  `cite_iface` does, with the step named when one step of the job stands at that line. Query-side, no re-parse.
+  `cite_iface` does, with its step named. Several steps of one job can stand at that line (one PROC run twice, two
+  PROCs with the FTP step on the same line, the job's own step beside an expanded one): each row is tied to its
+  own step by the notes the step's parm ends with, so each step keeps its own peer and its own row (LESSONS
+  240-241). Query-side, no re-parse.
 - **A step of an instream PROC is cited under the PROC's name.** `// PROC ... // PEND` lives in the job's own
   member, but the step and DD cites print `from_proc` - the PROC's name, which is no member. Next: cite the
   job's member when `proc_def.instream` is set for that name in it - query-side.

@@ -19,6 +19,14 @@
    "count": "USED BUT NOT DOCUMENTED",
    "truth": 0,
    "symptom": 1
+  },
+  {
+   "query": [
+    "values",
+    "R12-STATUS"
+   ],
+   "truth_has": "| AC | R12-ACTIVE | 0 | 1 | 0 | 1 | R12JOB.STEP010 INCLUDE",
+   "symptom_has": "| AC | R12-ACTIVE | 0 | 1 | 0 | 1 | R12JOB.STEP010 INCLUDE"
   }
  ]
 }

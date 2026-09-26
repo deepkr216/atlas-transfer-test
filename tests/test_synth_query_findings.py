@@ -22,6 +22,18 @@ tables an index already holds.
       fills reaches the DB2 column: the DCLGEN included over three lines is the
       program's (ROADMAP re-parse item 27), pinned here.
 
+The verifier's round on these (LESSONS 240-244):
+  240 / 241 - `interfaces` read an FTP step by its member and line: a job
+      running one PROC twice, or two PROCs whose FTP step is on one line, gave
+      both steps one step's peer, and a step whose cards are not indexed lost
+      its row beside another. Each interface row is now tied to its step.
+  242 - the hidden-rows sentence said 'default symbolics' for every row of a
+      PROC's own step (a literal DSN, a DUMMY); a DD with no DSN printed None.
+  243 - `field`'s sort-card table and `copybook`'s counts still read a PROC's
+      own default card while a job expands the PROC.
+  244 - a fact of jcl.py (ROADMAP re-parse item 30): a condition's operator,
+      OR / AND and a BUILD list's X were stored as the card's format.
+
 Every name here is fictional.
 """
 
@@ -38,7 +50,7 @@ import unittest
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 
-from atlas import build, query  # noqa: E402
+from atlas import build, jcl, query  # noqa: E402
 
 
 def _write(root, rel, text):
@@ -285,8 +297,9 @@ class ProcDefaultsAreNoDatasets(unittest.TestCase):
         self.assertNotIn("OLDMAST", out_row)                   # OLDMAST ends with MAST: another file's DD
         fix_row = [ln for ln in files.splitlines() if ln.startswith("| FIX-FILE |")][0]
         self.assertEqual(fix_row.count("PROD.KV.FIXED"), 1, fix_row)
-        self.assertIn("> 3 row(s) from PROC members' default symbolics hidden: the jobs that expand those PROCs "
-                      "are listed with the real names.", files)
+        # PROD.KV.FIXED is a literal DSN of the PROC's own step: 'default symbolics' was not what the three are
+        self.assertIn("> 3 row(s) of PROC members' own steps (read with the PROC's defaults) hidden: the jobs that "
+                      "expand those PROCs are listed with the real names.", files)
 
     def test_a_proc_no_job_runs_is_shown_as_the_proc(self):
         files = self.files("KVPPGM2")
@@ -559,6 +572,323 @@ class FlowUpToTheColumn(unittest.TestCase):
 
 
 # ===========================================================================
+# the verifier's round 1 on this stage (LESSONS 240-244)
+# ===========================================================================
+
+STEP_FTP_PROC = ("//KVUFTP   PROC HOST=kvudef.example,FT=KVUFTPD\n"
+                 "//F010     EXEC PGM=FTP,PARM='&HOST'\n"
+                 "//INPUT    DD   DSN=PROD.CMN.PARMLIB(&FT),DISP=SHR\n")
+STEP_FTQ_PROC = ("//KVUFTQ{x}  PROC HOST=kvuq{l}.example,FT=KVUMIS{x}\n"
+                 "//Q{x}010    EXEC PGM=FTP,PARM='&HOST'\n"
+                 "//INPUT    DD   DSN=PROD.CMN.PARMLIB(&FT),DISP=SHR\n")
+STEP_NDM_PROC = ("//KVUNDM   PROC NP=KVUNDMD\n"
+                 "//N010     EXEC PGM=DMBATCH\n"
+                 "//SYSIN    DD   DSN=PROD.CMN.PARMLIB(&NP),DISP=SHR\n")
+
+
+class OneRowPerTransferPerStep(unittest.TestCase):
+    """Two FTP steps of one job whose interface_edge rows sit at one line: the same PROC run twice (KVUJOB1 with
+    two hosts, KVUJOB6 twice alike), a step whose card member is not in the estate beside one whose is (KVUJOB2),
+    the job's own step at line 2 beside an expanded PROC step at the PROC's line 2 (KVUJOB3), two PROCs whose FTP
+    step is on line 2 (KVUJOB4 with one card, KVUJOB5 with none indexed), and a Connect:Direct PROC run twice
+    with two partners (KVUJOB7). The verifier's estates est1, est2 and est4."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.td = tempfile.mkdtemp()
+        root = os.path.join(cls.td, "estate")
+        jobs = {
+            "KVUJOB1": ["//S1       EXEC KVUFTP,HOST=kvua.example,FT=KVUFTPA\n",
+                        "//S2       EXEC KVUFTP,HOST=kvub.example,FT=KVUFTPB\n"],
+            "KVUJOB2": ["//S1       EXEC KVUFTP,HOST=kvuc.example,FT=KVUMISS\n",
+                        "//S2       EXEC KVUFTP,HOST=kvud.example,FT=KVUFTPA\n"],
+            "KVUJOB3": ["//F1       EXEC PGM=FTP,PARM='kvuown.example (EXIT'\n"
+                        "//INPUT    DD   DSN=PROD.CMN.PARMLIB(KVUMISS2),DISP=SHR\n",
+                        "//S2       EXEC KVUFTP,HOST=kvue.example,FT=KVUFTPA\n"],
+            "KVUJOB4": ["//S1       EXEC KVUFTQA,HOST=kvuf.example,FT=KVUCARD\n",
+                        "//S2       EXEC KVUFTQB,HOST=kvug.example,FT=KVUCARD\n"],
+            "KVUJOB5": ["//S1       EXEC KVUFTQA,HOST=kvuh.example\n",
+                        "//S2       EXEC KVUFTQB,HOST=kvui.example\n"],
+            "KVUJOB6": ["//S1       EXEC KVUFTP,HOST=kvuj.example,FT=KVUFTPA\n",
+                        "//S2       EXEC KVUFTP,HOST=kvuj.example,FT=KVUFTPA\n"],
+            "KVUJOB7": ["//S1       EXEC KVUNDM,NP=KVUNDMA\n",
+                        "//S2       EXEC KVUNDM,NP=KVUNDMB\n"],
+        }
+        for name, steps in jobs.items():
+            _write(root, f"POLICY/PROD.KV.JCLLIB/{name}.jcl", _job(name, *steps))
+        _write(root, "SHARED/PROD.CMN.PROCLIB/KVUFTP.prc", STEP_FTP_PROC)
+        _write(root, "SHARED/PROD.CMN.PROCLIB/KVUFTQA.prc", STEP_FTQ_PROC.format(x="A", l="a"))
+        _write(root, "SHARED/PROD.CMN.PROCLIB/KVUFTQB.prc", STEP_FTQ_PROC.format(x="B", l="b"))
+        _write(root, "SHARED/PROD.CMN.PROCLIB/KVUNDM.prc", STEP_NDM_PROC)
+        _write(root, "SHARED/PROD.CMN.PARMLIB/KVUFTPA.ctl", "put 'PROD.KVU.SHARED' a.txt\nquit\n")
+        _write(root, "SHARED/PROD.CMN.PARMLIB/KVUFTPB.ctl", "put 'PROD.KVU.SHARED' b.txt\nget in.txt 'PROD.KVU.BACK'\nquit\n")
+        _write(root, "SHARED/PROD.CMN.PARMLIB/KVUFTPD.ctl", "put 'PROD.KVU.DEFAULT' d.txt\nquit\n")
+        _write(root, "SHARED/PROD.CMN.PARMLIB/KVUCARD.ctl", "put 'PROD.KVU.SAME' same.txt\nquit\n")
+        for x in "ABD":
+            _write(root, f"SHARED/PROD.CMN.PARMLIB/KVUNDM{x}.ctl",
+                   f"  SUBMIT PROC=KVUPRC SNODE=KVUNODE{x} &DSN=PROD.KVU.NDM{'DEF' if x == 'D' else ''}\n")
+        cls.db = os.path.join(cls.td, "t.db")
+        _build(root, cls.db)
+        # an index built before ROADMAP re-parse item 29: an expanded FTP step also held the PROC's own reading, its
+        # default card's file, as a second pseudo-DD `unknown [undetermined]` beside the job's (LESSONS 226)
+        cls.aged_db = os.path.join(cls.td, "aged.db")
+        shutil.copyfile(cls.db, cls.aged_db)
+        c = sqlite3.connect(cls.aged_db)
+        for sid, line in c.execute("SELECT s.id, s.line FROM step s WHERE s.from_proc='KVUFTP' AND EXISTS "
+                                   "(SELECT 1 FROM dd d WHERE d.step_id=s.id AND d.dd_name='*FTP*')").fetchall():
+            c.execute("INSERT INTO dd(step_id,dd_name,concat_seq,dsn,dsn_resolved,mode,mode_source,is_override,line) "
+                      "VALUES(?,'*FTP*',0,'PROD.KVU.DEFAULT','PROD.KVU.DEFAULT','unknown','undetermined',0,?)",
+                      (sid, line))
+        c.commit()
+        c.close()
+        cls.conn = query.connect(cls.db)
+        cls.aged = query.connect(cls.aged_db)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.conn.close()
+        cls.aged.close()
+        shutil.rmtree(cls.td, ignore_errors=True)
+
+    def rows(self, job, conn=None):
+        """(kind, dir, peer, what, where, cite) of the job's FTP / Connect:Direct rows."""
+        return sorted(r[:5] + r[6:] for r in query._interface_rows(conn or self.conn)
+                      if r[0] in ("ftp", "ndm") and r[4].split()[0] == job)
+
+    def test_the_rows_share_a_line(self):
+        # what the old key read as one: KVUJOB1's two edge rows on the job's member at the PROC's line 2
+        got = self.conn.execute("SELECT i.line, i.detail FROM interface_edge i JOIN member m ON m.id=i.member_id "
+                                "WHERE m.name='KVUJOB1' ORDER BY i.id").fetchall()
+        self.assertEqual([g[0] for g in got], [2, 2])
+        self.assertIn("FTP host kvua.example", got[0][1])
+        self.assertIn("FTP host kvub.example", got[1][1])
+
+    def test_every_edge_row_is_tied_to_its_step(self):
+        tied = query.interface_edge_steps(self.conn)
+        for eid, detail, job in self.conn.execute(
+                "SELECT i.id, i.detail, m.name FROM interface_edge i JOIN member m ON m.id=i.member_id "
+                "WHERE i.kind IN ('ftp','ndm') AND m.name LIKE 'KVUJOB%'"):
+            with self.subTest(job=job, detail=detail):
+                self.assertIn(eid, tied)
+                self.assertEqual(tied[eid]["job_name"], job)
+                self.assertTrue(tied[eid]["parm"].endswith(f" /* {detail[:300]} */"))
+
+    def test_the_same_proc_twice_each_step_its_own_peer(self):
+        for conn, tag in ((self.conn, "this batch"), (self.aged, "before item 29")):
+            with self.subTest(tag):
+                self.assertEqual(self.rows("KVUJOB1", conn), [
+                    ("ftp", "in", "kvub.example", "PROD.KVU.BACK", "KVUJOB1 S2.F010", "KVUFTP:2"),
+                    ("ftp", "out", "kvua.example", "PROD.KVU.SHARED", "KVUJOB1 S1.F010", "KVUFTP:2"),
+                    ("ftp", "out", "kvub.example", "PROD.KVU.SHARED", "KVUJOB1 S2.F010", "KVUFTP:2")])
+
+    def test_the_same_proc_twice_alike(self):
+        self.assertEqual(self.rows("KVUJOB6"), [
+            ("ftp", "out", "kvuj.example", "PROD.KVU.SHARED", "KVUJOB6 S1.F010", "KVUFTP:2"),
+            ("ftp", "out", "kvuj.example", "PROD.KVU.SHARED", "KVUJOB6 S2.F010", "KVUFTP:2")])
+
+    def test_two_procs_with_their_ftp_step_on_one_line(self):
+        self.assertEqual(self.rows("KVUJOB4"), [
+            ("ftp", "out", "kvuf.example", "PROD.KVU.SAME", "KVUJOB4 S1.QA010", "KVUFTQA:2"),
+            ("ftp", "out", "kvug.example", "PROD.KVU.SAME", "KVUJOB4 S2.QB010", "KVUFTQB:2")])
+
+    def test_connect_direct_twice_each_step_its_partner(self):
+        self.assertEqual(self.rows("KVUJOB7"), [
+            ("ndm", "unknown", "KVUNODEA", "PROD.KVU.NDM", "KVUJOB7 S1.N010", "KVUNDM:2"),
+            ("ndm", "unknown", "KVUNODEB", "PROD.KVU.NDM", "KVUJOB7 S2.N010", "KVUNDM:2")])
+
+    def test_dataset_names_each_step_s_own_peer(self):
+        out = query.cmd_dataset(self.conn, "PROD.KVU.SAME")
+        self.assertIn("ftp out to/from kvuf.example (KVUJOB4 S1.QA010); ftp out to/from kvug.example (KVUJOB4 S2.QB010)",
+                      out)
+        out = query.cmd_dataset(self.conn, "PROD.KVU.SHARED")
+        self.assertIn("ftp out to/from kvua.example (KVUJOB1 S1.F010)", out)
+        self.assertNotIn("kvub.example (KVUJOB1 S1.F010)", out)
+
+    def notes_only(self, job, conn=None):
+        return [(r[0], r[1], r[2], r[4], r[5]) for r in self.rows(job, conn) if r[1] == "?"]
+
+    def test_a_step_whose_cards_are_not_indexed_beside_one_whose_are(self):
+        for conn, tag in ((self.conn, "this batch"), (self.aged, "before item 29")):
+            with self.subTest(tag):
+                got = self.rows("KVUJOB2", conn)
+                self.assertEqual(len(got), 2, got)
+                self.assertEqual(self.notes_only("KVUJOB2", conn),
+                                 [("ftp", "?", "kvuc.example", "KVUJOB2 S1.F010", "KVUFTP:2")])
+                self.assertIn("FTP host kvuc.example", [r for r in got if r[1] == "?"][0][3])
+                self.assertIn(("ftp", "out", "kvud.example", "PROD.KVU.SHARED", "KVUJOB2 S2.F010", "KVUFTP:2"), got)
+
+    def test_the_job_s_own_step_beside_an_expanded_one(self):
+        got = self.rows("KVUJOB3")
+        self.assertEqual(self.notes_only("KVUJOB3"), [("ftp", "?", "kvuown.example", "KVUJOB3 F1", "KVUJOB3:2")])
+        self.assertIn(("ftp", "out", "kvue.example", "PROD.KVU.SHARED", "KVUJOB3 S2.F010", "KVUFTP:2"), got)
+        self.assertEqual(len(got), 2, got)
+
+    def test_two_procs_steps_with_no_cards_each_in_its_proc(self):
+        self.assertEqual(self.notes_only("KVUJOB5"), [
+            ("ftp", "?", "kvuh.example", "KVUJOB5 S1.QA010", "KVUFTQA:2"),
+            ("ftp", "?", "kvui.example", "KVUJOB5 S2.QB010", "KVUFTQB:2")])
+        self.assertEqual(len(self.rows("KVUJOB5")), 2)
+
+    def test_the_report_counts_each_transfer_once(self):
+        out = query.cmd_interfaces(self.conn, system="POLICY")
+        # KVUJOB1 3, KVUJOB2 2, KVUJOB3 2, KVUJOB4 2, KVUJOB5 2, KVUJOB6 2; the PROCs' own steps are not listed
+        self.assertEqual(out.count("| ftp |"), 13, out)
+        self.assertEqual(out.count("| ndm |"), 2, out)
+        self.assertNotIn("PROD.KVU.DEFAULT", out)
+
+
+LESS_PGM = _cbl("KVWPGM", [("IN-FILE", "WIN"), ("HIST-FILE", "WHIST")],
+                [("IN-FILE", "IN-REC", "IN-CODE"), ("HIST-FILE", "HIST-REC", "HI-CODE")], ["WS-A"],
+                ["OPEN INPUT IN-FILE HIST-FILE.", "READ IN-FILE.", "READ HIST-FILE.", "CLOSE IN-FILE HIST-FILE."])
+LESS_PROC = ("//KVWPRC   PROC IN=TEST.KVW.DAILY\n"
+             "//W010     EXEC PGM=KVWPGM\n"
+             "//WIN      DD   DSN=&IN,DISP=SHR\n"
+             "//WHIST    DD   DUMMY\n")
+LESS_SORT_PROC = ("//KVWSRT   PROC CARDS=KVWDEF\n"
+                  "//SRT      EXEC PGM=SORT\n"
+                  "//SORTIN   DD   DSN=PROD.KVW.IN,DISP=SHR\n"
+                  "//SORTOUT  DD   DSN=PROD.KVW.OUT,DISP=(NEW,CATLG,DELETE)\n"
+                  "//SYSIN    DD   DSN=PROD.CMN.PARMLIB(&CARDS),DISP=SHR\n")
+LESS_LONE_PROC = LESS_SORT_PROC.replace("KVWSRT  ", "KVWLONE ").replace("CARDS=KVWDEF", "CARDS=KVWLNC")
+LESS_WRT = _cbl("KVWWRT", [("OUT-FILE", "WOUT")], [], ["WS-B"],
+                ["OPEN OUTPUT OUT-FILE.", "WRITE KVW-REC.", "CLOSE OUT-FILE."]).replace(
+    "       FILE SECTION.\n", "       FILE SECTION.\n       FD  OUT-FILE.\n           COPY KVWREC.\n")
+LESS_REC = ("       01  KVW-REC.\n"
+            "           05  KVW-KEY             PIC X(12).\n"
+            "           05  KVW-STATUS          PIC X(02).\n")
+
+
+class ProcOwnRowsSaidAsTheyAre(unittest.TestCase):
+    """KVWJOB1 runs KVWPRC (a symbolic DSN, a DUMMY) with IN=PROD.KVW.DAILY; KVWJOB3's KVWWRT, which copies
+    KVWREC, writes PROD.KVW.IN, the input of the sort PROC KVWSRT (a literal DSN) that KVWJOB2 runs with its own
+    card member; KVWLONE, the same sort with other cards, is run by no job. `program`, `dataset`, `field`,
+    `copybook`."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.td = tempfile.mkdtemp()
+        root = os.path.join(cls.td, "estate")
+        _write(root, "POLICY/PROD.KV.COBOL/KVWPGM.cbl", LESS_PGM)
+        _write(root, "POLICY/PROD.KV.COPYLIB/KVWREC.cpy", LESS_REC)
+        _write(root, "POLICY/PROD.KV.JCLLIB/KVWJOB1.jcl",
+               _job("KVWJOB1", "//S1       EXEC KVWPRC,IN=PROD.KVW.DAILY\n"))
+        _write(root, "POLICY/PROD.KV.COBOL/KVWWRT.cbl", LESS_WRT)
+        _write(root, "POLICY/PROD.KV.JCLLIB/KVWJOB3.jcl",
+               _job("KVWJOB3", "//S1       EXEC PGM=KVWWRT\n//WOUT     DD   DSN=PROD.KVW.IN,DISP=(NEW,CATLG,DELETE)\n"))
+        _write(root, "POLICY/PROD.KV.JCLLIB/KVWJOB2.jcl", _job("KVWJOB2", "//S1       EXEC KVWSRT,CARDS=KVWJBC\n"))
+        _write(root, "SHARED/PROD.CMN.PROCLIB/KVWPRC.prc", LESS_PROC)
+        _write(root, "SHARED/PROD.CMN.PROCLIB/KVWSRT.prc", LESS_SORT_PROC)
+        _write(root, "SHARED/PROD.CMN.PROCLIB/KVWLONE.prc", LESS_LONE_PROC)
+        _write(root, "SHARED/PROD.CMN.PARMLIB/KVWDEF.ctl", "  SORT FIELDS=(1,12,CH,A)\n  INCLUDE COND=(13,2,CH,EQ,C'DF')\n")
+        _write(root, "SHARED/PROD.CMN.PARMLIB/KVWJBC.ctl", "  SORT FIELDS=(1,12,CH,A)\n  OMIT COND=(13,2,CH,EQ,C'JB')\n")
+        _write(root, "SHARED/PROD.CMN.PARMLIB/KVWLNC.ctl", "  SORT FIELDS=(1,12,CH,A)\n  INCLUDE COND=(13,2,CH,EQ,C'LN')\n")
+        cls.db = os.path.join(cls.td, "t.db")
+        _build(root, cls.db)
+        cls.conn = query.connect(cls.db)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.conn.close()
+        shutil.rmtree(cls.td, ignore_errors=True)
+
+    SENTENCE = ("row(s) of PROC members' own steps (read with the PROC's defaults) hidden: the jobs that expand those "
+                "PROCs are listed with the real names.")
+
+    def test_the_proc_s_own_rows_are_no_default_symbolic_alone(self):
+        got = sorted((r[0], r[1]) for r in self.conn.execute(
+            "SELECT d.dd_name, d.dsn FROM dd d JOIN step s ON s.id=d.step_id WHERE s.proc_id IS NOT NULL "
+            "AND s.effective_pgm='KVWPGM'"))
+        self.assertEqual(got, [("WHIST", None), ("WIN", "&IN")])      # a DUMMY is no symbolic
+
+    def test_program_says_what_it_hid(self):
+        text = query.cmd_program(self.conn, "KVWPGM")
+        files = text.split("### Files", 1)[1].split("\n### ", 1)[0]
+        self.assertIn(f"> 2 {self.SENTENCE}", files)
+        self.assertNotIn("default symbolics", text)
+        self.assertNotIn("None [", files)
+        self.assertIn("(no DSN: DUMMY, SYSOUT or instream) [input/open_verb] KVWJOB1", files)
+        self.assertIn("PROD.KVW.DAILY [input/open_verb] KVWJOB1", files)
+        self.assertNotIn("TEST.KVW", files)
+
+    def test_dataset_says_it_alike(self):
+        out = query.cmd_dataset(self.conn, "PROD.KVW.IN")        # a literal DSN of the sort PROC's own step
+        self.assertIn(f"> 1 {self.SENTENCE}", out)
+        self.assertNotIn("default symbolics", out)
+
+    def test_field_lists_no_card_of_a_proc_a_job_runs(self):
+        out = query.cmd_field(self.conn, "KVW-STATUS")
+        cards = out.split("### Sort/control cards addressing these bytes", 1)[1].split("\n### ", 1)[0]
+        rows = [ln for ln in cards.splitlines() if ln.startswith("| KVWREC |")]
+        self.assertIn("| KVWREC | 13-14 | KVWJOB2 | S1.SRT | OMIT | 13-14 |", rows)
+        self.assertIn("| KVWREC | 13-14 | (PROC KVWLONE defaults - no indexed job runs it) | SRT | INCLUDE | 13-14 |",
+                      rows)
+        self.assertEqual(len(rows), 2, rows)                   # KVWSRT's own step, read with KVWDEF: hidden
+        self.assertIn(f"> 1 {self.SENTENCE}", cards)
+
+    def test_the_card_rows_are_in_the_index(self):
+        # what the field table listed: the INCLUDE of KVWSRT's own step, its default KVWDEF
+        got = self.conn.execute("SELECT c.card_kind FROM card_field_ref c JOIN step s ON s.id=c.step_id "
+                                "JOIN proc_def pd ON pd.id=s.proc_id WHERE pd.proc_name='KVWSRT' AND c.pos=13").fetchall()
+        self.assertEqual([g[0] for g in got], ["INCLUDE"])
+
+    def test_copybook_counts_no_card_of_a_proc_a_job_runs(self):
+        # the sorts reading PROD.KVW.IN, which KVWWRT writes: KVWJOB2's S1.SRT (SORT, OMIT) and KVWLONE's own step
+        # (SORT, INCLUDE) - not KVWSRT's own step, read with its default KVWDEF (it made 6)
+        out = query.cmd_copybook(self.conn, "KVWREC")
+        self.assertIn("Sort-card byte references: 0 on these steps, **4 on steps that consume the datasets written "
+                      "above**", out)
+
+
+class RelationalOperatorIsNoFormat(unittest.TestCase):
+    """`INCLUDE COND=(13,2,NE,C'CN'),FORMAT=CH` stored card_field_ref.fmt = 'NE' (found by the verifier in passing,
+    jcl._CARD_TRIPLE); the FORMAT= gives the format. The same word-after-the-pair reading took OR / AND after a
+    comparison's second field and a BUILD list's X separator as formats. A fact of jcl.py: the re-parse night."""
+
+    def test_the_cards(self):
+        f = [(k, p, ln, fmt) for (k, p, ln, fmt, _raw) in jcl.sort_card_fields(
+            "  SORT FIELDS=COPY\n  INCLUDE COND=(13,2,NE,C'CN'),FORMAT=CH\n")]
+        self.assertEqual(f, [("INCLUDE", 13, 2, "CH")])
+        f = [(k, p, ln, fmt) for (k, p, ln, fmt, _raw) in jcl.sort_card_fields(
+            "  OMIT COND=(1,2,EQ,5,2,OR,20,3,GT,+100),FORMAT=BI\n")]
+        self.assertEqual(f, [("OMIT", 1, 2, "BI"), ("OMIT", 5, 2, "BI"), ("OMIT", 20, 3, "BI")])
+        # no FORMAT=: the compared bytes stay a field reference, with no format
+        f = [(k, p, ln, fmt) for (k, p, ln, fmt, _raw) in jcl.sort_card_fields("  INCLUDE COND=(13,2,EQ,C'CN')\n")]
+        self.assertEqual(f, [("INCLUDE", 13, 2, None)])
+        # a format given on the condition is kept, and a SORT's order takes FORMAT='s as before
+        f = [(k, p, ln, fmt) for (k, p, ln, fmt, _raw) in jcl.sort_card_fields(
+            "  SORT FIELDS=(1,12,A),FORMAT=CH\n  INCLUDE COND=(13,2,ZD,GT,+5)\n")]
+        self.assertEqual(f, [("SORT", 1, 12, "CH"), ("INCLUDE", 13, 2, "ZD")])
+        # a reformatting list's blank / binary-zero separator is no format either
+        f = [(k, p, ln, fmt) for (k, p, ln, fmt, _raw) in jcl.sort_card_fields(
+            "  OUTREC BUILD=(1,10,X,11,5,Z,16,4,PD)\n")]
+        self.assertEqual(f, [("OUTREC", 1, 10, None), ("OUTREC", 11, 5, None), ("OUTREC", 16, 4, "PD")])
+
+    def test_in_the_index_and_on_the_job_page(self):
+        td = tempfile.mkdtemp()
+        try:
+            root = os.path.join(td, "estate")
+            _write(root, "POLICY/PROD.KV.JCLLIB/KVYJOB.jcl", _job(
+                "KVYJOB", "//S010     EXEC PGM=SORT\n//SORTIN   DD   DSN=PROD.KVY.IN,DISP=SHR\n"
+                          "//SORTOUT  DD   DSN=PROD.KVY.OUT,DISP=(NEW,CATLG,DELETE)\n"
+                          "//SYSIN    DD   *\n  SORT FIELDS=COPY\n  INCLUDE COND=(13,2,NE,C'CN'),FORMAT=CH\n/*\n"))
+            db = os.path.join(td, "t.db")
+            _build(root, db)
+            conn = query.connect(db)
+            try:
+                self.assertEqual(conn.execute("SELECT fmt FROM card_field_ref WHERE pos=13").fetchall()[0][0], "CH")
+                self.assertIn("- sort card byte positions: INCLUDE 13-14 CH\n", query.cmd_job(conn, "KVYJOB"))
+                # an index built before: the operator stored as the format is not said
+                conn.execute("UPDATE card_field_ref SET fmt='NE' WHERE pos=13")
+                self.assertIn("- sort card byte positions: INCLUDE 13-14\n", query.cmd_job(conn, "KVYJOB"))
+                conn.execute("UPDATE card_field_ref SET fmt='OR' WHERE pos=13")
+                self.assertIn("- sort card byte positions: INCLUDE 13-14\n", query.cmd_job(conn, "KVYJOB"))
+            finally:
+                conn.close()
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
+
+
+# ===========================================================================
 # the reproductions and the documents
 # ===========================================================================
 
@@ -588,6 +918,8 @@ class TheReproductions(unittest.TestCase):
                 if "count" in ck:
                     self.assertEqual(text.count(ck["count"]), ck["truth"], (rid, ck["count"], text))
                     self.assertNotEqual(ck["truth"], ck["symptom"])
+                elif ck["truth_has"] == ck.get("symptom_has"):
+                    self.assertIn(ck["truth_has"], text, (rid, ck["query"]))
                 else:
                     self.assertIn(ck["truth_has"], text, (rid, ck["query"]))
                     self.assertNotIn(ck["symptom_has"], text, (rid, ck["query"]))
@@ -611,7 +943,16 @@ class TheReproductions(unittest.TestCase):
             got = [g for rid in THREE for g in verify.verify(os.path.join(REPRO, rid), out)]
         finally:
             shutil.rmtree(out, ignore_errors=True)
-        self.assertEqual([v for _l, v, _d in got], ["FIXED"] * 4, got)
+        self.assertEqual([v for _l, v, _d in got], ["FIXED"] * 5, got)
+
+    def test_f12_holds_the_compared_constant(self):
+        # F12's two counts read 0 on an empty or crashed page too: its third check is the row the page must hold
+        with open(os.path.join(REPRO, "F12-values-sort-length", "expect.json"), encoding="utf-8") as fh:
+            checks = json.load(fh)["checks"]
+        self.assertEqual([c.get("truth") for c in checks if "count" in c], [0, 0])
+        self.assertIn({"query": ["values", "R12-STATUS"],
+                       "truth_has": "| AC | R12-ACTIVE | 0 | 1 | 0 | 1 | R12JOB.STEP010 INCLUDE",
+                       "symptom_has": "| AC | R12-ACTIVE | 0 | 1 | 0 | 1 | R12JOB.STEP010 INCLUDE"}, checks)
 
 
 class TheDocsSayIt(unittest.TestCase):
@@ -638,6 +979,21 @@ class TheDocsSayIt(unittest.TestCase):
         self.assertIn("the constant after the operator, never a position or a length", manual)
         self.assertIn("one row per file an FTP / Connect:Direct step sends or receives", manual)
         self.assertIn("a PROC's own default datasets only when no indexed job runs the PROC", manual)
+
+    def test_the_verifier_s_round(self):
+        text = self.read("LESSONS.md")
+        for n in range(240, 245):
+            row = next((ln for ln in text.splitlines() if ln.startswith(f"| {n} |")), "")
+            self.assertIn("tests/test_synth_query_findings.py", row, n)
+            self.assertEqual(row.replace("\\|", "").count("|") - 1, 5, n)
+        roadmap = self.read("ROADMAP.md")
+        self.assertIn("30. **Delivered in the batch - a condition's operator is no sort-card format.**", roadmap)
+        self.assertIn("each row is tied to its\n  own step by the notes the step's parm ends with", roadmap)
+        self.assertIn("a job running one FTP PROC twice gives each step its own", " ".join(self.read("README.md").split()))
+        self.assertIn("**The verifier's round on the query side (LESSONS 240-244).**",
+                      self.read("docs", "SYNTH-findings-2026-09-25.md"))
+        self.assertIn("so the third check is a control",
+                      self.read("tools", "synth", "repro", "F12-values-sort-length", "README.md"))
 
     def test_roadmap_closes_its_known_limit(self):
         self.assertIn("**Closed (LESSONS 237) - `interfaces` cited an expanded step's `interface_edge` row",

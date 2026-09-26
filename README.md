@@ -418,8 +418,9 @@ own step and `values` counts no card of one while a job expands that PROC.
   callee's LINKAGE; a count mismatch is flagged (the S0C4 check).
 - `interfaces [--system S] [--dsn X]` — what leaves and enters the
   mainframe: FTP / Connect:Direct steps, one row per file sent or received,
-  with the peer the step names (the FTP PARM's host, the Connect:Direct SNODE)
-  - a step whose cards name no file is one row of its own; MQ queues with the
+  with the peer the step names (the FTP PARM's host, the Connect:Direct SNODE;
+  a job running one FTP PROC twice gives each step its own) - a step whose
+  cards name no file is one row of its own; MQ queues with the
   message layout, IMS message switches, CICS TD queues and web entry points,
   and the peers you declare in the manifest (`"external_interfaces":
   [{"kind":"ndm","peer":"REINSURER-X","direction":"out","dataset":"PROD.POLICY.EXTRACT"}]`)
