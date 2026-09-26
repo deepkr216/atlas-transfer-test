@@ -3,3 +3,5 @@
 The MOVE on line 10 opens a sentence that holds a SELECT (line 11) and an UPDATE (line 15). Truth: each statement cited at its own first line. Tool: both at line 10, and the host variables the SQL reads/writes at line 10 too. `table PRD.POLICY_TBL` then prints two different statements with the same cite.
 
 In the estate: every DB2 program (POLDB201 and its twins), 6 statements each.
+
+Fixed by ROADMAP re-parse item 26 (LESSONS 211): each EXEC SQL statement is cited at its own EXEC SQL line - the SELECT at line 11, the UPDATE at line 15 - with its tables, columns and host-variable references.

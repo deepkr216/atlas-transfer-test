@@ -609,11 +609,48 @@ shipped alone and cost one such night; these still wait for the next one:
    followed by `COPY LITBK.` with LITBK missing: the expander turns the COPY line into a comment, period
    included, so the data entry runs on into `PROCEDURE DIVISION.` - the member is 'partial' with no paragraphs,
    WS-STATES carries the value 'PROCEDURE DIVISION', and the note says only 'fields/code from it are missing'.
-   The same shape as the synthetic reproduction F15 (an EXEC SQL in WORKING-STORAGE without its period,
-   tools/synth/repro). Since item 21 an incremental build reaches this state as well when such a copybook goes
-   from disk (a --rebuild gives the same; before, the program kept 'ok' and its old paragraphs). At the re-parse,
-   with F15: end an open data entry at a division header in area A (cobol_statements), and say in the note when
-   the procedure division was lost.
+   The same run-on as the synthetic reproduction F15 (an EXEC SQL in WORKING-STORAGE without its period,
+   tools/synth/repro), whose own shape item 26 delivers: the reader closes that EXEC block at its END-EXEC, and it
+   counts the PROCEDURE DIVISION as entered when a statement holds its header anywhere, so procedure code after
+   such a run-on is never given F15's note - but cobol.py still reads a division header only at the start of a
+   statement, so this item's program still loses its paragraphs. Since item 21 an incremental build reaches this
+   state as well when such a copybook goes from disk (a --rebuild gives the same; before, the program kept 'ok'
+   and its old paragraphs). At the re-parse: end an open data entry at a division header in area A
+   (cobol_statements), and say in the note when the procedure division was lost.
+26. **Delivered in the batch - every fact of a sentence at its own line, END-DATE a data name, no file or FUNCTION
+   name a field, an EXEC block before the PROCEDURE DIVISION closed at its END-EXEC.** The synthetic estate's
+   COBOL findings (docs/SYNTH-findings-2026-09-25.md; the reproductions F01, F02, F04, F14 and F15 under
+   tools/synth/repro, which verify.py now reports FIXED; LESSONS 211). IMS programs write GU, then CHKP, then GN
+   without a period between them: only the first call was kept, cited at the sentence's first line, the rest of
+   the sentence read as its SSAs (29 calls lost), and an ordinary CALL in such a sentence was dropped with it. Now
+   every CBLTDLI / AIBTDLI / PLITDLI call of a sentence is a row at its own line with its own USING list, each MQ
+   call and each EXEC SQL statement - its tables, columns and host variables with it - sits at its own line (27
+   statement cites and the field cites F04-F10, F14 of the report). The verb list held `END-[A-Z]+`: END-DATE,
+   END-TIME and END-BALANCE cut the statement, so `IF END-DATE < START-DATE` lost both references and `MOVE
+   WS-PURGE-DATE TO END-DATE` its read and its write; the same prefix left an argument named `WS-` for `USING
+   WS-END-DATE`, closed a file called END-IF, and lost a CALL through END-PGM. The scope terminators are now a word
+   list (`cobol.SCOPE_TERMINATORS`) wherever the prefix was, the lists that end at the next verb end at any
+   statement verb (`cobol._STATEMENT_VERBS`: before, `OPEN OUTPUT X` then `COMPUTE` opened COMPUTE as a file, a
+   SORT's GIVING list took GOBACK, a DISPLAY after a MOVE 'lit' took the literal and the next literal MOVE of the
+   sentence was never seen), and SORT / MERGE / CANCEL / ALTER / ENTRY joined the splitter. OPEN and CLOSE record no
+   field reference, START and DELETE not their file, a SELECT / FD name is never one, and the name after FUNCTION
+   is the function's (its arguments are read). An EXEC SQL / CICS / DLI block before the PROCEDURE DIVISION whose
+   END-EXEC lacks its period - a compile error - ran on into the division header and the program lost every
+   paragraph while it read `parse: ok`: `reader.cobol_statements` closes it at the END-EXEC (in a member with no
+   division header, when a level number follows), and the member is `partial` with 'EXEC SQL at line N ends
+   without its period - the compiler would reject it; the facts after it were read as if the period were there'
+   ('line N of copybook X' when the block came from a COPY), explained in coverage's kinds table
+   (exec_no_period). `program`'s Calls table shows the variable a CALL / LINK / XCTL names beside the targets it
+   resolves to (`query.call_target_cell` - the synth finding F25: a variable holding one literal printed the
+   target alone); that is query side, the same on an index built before the batch. The report's POLUPD05 findings
+   (F16, F17, F21-F24) came from the 8-digit stub POLSTUBC expanded as code, the same run-on into the division
+   header, and item 23 had already fixed them. The stand-ins of this week find nothing to do on such an index:
+   partial_kind calls the F15 member truly partial, recover marks, re-files and names nothing. The synth harness
+   over the whole estate: 428 findings (433 facts) before, 310 (315) after, 10,886 facts matched before and 11,053
+   after, none new. The first build of this toolkit re-parses every member. tests/test_sentence_facts.py
+   (DliCallsInOneSentence, SqlInOneSentence, NamesBeginningWithEnd, LiteralMovesInOneSentence,
+   FileAndFunctionNames, ExecWithoutItsPeriod, TheBuildAndTheReports, TheStandInsFindNothingToDo,
+   TheReproductions).
 
 ### flow: known limits (open after review)
 

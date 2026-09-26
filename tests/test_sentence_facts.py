@@ -732,5 +732,30 @@ class TheReproductions(unittest.TestCase):
         self.check("F15-ws-exec-sql-no-period")
 
 
+class TheDocsSayIt(unittest.TestCase):
+    """ROADMAP 26 (and 25's remainder), LESSONS 211, README's COBOL row, the reproductions' READMEs and the findings
+    report say what changed."""
+
+    def read(self, *path):
+        with open(os.path.join(ROOT, *path), encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_the_docs(self):
+        roadmap = self.read("ROADMAP.md")
+        self.assertIn("26. **Delivered in the batch - every fact of a sentence at its own line, END-DATE a data name", roadmap)
+        self.assertIn("so this item's program still loses its paragraphs", roadmap)
+        lessons = self.read("LESSONS.md")
+        self.assertIn("| 211 | Not seen on his estate - the synthetic estate's first comparison", lessons)
+        self.assertIn("Rule for me: a sentence is a container, not a fact", lessons)
+        self.assertIn("`END-DATE` taken for a scope terminator", self.read("README.md"))
+        for rid in ("F01-dli-two-calls-one-sentence", "F02-sql-sentence-cite", "F04-end-date-reference",
+                    "F14-file-and-function-as-field", "F15-ws-exec-sql-no-period"):
+            self.assertIn("Fixed by ROADMAP re-parse item 26 (LESSONS 211)", self.read("tools", "synth", "repro", rid,
+                                                                                     "README.md"), rid)
+        report = self.read("docs", "SYNTH-findings-2026-09-25.md")
+        self.assertIn("F25 is the toolkit's, not the generator's", report)
+        self.assertIn("POLUPD05's rows F16, F17, F21-F24 did not come from F15's shape", report)
+
+
 if __name__ == "__main__":
     unittest.main()
