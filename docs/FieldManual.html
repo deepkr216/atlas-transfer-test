@@ -342,7 +342,8 @@ python -m atlas.query  --db atlas.db ambiguous       # duplicate member names</c
 <tbody>
 <tr><td class="mono">open_verb</td><td>The program's own <code>OPEN INPUT / OUTPUT / I-O / EXTEND</code>, joined through SELECT…ASSIGN to the DD</td><td>Authoritative</td></tr>
 <tr><td class="mono">gdg_relative</td><td><code>(+1)</code> is created here; <code>(0)</code> / <code>(−n)</code> is read</td><td>Strong</td></tr>
-<tr><td class="mono">dd_convention</td><td>SORTIN / SYSUT1 read; SORTOUT / SYSUT2 write</td><td>Strong for utilities</td></tr>
+<tr><td class="mono">gdg_same_job</td><td>A <code>(+1)</code> an earlier step of the same job wrote, named again by a DD that reads it (SORTIN, SYSUT1, a sort card's input, <code>DISP=SHR / OLD</code>): the same new generation, read here. JES resolves relative numbers once per job</td><td>Strong</td></tr>
+<tr><td class="mono">dd_convention</td><td>SORTIN / SYSUT1 read; SORTOUT / SYSUT2 write - also where the relative generation says the other way (a sort never writes its SORTIN)</td><td>Strong for utilities</td></tr>
 <tr><td class="mono">disp_new_weak · disp_mod_weak</td><td><code>DISP=NEW</code> / <code>MOD</code></td><td>Weak</td></tr>
 <tr><td class="mono">undetermined</td><td>Only <code>DISP=OLD/SHR</code> was available — serialisation, not direction</td><td>Unknown, and said so</td></tr>
 </tbody></table></div>

@@ -12,7 +12,7 @@
     "dataset",
     "PROD.R09.EXTRACT"
    ],
-   "truth_has": "| input [gdg_relative] | POLICY | *SORT* |",
+   "truth_has": "| input [gdg_same_job] | POLICY | *SORT* |",
    "symptom_has": "| output [gdg_relative] | POLICY | *SORT* |"
   }
  ]

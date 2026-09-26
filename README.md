@@ -269,6 +269,12 @@ dataset. Direction is taken from, in order: the program's own `OPEN`
 verb (joined through `ASSIGN`), the GDG relative generation, utility DD-name
 conventions (SORTIN/SORTOUT, SYSUT1/SYSUT2), and only then `DISP=NEW/MOD` as a
 weak hint. Every DD row records which signal decided it (`mode_source`).
+A relative generation is resolved once per job: a `(+1)` an earlier step of
+the job wrote, named `(+1)` again by a later DD that reads it (SORTIN, SYSUT1,
+an input of the sort cards, `DISP=SHR` / `OLD`), is that same new generation,
+recorded `input [gdg_same_job]` - never a second writer. Where the generation
+number and a utility's own DD disagree, the DD decides (`dd_convention`): a
+sort never writes its SORTIN, even at `(+1)`.
 
 ## Symbolics, PROCs and where a file is created or used
 
@@ -293,6 +299,12 @@ Three more shapes that production JCL has and toy JCL does not:
   `RUN PROGRAM(...)` resolves, sort byte positions and IDCAMS operations are
   harvested. `program SRTCLM` says which jobs use the member. If the member
   is not indexed the job dossier says so ("card member NOT indexed").
+  A member a PROC names through a symbolic (`DSN=PROD.PARMLIB(&CARDS)`) is
+  the one the calling job's `EXEC PROC=...,CARDS=` names (EXEC override ›
+  PROC default › SET), with that member's cards; `//PS.SYSIN DD *` replaces
+  the PROC's member with the job's own cards. Coverage's 'referenced by JCL
+  but NOT indexed' table counts a PROC's default member only when no indexed
+  job runs the PROC.
 - **`&&TEMP` datasets** exist only between the steps of one job. They never
   become `dataset` rows and `dataset` hides them, so two jobs that both use
   `&&SORTED` are never joined; `job X` lists them under "Job-local datasets".

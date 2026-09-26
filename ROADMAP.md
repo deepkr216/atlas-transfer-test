@@ -783,6 +783,34 @@ shipped alone and cost one such night; these still wait for the next one:
    itself was never cut, and a `/* ... */` one never read, so an apostrophe in either did the same.
    `reader.sql_comments_out` takes the comments out outside the SQL's literals, on the opening line too, a `/* */`
    one over several lines until `*/` or END-EXEC. tests/test_exec_in_literal.py (SqlCommentsOutsideLiterals).
+29. **Delivered in the batch - a PROC's card member named by a symbolic is the calling job's, and a (+1) named again
+   later in the same job is read, not written again.** The synthetic estate's findings in the JCL parser
+   (docs/SYNTH-findings-2026-09-25.md; the reproductions F09 and F10 under tools/synth/repro, which verify.py now
+   reports FIXED; LESSONS 222-224). (F10) The shared sort PROC's `//SYSIN DD DSN=PROD.CMN.PARMLIB(&CARDS)`, run with
+   `EXEC PROC=CMNSORT,...,CARDS=BILSORT1`: the effective step's DSN was the job's, but its card member, the member's
+   text, the program read from the cards and the sort byte positions stayed the PROC default's (CMNSRT1, not in the
+   estate) - `job` said 'card member NOT indexed' for a member the estate holds, coverage had a 'SORT with no cards'
+   row, the step had no card_field_ref rows, and coverage's table of members 'referenced by JCL but NOT indexed'
+   named the default no job reads. `jcl._resolve_dd` resolves the card member with the job's symbols (EXEC override >
+   PROC default > SET, `jcl.PROC_DEFAULT_BEATS_SET` as it is) and loads its text (`jcl._card_source`, the reading
+   `_build_dd` uses); the effective step's program, launcher and submits are read again from those cards; an
+   override naming a dataset brings its own cards; `//PS.SYSIN DD *` replaces the PROC's dataset instead of sitting
+   beside it (LESSONS 224). Coverage's table (`query.card_members_not_indexed`) counts a PROC's own rows only when no
+   indexed job expands the PROC, and a job step's //PS.DD override once; on an index built before the item an
+   effective step still names the default, and is counted as it is. (F09) JES resolves relative generation numbers
+   once per job: `jcl._same_job_generations` reads a (+n) an earlier step of the job wrote, named again by a DD that
+   reads it (SORTIN, SYSUT1, an input of the sort / ICETOOL / JOINKEYS / Easytrieve cards, DISP=SHR or OLD on a DD
+   whose name is not a writing one), as input 'gdg_same_job', not a second writer; the program's OPEN still decides
+   over it; where a utility's own DD and the relative number disagree the DD decides ('dd_convention': SORTIN at
+   (+1), SORTOUT at (0)). The reproduction F10's EXEC ran to column 82, past what JCL reads, and is continued on a
+   second line; F09's check names `gdg_same_job` as the finding does. The synthetic estate's nightly jobs override
+   the extract's (+1) under another name, so their sort reads a generation no earlier step wrote: 'input
+   [dd_convention]' there, where the generator names the reason gdg_same_job and the checker compares the direction.
+   The harness over the whole estate, before the item and after it: 62 findings (65 facts) and 27 (30), 11,358
+   facts matched and 11,393, none new; the one JCL finding left is `crud --job POLNIGHT` (the sorted extract absent),
+   a query-side question of its own. The first build of this toolkit re-parses every member (jcl.py is a fact
+   module). tests/test_jcl_generations_and_cards.py (SameJobGenerations, ProcCardMember, InTheIndex,
+   TheReproductions).
 
 ### flow: known limits (open after review)
 

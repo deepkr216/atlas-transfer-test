@@ -1398,6 +1398,32 @@ def cmd_literal(conn: sqlite3.Connection, value: str, field: Optional[str] = Non
 # dataset / copybook impact
 # --------------------------------------------------------------------------
 
+def card_members_not_indexed(conn: sqlite3.Connection, limit: int = 30) -> List[Tuple[str, int]]:
+    """[(card member, DDs)] - the control-card members the jobs' DDs name
+    (`DSN=LIB(MEMBER)`) whose text the index does not hold, most DDs first.
+    A PROC's own rows carry its DEFAULT symbolics (`SYSIN DD
+    DSN=PARMLIB(&CARDS)` with `CARDS=DEFCARD` on the PROC statement): they
+    count only when no indexed job expands that PROC - each job's effective
+    step names the member that job reads (EXEC override > PROC default >
+    SET). A job step's own //PS.DD override counts once, on the effective
+    step. The rule `dataset` and `program NAME` show rows by. On an index
+    built before ROADMAP re-parse item 29 an effective step still names the
+    PROC's default member, and is counted as it is."""
+    expanded = {str(r[0]).upper() for r in conn.execute(
+        "SELECT DISTINCT from_proc FROM step WHERE from_proc IS NOT NULL")}
+    counts: Dict[str, int] = {}
+    for r in conn.execute("""SELECT d.card_member, pd.proc_name, s.proc_called, s.job_id, s.step_name
+                             FROM dd d JOIN step s ON s.id=d.step_id LEFT JOIN proc_def pd ON pd.id=s.proc_id
+                             WHERE d.card_member IS NOT NULL AND d.sysin_text IS NULL"""):
+        if r[1] and str(r[1]).upper() in expanded:
+            continue
+        if r[2] and r[3] and conn.execute("SELECT 1 FROM step WHERE job_id=? AND parent_step=? LIMIT 1",
+                                          (r[3], r[4])).fetchone():
+            continue
+        counts[str(r[0])] = counts.get(str(r[0]), 0) + 1
+    return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:limit]
+
+
 def cmd_dataset(conn: sqlite3.Connection, dsn: str) -> str:
     rows = conn.execute("""SELECT * FROM v_dataset_flow WHERE UPPER(dsn) LIKE ? ORDER BY dsn, mode, job_name""",
                         (f"%{dsn.upper()}%",)).fetchall()
@@ -2104,8 +2130,11 @@ UNRESOLVED_MEANING = {
     "ndm_process": ("a Connect:Direct process member named by a SUBMIT PROC= that is not indexed",
                     "fetch that process library: the datasets sent or received are unknown"),
     "mq": ("an MQ queue name built at run time", "the queue cannot be known from the source"),
-    "card_seq_assumed": ("a card deck with no sequence field; the order on disk was assumed",
-                         "harmless for reading, but confirm before regenerating the deck"),
+    "card_seq_assumed": ("a card DD naming a sequential dataset (`//SYSIN DD DSN=PROD.CLM.SORTCLM`): its cards were "
+                         "taken from the indexed member named like the dataset's last qualifier (SORTCLM) - an "
+                         "assumption, said on each row",
+                         "compare that member with the dataset the job reads - the name is the only link the index has; "
+                         "nothing to do when they hold the same cards"),
     "scheduler_format": ("a scheduler export line the loader did not understand",
                          "send one line of the export (no names) so the loader can be extended"),
     "copy_replacing": ("a COPY ... REPLACING: the field names in this program differ from the copybook as stored",
@@ -6227,12 +6256,11 @@ def _coverage_extras(conn: sqlite3.Connection) -> str:
     ]
     out.append("\n### Optional inputs\n")
     out.append(table(["input", "loaded"], [(n, str(v) if v else "NO") for n, v in checks]))
-    miss = conn.execute("""SELECT card_member, COUNT(*) AS n FROM dd WHERE card_member IS NOT NULL AND sysin_text IS NULL
-                           GROUP BY card_member ORDER BY n DESC LIMIT 30""").fetchall()
+    miss = card_members_not_indexed(conn)
     if miss:
         out.append(f"\n### Control-card members referenced by JCL but NOT indexed ({len(miss)} shown)\n"
                    "Fetch the PARMLIB/CNTL library: until then these steps' cards, programs and sort fields are unknown.\n")
-        out.append(table(["member", "DDs"], [(m["card_member"], m["n"]) for m in miss]))
+        out.append(table(["member", "DDs"], [(name, n) for name, n in miss]))
     unres = conn.execute("SELECT COUNT(*) FROM unresolved WHERE kind='dli_function'").fetchone()[0]
     return "".join(out)
 

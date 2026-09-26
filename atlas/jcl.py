@@ -342,8 +342,12 @@ def _parse_statements(stmts: List[JclStatement], extra_symbols: Optional[Dict[st
         _resolve_effective_pgm(step, job, member_lookup)
     _apply_joblib(job.steps, job.job_dds)
     _resolve_referbacks(job.steps, job, report=not any(s.proc_called for s in job.steps))
+    # A PROC's steps run inside one job too: its own rows (default symbolics)
+    # read a (+1) its earlier step wrote, as the expanded steps do.
+    _same_job_generations(job.steps)
     for p in job.instream_procs.values():
         _resolve_referbacks(p.steps, p, report=False)
+        _same_job_generations(p.steps)
     return job
 
 
@@ -465,29 +469,12 @@ def _build_dd(st: JclStatement, dd_name: str, concat_seq: int,
         # &&TEMP lives only between the steps of THIS job. It is not a dataset
         # another job can read, so it must never join two jobs' lineage.
         is_temp = resolved.startswith("&&")
-        m = _MEMBER_REF.search(resolved)
-        if m and not m.group(1)[0].isdigit() and dd_name.upper().split(".")[-1] not in _NOT_CARD_DDS:
-            # DSN=PROD.PARMLIB(SRTCLM): the control cards live in a member, not
-            # instream. If that member is indexed, its text becomes this DD's
-            # cards, so launchers, sort fields and IDCAMS ops resolve exactly as
-            # for `DD *`. Without this, most production steps have no cards.
-            card_member = m.group(1).upper()
-            if sysin is None and member_lookup is not None:
-                body = member_lookup(card_member)
-                if body is not None:
-                    sysin = body
-        elif (sysin is None and member_lookup is not None and not gdg
-              and dd_name.upper().split(".")[-1] in _CARD_DDS):
-            # Cards in a SEQUENTIAL dataset (//SYSIN DD DSN=PROD.CLAIMS.SORTCLM):
-            # fetched as a file named by the last qualifier - matched by that
-            # name, and said so, because it is an assumption.
-            last = resolved.rsplit(".", 1)[-1]
-            if 1 <= len(last) <= 8:
-                body = member_lookup(last)
-                if body is not None:
-                    sysin, card_member = body, last
-                    facts.unresolved.append(("card_seq_assumed", f"{dd_name}: cards taken from member {last} "
-                                                                 f"matching the last qualifier of {resolved}", st.start))
+        card_member, body, by_last = _card_source(dd_name, resolved, gdg, member_lookup if sysin is None else None)
+        if body is not None:
+            sysin = body
+        if by_last:
+            facts.unresolved.append(("card_seq_assumed", f"{dd_name}: cards taken from member {card_member} "
+                                                         f"matching the last qualifier of {resolved}", st.start))
 
     # `//STEP1.DD1 DD ...` overrides a DD inside a called PROC.
     is_override = "." in dd_name
@@ -512,11 +499,52 @@ def _build_dd(st: JclStatement, dd_name: str, concat_seq: int,
     )
 
 
+def _card_source(dd_name: str, resolved: str, gdg: Optional[str],
+                 member_lookup: Optional[Callable[[str], Optional[str]]]) -> Tuple[Optional[str], Optional[str], bool]:
+    """(card member, its text, taken by the last qualifier?) for a DD's
+    resolved DSN. The text is None when the member is not indexed or no
+    lookup is given (the DD's cards are instream).
+
+    DSN=PROD.PARMLIB(SRTCLM): the control cards live in a member, not
+    instream. If that member is indexed, its text becomes this DD's cards, so
+    launchers, sort fields and IDCAMS ops resolve exactly as for `DD *`.
+    Without this, most production steps have no cards. Cards in a SEQUENTIAL
+    dataset (//SYSIN DD DSN=PROD.CLAIMS.SORTCLM) are fetched as a file named
+    by the last qualifier - matched by that name, and said so by the caller,
+    because it is an assumption."""
+    base = dd_name.upper().split(".")[-1]
+    m = _MEMBER_REF.search(resolved)
+    if m and not m.group(1)[0].isdigit() and base not in _NOT_CARD_DDS:
+        name = m.group(1).upper()
+        return name, (member_lookup(name) if member_lookup is not None else None), False
+    if member_lookup is not None and not gdg and base in _CARD_DDS:
+        last = resolved.rsplit(".", 1)[-1]
+        if 1 <= len(last) <= 8:
+            body = member_lookup(last)
+            if body is not None:
+                return last, body, True
+    return None, None, False
+
+
 # DD names whose direction is fixed by the utility that reads them.
 _INPUT_DDS = {"SORTIN", "SYSUT1", "INFILE", "SYSIN", "SYSTSIN", "STEPLIB", "JOBLIB", "TOOLIN", "SYMNAMES",
               "SYSLIB", "IMSACB", "DFSRESLB", "DFSVSAMP", "IEFRDER", "SYSLMOD"}
 _OUTPUT_DDS = {"SORTOUT", "SYSUT2", "OUTFILE", "SYSPRINT", "SYSOUT", "SYSUDUMP",
                "SYSABEND", "CEEDUMP"}
+
+
+def _utility_side(base: str) -> Optional[str]:
+    """'input' / 'output' for the DD names whose direction the utility itself
+    fixes whatever dataset they name - SORT reads SORTIN (SORTIN01...) and
+    writes SORTOUT / SORTOFxx, IEBGENER reads SYSUT1 and writes SYSUT2 - else
+    None. Where a relative generation number says the other way, these
+    decide: a sort never writes its SORTIN, even when the DSN reads (+1), and
+    never reads its SORTOUT, even when it reads (0) (LESSONS 223)."""
+    if base == "SYSUT1" or base.startswith("SORTIN"):
+        return "input"
+    if base in ("SORTOUT", "SYSUT2") or base.startswith("SORTOF"):
+        return "output"
+    return None
 
 
 def _direction(dd_name: str, gdg: Optional[str], disp: Optional[str],
@@ -530,7 +558,12 @@ def _direction(dd_name: str, gdg: Optional[str], disp: Optional[str],
     with arrows pointing the wrong way - and it looks fine.
 
     Signals, strongest first:
-      1. GDG relative generation: (+1) is created here, (0)/(-n) is read.
+      1. GDG relative generation: (+1) is created here, (0)/(-n) is read -
+         unless the DD is one whose direction the utility fixes and it says
+         the other way (_utility_side: a sort never writes its SORTIN).
+         A (+1) named again by a later step of the same job is the SAME new
+         generation - decided over the whole job, once every step is known
+         (_same_job_generations: 'gdg_same_job').
       2. Utility DD-name conventions: SORTIN/SYSUT1 read, SORTOUT/SYSUT2 write.
       3. DISP=NEW / MOD - weak corroboration only.
       4. The program's own OPEN INPUT/OUTPUT/I-O verb, joined through
@@ -551,15 +584,19 @@ def _direction(dd_name: str, gdg: Optional[str], disp: Optional[str],
     if re.search(r"\bDSN(?:AME)?=NULLFILE\b", up):
         return "dummy", "dummy"
 
+    base = dd_name.upper().split(".")[-1]
     if gdg is not None:
         try:
             g = int(gdg)
         except ValueError:
             g = None
         if g is not None:
-            return ("output" if g > 0 else "input"), "gdg_relative"
+            mode = "output" if g > 0 else "input"
+            side = _utility_side(base)
+            if side is not None and side != mode:
+                return side, "dd_convention"
+            return mode, "gdg_relative"
 
-    base = dd_name.upper().split(".")[-1]
     if base in _INPUT_DDS or base.startswith("SORTIN"):
         return "input", "dd_convention"
     if base in _OUTPUT_DDS or base.startswith("SORTOF"):
@@ -1218,10 +1255,13 @@ def expand_job(job: JclFacts, proc_lookup: Callable[[str], Optional["JclFacts"]]
 
         for ps in proc.steps:
             psn = ps.step_name.upper()
+            # effective_pgm / launcher / submits are re-derived below by
+            # _resolve_effective_pgm from THIS job's cards: the PROC's own
+            # reading came from its default card member (LESSONS 222).
             eff = replace(ps,
                           step_name=f"{s.step_name}.{ps.step_name}",
                           from_proc=s.proc_called.upper(), parent_step=s.step_name,
-                          dds=[], notes=[],            # re-derived below by _resolve_effective_pgm
+                          dds=[], notes=[], effective_pgm=None, launcher=None, submits=[],
                           parm=substitute_symbols(ps.parm, symbols) if ps.parm else ps.parm,
                           pgm=substitute_symbols(ps.pgm, symbols) if ps.pgm else ps.pgm,
                           guard=" AND ".join(g for g in (s.guard, ps.guard) if g) or None,
@@ -1248,18 +1288,28 @@ def expand_job(job: JclFacts, proc_lookup: Callable[[str], Optional["JclFacts"]]
                         nd = replace(d, dsn=None, dsn_resolved=None, gdg_rel=None, sysin_text=None,
                                      card_member=None, referback=None, is_temp=False,
                                      mode="dummy", mode_source="dummy", is_override=True, line=o.line)
+                    elif not o.dsn and o.sysin_text is not None:
+                        # //PS.SYSIN DD *: the instream cards REPLACE the PROC's
+                        # dataset - the step reads no PARMLIB member.
+                        nd = replace(d, dsn=None, dsn_resolved=None, gdg_rel=None, disp=o.disp,
+                                     sysin_text=o.sysin_text, card_member=None, referback=None, is_temp=False,
+                                     mode=o.mode, mode_source=o.mode_source, is_override=True, line=o.line)
                     else:
+                        # An override naming a dataset brings its own cards (or
+                        # none, when its member is not indexed), never the
+                        # PROC's default member's.
                         nd = replace(d, dsn=o.dsn or d.dsn, disp=o.disp or d.disp,
-                                     sysin_text=o.sysin_text or d.sysin_text,
+                                     sysin_text=o.sysin_text if o.dsn else d.sysin_text,
                                      card_member=o.card_member if o.dsn else d.card_member,
                                      is_override=True, line=o.line)
                 else:
                     nd = replace(d)
-                eff.dds.append(_resolve_dd(nd, symbols, job, eff))
+                eff.dds.append(_resolve_dd(nd, symbols, job, eff, member_lookup))
             for key, o in sorted(ov.items(), key=lambda kv: (kv[0][1], kv[0][2])):
                 if key[0] == psn and key not in used:
                     used.add(key)
-                    eff.dds.append(_resolve_dd(replace(o, dd_name=key[1], is_override=True), symbols, job, eff))
+                    eff.dds.append(_resolve_dd(replace(o, dd_name=key[1], is_override=True), symbols, job, eff,
+                                               member_lookup))
             for key in ov:
                 if key[0] not in {p.step_name.upper() for p in proc.steps} and key not in used:
                     job.unresolved.append(("override_target",
@@ -1286,12 +1336,21 @@ def expand_job(job: JclFacts, proc_lookup: Callable[[str], Optional["JclFacts"]]
             out.append(eff)
     if depth == 0:
         # Every step is now known, PROC steps included: DSN=*.STEP.DD can be
-        # followed to the dataset it names.
+        # followed to the dataset it names, and a (+1) named again after an
+        # earlier step wrote it is read (gdg_same_job).
         _resolve_referbacks(out, job, report=True)
+        _same_job_generations(out)
     return out
 
 
-def _resolve_dd(d: DdFact, symbols: Dict[str, str], job: JclFacts, step: StepFact) -> DdFact:
+def _resolve_dd(d: DdFact, symbols: Dict[str, str], job: JclFacts, step: StepFact,
+                member_lookup: Optional[Callable[[str], Optional[str]]] = None) -> DdFact:
+    """A PROC step's DD with the calling job's symbols: the DSN, its
+    generation and direction - and the card member it names, with that
+    member's text. `//SYSIN DD DSN=PROD.PARMLIB(&CARDS)` was read with the
+    PROC's default CARDS=DEFCARD when the PROC member was parsed; the job's
+    EXEC PROC=...,CARDS=R10CARD makes it R10CARD, so the step's cards,
+    launcher and sort byte positions are R10CARD's (LESSONS 222)."""
     if not d.dsn:
         return d
     if d.dsn.startswith("*."):
@@ -1302,8 +1361,18 @@ def _resolve_dd(d: DdFact, symbols: Dict[str, str], job: JclFacts, step: StepFac
         job.unresolved.append((kind, f"{step.step_name} {d.dd_name}: {tok} still unresolved in {d.dsn}", d.line))
     resolved, gdg = _strip_gdg(resolved)
     mode, src = _direction(d.dd_name, gdg, d.disp, f"DSN={resolved},DISP={d.disp or ''}")
+    member, text = d.card_member, d.sysin_text
+    name, body, by_last = _card_source(d.dd_name, resolved, gdg, member_lookup)
+    if name != d.card_member or text is None:
+        # The member the job's symbols name. When it is the one the PROC
+        # member was read with and that text is there, the text stays (the
+        # PROC's own department chose among same-named members).
+        member, text = name, body
+        if by_last and name != d.card_member:
+            job.unresolved.append(("card_seq_assumed", f"{step.step_name} {d.dd_name}: cards taken from member "
+                                                       f"{name} matching the last qualifier of {resolved}", d.line))
     return replace(d, dsn_resolved=resolved, gdg_rel=gdg, mode=mode, mode_source=src,
-                   is_temp=resolved.startswith("&&"), referback=None)
+                   is_temp=resolved.startswith("&&"), referback=None, card_member=member, sysin_text=text)
 
 
 def _resolve_referbacks(steps: List[StepFact], facts: JclFacts, report: bool = True) -> None:
@@ -1360,6 +1429,65 @@ def _resolve_referbacks(steps: List[StepFact], facts: JclFacts, report: bool = T
             mode, msrc = _direction(d.dd_name, None, d.disp, f"DSN={src.dsn_resolved},DISP={d.disp or ''}")
             s.dds[i] = replace(d, dsn_resolved=src.dsn_resolved, is_temp=src.is_temp,
                                card_member=src.card_member, mode=mode, mode_source=msrc)
+
+
+def _new_generation(d: DdFact) -> Optional[int]:
+    """n for a DD naming the relative generation (+n), n > 0; else None - and
+    None for a DD that neither reads nor writes it: SYSOUT, DUMMY, the
+    internal reader, an IEFBR14 step's allocation or delete."""
+    if (d.gdg_rel is None or not d.dsn_resolved or d.is_temp
+            or d.mode in ("sysout", "dummy", "submit", "alloc", "delete", "none")):
+        return None
+    try:
+        g = int(d.gdg_rel)
+    except ValueError:                           # an absolute generation G0012V00
+        return None
+    return g if g > 0 else None
+
+
+def _reads_a_generation(d: DdFact) -> bool:
+    """A DD that reads the generation it names: its role reads it (SORTIN,
+    SYSUT1, an input of the sort / ICETOOL / JOINKEYS / Easytrieve cards - the
+    mode already set from them), or DISP=SHR / OLD - a status that never
+    creates a generation - on a DD whose direction only the generation number
+    decided and whose name is not a writing one (SORTOUT, SYSUT2, ...): a
+    role that writes it (an OUTFIL FNAMES= of the sort cards, an Easytrieve
+    PUT) keeps it written. The program's own OPEN is applied later, in
+    build.py, and decides over this."""
+    base = d.dd_name.upper().split(".")[-1]
+    if _utility_side(base) == "output" or base in _OUTPUT_DDS:
+        return False
+    if d.mode == "input":
+        return True
+    return (d.mode_source == "gdg_relative" and d.disp is not None
+            and _disp_parts(d.disp)[0] in ("SHR", "OLD"))
+
+
+def _same_job_generations(steps: List[StepFact]) -> None:
+    """JES resolves relative generation numbers ONCE PER JOB: the (+1) an
+    earlier step of the job created and a later step names again as (+1) is
+    the same new generation, read there - not a second one, and the later
+    step is not its second writer. `steps` are the job's steps in the order
+    they run (PROC steps expanded in place). A generation counts as written
+    by a DD of it whose direction is output / mod / both - an IEFBR14
+    allocation writes nothing, so the program that writes into the
+    pre-allocated generation with DISP=OLD is still its writer. A later DD of
+    it that reads it (_reads_a_generation) becomes input 'gdg_same_job'; one
+    that writes it stays as it is. A step's own DDs never count as an earlier
+    step's."""
+    written: set = set()
+    for s in steps:
+        mine = []
+        for i, d in enumerate(s.dds):
+            g = _new_generation(d)
+            if g is None:
+                continue
+            key = (d.dsn_resolved.upper(), g)
+            if key in written and _reads_a_generation(d):
+                s.dds[i] = replace(d, mode="input", mode_source="gdg_same_job")
+            elif d.mode in ("output", "mod", "both"):
+                mine.append(key)
+        written.update(mine)
 
 
 # --------------------------------------------------------------------------
