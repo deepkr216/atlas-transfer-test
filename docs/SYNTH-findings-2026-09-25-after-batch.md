@@ -1,30 +1,44 @@
-# Synthetic-estate comparison - after the re-parse batch (2026-09-26)
+# Synthetic-estate comparison - after the re-parse batch (2026-09-26, second acceptance run)
 
-This is the acceptance test of branch reparse-batch-2 at 4d6d976 (66 commits after main a0448c1). The report it
-answers is `docs/SYNTH-findings-2026-09-25.md`, which `tools/synth/check.py` wrote on the toolkit at a0448c1.
+This is the second acceptance test of branch reparse-batch-2, run on 5e63965 (71 commits after a0448c1). The first
+run tested 4d6d976 and is in this file's history (47ebf2e, with its closing section in cca6c73). Between the two,
+6a572c7 and c921d35 fixed the thirteen fact-module errors the first run left open. The report this one answers is
+`docs/SYNTH-findings-2026-09-25.md`, which `tools/synth/check.py` wrote on the toolkit at a0448c1.
 
 ## For the owner, in plain words
 
 The synthetic estate is a made-up insurance estate whose every fact is known, because the generator wrote it. On
-the toolkit before the batch, 434 of its facts came out wrong in the index or the reports. On the batch, 16 do,
-and all 16 are the checker's own expectations, not errors of the toolkit: 7 are the D1 programs that the checker
-still expects to be `partial` (item 18 makes them `ok` on purpose), 5 are the D2 listing check that the checker
-still expects to read "contradicted" after the build that follows the listing (item 19 makes it confirmed on
-purpose), and 4 are two layout checks that read the wrong copy of STDHDR or forgot to add 3 bytes to CLMTRANR's
-record after the checker changed it. A second, larger estate (seed 20260926, scale 30) gives the same 16 and
-nothing new. All fifteen minimal reproductions now say FIXED.
+the toolkit before the batch, 434 of its facts came out wrong. On the batch as it stands, 16 do, at both sizes of
+the estate, and all 16 are the checker's own expectations, not errors of the toolkit (the table below says why for
+each). All 30 minimal reproductions say FIXED: the fifteen from the synthetic estate and the fifteen shapes the
+stages' verifiers found. The tests pass on Python 3.9 and 3.12, and selfcheck passes.
 
-That does not make the batch ready for the re-parse night. The stages' own verifiers found wrong facts in the
-fact modules that the synthetic estate never generates, and I reproduced ten of them on this branch as it
-stands (the list is below). Each one would be written into the index on the re-parse night and would need
-another night to take out. Next: fix the rows below whose status is "confirmed", each with its regression
-test and LESSONS row, then run this acceptance again before the night.
+An index built by main still opens: this branch's `query` and `recover` read it without a crash, and the stand-ins
+built this week still speak there. After this branch's build over that index (what the re-parse night does), the
+index is the same as one built fresh by this branch, table for table, and recover finds nothing to re-file and
+nothing arrived.
+
+The batch is not ready for the re-parse night yet, for two reasons that the synthetic estate never shows. I tried
+shapes around the fixes of 6a572c7 and found two new wrong facts, both in fact modules and both worse than main:
+
+1. A program line that ends in a floating comment whose last word is COPY (`MOVE 1 TO WS-A.  *> KEEP A COPY`) makes
+   the build read the first word of the next line as a copybook: `COPY GOBACK NOT FOUND`, and the program is
+   `partial`. Main and 47ebf2e left the program `ok`. The cause is the new rule that reads a COPY over two lines,
+   together with an older gap: in fixed format the reader keeps a `*>` comment as code.
+2. A data copybook whose sequence numbers go up by 1 (000001, 000002, ...) and whose 88-level VALUES list of
+   six-digit codes runs over three lines is still filed as a compiler listing, and its programs say `COPY ... NOT
+   FOUND`. 6a572c7 fixed the usual numbering by 100; this is the case it left. Main filed it as a copybook.
+
+Next: fix both in the fact modules, each with its regression test, LESSONS row and reproduction, then run this
+acceptance again. Neither is likely in your estate (floating comments are rare in older code, and sequence numbers
+usually go up by 100), but each would be written into the index on the re-parse night and would need another night
+to take out.
 
 ## Before and after
 
 Seed 20260925, scale 12 (268 members, 95 programs, 61 jobs). "Before" is the report of 2026-09-25 (toolkit at
-a0448c1, the checker as first written). "After" is `tools/synth/check.py` on 4d6d976 (the checker as the batch
-left it, with its truth for DFHAID and for D3 / D4 moved to what items 20, 22 and 27 decided).
+a0448c1, the checker as first written). "After" is `tools/synth/check.py` on 5e63965, with the checker as the batch
+left it (its truth for DFHAID and for D3 / D4 moved to what items 20, 22 and 27 decided).
 
 | module | before: facts (rows) | after: facts (rows) | what is left |
 |---|---|---|---|
@@ -42,107 +56,146 @@ left it, with its truth for DFHAID and for D3 / D4 moved to what items 20, 22 an
 | **total** | **434 facts, 430 findings, 52 rows** | **16 facts, 15 findings, 9 rows** | none is the toolkit's |
 | facts matched | 10,776 | 11,394 | |
 
-The "after" checker makes more checks than the first one did, so the matched counts are not a one-for-one
-comparison; the wrong counts are.
+The "after" checker makes more checks than the first one, so the matched counts are not a one-for-one comparison.
+The wrong counts are.
 
-Seed 20260926, scale 30 (376 members, 149 programs, 115 jobs), run to catch what the first seed never generates:
+Seed 20260926, scale 30 (376 members, 149 programs, 115 jobs), to catch what the first seed never generates:
 
-| | before (a0448c1, the first checker) | after (4d6d976) |
+| | before (a0448c1, the first checker, measured in the first acceptance run) | after (5e63965) |
 |---|---|---|
 | findings (facts) | 430 (434), in the same nine modules as seed 20260925 | 15 (16) - the same nine rows as seed 20260925 |
 | facts matched | 11,832 | 12,477 |
 
+Both runs are the same as on 4d6d976, so the fixes of 6a572c7 and c921d35 changed nothing the estate generates. One
+thing did change, as intended: in the first run, the harness's step-by-step index said "1 choice decided by the
+listing" where a full re-parse said 2, because POLRPT01 was not parsed again when its listing rows arrived. Now the
+harness's own index says "2 choices decided by the program's compiler listing", as a full re-parse does
+(`build.picks_moved`, LESSONS 249).
+
 ## The reproductions
 
-`python tools/synth/repro/verify.py`: 15 reproduction folders, 34 checks, every one FIXED, 0 still showing the
-symptom. F01 F02 F04 F05 F06 F07 F08 F09 F10 F12 F13 F14 F15 F16 F17.
+`python tools/synth/repro/verify.py`: 30 reproduction folders, 58 checks, every one FIXED, none REPRODUCED or OTHER.
+
+- From the synthetic estate: F01 F02 F04 F05 F06 F07 F08 F09 F10 F12 F13 F14 F15 F16 F17.
+- From the stages' verifiers: V01 (VALUES list read as a listing), V02 (MFS continued literal), V03 (prose heading),
+  V04 (PL/I GO TO), V05 (change tag read as a stub), V06 (CA-PROGRAM-ID field), V07 (XML PARSE), V08 (nested
+  END-CALL), V09 (GO TO separators), V10 (COPY over two lines), V11 (default card dataset), V12 (override row's
+  generation), V13 (listing arrives after), V14 (listing moved while a twin exists), V15 (listing gone while a twin
+  exists).
 
 ## Every remaining finding, judged
 
-The nine rows are the same at both seeds.
+The nine rows are the same at both seeds. I checked each against this run's index and pages, not only against the
+first run's verdicts.
 
 | id | what the checker says | verdict |
 |---|---|---|
-| F01, F02 | POLEXT01, POLRPT01, CLMEXT01, CLMRPT01, BILEXT01, BILRPT01 and CMNUTIL should be `partial` (STDHDR chosen among several); the index says `ok` | The checker's expectation. ROADMAP re-parse item 18 records the pick once as the `ambiguous_copybook` row and leaves the program `ok`; D1's own words in the truth ("Complete, with a copybook chosen among several", "NOT parsed only in part") are matched in coverage and in `program` for all seven. Next: the checker's truth for D1 should say `ok`. |
-| F03 | recover's sentence "copybook choices checked against the listings: ..." is absent | The checker's expectation. The sentence is there: "1 confirmed, 1 contradicted by a current listing, 0 named by an older listing, 0 name a library the index does not hold, 6 unknown". The checker's pattern expects the older three-count wording, from before main's five listing verdicts. Next: widen the pattern in `phase_recover`. |
-| F04 | CLMRPT01 should be left alone by recover, and it is marked pending | The checker's expectation. CLMRPT01's current listing names a held copy with different text, so recover marks it for the next build (item 19), and the next build follows the listing. The second recover run then reads "2 confirmed, 0 contradicted". Next: the checker should expect D2's contradicted program among the marked ones. |
+| F01, F02 | POLEXT01, POLRPT01, CLMEXT01, CLMRPT01, BILEXT01, BILRPT01 and CMNUTIL should be `partial` (STDHDR chosen among several); the index says `ok` | The checker's expectation. ROADMAP re-parse item 18 records the pick once as the `ambiguous_copybook` row and leaves the program `ok`. `program POLEXT01` and `program CMNUTIL` say "parse: complete (copybook chosen among several - see notes)", which is D1's own promise. Next: the checker's truth for D1 should say `ok`. |
+| F03 | recover's sentence "copybook choices checked against the listings: ..." is absent | The checker's expectation. The sentence is there: "1 confirmed, 1 contradicted by a current listing, 0 named by an older listing, 0 name a library the index does not hold, 6 unknown". The checker's pattern expects the older three-count wording from before main's five listing verdicts. Next: widen the pattern in `phase_recover`. |
+| F04 | CLMRPT01 should be left alone by recover, and it is marked pending | The checker's expectation. CLMRPT01's current listing names a held copy with different text, so recover marks it for the next build (item 19), and the next build follows the listing. The second recover run reads "2 confirmed, 0 contradicted". Next: the checker should expect D2's contradicted program among the marked ones. |
 | F05 | `program CLMRPT01` should say the listing CONTRADICTS the copy used | The checker's expectation. The queries run after the build that followed the listing, and the page says "listing says: STDHDR came from PROD.POL.COPYLIB (SYSLIB) - confirms the copy the build used", which is right. Next: expect "confirms" after the final build. |
-| F06 | coverage's "of these choices is confirmed by the program's listing" is absent | The checker's expectation. Coverage says "2 of these choices are confirmed by the program's listing, 0 contradicted": the plural of the same sentence, for the same reason as F05. |
-| F07, F09 | `layout STDHDR`: STD-HEADER 55 bytes, HDR-FILLER at 35 | The checker's reading. The page prints all three copies of STDHDR, BILLING's first (54 bytes, HDR-FILLER at 34), then CLAIMS's (62), then POLICY's (55, HDR-FILLER at 35). Each is right for its own text; the checker compares the first block with POLICY's truth. Next: the checker should pick the block of the copy its truth describes. |
-| F08 | CLMTRANR's CT-TRAN-RECORD: length 126 | The checker's expectation. After the checker adds `05 CT-NEW-CHANNEL-CD PIC X(03)` for the incremental build, the record is 40 + 63 + 3 + 23 = 129 bytes, which is what the index says. `_patch_incremental_truth` adds 3 to `record_length` and to CT-FILLER's offset, but not to the 01 group's own length. Next: add 3 there too. |
+| F06 | coverage's "of these choices is confirmed by the program's listing" is absent | The checker's expectation. Coverage says "2 of these choices are confirmed by the program's listing, 0 contradicted by a current listing": the plural of the same sentence, for the same reason as F05. |
+| F07, F09 | `layout STDHDR`: STD-HEADER 55 bytes, HDR-FILLER at 35 | The checker's reading. The page prints all three copies of STDHDR: 54 bytes with HDR-FILLER at 34 first, then 62 with HDR-FILLER at 42, then 55 with HDR-FILLER at 35. Each is right for its own text. The checker compares the first block with POLICY's truth. Next: the checker should pick the block of the copy its truth describes. |
+| F08 | CLMTRANR's CT-TRAN-RECORD: length 126 | The checker's expectation. After the checker adds `05 CT-NEW-CHANNEL-CD PIC X(03)` for the incremental build, the record is 1 + 10 + 8 + 6 + 8 + 6 + 1 + 63 + 3 + 23 = 129 bytes, which is what the index says. `_patch_incremental_truth` adds 3 to `record_length` and to CT-FILLER's offset, but not to the 01 group's own length. Next: add 3 there too. |
 
-Names printed that the estate does not hold (the report's candidate list): I read them. They are column headings
-and words of the reports (FIELD-NAME, MEMBER, WRITTEN, FOUND), IMS system-definition keywords (APPLCTN, GPSB,
-SNGLSEG), REPLACING tokens (CLMU in `==:PCB:== BY ==CLMU==`), literals (SMITH), TS queue names (BILTSQ01), the
-manifest's peer (REINSURER-X) and the `EXEC-SQL` verb label. None of them is a fact that the estate does not hold.
-One is a known wrong cite: BILWKLY, an instream PROC's name, is printed as the member of a cite (`BILWKLY:7`).
-ROADMAP's "JCL cites: known limits" lists this. It is query-side only.
+Names printed that the estate does not hold (the report's candidate list, 60 names at seed 20260926): I read them.
+They are column headings and words of the reports (FIELD-NAME, MEMBER, WRITTEN, FOUND, INTENDED from "what was
+INTENDED"), PARM text (RUNMODE=DELTA, CYCLE=52, RESTART=NO), IMS system-definition keywords (APPLCTN, GPSB, SNGLSEG),
+temporary dataset names (`&&WKRPT`), queue names (POLQ, BILTSQ01), literals (AGENT NOT FOUND FOR THIS RECORD), the
+manifest's peer (REINSURER-X) and the `EXEC-SQL` verb label. None of them is a fact the estate does not hold. Two
+are the known wrong cite for an instream PROC (`BILWKLY:7`, `CLMWKLY:4`, the PROC's name printed as the member),
+which ROADMAP's "JCL cites: known limits" lists. It is query-side only.
 
 ## An index built by main, opened by this branch
 
-I built the synthetic estate with main's toolkit (`git archive main atlas`), once as built and once after main's
-own recover and build. Then I opened both with this branch's `query` (coverage, program, copybook, layout,
-ambiguous, job, interfaces, crud, dead, values: 23 commands on each) and `recover`. Nothing crashed. The stand-ins
-speak on the index built by main. Coverage splits the 13 `partial` members into 5 parsed only in part and 8
-complete with a copybook chosen among several. recover says that POLARRVB and the recovered POLMISSB arrived after
-the last build, that POLPROCB (filed `proc` by main) is a copybook to re-file, and that POLSTUBB is held in a form
-the reader cannot see.
+I built the seed 20260925 estate with main's toolkit (`git archive main atlas`, main at 68c51f9): once as built
+(main1), and once after main's own recover and build (main2). The arrived copybook was dropped in after the first
+build, as the harness does. Then I opened copies of both with this branch.
 
-This branch's build over that index re-parsed all 270 members, because the toolkit changed. After it, recover finds
-nothing to re-file and nothing arrived, coverage prints no "built before" sentence, and the listing check reads
-"2 confirmed, 0 contradicted".
+- `query`: 32 commands on each (coverage, coverage --all, ambiguous, interfaces, dead, values, program for nine
+  programs, copybook for nine copybooks including SQLCA and the stub, layout, job, crud --job). No crash, no
+  non-zero exit.
+- The stand-ins speak on both. On main1, coverage splits the 45 `partial` members into 40 parsed only in part and 5
+  complete with a copybook chosen among several, and says that POLARRVB and the recovered POLMISSB are on disk but
+  arrived after the last build. On main2 the split is 5 and 8. Both name POLPROCB (and on main1 CMNDATEA and
+  CMNCUSTP) as filed by the older classifier and to be re-filed by recover.
+- `recover`: no crash on either. On main1 it re-files the three misfiled copybooks and marks 33 programs; on main2
+  it re-files POLPROCB and marks 1. Both say the one contradicted choice will be followed by the next build, which
+  re-parses every member because the toolkit changed.
+- This branch's build over main2 re-parsed all 270 members. After it, recover finds nothing to re-file and nothing
+  arrived, the listing check reads "2 confirmed, 0 contradicted", and coverage has no "built before" sentence. What
+  recover still lists is true of the estate: the two stubs (POLSTUBB, POLSTUBC), the recovered POLMISSB, and one
+  library the listings name that is not fetched.
+- That index against one built fresh by this branch (build, recover, build) over the same estate: member kinds and
+  statuses, every copy_use row with the member it resolved to, and every unresolved row are identical, and so are the
+  row counts of field, pfield, field_ref, literal_ref, dd, step, paragraph, perform_edge, call_edge and cond88.
 
-One difference remains between that index and one built step by step. POLRPT01's listing confirms the copy the
-chain picked. After a full re-parse the pick's note says "the program's compiler listing names PROD.POL.COPYLIB".
-After the harness's incremental build it still says "same system", because the program was not parsed again when
-its listing rows arrived, so coverage reads "1 choice decided by the listing" in one index and "2" in the other.
-The copy used is the same in both. This is the milder form of the arrival-order problem below.
+## Found in this run - fact modules
 
-## Open in the fact modules - found by the stages' verifiers, never generated by the synthetic estate
+I probed the shapes around the fixes of 6a572c7 and c921d35 on small fictional estates and compared the results
+with main (68c51f9) and with 47ebf2e. `cobol._leaves` gave the expected answer on 44 sentences (nested terminators,
+phrases, inline PERFORM, XML / JSON), where 47ebf2e got 5 of them wrong. The PROGRAM-ID forms (name on the next line,
+lower case, `IS INITIAL`, `ID DIVISION`, a CA-PROGRAM-ID field) came out right, and a quoted or unspaced PROGRAM-ID
+falls back to the member name as it did before. `picks_moved` parses nothing again on an unchanged estate, including
+with a nested COPY ... OF of a name chosen among several. `stub_count` reads change tags and real stubs as intended.
+Two shapes came out wrong.
 
-"Confirmed" means I reproduced it on 4d6d976 for this acceptance test. "Reported" means the stage's verifier
-reproduced it, and the code it names has not changed since.
-
-| stage | what goes wrong | module | status |
+| what goes wrong | module | against main | status |
 |---|---|---|---|
-| 19 | A pick made by following a listing filed elsewhere stays in the index after the program's own current listing arrives. The index then depends on the order the listings arrived, and recover says "the copy it used stands". | build.py / recover.py | confirmed (runner `arrive`: step 3 keeps POLICY's copy, the forced re-parse gives CLAIMS's) |
-| 21 | A compiler listing that leaves the program's system (moved to SHARED\LISTINGS, or deleted) while a twin of the program exists forces no re-parse. The program keeps the other system's copy, and recover says "unknown". | build.py / recover.py | confirmed (moved and deleted: DIFFERENT from a full parse) |
-| 20/22 | A data copybook whose 88 VALUES list of six-digit codes runs over three lines is filed as a compiler listing, and its copiers go `partial`. | classify.py | confirmed |
-| 20/22 | An MFS or Assembler continuation line whose literal starts with MOVE ... TO (or GO TO, PERFORM, SET, ADD) files the member as a copybook, and `screen` says NOT FOUND. | classify.py | confirmed |
-| 20/22 | A prose heading such as `02 Premium values` files a document as a copybook. | classify.py | confirmed (minor) |
-| 23 | A copybook whose lines carry a `*` change tag in columns 1-6, with one line of digits alone, is filed `stub` and never expanded. | reader.py | confirmed (`stub_count` returns 1) |
-| 11/12 | A copybook with a field named `CA-PROGRAM-ID` is taken for a program and dropped from the choice. The program silently expands another system's copy, with no `ambiguous_copybook` row. | build.py / cobol.py / classify.py | confirmed (GC's program expands SHARED's copy; CA-PROGRAM-ID is lost) |
-| 26 | `XML PARSE ... ON EXCEPTION GO TO` at the start of a sentence, and a scope terminator inside a nested statement of the same verb, are read as always leaving, so the next paragraph is "reached by nothing". | cobol.py | confirmed (`_leaves` returns True for both) |
-| 27 | `COPY` with the copybook's name on the next line is silently not expanded: `parse: ok`, no copybook listed. | expand.py | confirmed |
-| 29 | A job that runs a PROC with its default sequential card dataset gets no `card_seq_assumed` row, and the same PROC run with an override does. | jcl.py | confirmed |
-| 29 | A job step's `//PS.DD` override row naming a (+1) that an earlier PROC step writes still says `output [gdg_relative]`. | jcl.py | reported |
-| 26 | GO TO ... DEPENDING ON with a comma or semicolon after the index, and `GO X` without TO, give no edge. | cobol.py | reported (minor, older than the batch) |
-| 20/22 | A PL/I member with `GO TO` in a folder named like a dataset is filed as a copybook. | classify.py | reported (minor; my probe with another PL/I text stayed `unknown`) |
+| A line ending in a floating comment whose last word is COPY (`MOVE 1 TO WS-A.  *> KEEP A COPY`, then `GOBACK.`) is read as a COPY of the next line's first word: `COPY GOBACK NOT FOUND`, the program `partial`. | expand.py (`copy_over_lines`) with reader.py | new: main and 47ebf2e give `ok` | confirmed (scratch probe p1b, QAPRM4). Next: read `_COPY_AT_END` and `find_copy_start` on the code before an unquoted `*>`; a regression test for both the two-line and the one-line shape; a LESSONS row. |
+| The older shape of the same gap: `MOVE 1 TO WS-A.  *> SEE COPY QAKBK` expands QAKBK into the program, so the comment adds fields. | reader.py / expand.py | same on main | confirmed (QAPRM7). The same fix closes it. |
+| A copybook numbered by 1 in columns 1-6 (000001, 000002, ...) whose 88-level VALUES list of six-digit codes runs over three lines is filed `listing`; its program says `COPY QCNAICS NOT FOUND`. | classify.py (`listing_hit`) | new since stage 20-22: main files it a copybook | confirmed (probe p3, QCNAICS). Next: check the numbered-lines shape after the copybook's own lines (a listing's numbered lines never match `_SIG_DATA_LEVEL`, because the code sits behind two numbers), as the stage verifier proposed; a regression test; a LESSONS row. |
 
-The stages' query-side and recover-side findings (for example: `flow` saying a PROC's own default-card FTP
-transfer leaves the mainframe, a dataset matched by substring in `flow`, wording of the STUB verdict for an older
-listing, the fetch list for a confirmed recovered pick) are open too. None of them costs a re-parse night.
+## Still open outside the fact modules
+
+These are in query.py, recover.py and flow.py. None of them changes the index, so none needs a re-parse night.
+"Confirmed" means I read the code on 5e63965 and it is unchanged from what the finding describes; recover.py has not
+changed since 08e96fd and flow.py since b100a33.
+
+| stage | what goes wrong | file | severity | status |
+|---|---|---|---|---|
+| S-query | `flow` says a PROC's own default-card FTP transfer is where the dataset leaves the mainframe, while the only job that runs the PROC sends another dataset; `dataset` and `interfaces` say nothing of it | flow.py `interfaces_on` | bug | confirmed |
+| S-query | `flow` matches a dataset against FTP notes by substring, so PROD.QW.IN "leaves the mainframe" because PROD.QW.INNER does | flow.py `interfaces_on` | bug | confirmed (`LIKE '%DSN%'`) |
+| 11/12 | A NOT HELD verdict says to fetch a library the index holds as a marker-less dataset folder, and points at a fetch-list.txt that does not name it | recover.py `check_choices` | wrong words | confirmed (`holders` still built from the library table only) |
+| 11/12 | The fetch list and coverage say to fetch for a recovered pick that the listing confirms or contradicts | recover.py, query.py | wrong words | reported |
+| 19 | A recover run without the earlier `--from` folder drops that folder's listing rows. The next build now follows the rows left (so the index equals a fresh build over them), but the current listing is forgotten until recover is run with `--from` again. Nothing in ROADMAP or README says so. | recover.py `store_copy_sources` | minor | confirmed (probe fdrop: POLICY's copy, then CLAIMS's after the next build) |
+| S-expand | A COBOL `COPY SQLCA` with no member is in no fetch list: recover says every copybook is in the index, and coverage's "Copybooks not found" is empty | recover.py, query.py | minor | confirmed (`_SYSTEM_INCLUDES` filter at recover.py:1839) |
+| S-expand | A program's view of a record holding an IBM-supplied COPY (the MQ `COPY CMQMDV` shape) gives lengths and offsets without its bytes and says nothing | query.py | wrong words | reported |
+| 23 | The STUB verdict of an older listing says "the program was compiled against the text the listing prints" | recover.py, query.py | wrong words | reported |
+| 23 | `flow` names the outer copybook with a stray ')' for a stub copied inside another copybook | flow.py `_MISSING_COPY` | minor | confirmed (regex unchanged) |
+| 23 | A stub copied only by a copybook no program copies: recover says "the programs copying it", `copybook` says no program copies it | recover.py | minor | reported |
+| 21 | `copybook` of a card member filed ctlcard advises renaming its folder to end in COPYLIB although no program copies it | query.py | minor | reported |
+| S-cobol | `field`'s flow line pairs the FD record with a program that does not hold it | query.py | minor | confirmed (`flow_name` and `files[0]` still taken apart) |
+| S-cobol | coverage's "... N more" line counts a skipped (recursive) COPY as a missing copybook | query.py | minor | confirmed (`by_book` unchanged) |
+| S-jcl | `interfaces` lists a job's USS override twice; a PROC run only as the outer PROC of a nest reads as "no indexed job runs it"; an expanded step's unresolved row is cited with the PROC's line | query.py | wrong words / minor | reported (the cite is in ROADMAP's known limits) |
+| S-query | The hidden-rows sentence names jobs that the table does not list; a null PROC default prints `&HOST (PROC default )`; "(referback not followed)" for a referback to a DD with no dataset; a PROC named by its label rather than its member | query.py | wrong words / minor | reported |
+| 11/12 | The precedence chain as README, the Field Manual, coverage and recover write it leaves out the estate's recovered copy | docs, query.py, recover.py | minor | reported |
+
+## Fact-module limits the stages left on purpose
+
+These are written in ROADMAP or README as the stage's choice. I do not count them against the batch, but the owner
+may want to decide some of them before the night.
+
+- A GO TO in both branches of IF ... ELSE (or in every WHEN of an EVALUATE) is still read as one that may not run,
+  so a fall-through edge that never runs is recorded (cobol.py; ROADMAP 26 names it for a later night).
+- Where a program is the only member of a copybook's name, the caller expands the whole program and the copybook is
+  never reported missing (build.py; older behaviour, README states the exception).
+- A procedure copybook whose only statement is one START line still takes `ctlcard` in a CNTL library, and prose in a
+  `.txt` with no hint is still told from COBOL by its words (classify.py; LESSONS 199 and the stage's notes).
+- On an index built before item 21, a COBOL `COPY SQLCA` whose copybook left the index reads as the precompiler's;
+  the re-parse night clears it.
 
 ## How this was run
 
-- `git status` clean. The diff a0448c1..HEAD holds no scratch file: the only files outside `atlas/`, `tests/`,
-  `tools/` and `docs/` are README.md, ROADMAP.md, LESSONS.md and manifest.example.json.
-- The gate on 4d6d976: `python -m unittest discover -s tests` 1,286 tests OK. `py -3.12 -m unittest discover -s tests`:
-  1,286 tests OK. The first run failed one test, `test_convert`'s check that no `atlas-stage-` folder is left in
-  the system temp folder, because I ran the two suites at the same time and they share that folder. Run alone, it
-  passes. `python selfcheck.py`: PASSED.
-- `tools/synth/check.py --out <scratch> --report <scratch>` at seed 20260925 scale 12 and at seed 20260926 scale
-  30. The report was written to a scratch file. With no `--report`, check.py writes into this repository's
-  `docs/` folder, under the day's date.
-
-## After this report
-
-Every row of "Open in the fact modules" above is fixed in 6a572c7, each with its test in
-`tests/test_acceptance_fixes.py`, its LESSONS row (248-252) and a minimal reproduction under `tools/synth/repro/`:
-V01-V06 the classifier, the reader and the program test; V07-V09 `cobol._leaves` and the GO TO edges; V10 the COPY
-over two lines; V11-V12 the two JCL rows; V13-V15 the listing that arrives, moves or goes (verify.py runs those with
-the new `steps` in expect.json). On the toolkit this report tested (4d6d976's code) each of the fifteen shows its
-symptom (23 checks REPRODUCED, V12's control FIXED); after the fix all 30 folders say FIXED. The synthetic estate at seed 20260925, scale 12 gives the same 15 findings (all the checker's own) and 11,394
-facts matched. What is left: the checker's own rows F01-F09 (its "Next:" in the table of judged findings) and the
-query-side and recover-side findings the stages listed, none of which costs a re-parse night. Next: run this
-acceptance again before the night.
+- `git status` clean on 5e63965. `git diff --stat a0448c1..HEAD`: 181 files. No scratch file is committed: outside
+  `atlas/`, `tests/`, `tools/` and `docs/` the diff holds only README.md, ROADMAP.md, LESSONS.md and
+  manifest.example.json; no .db, log or findings file outside `docs/`.
+- The gate on 5e63965, run one after the other (they share a temp folder): `python -m unittest discover -s tests`,
+  1,314 tests OK, exit 0; `py -3.12 -m unittest discover -s tests`, 1,314 tests OK, exit 0; `python selfcheck.py`,
+  SELFCHECK PASSED, exit 0.
+- `python tools/synth/repro/verify.py --out <scratch>`: exit 0, 58 checks FIXED.
+- `tools/synth/check.py --out <scratch> --report <scratch>` at seed 20260925 scale 12 and at seed 20260926 scale 30.
+  Both exited 0. With no `--report`, check.py writes into this repository's `docs/` folder under the day's date, so
+  the report was sent to a scratch file.
+- The main-built index, the probes and the `--from` scenario were run from scratch scripts outside the repository
+  (scratchpad `batch3\acceptance2`).
