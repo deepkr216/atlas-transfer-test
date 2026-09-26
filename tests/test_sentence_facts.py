@@ -1450,6 +1450,18 @@ class TheDocsSayIt(unittest.TestCase):
         self.assertNotIn("which the compiler rejects", f15)
         report = self.read("docs", "SYNTH-findings-2026-09-25.md")
         self.assertIn("F25 is the toolkit's, not the generator's", report)
+        # the verifier's second round
+        self.assertIn("| 213 | Not seen on his estate - the verifier's second round on ROADMAP re-parse item 26", lessons)
+        self.assertIn("Rule for me: a phrase has a scope", lessons)
+        self.assertIn("The verifier's second round (LESSONS 213) added", roadmap)
+        self.assertIn("so the COBOL-85 READ loop `READ F AT END ... END-READ GO TO X.` records no fall-through",
+                      " ".join(roadmap.split()))
+        self.assertIn("a GO TO after `END-READ` or `END-IF` read as a conditional one", self.read("README.md"))
+        for path in (("atlas", "build.py"), ("atlas", "cobol.py")):
+            for words in ("not what compiled", "not the one that compiled", "compile error"):
+                self.assertNotIn(words, self.read(*path), (path, words))
+        for fn in ("README.md", "expect.json"):
+            self.assertNotIn("compile error", self.read("tools", "synth", "repro", "F15-ws-exec-sql-no-period", fn))
         self.assertIn("POLUPD05's rows F16, F17, F21-F24 did not come from F15's shape", report)
 
 

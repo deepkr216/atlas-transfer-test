@@ -1614,8 +1614,8 @@ _PHRASE_VERBS = {
 }
 # a word of a statement that can leave the paragraph: a sentence without one never does, and is not split
 _LEAVING_WORD = re.compile(B + r"(?:GO|GOBACK|STOP|EXIT)" + E, re.IGNORECASE)
-# NEXT SENTENCE skips the rest of the sentence (EXIT PARAGRAPH / SECTION, the verb split off, the paragraph's): a GO
-# TO after it may never run
+# NEXT SENTENCE skips the rest of the sentence, EXIT PARAGRAPH / SECTION (read from the EXIT statement's own words)
+# the rest of the paragraph: a GO TO after either may never run
 _NEXT_SENTENCE = re.compile(B + r"NEXT\s+SENTENCE" + E, re.IGNORECASE)
 
 

@@ -660,10 +660,28 @@ shipped alone and cost one such night; these still wait for the next one:
    its own, flow's partial note names it, the Unresolved table's line column is the member's own line
    (`query.unresolved_line_cell` - a parser note after a COPY printed its expanded line), notes are cut at a word
    (`query.clip`), and `field` of a SELECT / FD file name says it is a file instead of NOT DEFINED.
+   The verifier's second round (LESSONS 213) added: a paragraph's fall-through closes a scope at its own terminator -
+   a GO TO after END-READ, END-WRITE, END-ADD, END-CALL, END-IF, END-EVALUATE or END-PERFORM always runs, so the
+   COBOL-85 READ loop `READ F AT END ... END-READ GO TO X.` records no fall-through (round 1 recorded one, as it did
+   after INVALID KEY ... END-WRITE, SIZE ERROR ... END-ADD and ON EXCEPTION ... END-CALL), while `READ F AT END GO TO
+   X.` still falls through. Against the index he has, built before the batch, the night removes the fall-through
+   edges after such a GO TO (`IF ... END-IF GO TO X.` among them) and adds one after a GO TO under AT END, INVALID
+   KEY, SIZE ERROR, EXCEPTION or an inline PERFORM, or inside a literal, and after an EXIT PARAGRAPH; `dead`, `walk`
+   and `paragraph` read the edges as they are. A GO TO in both branches of IF ... ELSE still reads as one that may
+   not run: the fall-through recorded after it never runs - a later night may read the branches. A GO TO ...
+   DEPENDING ON a qualified or subscripted index (`WS-IX OF WS-GRP`, `WS-TIX (WS-SUB)`) gives its goto_depending
+   edges; before, plain GO TO edges to DEPENDING and ON, or no edge at all (older than the item). The statement split
+   is a trie (`cobol.word_trie`, the same matches) and a sentence without GO, GOBACK, STOP or EXIT is not split
+   again: a 49k-line program parses within 3% of before the item (round 1 was 5-10% slower). Query side, on either
+   index: `field` of a file name another program uses as a data item says so, with the copybook that program misses,
+   and the older-index sentence names only the file statements of the programs that declare the file; coverage's '...
+   N more' line and its copybook advice speak of the members they concern.
    tests/test_sentence_facts.py (DliCallsInOneSentence, SqlInOneSentence, NamesBeginningWithEnd,
    LiteralMovesInOneSentence, FileAndFunctionNames, ExecWithoutItsPeriod, TheBuildAndTheReports,
    TheStandInsFindNothingToDo, GoToDependingInASentence, TheNoteIsReadWhole,
-   CoverageGivesTheReasonThatMadeItPartial, OnlyTheExecReason, TheReproductions).
+   CoverageGivesTheReasonThatMadeItPartial, OnlyTheExecReason, FallThroughAfterAScopeTerminator,
+   GoToDependingOnAQualifiedIndex, TheReadLoopInTheIndex, FieldOfAFileNameUsedAsADataItem,
+   TheMoreLineSaysWhatTheHiddenMembersMiss, TheVerbSplitIsATrie, TheReproductions).
 
 ### flow: known limits (open after review)
 
