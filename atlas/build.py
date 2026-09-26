@@ -1882,6 +1882,14 @@ _DIVISION_HEADER = re.compile(r"(?<![A-Z0-9\-])(?:IDENTIFICATION|ID|DATA|PROCEDU
 _HEADER_LITERAL = re.compile(r"'[^'\n]*'|\"[^\"\n]*\"")
 
 
+def division_header(text: str) -> bool:
+    """Whether `text` holds a DIVISION header outside its literals - with a
+    PROGRAM-ID paragraph, what makes a member a program: one test for
+    holds_program and index_cobol, so a member the resolver takes for a
+    copybook is never written as a program, nor the other way round."""
+    return bool(_DIVISION_HEADER.search(_HEADER_LITERAL.sub(" ", text)))
+
+
 def holds_program(lines: Sequence[Line]) -> bool:
     """Whether a member's own code lines (comments left out) hold a program:
     a PROGRAM-ID paragraph or a DIVISION header - the test index_cobol
@@ -1894,8 +1902,8 @@ def holds_program(lines: Sequence[Line]) -> bool:
     copybook with a `05 CA-PROGRAM-ID PIC X(8).` field was taken for a
     program and dropped from the choice - the program silently expanded
     another system's copy, with no 'ambiguous_copybook' row (LESSONS 248)."""
-    text = _HEADER_LITERAL.sub(" ", "\n".join(ln.code for ln in lines if not ln.is_comment))
-    return bool(cobol._PROGRAM_ID.search(text) or _DIVISION_HEADER.search(text))
+    text = "\n".join(ln.code for ln in lines if not ln.is_comment)
+    return bool(cobol._PROGRAM_ID.search(_HEADER_LITERAL.sub(" ", text)) or division_header(text))
 
 
 def _holds_program(ctx: Ctx, mem: Mem) -> bool:
@@ -2121,7 +2129,7 @@ def index_cobol(ctx: Ctx, mem: Mem) -> None:
     exp_text = expand.expanded_text(exp)
     facts = cobol.parse_program(exp_text)
 
-    if facts.program_id is None and not _DIVISION_HEADER.search(exp_text):
+    if facts.program_id is None and not division_header(exp_text):
         # Not a program at all (a copybook or a card deck filed in the source
         # library): no program row, and the member says why.
         conn.execute("UPDATE member SET parse_status='skipped', parse_error=? WHERE id=?",

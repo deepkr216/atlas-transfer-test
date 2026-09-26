@@ -180,6 +180,10 @@ class TheClassifier(unittest.TestCase):
         # COBOL that merely begins a paragraph name with DCL, or a DB2 cursor declared in a copybook, is not PL/I
         self.assertEqual(classify.not_cobol("       DCL-100-START.\n           MOVE 1 TO WS-X.\n"), "")
         self.assertEqual(classify.not_cobol("           EXEC SQL\n             DECLARE CSR1 CURSOR FOR\n"), "")
+        # nor is a REXX routine's label and PROCEDURE: PL/I ends its PROC statement with a semicolon or opens options
+        self.assertEqual(classify.not_cobol("MAIN: PROCEDURE\n  SAY 'HI'\n  RETURN\n"), "")
+        self.assertEqual(classify.not_cobol("CHECK: PROCEDURE EXPOSE RC\n"), "")
+        self.assertEqual(classify.not_cobol(" SUB1: PROC;\n"), classify.PLI_WORDS)
 
     def test_a_field_named_program_id_is_no_program(self):
         # Wrong answer guarded: ('cobol', 'IDENTIFICATION DIVISION / PROGRAM-ID') and a program row named PIC
@@ -189,6 +193,12 @@ class TheClassifier(unittest.TestCase):
         self.assertIsNone(cobol.parse_program(COMMAREA).program_id)
         msgs = "       01  XQ-MSGS.\n           05  FILLER PIC X(20) VALUE 'PROCEDURE DIVISION'.\n"
         self.assertFalse(build.holds_program(reader.read_cobol_lines(msgs)[0]))
+        # the build's program test and index_cobol's read the words outside literals alike (build.division_header)
+        self.assertFalse(build.division_header("       01  X PIC X(20) VALUE 'PROCEDURE DIVISION'.\n"))
+        self.assertTrue(build.division_header("       PROCEDURE DIVISION USING LK-AREA.\n"))
+        said = "       A-100-SAY.\n           DISPLAY 'PROGRAM-ID IS KVX'.\n"
+        self.assertIsNone(cobol.parse_program(said).program_id)
+        self.assertFalse(build.holds_program(reader.read_cobol_lines(said)[0]))
         real = program("KCPGM", "KCCOMM1")
         self.assertTrue(build.holds_program(reader.read_cobol_lines(real)[0]))
         self.assertEqual(cobol.parse_program(real).program_id, "KCPGM")
@@ -410,6 +420,9 @@ class InTheIndex(unittest.TestCase):
             "QX/PROD.QX.SRC/KVSPLIT.cbl": SPLIT_PROG,
             "QX/PROD.QX.COPYLIB/KVBOOK.cpy": KVBOOK,
             "QX/PROD.QX.SCREENS/XQFM3.txt": MFS_CONTINUED,
+            # a literal copied into a VALUE clause, filed cobol by its SRC folder: no program - its DIVISION words are text
+            "QX/PROD.QX.SRC/KVLIT.cbl": "      * THE MESSAGE, COPIED INTO A VALUE CLAUSE\n"
+                                        "               'DATA DIVISION MISSING'.\n",
         })
         cls.db = os.path.join(cls.td, "t.db")
         build_it(cls.root, cls.db, rebuild=True)
@@ -430,6 +443,9 @@ class InTheIndex(unittest.TestCase):
         self.assertEqual(kinds["XQNAICS@PROD.QX.COPYLIB"], "copybook")
         self.assertEqual(kinds["XQFM3@PROD.QX.SCREENS"], "mfs")
         self.assertEqual(self.q("SELECT program_id FROM program WHERE program_id='PIC'"), [])
+        self.assertEqual(self.q("SELECT kind, parse_status, parse_error FROM member WHERE name='KVLIT'"),
+                         [("cobol", "skipped", "no PROGRAM-ID and no DIVISION header - not a program")])
+        self.assertEqual(self.q("SELECT COUNT(*) FROM program WHERE program_id='KVLIT'"), [(0,)])
 
     def test_the_program_expands_its_own_systems_commarea_and_says_the_choice(self):
         # Wrong answer guarded: SHARED's KCCOMM1 expanded, no 'ambiguous_copybook' row, CA-PROGRAM-ID unknown

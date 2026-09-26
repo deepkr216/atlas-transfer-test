@@ -482,7 +482,8 @@ def parse_program(text: str, data: bytes = b"", enc: str = "utf-8") -> ProgramFa
             if tok:
                 f.program_id = tok.group(1).upper()
             want_program_id = False
-        m = _PROGRAM_ID.search(up)
+        # outside literals: `DISPLAY 'PROGRAM-ID IS X'` names no program (build.holds_program reads it so too)
+        m = _PROGRAM_ID.search(_LITERAL.sub(lambda x: " " * len(x.group(0)), up)) if "PROGRAM-ID" in up else None
         if m and f.program_id is None:
             f.program_id = m.group(1).upper()
         elif re.fullmatch(r"PROGRAM-ID\s*\.?", up.strip().rstrip(".")):

@@ -239,10 +239,11 @@ _NDM_PROCESS = re.compile(r"^[A-Z@#$][A-Z0-9@#$]{0,7}[ \t]+PROCESS(?:[ \t]|$)", 
 _NDM_NODE = re.compile(r"\b[SP]NODE[ \t]*=", re.I)                                              # ... SNODE=QZREMOTE
 _NDM_STMT = re.compile(r"^(?:[A-Z@#$][A-Z0-9@#$]{0,7})?[ \t]+(?:COPY[ \t]+FROM[ \t]*\([ \t]*(?:DSN|PNODE|SNODE|FILE)\b"
                        r"|RUN[ \t]+(?:TASK|JOB)[ \t]*\(|EIF[ \t]*$)", re.I | re.M)
-# PL/I: a procedure's label and PROC (`XQPLI: PROC OPTIONS(MAIN);`) or a DECLARE with its structure level or its
-# attributes - its GO TO, IF, READ FILE(...) and CLOSE FILE(...) are no COBOL statements (LESSONS 248)
+# PL/I: a procedure's label and PROC (`XQPLI: PROC OPTIONS(MAIN);`, `SUB1: PROC;`) or a DECLARE with its structure
+# level or its attributes - its GO TO, IF, READ FILE(...) and CLOSE FILE(...) are no COBOL statements (LESSONS 248).
+# A REXX routine's `MAIN: PROCEDURE` (alone, or with EXPOSE) is none: PL/I ends the statement with its semicolon.
 _PLI_PROC = re.compile(r"^[ \t]*[A-Z@#$_][A-Z0-9@#$_]*[ \t]*:[ \t]*PROC(?:EDURE)?[ \t]*(?:OPTIONS|RECURSIVE|REORDER|"
-                       r"RETURNS|\(|;|$)", re.I | re.M)
+                       r"RETURNS|\(|;)", re.I | re.M)
 _PLI_DCL = re.compile(r"^[ \t]*(?:DCL|DECLARE)[ \t]+(?:\d{1,2}[ \t]+)?[A-Z@#$_][A-Z0-9@#$_]*[ \t]*(?:[,;(]|[ \t]+(?:"
                       r"CHAR(?:ACTER)?|FIXED|FLOAT|BIN(?:ARY)?|DEC(?:IMAL)?|BIT|FILE|POINTER|PTR|ENTRY|BASED|STATIC|"
                       r"AUTOMATIC|AUTO|EXTERNAL|EXT|BUILTIN|LIKE|PIC(?:TURE)?|INIT(?:IAL)?|CONTROLLED|CTL|LABEL|"
