@@ -831,6 +831,32 @@ shipped alone and cost one such night; these still wait for the next one:
    format now: FORMAT= gives it, or there is none, and a compared field stays a field reference. The positions are
    the same, so selfcheck's counts and the synthetic harness are too. On an index built before the item, `job`
    leaves such a word out of its positions line. tests/test_synth_query_findings.py RelationalOperatorIsNoFormat.
+31. **Delivered in the batch - what the acceptance test left open in the fact modules.** The acceptance test of the
+   batch (docs/SYNTH-findings-2026-09-25-after-batch.md) found every synthetic finding fixed, and ten wrong facts the
+   stages' verifiers had found in shapes the synthetic estate never generates still open, three more reported. Each
+   is fixed, with its test in tests/test_acceptance_fixes.py and a minimal reproduction under tools/synth/repro/V01-V15
+   (`python tools/synth/repro/verify.py`: REPRODUCED on the toolkit before the fix, FIXED after it):
+   - build: every build asks the resolver again (`build.choose`, the resolver's own choice) for each 'ambiguous_copybook'
+     note of the programs it keeps, and parses again, with its copiers, a program whose choice the listings now make
+     differently (`build.picks_moved`, `build.parse_again`) - its own current listing read after a listing filed
+     elsewhere decided, a listing moved to SHARED or gone while another system holds a program of the name, a listing
+     now confirming the chain's copy. Items 19 and 21 left that to the order the listings arrived in (LESSONS 249;
+     V13-V15, verify.py's new `steps`);
+   - classify, reader, cobol: a listing's numbered lines count up by one (an 88-level VALUES list of six-digit codes
+     is no listing); the text of a literal continued from the line before is text to the COBOL signatures
+     (`classify.code_view`: an MFS or Assembler literal saying MOVE ... TO); a data entry in column 1, or in a library
+     of documents, needs its clause's operand; PL/I is not COBOL; PROGRAM-ID and a DIVISION header are their own
+     words, never the tail of CA-PROGRAM-ID (classify, cobol, build.holds_program); a '*' change tag in columns 1-6
+     is no remark to the stub test (items 20, 22, 23, 11; LESSONS 248; V01-V06);
+   - cobol: the words before the first verb the splitter knows (XML PARSE ... ON EXCEPTION) are a statement, and a
+     nested statement's own END-verb ends it only - neither makes a sentence always leave; GO TO with ',' or ';' and
+     GO without TO give their edges (item 26; LESSONS 252; V07-V09);
+   - expand: a COPY whose text-name is on the next line is expanded (item 27; LESSONS 251; V10);
+   - jcl: a job running a PROC with its default sequential card dataset carries its card_seq_assumed row, and a job
+     step's //PS.DD override row naming a (+1) an earlier step wrote reads it, as its effective DD does (item 29;
+     LESSONS 250; V11, V12).
+   selfcheck's counts and the synthetic estate's findings do not change (seed 20260925, scale 12: the same 15
+   findings, all the checker's own, and 11,394 facts matched).
 
 ### flow: known limits (open after review)
 

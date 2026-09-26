@@ -23,7 +23,7 @@ instead of being copied into the truth.
 | `synth_estate.py` | the estate: three systems (POLICY, CLAIMS, BILLING) and SHARED, the deliberate defects, `truth.json` |
 | `generate.py` | `python tools/synth/generate.py --out FOLDER [--seed N] [--scale N]` |
 | `check.py` | `python tools/synth/check.py --out FOLDER` - the whole flow, then the findings report |
-| `repro/` | one folder per finding: the smallest member(s) that show it, with the command and the two answers |
+| `repro/` | one folder per finding: the smallest member(s) that show it, with the command and the two answers - F* from the synthetic estate's findings, V* from the stages' verifiers (shapes the estate never generates); `steps` in expect.json for a finding that shows only after the estate changes between builds (a listing dropped in, moved or removed, recover, an incremental build); `python tools/synth/repro/verify.py [ID ...]` says REPRODUCED / FIXED / OTHER for each check |
 
 ## The deliberate defects (the shapes LESSONS 181-192 were written for)
 

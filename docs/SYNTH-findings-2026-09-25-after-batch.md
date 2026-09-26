@@ -134,3 +134,15 @@ listing, the fetch list for a confirmed recovered pick) are open too. None of th
 - `tools/synth/check.py --out <scratch> --report <scratch>` at seed 20260925 scale 12 and at seed 20260926 scale
   30. The report was written to a scratch file. With no `--report`, check.py writes into this repository's
   `docs/` folder, under the day's date.
+
+## After this report
+
+Every row of "Open in the fact modules" above is fixed in 6a572c7, each with its test in
+`tests/test_acceptance_fixes.py`, its LESSONS row (248-252) and a minimal reproduction under `tools/synth/repro/`:
+V01-V06 the classifier, the reader and the program test; V07-V09 `cobol._leaves` and the GO TO edges; V10 the COPY
+over two lines; V11-V12 the two JCL rows; V13-V15 the listing that arrives, moves or goes (verify.py runs those with
+the new `steps` in expect.json). On the toolkit this report tested (4d6d976's code) each of the fifteen shows its
+symptom (23 checks REPRODUCED, V12's control FIXED); after the fix all 30 folders say FIXED. The synthetic estate at seed 20260925, scale 12 gives the same 15 findings (all the checker's own) and 11,394
+facts matched. What is left: the checker's own rows F01-F09 (its "Next:" in the table of judged findings) and the
+query-side and recover-side findings the stages listed, none of which costs a re-parse night. Next: run this
+acceptance again before the night.

@@ -182,7 +182,10 @@ everything else:
   no current listing of its own names (it has none, only an older
   compile's, or one not yet dated), every listing of that name speaks
   wherever it is filed (a SHARED listings folder, a `--from` folder), and
-  where two disagree the current one decides. The declared order is simply the
+  where two disagree the current one decides. Every build asks these choices
+  again for the programs it keeps: a listing read, moved or gone since a
+  program was parsed changes its copy at that build, as a full parse would,
+  so the index never depends on the order the listings arrived in. The declared order is simply the
   order of a department's copybook rows in the table (Move up / Move down):
   that is the SYSLIB concatenation its programs compile against.
 - **Cross-department flow** — `dataset X` shows each writer's and reader's
@@ -534,10 +537,17 @@ UI's table and the folder name (ROADMAP re-parse items 20 and 22); the
 statements an Assembler or MFS member writes too - COPY, IF, CALL, EXEC,
 CLOSE, START - count only after those shapes, so an MFS member that COPYs its
 device header stays MFS. A data description entry types a copybook in any
-library - a tagged `WS-:XR:-ID` and one written from column 1 too. The COBOL
-statements say only as much as the library lets them (LESSONS 199, 200): an
-Easytrieve program or a Connect:Direct process - read by its job through
-SYSIN - is never typed by them; in a library of documents (a folder named
+library - a tagged `WS-:XR:-ID` and one written from column 1 too; one
+written from column 1, or any in a library of documents, with its clause's
+operand (a picture string, a literal, a number), so a heading `02 Premium
+values` stays prose. The text of a literal continued from the line before
+is text to all of these (an MFS field's `MOVE THE CURSOR ...` on its
+continuation line keeps the format MFS), and a compiler listing's numbered
+lines count up by one (an 88-level VALUES list of six-digit codes is no
+listing - LESSONS 248). The COBOL statements say only as much as the library
+lets them (LESSONS 199, 200): an Easytrieve program or a Connect:Direct process
+- read by its job through SYSIN - is never typed by them, nor is a PL/I
+program; in a library of documents (a folder named
 DOCS, SPECS or DESIGN, a library declared doc, a .md, .html or .csv file, or
 a .txt with a line of prose - a letter in column 1, a numbered line, or an
 English word such as THE outside a literal) they count for nothing; in a
