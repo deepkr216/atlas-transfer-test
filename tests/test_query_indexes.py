@@ -9,9 +9,17 @@ lookup scanned the member table: QUERY_INDEXES held an index on UPPER(name)
 only. Now it holds one on UPPER(TRIM(name)) beside it. The helper
 that decides whether a table has the columns an expression reads took only
 UPPER( off, so it read `TRIM(name` for the new expression and would have
-created nothing - `index_columns` takes every call off. An index built
-before the item opens and answers as before (by a scan), and its next build
-adds the index.
+created nothing - `index_columns` reads every name that is not a function's.
+An index built before the item opens and answers as before (by a scan, and
+`doc` and a `diff` of one kind by the kind index), and its next build adds
+the index.
+
+The plans are taken of the statements as the commands run them, with their
+values bound (LESSONS 209): the first delivery traced the SQL with the
+values written in, and for `doc PLAN` that is `... ='PLAN' OR ... ='PLAN'`,
+which SQLite folds into one equality - only that folded form used the new
+index, while `doc` itself read the kind index. Each command is asked for a
+name with an extension too, so its two values differ.
 """
 
 import contextlib
@@ -22,6 +30,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
@@ -62,27 +71,43 @@ def indexes(conn):
     return {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")}
 
 
+class Recording:
+    """A connection that keeps every statement it runs with the values it
+    binds - what the planner sees when the command runs."""
+
+    def __init__(self, conn):
+        self._conn = conn
+        self.ran = []
+
+    def execute(self, sql, params=()):
+        self.ran.append((sql, tuple(params)))
+        return self._conn.execute(sql, params)
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
 def trimmed_lookups(conn, root):
     """Run the trimmed-name lookups of the gate, `doc`, `images` and `diff`;
-    return (what each found, every statement they ran that tests
-    TRIM(name))."""
+    return (what each found, [(label, statement, values)] for every
+    statement they ran that tests TRIM(name))."""
     ran = []
-    conn.set_trace_callback(ran.append)
-    try:
-        found = {
-            "gate": verify_citations._resolve("PLAN", root, conn)[1],
-            "gate, a kind that is part of the name": verify_citations._resolve("PLANX(draft)", root, conn)[1],
-            "doc": [r["name"] for r in query._doc_members(conn, "PLAN")],
-            "diff": [r["name"] for r in query._members_named(conn, None, "PLAN", "doc", None, trim=True)],
-            "images": query.cmd_images(conn, "PLAN"),
-        }
-    finally:
-        conn.set_trace_callback(None)
-    return found, [s for s in ran if "TRIM(" in s.upper() and "MEMBER" in s.upper()]
+    found = {}
+    for label, call in (
+            ("gate", lambda c: verify_citations._resolve("PLAN", root, c)[1]),
+            ("gate, a kind that is part of the name", lambda c: verify_citations._resolve("PLANX(draft)", root, c)[1]),
+            ("doc", lambda c: [r["name"] for r in query._doc_members(c, "PLAN")]),
+            ("doc, with the extension", lambda c: [r["name"] for r in query._doc_members(c, "PLAN.txt")]),
+            ("diff", lambda c: [r["name"] for r in query._members_named(c, None, "PLAN", "doc", None, trim=True)]),
+            ("images", lambda c: query.cmd_images(c, "PLAN")),
+            ("images, with the extension", lambda c: query.cmd_images(c, "PLAN.txt"))):
+        rec = Recording(conn)
+        found[label] = call(rec)
+        ran += [(label, sql, args) for sql, args in rec.ran if "TRIM(" in sql.upper() and "MEMBER" in sql.upper()]
+    return found, ran
 
 
-def plan_of(conn, sql):
-    args = ("PLAN",) * sql.count("?")
+def plan_of(conn, sql, args):
     return [str(r[-1]) for r in conn.execute("EXPLAIN QUERY PLAN " + sql, args)]
 
 
@@ -93,16 +118,53 @@ class IndexColumns(unittest.TestCase):
         self.assertEqual(build.index_columns("UPPER(name)"), {"name"})
         self.assertEqual(build.index_columns("program_id, target"), {"program_id", "target"})
 
+    def test_other_shapes_of_expression(self):
+        # split at every comma first, COALESCE(system, '') read as 'COALESCE(system' and "'')"; a lower-case call was
+        # not taken off - either one read as an older schema and skipped without a word (LESSONS 209)
+        self.assertEqual(build.index_columns("COALESCE(system, '')"), {"system"})
+        self.assertEqual(build.index_columns("lower(name)"), {"name"})
+        self.assertEqual(build.index_columns("UPPER(name) COLLATE NOCASE, kind DESC"), {"name", "kind"})
+        self.assertEqual(build.index_columns("substr(Name, 1, 3), 'a,b(c)'"), {"name"})
+        self.assertEqual(build.index_columns('"library", upper ( TRIM( name ) )'), {"library", "name"})
+
+    def test_every_entry_reads_columns_its_table_has(self):
+        conn = sqlite3.connect(":memory:")
+        self.addCleanup(conn.close)
+        with open(os.path.join(os.path.dirname(HERE), "atlas", "schema.sql"), encoding="utf-8") as fh:
+            conn.executescript(fh.read())
+        for table, name, expr in build.QUERY_INDEXES:
+            cols = {str(r[1]).lower() for r in conn.execute(f"PRAGMA table_info('{table}')")}
+            self.assertTrue(cols, (name, table))
+            self.assertLessEqual(build.index_columns(expr), cols, name)
+
     def test_the_trimmed_expression_sits_beside_the_plain_one(self):
         entries = {name: (table, expr) for table, name, expr in build.QUERY_INDEXES}
         self.assertEqual(entries["ix_q_member_uname"], ("member", "UPPER(name)"))
         self.assertEqual(entries[TRIMMED], ("member", "UPPER(TRIM(name))"))
+        self.assertEqual(query.TRIMMED_NAME_INDEX, TRIMMED)
 
-    def test_an_older_schema_gets_no_index_and_no_error(self):
+    def test_an_older_schema_gets_no_index_and_no_error_and_says_so(self):
         conn = sqlite3.connect(":memory:")
         self.addCleanup(conn.close)
         conn.execute("CREATE TABLE member(id INTEGER PRIMARY KEY, path TEXT)")      # no name column
-        self.assertEqual(build.ensure_query_indexes(conn), 0)
+        said = []
+        self.assertEqual(build.ensure_query_indexes(conn, said.append), 0)
+        self.assertEqual(indexes(conn), set())
+        # the two entries on member, each said once; a table the schema lacks is not an entry skipped
+        self.assertEqual(said, [f"  lookup index {n} not added: table member has no column name (an older schema)"
+                                for n in ("ix_q_member_uname", TRIMMED)])
+        self.assertEqual(build.ensure_query_indexes(conn), 0)                      # and quiet with no one to tell
+
+    def test_a_column_the_reading_misses_is_said_too(self):
+        conn = sqlite3.connect(":memory:")
+        self.addCleanup(conn.close)
+        conn.execute("CREATE TABLE member(id INTEGER PRIMARY KEY, path TEXT)")
+        said = []
+        with mock.patch.object(build, "index_columns", return_value=set()):
+            self.assertEqual(build.ensure_query_indexes(conn, said.append), 0)
+        self.assertEqual(len(said), 2, said)
+        self.assertTrue(said[0].startswith("  lookup index ix_q_member_uname not added: table member: no such column: "
+                                           "name"), said)
         self.assertEqual(indexes(conn), set())
 
 
@@ -119,8 +181,8 @@ class _Built(unittest.TestCase):
     def lookups(self):
         conn = query.connect(self.db)
         try:
-            found, sqls = trimmed_lookups(conn, self.root)
-            return found, sqls, {s: plan_of(conn, s) for s in sqls}, indexes(conn)
+            found, ran = trimmed_lookups(conn, self.root)
+            return found, [(label, sql, args, plan_of(conn, sql, args)) for label, sql, args in ran], indexes(conn)
         finally:
             conn.close()
 
@@ -129,8 +191,19 @@ class _Built(unittest.TestCase):
         self.assertIn("AMBIGUOUS", found["gate"])                  # the program PLAN and the document `PLAN `
         self.assertEqual(found["gate, a kind that is part of the name"], "member PLANX not in index")
         self.assertEqual(found["doc"], ["PLAN "])
+        self.assertEqual(found["doc, with the extension"], ["PLAN "])
         self.assertEqual(found["diff"], ["PLAN "])
-        self.assertIn("_no images recorded_", found["images"])    # a text document holds no picture
+        for label in ("images", "images, with the extension"):
+            self.assertIn("_no images recorded_", found[label])  # a text document holds no picture
+
+    def check_ran(self, ran):
+        # the gate three times (PLAN; PLANX(DRAFT) whole, then PLANX), doc and images twice each, diff once
+        self.assertEqual(sorted(label for label, *_rest in ran),
+                         ["diff", "doc", "doc, with the extension", "gate", "gate, a kind that is part of the name",
+                          "gate, a kind that is part of the name", "images", "images, with the extension"], ran)
+        # with the extension the two values differ: the plan is not the one of a single folded equality
+        (doc_ext,) = [args for label, _sql, args, _plan in ran if label == "doc, with the extension"]
+        self.assertEqual(doc_ext, ("PLAN.TXT", "PLAN"))
 
 
 class TheLookupsUseTheIndex(_Built):
@@ -147,19 +220,19 @@ class TheLookupsUseTheIndex(_Built):
             conn.close()
 
     def test_the_gate_doc_images_and_diff_search_it(self):
-        found, sqls, plans, _have = self.lookups()
+        found, ran, _have = self.lookups()
         self.check_found(found)
-        # the gate three times (PLAN; PLANX(DRAFT) whole, then PLANX), doc, diff, images
-        self.assertEqual(len(sqls), 6, sqls)
-        for sql, plan in plans.items():
-            self.assertTrue(any(TRIMMED in step for step in plan), (sql, plan))
+        self.check_ran(ran)
+        for label, sql, args, plan in ran:
+            self.assertTrue(any(TRIMMED in step for step in plan), (label, sql, args, plan))
             self.assertFalse(any(step.startswith("SCAN") and ("member" in step or " m" in step) for step in plan),
-                             (sql, plan))
+                             (label, sql, args, plan))
 
 
 class AnIndexBuiltBeforeTheItem(_Built):
     """The index as a build before the item left it - no trimmed-name index: it opens, every lookup answers as
-    before (scanning the member table), and the next build adds the index."""
+    before (the gate and images scanning the member table, doc and a diff of one kind reading the kind index),
+    and the next build adds the index."""
 
     def setUp(self):
         super().setUp()
@@ -170,21 +243,24 @@ class AnIndexBuiltBeforeTheItem(_Built):
         finally:
             conn.close()
 
-    def test_it_opens_and_answers_by_a_scan(self):
-        found, sqls, plans, have = self.lookups()
+    def test_it_opens_and_answers_as_before(self):
+        found, ran, have = self.lookups()
         self.assertNotIn(TRIMMED, have)
         self.check_found(found)
-        self.assertTrue(sqls)
-        for sql, plan in plans.items():
-            self.assertFalse(any(TRIMMED in step for step in plan), (sql, plan))
+        self.check_ran(ran)
+        for label, sql, args, plan in ran:
+            self.assertFalse(any(TRIMMED in step for step in plan), (label, sql, args, plan))
+            if label.startswith("doc") or label == "diff":
+                self.assertTrue(any("ix_member_kind" in step for step in plan), (label, sql, args, plan))
 
     def test_the_next_build_adds_it_once(self):
         out = build_it(self.root, self.docs, self.db)
         self.assertNotIn("Traceback", out)
-        found, _sqls, plans, have = self.lookups()
+        self.assertNotIn("not added", out)
+        found, ran, have = self.lookups()
         self.assertIn(TRIMMED, have)
         self.check_found(found)
-        self.assertTrue(all(any(TRIMMED in step for step in plan) for plan in plans.values()), plans)
+        self.assertTrue(all(any(TRIMMED in step for step in plan) for _l, _s, _a, plan in ran), ran)
         conn = sqlite3.connect(self.db)
         try:
             self.assertEqual(build.ensure_query_indexes(conn), 0, "a second call finds nothing missing")

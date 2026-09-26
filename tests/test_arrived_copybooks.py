@@ -957,6 +957,21 @@ class RemovedCopiesAreNotNothingToReport(_Estate):
                       "the index.", self.report_text())
         self.removed_and_built()
 
+    def test_a_dry_run_says_would_be_removed_from_its_first_lines(self):
+        # the report's first lines said 'removed (real member arrived): 1' on a dry run, a few lines above 'Would be
+        # removed (dry run: nothing removed, nothing marked)' (LESSONS 209); the run ends before any listing is read
+        self.real_member_arrives()
+        stats, said = self.recover(dry_run=True)
+        self.assertEqual((stats["removed"], stats["marked"]), (1, 0), said)
+        rep = self.report_text()
+        self.assertIn("; would be removed (real member arrived): 1\n", rep)
+        self.assertNotIn("; removed (real member arrived)", rep)
+        self.assertIn("Would be removed (dry run: nothing removed, nothing marked): DATABOOK.", rep)
+        self.assertTrue(os.path.exists(os.path.join(self.root, "SHARED", recover.FOLDER, "DATABOOK.cpy")))
+        stats, said = self.recover()
+        self.assertIn("; removed (real member arrived): 1\n", self.report_text())
+        self.assertNotIn("would be removed", self.report_text())
+
     def test_on_an_index_built_before_the_item_the_program_that_expanded_it_is_marked(self):
         # before ROADMAP re-parse item 11 a build could keep the recovered copy after the real member arrived:
         # DATAPGM's COPY row still points at it (written by hand). The run marks that program and says so

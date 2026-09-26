@@ -1084,9 +1084,10 @@ class EndToEnd(unittest.TestCase):
         stats = recover.run(self.db, log=said.append, report=self.report)
         self.assertEqual(stats["missing"], 0, said)
         self.assertTrue(any("nothing to recover: every copybook" in s for s in said), said)
-        # the real copybook arrives: the build expands it at once - a recovered copy ranks after every other candidate
-        # (ROADMAP re-parse item 11) - with no choice among several; recover then removes the recovered copy and
-        # marks nothing, for no program expands it; the next build drops it and the real one is the only one
+        # the real copybook arrives under SHARED: the build expands it at once - a recovered copy gives way to a real
+        # member in SHARED (ROADMAP re-parse item 11) - with no choice among several; recover then removes the
+        # recovered copy and marks nothing, for no program expands it; the next build drops it and the real one is
+        # the only one
         shutil.copy(os.path.join(FIX, "PMASTREC.cpy"), os.path.join(self.root, "SHARED", "COPYLIB"))
         self.build()
         conn = query.connect(self.db)
@@ -1150,8 +1151,8 @@ class EndToEnd(unittest.TestCase):
         self.build()
 
     def test_the_real_member_beats_a_recovered_copy_the_moment_it_arrives(self):
-        # ROADMAP re-parse item 11: the build ranks a recovered copy after every other candidate, so the real member
-        # is expanded at the build it arrives in, with no choice among several; coverage has nothing to warn of
+        # ROADMAP re-parse item 11: a recovered copy gives way to a real member in SHARED, so the real member is
+        # expanded at the build it arrives in, with no choice among several; coverage has nothing to warn of
         self.real_member_arrives_late()
         self.assertIn("ZCOPYLIB", self.resolved_path("PMASTREC"))
         self.assertEqual((self.status("SAMPPGM"), self.status("ERRPGM")), ("ok", "ok"))
@@ -1164,9 +1165,20 @@ class EndToEnd(unittest.TestCase):
             self.assertNotIn("chosen among several", query.cmd_program(conn, "SAMPPGM"))
         finally:
             conn.close()
+        # a dry run reads the listings and says what it would remove, from the report's first lines (LESSONS 209)
+        said = []
+        stats = recover.run(self.db, log=said.append, report=self.report, dry_run=True)
+        with open(self.report, encoding="utf-8") as fh:
+            rep = fh.read()
+        self.assertIn("; would be removed (real member arrived): 1", rep)
+        self.assertNotIn("; removed (real member arrived)", rep)
+        self.assertIn("expanded texts read: ", rep)
+        self.assertNotIn("expanded texts read: 0;", rep)
         # recover removes the stand-in and marks nothing - no program expands it; the next build drops it
         said = []
         stats = recover.run(self.db, log=said.append, report=self.report)
+        with open(self.report, encoding="utf-8") as fh:
+            self.assertIn("; removed (real member arrived): 1", fh.read())
         self.assertEqual((stats["removed"], stats["marked"]), (1, 0), said)
         self.assertIn("  " + recover.REMOVED_NONE_EXPANDS, said)
         self.assertIn(recover.REMOVED_NEXT, said)

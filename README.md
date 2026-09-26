@@ -152,10 +152,14 @@ everything else:
   department in its **declared order** › same department › authoritative ›
   same folder › first found — and the choice is written into the
   `ambiguous_copybook` note either way. A copy `atlas.recover` wrote under a
-  `RECOVERED-COPYBOOKS` folder stands in for a missing member: it ranks after
-  every other member of its name, so the real copybook is expanded at the
-  build it arrives in, and a stand-in is never counted as a second library
-  in that note. Where `atlas.recover` has stored the
+  `RECOVERED-COPYBOOKS` folder stands in for its system's missing member
+  (SHARED's for the estate): it gives way to a real member of its name in
+  the program's own system, in SHARED, or in the system it was written for,
+  so the real copybook is expanded at the build it arrives in, and a
+  stand-in it replaced is never counted as a second library in that note.
+  A real member that only another system holds does not replace it: the
+  program keeps its own system's recovered copy and the note says it had
+  two to choose from. Where `atlas.recover` has stored the
   program's compiler listing's copybook-source table (`listing_copy_source`),
   the build reads it too, and a **current** listing (its source is the
   program as indexed) changes the chain's pick only where the copy it names
@@ -599,11 +603,14 @@ missing, but its library stays on the list until the real member arrives.
 only - to paste into the UI's Bulk add or give to zowe; once fetched and
 built, those copybooks resolve - the build expands a real member over a
 recovered copy at once - and the next recover run removes the recovered
-copies. It marks for the next build only a program whose COPY row still
-names a removed copy (on an index built before the batch, a build could
-keep one after the real member arrived); otherwise it says 'no program
-expands them, so none is marked' and that the next build drops them from
-the index.
+copies no program copying the name would still expand (a system's own
+recovered copy stays while a program of that system has no real member
+of its own, even when another system's has arrived; a program copying a
+copybook of its own name keeps its recovered copy). It marks for the next
+build only a program whose COPY row still resolves to a removed copy (on
+an index built before the batch, a build could keep one after the real
+member arrived); otherwise it says 'no program expands them, so none is
+marked' and that the next build drops them from the index.
 
 **Pictures are read, not just counted.** `OCR images` (UI) or
 `python -m atlas.ocr --db atlas.db --out out/images` pulls every image out of

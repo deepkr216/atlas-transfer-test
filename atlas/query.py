@@ -2520,20 +2520,29 @@ def _top_reason(rows: List[sqlite3.Row]) -> str:
 
 def _recovered_shadowing(conn: sqlite3.Connection) -> str:
     """COPY statements that expand a recovered copybook (atlas.recover) while
-    the estate now holds the real member. A build before ROADMAP re-parse
-    item 11 ranked the recovered copy like any library (the same folder,
-    first found), so until the recovered one is removed a program may carry
-    the recovered layout. The build of this toolkit takes a recovered copy
-    only while no other member of the name is a candidate, and parses the
-    copying programs again when the real member arrives: on an index it
-    built this finds nothing."""
+    the estate now holds the real member that replaces it: one in the
+    program's own system, in SHARED (or with no system), or in the system
+    the recovered copy was written for - not the copying program itself,
+    which the build never expands into itself. A build before ROADMAP
+    re-parse item 11 ranked the recovered copy like any library (the same
+    folder, first found), so until the recovered one is removed a program
+    may carry the recovered layout. The build of this toolkit drops a
+    recovered copy on exactly this test (build.recovered_gives_way) and
+    parses the copying programs again when the real member arrives: on an
+    index it built this finds nothing. A real member only another system
+    holds is that system's copy, not this program's: atlas.recover keeps the
+    recovered copy then, and this says nothing of it (LESSONS 209)."""
     rows = conn.execute("""
         SELECT r.name, COUNT(*) FROM copy_use c
         JOIN member r ON r.id = c.resolved_member_id
+        JOIN member p ON p.id = c.member_id
         WHERE UPPER(r.library) = 'RECOVERED-COPYBOOKS'
           AND EXISTS (SELECT 1 FROM member m WHERE UPPER(m.name) = UPPER(r.name) AND m.id != r.id
+                      AND m.id != c.member_id
                       AND m.kind IN ('copybook', 'cobol', 'sql', 'unknown')
-                      AND UPPER(COALESCE(m.library, '')) != 'RECOVERED-COPYBOOKS')
+                      AND UPPER(COALESCE(m.library, '')) != 'RECOVERED-COPYBOOKS'
+                      AND UPPER(COALESCE(m.system, '')) IN ('', 'SHARED', UPPER(COALESCE(r.system, '')),
+                                                            UPPER(COALESCE(p.system, ''))))
         GROUP BY r.name ORDER BY 2 DESC""").fetchall()
     if not rows:
         return ""
@@ -3041,14 +3050,25 @@ def cmd_docs(conn: sqlite3.Connection, term: str) -> str:
     return "".join(out)
 
 
+# build.QUERY_INDEXES' index on UPPER(TRIM(name)) (ROADMAP re-parse item 12)
+TRIMMED_NAME_INDEX = "ix_q_member_utname"
+
+
+def _has_index(conn: sqlite3.Connection, name: str) -> bool:
+    return conn.execute("SELECT 1 FROM sqlite_master WHERE type='index' AND name=?", (name,)).fetchone() is not None
+
+
 def _doc_members(conn: sqlite3.Connection, name: str) -> List[sqlite3.Row]:
     n = name.upper()
     stem = os.path.splitext(n)[0]
     rows = conn.execute("SELECT id, name, path FROM member WHERE kind='doc' AND (UPPER(name)=? OR UPPER(name)=?) "
                         "ORDER BY path", (n, stem)).fetchall()
     # a file named `PLAN .docx` is member `PLAN ` - nobody types the trailing space; shown after
-    # an exact PLAN.docx, never instead of it
-    twins = conn.execute("SELECT id, name, path FROM member WHERE kind='doc' AND "
+    # an exact PLAN.docx, never instead of it. `+kind`: with no statistics the planner took the kind index (every
+    # document) over the name's; an index built before ROADMAP re-parse item 12 has no index on the trimmed name, and
+    # reads the kind index as before (LESSONS 209)
+    kind = "+kind" if _has_index(conn, TRIMMED_NAME_INDEX) else "kind"
+    twins = conn.execute(f"SELECT id, name, path FROM member WHERE {kind}='doc' AND "
                          "(UPPER(TRIM(name))=? OR UPPER(TRIM(name))=?) ORDER BY path", (n.strip(), stem.strip())).fetchall()
     seen = {r["id"] for r in rows}
     rows = list(rows) + [r for r in twins if r["id"] not in seen]

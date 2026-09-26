@@ -39,10 +39,16 @@ own folder, so no program expands the other system's layout. A block is
 written only when the copybook parser reads it as data items, procedure
 code, or comments, and the build would file it as a copybook. When the
 real copybook later arrives in the estate, the build expands it at once (a
-recovered copy ranks after every other member of its name - ROADMAP
-re-parse item 11), and the next run removes the recovered one; a program
-whose COPY row still names it (an index built before the item) is marked
-for the next build.
+recovered copy gives way to a real member of its name in the program's own
+system, in SHARED, or in the system it was written for - ROADMAP re-parse
+item 11), and the next run removes the recovered one once no program
+copying its name would still expand it (a real member in SHARED or in the
+system it was written for, or one in the own system of every program that
+copies it); a program whose COPY row still resolves to it (an index built
+before the item) is marked for the next build. A real member only another
+system holds leaves a system's own recovered copy in place: that system's
+programs keep its layout, and the build records the choice. A program that
+copies its own name never expands itself, so its recovered copy stays.
 
 Every recovered copybook says in its first lines where it came from; it is
 the copybook's text as one program saw it, not the library copy, and the
@@ -3535,20 +3541,75 @@ def disk_report(checked: Dict[str, Dict[str, object]], missing: Dict[str, int], 
     return lines
 
 
-def real_copies(conn: sqlite3.Connection, roots: Sequence[str]) -> Set[str]:
-    """Names for which the estate now holds a real member outside every
-    recovered folder."""
+def real_copies(conn: sqlite3.Connection, roots: Sequence[str]) -> Dict[str, Set[str]]:
+    """{NAME: the systems holding a real member of the name} for every name
+    the estate holds outside the recovered folders: a member of a resolver
+    kind, its system as build.recovered_home reads it ('' for SHARED and for
+    none). A program (kind cobol) that copies its own name is not counted
+    for that name: the build never expands a program into itself, so its own
+    COPY takes the recovered copy, and removing that copy made the COPY NOT
+    FOUND on the next build and the copy written again on the run after -
+    every run (LESSONS 209)."""
+    from . import build as _build
     rec = [os.path.normcase(os.path.abspath(r)) + os.sep for r in roots]
-    names: Set[str] = set()
-    for name, path in conn.execute(f"SELECT name, path FROM member WHERE kind IN ({','.join('?' * len(RESOLVER_KINDS))})",
-                                   RESOLVER_KINDS):
+    itself = {int(r[0]) for r in conn.execute("SELECT DISTINCT c.member_id FROM copy_use c JOIN member m ON m.id = c.member_id "
+                                              "WHERE m.kind = 'cobol' AND UPPER(c.copybook) = UPPER(m.name)")}
+    names: Dict[str, Set[str]] = {}
+    for mid, name, path, system in conn.execute(f"SELECT id, name, path, system FROM member WHERE kind IN "
+                                                f"({','.join('?' * len(RESOLVER_KINDS))})", RESOLVER_KINDS):
+        if int(mid) in itself:
+            continue
         p = os.path.normcase(os.path.abspath(path))
         if not any(p.startswith(r) for r in rec) and FOLDER.lower() not in p.lower():
-            names.add(name.upper())
+            names.setdefault(name.upper(), set()).add(_build.recovered_home(system))
     return names
 
 
-def recovered_only(conn: sqlite3.Connection, roots: Sequence[str], real: Set[str]) -> Dict[str, int]:
+def folder_home(folder: str, root: Optional[str]) -> str:
+    """The system a recovered folder was written for, as
+    build.recovered_home reads it: estate\\SYSTEM\\RECOVERED-COPYBOOKS is
+    SYSTEM's; SHARED's, one at the estate root and a --out folder elsewhere
+    are the estate's ('')."""
+    from . import build as _build
+    return _build.recovered_home(system_of(os.path.join(folder, "X.cpy"), root))
+
+
+def copier_homes(conn: sqlite3.Connection, names: Sequence[str]) -> Dict[str, Set[str]]:
+    """{NAME: the systems of the programs copying it} (build.recovered_home:
+    '' for SHARED and for none) - programs only, nested copies included (a
+    program's copy_use rows hold them); a copybook's own COPY rows are never
+    resolved."""
+    from . import build as _build
+    out: Dict[str, Set[str]] = {}
+    wanted = sorted({n.upper() for n in names})
+    for k in range(0, len(wanted), 500):
+        chunk = wanted[k:k + 500]
+        for name, system in conn.execute(f"SELECT DISTINCT UPPER(c.copybook), m.system FROM copy_use c JOIN member m "
+                                         f"ON m.id = c.member_id WHERE m.kind = 'cobol' AND UPPER(c.copybook) IN "
+                                         f"({','.join('?' * len(chunk))})", tuple(chunk)):
+            out.setdefault(str(name), set()).add(_build.recovered_home(system))
+    return out
+
+
+def replaced(homes: Optional[AbstractSet[str]], home: str, copiers: AbstractSet[str] = frozenset()) -> bool:
+    """Whether the real members held in `homes` (a real_copies value)
+    replace a recovered copy written for `home` (folder_home), so the copy
+    can go: no program copying the name (`copiers`: their systems,
+    copier_homes) would still expand it. The build drops the copy for a
+    program once a real member sits in SHARED, in the system the copy was
+    written for, or in the program's own system (build.recovered_gives_way):
+    so one in SHARED or in `home` replaces it for every program, and one in
+    each copier's own system does too. A real member that only another
+    system holds leaves the copy in place while a program of a system
+    without one copies the name - it still expands the copy, and removing
+    it handed that program the other system's layout with nothing said
+    (LESSONS 209)."""
+    if not homes:
+        return False
+    return "" in homes or home in homes or all(h in homes for h in copiers)
+
+
+def recovered_only(conn: sqlite3.Connection, roots: Sequence[str], real: AbstractSet[str]) -> Dict[str, int]:
     """{copybook: programs copying it} for the copybooks the index holds ONLY
     as recovered copies: a member inside a recovered folder and no real
     member anywhere. Once the build has read a recovered copy the copybook is
@@ -4076,6 +4137,10 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
         roots_out = [out_dir] + ([os.path.join(root, d, FOLDER) for d in os.listdir(root) if os.path.isdir(os.path.join(root, d))]
                                  if root and os.path.isdir(root) else [])
         real = real_copies(conn, roots_out)
+        # the systems of the programs copying each name a recovered folder holds whose real member arrived somewhere:
+        # a copy goes only when none of them would still expand it (replaced)
+        held = {n for d in roots_out for n in set(_load_marker(d)) | set(_on_disk(d))}
+        copiers_of = copier_homes(conn, [n for n in held if n in real])
         # held only as a recovered copy: no longer missing to the build, still to fetch for - the listings of the
         # programs copying them are read too, so the fetch list keeps naming their libraries after the build has run
         recovered = recovered_only(conn, roots_out, real)
@@ -4090,8 +4155,9 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
     removed_files: List[str] = []                                       # where each was: its programs are found by the row
     for d, ents in entries.items():
         disk = _on_disk(d)
+        home = folder_home(d, root)                                     # the system this folder's copies stand in for
         for name in sorted(set(ents) | set(disk)):
-            if name in real:
+            if replaced(real.get(name), home, copiers_of.get(name, set())):
                 if not dry_run:
                     try:
                         os.remove(os.path.join(d, name + ".cpy"))
@@ -4234,8 +4300,8 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
         run has nothing)."""
         if report:
             head = [f"# Recovered copybooks - {time.strftime('%Y-%m-%d %H:%M')}\n",
-                    f"\n- missing in the index: {len(missing)}; expanded texts read: 0; removed (real member arrived): "
-                    f"{len(removed)}\n"]
+                    f"\n- missing in the index: {len(missing)}; expanded texts read: 0; "
+                    f"{'would be removed' if dry_run else 'removed'} (real member arrived): {len(removed)}\n"]
             if disk_lines or arrival_lines:
                 _write_report(report, head + disk_lines + arrival_lines)
                 log(f"every name: {report}")
@@ -4501,7 +4567,8 @@ def run(db: str, folders: Sequence[str] = (), out_dir: Optional[str] = None, dry
              f"\n- missing in the index: {len(missing)}; expanded texts read: {len(sources)}; formats: "
              + ", ".join(f"{f} in {n}" for f, n in formats.most_common()),
              f"\n- written: {len(written)}" + (" (dry run: nothing written)" if dry_run else "")
-             + f"; already there: {kept}; unconfirmed: {len(unconfirmed)}; rejected: {len(rejected)}; removed (real member arrived): {len(removed)}",
+             + f"; already there: {kept}; unconfirmed: {len(unconfirmed)}; rejected: {len(rejected)}; "
+             + f"{'would be removed' if dry_run else 'removed'} (real member arrived): {len(removed)}",
              f"\n- not in any expanded text: {len(not_found)}"
              + (f"; in an older listing whose source column could not be proven: {len(unread)}" if unread else "") + "\n"]
     lines += disk_lines                                                 # every missing name, looked for on disk

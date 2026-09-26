@@ -301,9 +301,12 @@ RESOLVER_KINDS = ("copybook", "cobol", "sql", "unknown")
 STUB_KIND = "stub"
 COPY_KINDS = RESOLVER_KINDS + (STUB_KIND,)
 # the folder atlas.recover writes a copybook it rebuilt from the compiler listings into (recover.FOLDER: under SHARED,
-# or under a system when the systems' texts differ). Such a copy stands in for a missing member: make_resolver takes it
-# only while no other member of the name is a candidate (ROADMAP re-parse item 11)
+# or under a system when the systems' texts differ). Such a copy stands in for its system's missing member (SHARED's:
+# the estate's): make_resolver drops it once a real member of the name sits in the program's own system, in SHARED, or
+# in the system the copy was written for (recovered_gives_way; ROADMAP re-parse item 11)
 RECOVERED_FOLDER = "RECOVERED-COPYBOOKS"
+# the folder of the estate every system shares (estate\SHARED\...: derive_systems names its members' system so)
+SHARED_SYSTEM = "SHARED"
 # the kinds a job's expansion reads a member from: a cataloged PROC (_proc_facts), an `// INCLUDE MEMBER=` member
 # (_include_text) and a control-card member, `DSN=LIB(MEMBER)` or a sequential dataset's last qualifier (_card_text).
 # A member of one of these kinds that arrives, changes, goes or is re-typed into or out of them changes the facts of
@@ -692,21 +695,28 @@ QUERY_INDEXES = [
 ]
 
 
-_INDEX_CALL = re.compile(r"^[A-Z]+\((.*)\)$")
+# the words of an index expression that are not columns: a collation, an order, an operator, a type
+_INDEX_WORDS = {"COLLATE", "NOCASE", "BINARY", "RTRIM", "ASC", "DESC", "AND", "OR", "NOT", "NULL", "IS", "IN", "LIKE",
+                "GLOB", "BETWEEN", "ESCAPE", "CASE", "WHEN", "THEN", "ELSE", "END", "CAST", "AS", "TEXT", "INTEGER",
+                "REAL", "NUMERIC", "BLOB"}
+_INDEX_NAME = re.compile(r'"((?:[^"]|"")*)"|\b([A-Za-z_][A-Za-z0-9_]*)\b(\s*\()?')
 
 
 def index_columns(expr: str) -> Set[str]:
-    """The columns a QUERY_INDEXES expression reads: each comma-separated
-    term with its function calls taken off - `UPPER(TRIM(name))` reads
-    `name`, `program_id, target` reads both."""
+    """The columns a QUERY_INDEXES expression reads, in lower case (SQLite's
+    column names ignore case): every name in it that is not a function's
+    (followed by a parenthesis, in any case), a quoted literal, a number or
+    an SQL word - `UPPER(TRIM(name))` reads `name`, `program_id, target`
+    both, `COALESCE(system, '')` `system`, `lower(name)` `name`. Split at
+    the commas first, `COALESCE(system` read as a column name and the entry
+    was skipped as 'an older schema' without a word (LESSONS 209)."""
+    text = re.sub(r"'(?:[^']|'')*'", " ", expr)                         # string literals
     out: Set[str] = set()
-    for term in expr.split(","):
-        term = term.strip()
-        m = _INDEX_CALL.match(term)
-        while m:
-            term = m.group(1).strip()
-            m = _INDEX_CALL.match(term)
-        out.add(term)
+    for m in _INDEX_NAME.finditer(text):
+        if m.group(1) is not None:
+            out.add(m.group(1).replace('""', '"').lower())             # a quoted column name
+        elif not m.group(3) and m.group(2).upper() not in _INDEX_WORDS:
+            out.add(m.group(2).lower())
     return out
 
 
@@ -716,14 +726,28 @@ def ensure_query_indexes(conn: sqlite3.Connection, say=None) -> int:
     for table, name, expr in QUERY_INDEXES:
         if name in existing:
             continue
-        cols = {r[1] for r in conn.execute(f"PRAGMA table_info('{table}')")}
-        # a table without a column the expression reads (an older schema) gets no index, and no error
-        needed = index_columns(expr)
-        if not cols or not needed <= cols:
+        cols = {str(r[1]).lower() for r in conn.execute(f"PRAGMA table_info('{table}')")}
+        if not cols:
+            continue                                                    # a table an older schema does not hold
+        # a table without a column the expression reads (an older schema) gets no index and no error, and the build
+        # says so: a skip that says nothing looks like success (LESSONS 208). The build brings its schema up to date
+        # first, so on a build this line means an entry the reading above got wrong
+        lacking = sorted(index_columns(expr) - cols)
+        if lacking:
+            if say:
+                say(f"  lookup index {name} not added: table {table} has no column {', '.join(lacking)} (an older schema)")
             continue
         if say and made == 0 and conn.execute("SELECT COUNT(*) FROM member").fetchone()[0] > 5000:
             say("  adding lookup indexes this index was missing (one time)")
-        conn.execute(f"CREATE INDEX IF NOT EXISTS {name} ON {table}({expr})")
+        try:
+            conn.execute(f"CREATE INDEX IF NOT EXISTS {name} ON {table}({expr})")
+        except sqlite3.OperationalError as e:
+            if "no such column" not in str(e):
+                raise
+            # a column the reading above missed: the same older schema, said the same way
+            if say:
+                say(f"  lookup index {name} not added: table {table}: {e} (an older schema)")
+            continue
         made += 1
     if made:
         conn.commit()
@@ -1774,6 +1798,36 @@ def is_recovered(mem: Mem) -> bool:
     return (mem.library or "").upper() == RECOVERED_FOLDER
 
 
+def recovered_home(system: Optional[str]) -> str:
+    """The system a copy stands for when recovered copies are weighed: its
+    own, and '' for SHARED and for a member with no system - the copy every
+    system reads. atlas.recover writes under SHARED when the systems'
+    listings show one text, under a system's own folder when they differ."""
+    s = (system or "").upper()
+    return "" if s == SHARED_SYSTEM else s
+
+
+def recovered_gives_way(cands: List[Mem], prog: Mem) -> List[Mem]:
+    """`cands` without the recovered copies a real member has replaced. A
+    recovered copy stands in for the member of the system it was written
+    for (SHARED's for the estate) and gives way to a real candidate of the
+    name in the program's own system, in SHARED, or in that system - the
+    test query._recovered_shadowing makes of an index; atlas.recover
+    removes the copy once no program copying the name would still expand it
+    (recover.replaced). A real member that only
+    another system holds is that system's copy: a program whose own system's
+    copy is still a recovered one keeps it in the choice, and the chain
+    takes it ('same system') - a CLAIMS program never silently expands
+    POLICY's layout because POLICY's arrived first (LESSONS 209)."""
+    real = [c for c in cands if not is_recovered(c)]
+    if not real or len(real) == len(cands):
+        return cands
+    homes = {recovered_home(c.system) for c in real}
+    if "" in homes or recovered_home(prog.system) in homes:
+        return real
+    return [c for c in cands if not is_recovered(c) or recovered_home(c.system) not in homes]
+
+
 def make_resolver(ctx: Ctx, prog: Mem, notes: List[Tuple[str, str, int]]):
     def resolve(name: str, lib: Optional[str]):
         cands = [c for c in ctx.by_name.get(name.upper(), [])
@@ -1786,15 +1840,15 @@ def make_resolver(ctx: Ctx, prog: Mem, notes: List[Tuple[str, str, int]]):
             if stubs:
                 return None, [], expand.stub_note([(c.library, _stub_lines(ctx, c)) for c in stubs])
             return None
-        # A copy atlas.recover rebuilt from the listings stands in for a missing member: it ranks after every other
-        # candidate of the name, so the real copybook is expanded the moment it arrives - whatever the chain below
-        # would say (the same folder, first found) - and a stand-in never counts as a second library in a choice
+        # A copy atlas.recover rebuilt from the listings stands in for a missing member: once a real member of the
+        # name sits in the program's own system, in SHARED, or in the system the copy was written for, the copy is
+        # no candidate - the real copybook is expanded the moment it arrives, whatever the chain below would say
+        # (the same folder, first found), and a stand-in replaced is never counted as a second library in a choice
         # among several. Before, the chain could keep the recovered copy until atlas.recover removed it, and
-        # coverage warned meanwhile (ROADMAP re-parse item 11, LESSONS 168). Among recovered copies alone (one per
-        # system when the systems' texts differ) the chain decides as before.
-        real = [c for c in cands if not is_recovered(c)]
-        if real:
-            cands = real
+        # coverage warned meanwhile (ROADMAP re-parse item 11, LESSONS 168). A real member only another system
+        # holds does not replace the program's own system's recovered copy: both stay, and the chain decides and
+        # records the choice, as it does among recovered copies alone (LESSONS 209).
+        cands = recovered_gives_way(cands, prog)
         pick = cands[0]
         if len(cands) > 1:
             # The precedence chain's pick, then the program's compiler
