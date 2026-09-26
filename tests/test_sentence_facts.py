@@ -27,10 +27,12 @@ one sentence made SORT, the sort file, ASCENDING and the files targets of the MO
 
 F15 - an EXEC SQL in WORKING-STORAGE whose END-EXEC lacks its period. Read as one sentence the block swallowed the
 PROCEDURE DIVISION header and the program lost every paragraph while it read `parse: ok`. The reader closes the
-statement at the END-EXEC (reader.cobol_statements), the member is `partial` with the note 'EXEC SQL at line N ends
-without its period - the compiler would reject it; the facts after it were read as if the period were there' (the
-copybook's line and name when the block came from a COPY), and coverage's kinds table says what it means. Inside the
-PROCEDURE DIVISION an END-EXEC without a period is ordinary and nothing is said.
+statement at the END-EXEC (reader.cobol_statements), the member is `partial` with the note 'EXEC SQL at line N has no
+period after its END-EXEC; what follows was read as if it had one' (the copybook's line and name when the block came
+from a COPY), and coverage's kinds table says what it means. Inside the PROCEDURE DIVISION an END-EXEC without a period
+is ordinary and nothing is said. The note says nothing of the compile: whether a compile rejects the member depends on
+the step that read the block (a separate precompiler, or the compiler's own SQL option), which the member does not say
+(LESSONS 212).
 
 F25 - `program`'s Calls table printed a CICS XCTL through a variable holding one literal as the target alone: the
 variable (WS-NEXT-PGM) is now beside the targets it resolves to, as for a CALL through a variable.
@@ -58,8 +60,7 @@ sys.path.insert(0, HERE)
 from atlas import build, cobol, copybook, query, reader, recover  # noqa: E402
 
 REPRO = os.path.join(ROOT, "tools", "synth", "repro")
-NOTE = ("EXEC SQL at line {} ends without its period - the compiler would reject it; the facts after it were read "
-        "as if the period were there")
+NOTE = "EXEC SQL at line {} has no period after its END-EXEC; what follows was read as if it had one"
 
 
 def program(name, data, proc, env=""):
@@ -602,8 +603,8 @@ class TheBuildAndTheReports(_Built):
     def test_a_copybooks_block_is_named_with_its_own_line(self):
         self.assertEqual(self.q("""SELECT u.detail FROM unresolved u JOIN member m ON m.id = u.member_id
                                    WHERE m.name='BOOKPGM' AND u.kind='exec_no_period'"""),
-                         [("EXEC SQL at line 1 of copybook NOBOOK ends without its period - the compiler would reject "
-                           "it; the facts after it were read as if the period were there",)])
+                         [("EXEC SQL at line 1 of copybook NOBOOK has no period after its END-EXEC; what follows was "
+                           "read as if it had one",)])
         self.assertEqual(self.q("SELECT parse_status FROM member WHERE name='BOOKPGM'"), [("partial",)])
         self.assertEqual(self.q("SELECT kind, parse_status FROM member WHERE name='NOBOOK'"), [("copybook", "ok")])
         self.assertEqual(sorted(r[0] for r in self.q("SELECT f.name FROM field f JOIN member m ON m.id = f.member_id "
@@ -612,12 +613,14 @@ class TheBuildAndTheReports(_Built):
     def test_coverage_names_it_and_says_what_it_means(self):
         cov = self.page(query.cmd_coverage)
         part = cov.split("### Members parsed only in part")[1].split("\n### ")[0]
-        self.assertIn("| cobol | NOPGM | PROD.GC.SRC | exec_no_period: EXEC SQL at line "
-                      f"{line_of(NOPERIOD, 'NOCUR1 CURSOR')} ends without its period", part)
+        self.assertIn("| cobol | NOPGM | PROD.GC.SRC | exec_no_period: "
+                      + NOTE.format(line_of(NOPERIOD, 'NOCUR1 CURSOR')) + " |", part)
         row = [ln for ln in cov.splitlines() if ln.startswith("| exec_no_period |")]
         self.assertEqual(len(row), 1, cov)
-        self.assertIn("the compiler rejects the member as written", row[0])
-        self.assertIn("the facts after that line are right only if the period was all that was missing", row[0])
+        self.assertIn("the member is partial because the facts after that line rest on it", row[0])
+        self.assertIn("the program's compile JCL or listing says which", row[0])
+        self.assertIn("the facts after that line are right when the period is all that is missing", row[0])
+        self.assertNotIn("reject", row[0])
         page = self.page(query.cmd_program, "NOPGM")
         self.assertIn("parse: partial", page)
         self.assertIn("| NOPGM | exec_no_period | EXEC SQL at line", page)
@@ -688,6 +691,294 @@ class TheStandInsFindNothingToDo(_Built):
 
 
 # ---------------------------------------------------------------------------
+# the verifier's first round on this stage (LESSONS 212)
+# ---------------------------------------------------------------------------
+
+DISPATCH = program("DSPPGM", [
+    "WORKING-STORAGE SECTION.",
+    "01  WS-TRAN-IDX      PIC 9.",
+    "01  END-SW           PIC X.",
+], [
+    "0000-MAIN.",
+    "    GO TO 1000-ADD 2000-CHG 3000-DEL",
+    "          DEPENDING ON WS-TRAN-IDX",
+    "    GO TO 9000-BAD-TRAN.",
+    "0100-NEXT.",
+    "    GO TO 1000-ADD 2000-CHG DEPENDING ON WS-TRAN-IDX",
+    "    PERFORM 9000-BAD-TRAN.",
+    "0200-NEXT.",
+    "    GO TO 1000-ADD DEPENDING ON WS-TRAN-IDX",
+    "    MOVE SPACE TO END-SW",
+    "    GO TO 999-EXIT.",
+    "1000-ADD.",
+    "    READ IN-FILE AT END GO TO 999-EXIT.",
+    "2000-CHG.",
+    "    DISPLAY 'GO TO THE DESK'.",
+    "3000-DEL.",
+    "    PERFORM UNTIL END-SW = 'Y' GO TO 999-EXIT END-PERFORM.",
+    "9000-BAD-TRAN.",
+    "    DISPLAY 'IF IT FAILS' GOBACK.",
+    "999-EXIT.",
+    "    EXIT.",
+])
+
+
+class GoToDependingInASentence(unittest.TestCase):
+    """`GO TO A B C DEPENDING ON IX` with more statements in its sentence: the target list ended only at a period, a
+    scope terminator, ELSE or WHEN, so the next GO TO or PERFORM of the sentence became more plain GO TO targets -
+    DEPENDING, ON, the index, GO, TO - all at the first line, the index had no reference, and a fall-through was
+    recorded after a sentence whose last GO TO always leaves."""
+
+    def setUp(self):
+        self.f = cobol.parse_program(DISPATCH)
+        self.at = lambda needle: line_of(DISPATCH, needle)
+
+    def edges(self, frm):
+        return [(t, k, ln) for (fr, t, _th, ln, k) in self.f.performs if fr == frm]
+
+    def test_each_go_to_of_the_sentence_is_its_own_edge(self):
+        first = self.at("GO TO 1000-ADD 2000-CHG 3000-DEL")
+        self.assertEqual(self.edges("0000-MAIN"),
+                         [("1000-ADD", "goto_depending", first), ("2000-CHG", "goto_depending", first),
+                          ("3000-DEL", "goto_depending", first), ("9000-BAD-TRAN", "goto", self.at("GO TO 9000-BAD"))])
+        second = self.at("GO TO 1000-ADD 2000-CHG DEPENDING")
+        self.assertEqual(sorted(self.edges("0100-NEXT")),
+                         sorted([("9000-BAD-TRAN", "perform", self.at("PERFORM 9000-BAD-TRAN")),
+                                 ("1000-ADD", "goto_depending", second), ("2000-CHG", "goto_depending", second),
+                                 ("0200-NEXT", "fallthrough", self.at("PERFORM 9000-BAD-TRAN"))]))
+        # a name beginning with END- no longer ended the list, so the later GO TO was swallowed at the first line
+        third = self.at("GO TO 1000-ADD DEPENDING")
+        self.assertEqual(self.edges("0200-NEXT"),
+                         [("1000-ADD", "goto_depending", third), ("999-EXIT", "goto", self.at("GO TO 999-EXIT."))])
+        targets = {t for (_fr, t, _th, _ln, _k) in self.f.performs}
+        self.assertFalse(targets & {"DEPENDING", "ON", "GO", "TO", "WS-TRAN-IDX", "PERFORM", "MOVE", "END-SW"})
+
+    def test_the_index_is_tested(self):
+        # at the GO TO's line, as every reference is cited at its verb's
+        r = refs(self.f)
+        for needle in ("GO TO 1000-ADD 2000-CHG 3000-DEL", "GO TO 1000-ADD 2000-CHG DEPENDING", "GO TO 1000-ADD DEPENDING"):
+            self.assertIn(("WS-TRAN-IDX", "test", "GO TO", self.at(needle)), r, needle)
+
+    def test_fall_through_is_read_statement_by_statement(self):
+        falls = {fr for (fr, _t, _th, _ln, k) in self.f.performs if k == "fallthrough"}
+        # 0000-MAIN and 0200-NEXT end with a GO TO that always leaves; 0100-NEXT's PERFORM returns
+        self.assertNotIn("0000-MAIN", falls)
+        self.assertNotIn("0200-NEXT", falls)
+        self.assertIn("0100-NEXT", falls)
+        # a GO TO under AT END, a GO TO in a literal, a GO TO inside a loop that may not run: the paragraph goes on
+        for para in ("1000-ADD", "2000-CHG", "3000-DEL"):
+            self.assertIn(para, falls, para)
+        # a literal holding IF does not make the GOBACK after it conditional
+        self.assertNotIn("9000-BAD-TRAN", falls)
+        self.assertTrue(cobol._leaves("GO TO 999-EXIT."))
+        self.assertTrue(cobol._leaves("STOP RUN."))
+        self.assertTrue(cobol._leaves("EXIT PROGRAM."))
+        self.assertFalse(cobol._leaves("STOP 'WAIT'."))
+        self.assertFalse(cobol._leaves("GO TO A B DEPENDING ON IX."))
+        self.assertFalse(cobol._leaves("IF A = B GO TO X END-IF."))
+        self.assertFalse(cobol._leaves("ADD 1 TO X ON SIZE ERROR GO TO 999-EXIT."))
+        self.assertFalse(cobol._leaves("EXEC CICS RETURN END-EXEC."))
+
+    def test_a_lower_case_or_exec_dli_call_is_still_read(self):
+        # the cheap guard before the DL/I split reads the statement in upper case
+        src = program("LOWDLI", ["WORKING-STORAGE SECTION.", "01  WS-GU PIC X(4) VALUE 'GU  '.",
+                                 "01  WS-AREA PIC X(80).", "LINKAGE SECTION.", "01  DB-PCB PIC X(40)."],
+                      ["0000-MAIN.", "    call 'cbltdli' using ws-gu db-pcb ws-area",
+                       "    EXEC DLI GU USING PCB(1) SEGMENT(ROOTSEG) INTO(WS-AREA)",
+                       "    END-EXEC",
+                       "    GOBACK."])
+        f = cobol.parse_program(src)
+        self.assertEqual([(d.interface, d.func, d.line) for d in f.dli],
+                         [("CBLTDLI", "GU", line_of(src, "cbltdli")), ("EXEC DLI", "GU", line_of(src, "EXEC DLI"))])
+
+
+class TheNoteIsReadWhole(unittest.TestCase):
+
+    def test_the_note_fits_where_it_is_printed(self):
+        longest = cobol.exec_no_period_note("CICS", 99999, "ABCDEFGH")
+        self.assertLessEqual(len(longest), 120)               # `program` printed 120 characters of a detail
+        self.assertNotIn("reject", longest)                  # nothing said of a compile the member cannot show
+
+    def test_clip_cuts_at_a_word(self):
+        self.assertEqual(query.clip("short", 10), "short")
+        self.assertEqual(query.clip("", 10), "")
+        self.assertEqual(query.clip(None, 10), "")
+        cut = query.clip("the facts after it were read as if the period were there", 30)
+        self.assertEqual(cut, "the facts after it were ...")
+        self.assertLessEqual(len(cut), 30)
+        self.assertEqual(query.clip("A" * 50, 20), "A" * 16 + " ...")
+
+
+RNDREC = ("       01  RND-REC.\n"
+          "           05  RND-KEY          PIC X(10).\n"
+          "           05  RND-NAME         PIC X(30).\n"
+          "           05  RND-AMT          PIC S9(7)V99 COMP-3.\n"
+          "           05  RND-CODE         PIC X(02).\n")
+
+RNDCOPY = program("RNDCOPY1", [
+    "WORKING-STORAGE SECTION.",
+    "    COPY RNDREC.",
+    "01  WS-PGM           PIC X(08).",
+    "    EXEC SQL DECLARE RNDCUR2 CURSOR FOR",
+    "        SELECT STATUS_CD FROM PRD.RND_TBL",
+    "    END-EXEC",
+    "01  WS-LAST          PIC X(04).",
+], [
+    "0000-MAIN.",
+    "    EXEC SQL OPEN RNDCUR2 END-EXEC",
+    "    CALL WS-PGM",
+    "    GOBACK.",
+])
+
+RNDCICS = program("RNDCICS1", [
+    "WORKING-STORAGE SECTION.",
+    "01  WS-COMM          PIC X(100).",
+    "    EXEC SQL DECLARE RNDCUR CURSOR FOR",
+    "        SELECT STATUS_CD FROM PRD.RND_TBL",
+    "    END-EXEC",
+    "01  WS-STATUS        PIC X(02).",
+], [
+    "0000-MAIN.",
+    "    IF EIBCALEN = 0",
+    "        MOVE WS-STATUS TO WS-COMM",
+    "    END-IF",
+    "    EXEC SQL OPEN RNDCUR END-EXEC",
+    "    EXEC CICS RETURN END-EXEC.",
+])
+
+RNDMISS = program("RNDMISS1", ["WORKING-STORAGE SECTION.", "    COPY RNDGONE.", "01  WS-X PIC X."],
+                  ["0000-MAIN.", "    GOBACK."])
+
+
+class _RoundOne(_Built):
+
+    files = (("RN/PROD.RN.SRC/RNDCOPY1.cbl", RNDCOPY), ("RN/PROD.RN.SRC/RNDCICS1.cbl", RNDCICS),
+             ("RN/PROD.RN.SRC/RNDMISS1.cbl", RNDMISS), ("RN/PROD.RN.SRC/FILEPGM.cbl", FILES),
+             ("RN/PROD.RN.SRC/DSPPGM.cbl", DISPATCH), ("SHARED/PROD.RN.COPYLIB/RNDREC.cpy", RNDREC))
+
+
+class CoverageGivesTheReasonThatMadeItPartial(_RoundOne):
+    """A CICS program that tests EIBCALEN with no DFHCOMMAREA, and whose DECLARE CURSOR in WORKING-STORAGE has no period
+    after its END-EXEC: coverage named no_commarea - a note that makes no member partial, written first - as the
+    reason, the advice under the table sent the reader to fetch a copybook library, and flow said 'facts incomplete'."""
+
+    def test_the_reason_is_exec_no_period(self):
+        cov = self.page(query.cmd_coverage)
+        part = cov.split("### Members parsed only in part")[1].split("\n### ")[0]
+        self.assertIn("(3)", part.splitlines()[0])
+        self.assertIn("| cobol | 3 | exec_no_period (2) |", part)
+        self.assertIn("| cobol | RNDCICS1 | PROD.RN.SRC | exec_no_period: "
+                      + NOTE.format(line_of(RNDCICS, "RNDCUR CURSOR")) + " |", part)
+        self.assertIn("| cobol | RNDCOPY1 | PROD.RN.SRC | exec_no_period: "
+                      + NOTE.format(line_of(RNDCOPY, "RNDCUR2 CURSOR")) + " |", part)
+        self.assertIn("| cobol | RNDMISS1 | PROD.RN.SRC | expand: L5: COPY RNDGONE NOT FOUND", part)
+        self.assertNotIn("no_commarea", part)
+        # the advice speaks of both reasons the table holds
+        self.assertIn("usually partial because a copybook it copies is not in the index", part)
+        self.assertIn("2 of the members above are partial because an EXEC block before the PROCEDURE DIVISION has no "
+                      "period after its END-EXEC (exec_no_period): nothing to fetch", part)
+        # the note the CICS program also carries is still said, as what it is
+        self.assertEqual(self.q("""SELECT u.kind FROM unresolved u JOIN member m ON m.id = u.member_id
+                                   WHERE m.name = 'RNDCICS1' ORDER BY u.id"""),
+                         [("no_commarea",), ("exec_no_period",)])
+
+    def test_flow_names_the_reason(self):
+        out = self.page(query.cmd_flow, "WS-COMM", "RNDCICS1")
+        self.assertIn(f"[program partial: EXEC SQL at line {line_of(RNDCICS, 'RNDCUR CURSOR')} has no period after "
+                      "its END-EXEC]", out)
+        self.assertNotIn("facts incomplete", out)
+
+    def test_the_line_column_is_the_members_own(self):
+        page = self.page(query.cmd_program, "RNDCOPY1")
+        decl, call = line_of(RNDCOPY, "RNDCUR2 CURSOR"), line_of(RNDCOPY, "CALL WS-PGM")
+        self.assertIn(f"| RNDCOPY1 | exec_no_period | {NOTE.format(decl)} | {decl} |", page)
+        self.assertRegex(page, rf"\| RNDCOPY1 \| dynamic_call \| CALL WS-PGM [^|]* \| {call} \|")
+        # the rows are stored at their lines in the expanded text, the copybook's lines before them
+        stored = self.q("""SELECT u.kind, u.line FROM unresolved u JOIN member m ON m.id = u.member_id
+                             WHERE m.name = 'RNDCOPY1' AND u.kind IN ('exec_no_period', 'dynamic_call')
+                             ORDER BY u.line""")
+        self.assertEqual([k for k, _ln in stored], ["exec_no_period", "dynamic_call"])
+        self.assertEqual(stored[0][1] - decl, stored[1][1] - call)
+        self.assertGreaterEqual(stored[0][1] - decl, 5)
+
+    def test_an_index_without_the_line_map_keeps_the_stored_number(self):
+        conn = query.connect(self.db)
+        try:
+            pid = conn.execute("SELECT p.id FROM program p JOIN member m ON m.id = p.member_id "
+                               "WHERE m.name = 'RNDCOPY1'").fetchone()[0]
+            self.assertEqual(query.unresolved_line_cell(conn, pid, 99999), 99999)      # no run holds it
+            self.assertEqual(query.unresolved_line_cell(conn, None, 7), 7)             # no program row
+            self.assertIsNone(query.unresolved_line_cell(conn, pid, None))
+        finally:
+            conn.close()
+
+    def test_field_of_a_file_name_says_it_is_a_file(self):
+        page = self.page(query.cmd_field, "IN-FILE")
+        self.assertNotIn("NOT DEFINED", page)
+        self.assertIn("`IN-FILE` is a **file** (SELECT ... ASSIGN, FD), not a data item - declared in 1 program:", page)
+        self.assertIn(f"| FILEPGM | INFILE | INDEXED | IN-RECORD | RN/FILEPGM:{line_of(FILES, 'SELECT IN-FILE')} |", page)
+        self.assertIn("`flow IN-RECORD --program P`", page)          # a file's bytes travel as its record
+        self.assertIn("`program FILEPGM` shows what the program does with the file", page)
+        self.assertIn("`field IN-RECORD` the reads and writes of its record", page)
+        self.assertNotIn("an index built before", page)
+        self.assertIn("**NOT DEFINED**", self.page(query.cmd_field, "NO-SUCH-NAME"))
+
+    def test_field_of_a_file_name_on_an_older_index(self):
+        # an index built before ROADMAP re-parse item 26 recorded OPEN / CLOSE as reads of the file
+        td = tempfile.mkdtemp()
+        try:
+            db = os.path.join(td, "old.db")
+            shutil.copy(self.db, db)
+            conn = sqlite3.connect(db)
+            pid = conn.execute("SELECT p.id FROM program p JOIN member m ON m.id = p.member_id "
+                               "WHERE m.name = 'FILEPGM'").fetchone()[0]
+            conn.execute("INSERT INTO field_ref(program_id, name, mode, stmt, line) VALUES(?, 'IN-FILE', 'read', "
+                         "'OPEN', ?)", (pid, line_of(FILES, "OPEN I-O")))
+            conn.commit()
+            conn.close()
+            conn = query.connect(db)
+            try:
+                page = query.cmd_field(conn, "IN-FILE")
+            finally:
+                conn.close()
+            self.assertIn("is a **file**", page)
+            self.assertIn("file statements (OPEN, CLOSE, START, DELETE) that an index built before ROADMAP re-parse "
+                          "item 26 recorded as reads", page)
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
+
+    def test_the_dispatchers_index_answers_field(self):
+        page = self.page(query.cmd_field, "WS-TRAN-IDX")
+        self.assertIn(f"DSPPGM GO TO x3 @RN/DSPPGM:{line_of(DISPATCH, 'GO TO 1000-ADD 2000-CHG 3000-DEL')}", page)
+
+    def test_the_stand_ins_find_nothing_to_do(self):
+        conn = query.connect(self.db)
+        try:
+            for name in ("RNDCOPY1", "RNDCICS1", "RNDMISS1"):
+                self.assertEqual(query.partial_kind(conn, self.member_id(name)), "partial", name)
+            for name in ("FILEPGM", "DSPPGM"):
+                self.assertIsNone(query.partial_kind(conn, self.member_id(name)), name)
+        finally:
+            conn.close()
+        cov = self.page(query.cmd_coverage)
+        self.assertNotIn("chosen among several", cov.split("### Members parsed only in part")[1].split("\n### ")[0])
+
+
+class OnlyTheExecReason(_Built):
+    """Every partial member of the estate is partial for its EXEC block: the copybook advice is not printed."""
+
+    def test_the_advice_is_the_exec_sentence_alone(self):
+        cov = self.page(query.cmd_coverage)
+        part = cov.split("### Members parsed only in part")[1].split("\n### ")[0]
+        self.assertNotIn("usually partial because a copybook", part)
+        self.assertIn("2 of the members above are partial because an EXEC block", part)
+        page = self.page(query.cmd_program, "BOOKPGM")
+        self.assertRegex(page, r"\| BOOKPGM \| exec_no_period \| EXEC SQL at line 1 of copybook NOBOOK has no period "
+                               r"after its END-EXEC; what follows was read as if it had one \| (?:\w+/)?NOBOOK:1 "
+                               r"\(via COPY NOBOOK\) \|")
+
+
+# ---------------------------------------------------------------------------
 # the reproductions
 # ---------------------------------------------------------------------------
 
@@ -752,6 +1043,15 @@ class TheDocsSayIt(unittest.TestCase):
                     "F14-file-and-function-as-field", "F15-ws-exec-sql-no-period"):
             self.assertIn("Fixed by ROADMAP re-parse item 26 (LESSONS 211)", self.read("tools", "synth", "repro", rid,
                                                                                      "README.md"), rid)
+        # the verifier's first round
+        self.assertIn("| 212 | Not seen on his estate - the verifier's first round on ROADMAP re-parse item 26", lessons)
+        self.assertIn("a sentence written into the index says what the index did, never the verdict of a tool", lessons)
+        self.assertIn("(`query.unresolved_line_cell` - a parser note after a COPY printed its expanded line)", roadmap)
+        self.assertIn("so the note says nothing of the compile", roadmap)
+        self.assertNotIn("would reject", roadmap)
+        f15 = self.read("tools", "synth", "repro", "F15-ws-exec-sql-no-period", "README.md")
+        self.assertIn("'EXEC SQL at line 6 has no period after its END-EXEC; what follows was read as if it had one'", f15)
+        self.assertNotIn("which the compiler rejects", f15)
         report = self.read("docs", "SYNTH-findings-2026-09-25.md")
         self.assertIn("F25 is the toolkit's, not the generator's", report)
         self.assertIn("POLUPD05's rows F16, F17, F21-F24 did not come from F15's shape", report)

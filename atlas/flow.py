@@ -718,10 +718,14 @@ class _Walker(_Report):
         # a copybook chosen among several is not a partial parse (Q.partial_kind)
         if not p or not Q.is_truly_partial(self.conn, p["member_id"]):
             return None
-        rows = self.conn.execute("""SELECT detail FROM unresolved WHERE member_id=? AND kind IN ('expand','missing_copybook')
+        # the notes that make a program partial: a copybook not expanded, and an EXEC block with no period after its
+        # END-EXEC (exec_no_period), which printed '[program partial: facts incomplete]' with no reason (LESSONS 212)
+        rows = self.conn.execute("""SELECT kind, detail FROM unresolved WHERE member_id=?
+                                    AND kind IN ('expand','missing_copybook','exec_no_period')
                                     AND instr(COALESCE(detail, ''), ?) = 0 ORDER BY id LIMIT 4""",
                                  (p["member_id"], Q.AMBIGUOUS_PICK)).fetchall()
-        det = "; ".join(r["detail"].split(" - ")[0].replace("]", ")") for r in rows) or "facts incomplete"
+        det = "; ".join((r["detail"] or "").split(";")[0] if r["kind"] == "exec_no_period"
+                        else (r["detail"] or "").split(" - ")[0] for r in rows).replace("]", ")") or "facts incomplete"
         return f"[program partial: {det}]"
 
     # ---- closure -----------------------------------------------------------------

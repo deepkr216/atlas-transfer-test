@@ -635,22 +635,35 @@ shipped alone and cost one such night; these still wait for the next one:
    sentence was never seen), and SORT / MERGE / CANCEL / ALTER / ENTRY joined the splitter. OPEN and CLOSE record no
    field reference, START and DELETE not their file, a SELECT / FD name is never one, and the name after FUNCTION
    is the function's (its arguments are read). An EXEC SQL / CICS / DLI block before the PROCEDURE DIVISION whose
-   END-EXEC lacks its period - a compile error - ran on into the division header and the program lost every
-   paragraph while it read `parse: ok`: `reader.cobol_statements` closes it at the END-EXEC (in a member with no
-   division header, when a level number follows), and the member is `partial` with 'EXEC SQL at line N ends
-   without its period - the compiler would reject it; the facts after it were read as if the period were there'
-   ('line N of copybook X' when the block came from a COPY), explained in coverage's kinds table
-   (exec_no_period). `program`'s Calls table shows the variable a CALL / LINK / XCTL names beside the targets it
+   END-EXEC lacks its period ran on into the division header and the program lost every paragraph while it read
+   `parse: ok`: `reader.cobol_statements` closes it at the END-EXEC (in a member with no division header, when a
+   level number follows), and the member is `partial` with 'EXEC SQL at line N has no period after its END-EXEC;
+   what follows was read as if it had one' ('line N of copybook X' when the block came from a COPY), explained in
+   coverage's kinds table (exec_no_period). Whether a compile rejects such a member depends on the step that read
+   the block - a separate DB2 precompiler or CICS translator turns it into comment lines before the compiler runs,
+   the compiler's own SQL / CICS option reads it itself - so the note says nothing of the compile; worth asking him
+   which his compile JCL runs: if every such member compiled through a precompiler, a later night may call them
+   `ok` with the note kept. `program`'s Calls table shows the variable a CALL / LINK / XCTL names beside the targets it
    resolves to (`query.call_target_cell` - the synth finding F25: a variable holding one literal printed the
    target alone); that is query side, the same on an index built before the batch. The report's POLUPD05 findings
    (F16, F17, F21-F24) came from the 8-digit stub POLSTUBC expanded as code, the same run-on into the division
    header, and item 23 had already fixed them. The stand-ins of this week find nothing to do on such an index:
    partial_kind calls the F15 member truly partial, recover marks, re-files and names nothing. The synth harness
    over the whole estate: 428 findings (433 facts) before, 310 (315) after, 10,886 facts matched before and 11,053
-   after, none new. The first build of this toolkit re-parses every member. tests/test_sentence_facts.py
-   (DliCallsInOneSentence, SqlInOneSentence, NamesBeginningWithEnd, LiteralMovesInOneSentence,
-   FileAndFunctionNames, ExecWithoutItsPeriod, TheBuildAndTheReports, TheStandInsFindNothingToDo,
-   TheReproductions).
+   after, none new. The first build of this toolkit re-parses every member. The verifier's first round (LESSONS
+   212) added: a GO TO target list ends at every statement verb too (`GO TO A B DEPENDING ON IX` then `GO TO
+   9000-BAD.` in one sentence gave GO TO edges to DEPENDING, ON, IX, GO and TO at the first line), the DEPENDING ON
+   index is a test reference, a paragraph's fall-through is judged statement by statement (`cobol._leaves`: a GO TO
+   under AT END, in a literal or in an inline PERFORM UNTIL no longer counts as leaving), and `_extract_dli` skips a
+   statement without DLI (the split had made the parse ~10% slower); query side, on either index: coverage gives
+   exec_no_period as the reason that made a member partial (a CICS program's no_commarea was given) with advice of
+   its own, flow's partial note names it, the Unresolved table's line column is the member's own line
+   (`query.unresolved_line_cell` - a parser note after a COPY printed its expanded line), notes are cut at a word
+   (`query.clip`), and `field` of a SELECT / FD file name says it is a file instead of NOT DEFINED.
+   tests/test_sentence_facts.py (DliCallsInOneSentence, SqlInOneSentence, NamesBeginningWithEnd,
+   LiteralMovesInOneSentence, FileAndFunctionNames, ExecWithoutItsPeriod, TheBuildAndTheReports,
+   TheStandInsFindNothingToDo, GoToDependingInASentence, TheNoteIsReadWhole,
+   CoverageGivesTheReasonThatMadeItPartial, OnlyTheExecReason, TheReproductions).
 
 ### flow: known limits (open after review)
 

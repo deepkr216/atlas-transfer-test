@@ -199,6 +199,34 @@ def table(headers: Sequence[str], rows: Iterable[Sequence]) -> str:
     return "\n".join(out) + "\n"
 
 
+def clip(text: Optional[str], n: int) -> str:
+    """`text` whole when it fits in `n` characters, else cut at the last space
+    before and ' ...' said: a note cut at a fixed width ended mid-word ('the
+    facts after it were r') and read as if that were all it said (LESSONS 212)."""
+    text = text or ""
+    if len(text) <= n:
+        return text
+    cut = text.rfind(" ", 0, n - 3)
+    return (text[:cut] if cut > n // 2 else text[:n - 4]).rstrip(" ,;:-") + " ..."
+
+
+def unresolved_line_cell(conn: sqlite3.Connection, program_id: Optional[int], line: Optional[int]):
+    """The line an Unresolved row names, as the member's own: a COBOL parser
+    note is stored at its line in the EXPANDED text, so after a COPY the
+    number was not the member's line (a dynamic_call at member line 9 after a
+    5-line copybook read 15; the exec_no_period row named line 6 in its
+    sentence and 12 in this column - LESSONS 212). A line a copybook brought in
+    is `BOOK:N (via COPY BOOK)`. A member with no program row (a copybook, a
+    job, a map) stores its own lines; an index without the line map keeps the
+    stored number."""
+    if line is None or program_id is None:
+        return line
+    tag, src, depth, via = origin(conn, program_id, line)
+    if tag is None:
+        return line
+    return f"{tag}:{src} (via COPY {via})" if depth else src
+
+
 # The resolver's own wording when several members share a copybook's name
 # with different content and one was chosen (build.make_resolver): the
 # 'ambiguous_copybook' row carries it. An index built BEFORE ROADMAP re-parse
@@ -359,16 +387,23 @@ def unresolved_for(conn: sqlite3.Connection, member_ids: Sequence[int], limit: i
     # 'ambiguous_copybook' row says: shown once, as the choice it is
     not_pick = "NOT (u.kind = 'expand' AND instr(COALESCE(u.detail, ''), ?) > 0)"
     rows = conn.execute(f"""
-        SELECT m.name, u.kind, u.detail, u.line FROM unresolved u JOIN member m ON m.id = u.member_id
+        SELECT m.id AS mid, m.name, u.kind, u.detail, u.line FROM unresolved u JOIN member m ON m.id = u.member_id
         WHERE u.member_id IN ({q}) AND {not_pick} ORDER BY u.kind, m.name LIMIT ?""",
                         (*member_ids, AMBIGUOUS_PICK, limit)).fetchall()
     total = conn.execute(f"SELECT COUNT(*) FROM unresolved u WHERE u.member_id IN ({q}) AND {not_pick}",
                          (*member_ids, AMBIGUOUS_PICK)).fetchone()[0]
     if not total:
         return "\n### Unresolved in scope\n_none - but see `coverage` for estate-wide blind spots_\n"
+    # each member's program row, whose line map turns a parser note's expanded line into the member's own
+    mids = sorted({r["mid"] for r in rows})
+    pid_of: Dict[int, int] = {}
+    for mid, pid in conn.execute(f"SELECT member_id, id FROM program WHERE member_id IN ({','.join('?' * len(mids))}) "
+                                 "ORDER BY id DESC", mids):
+        pid_of[mid] = pid
     out = [f"\n### Unresolved in scope ({total}) - the answer is incomplete to this extent\n"]
     out.append(table(["member", "kind", "detail", "line"],
-                     [(r["name"], r["kind"], r["detail"][:120], r["line"]) for r in rows]))
+                     [(r["name"], r["kind"], clip(r["detail"], 160),
+                       unresolved_line_cell(conn, pid_of.get(r["mid"]), r["line"])) for r in rows]))
     if total > limit:
         out.append(f"_...{total - limit} more_\n")
     return "".join(out)
@@ -936,11 +971,45 @@ def _root_of(conn: sqlite3.Connection, field_id: int) -> sqlite3.Row:
     return r
 
 
+def _file_decls(conn: sqlite3.Connection, name: str) -> List[sqlite3.Row]:
+    """The SELECT / FD declarations of a file name, program by program."""
+    return conn.execute("""SELECT p.id AS pid, p.program_id, f.assign_dd, f.organization, f.fd_record, f.line
+                           FROM file_decl f JOIN program p ON p.id = f.program_id
+                           WHERE UPPER(f.select_name) = ? ORDER BY p.program_id, f.line""", (name.upper(),)).fetchall()
+
+
+def _file_not_field(conn: sqlite3.Connection, name: str, files: Sequence[sqlite3.Row], shown: int = 12) -> str:
+    """`field` for a name the index holds as a SELECT / FD file and nowhere
+    as a data item. Since ROADMAP re-parse item 26 no statement records a file
+    as a field reference (OPEN / CLOSE recorded it as a read), and `field
+    VOY-FILE` answered only NOT DEFINED with 'check spelling' - wrong advice
+    for a name the index holds (LESSONS 212). Says where it is declared and
+    which report answers for a file; on an index built before item 26 the
+    file statements it recorded as reads are listed below, and said to be so."""
+    nm = name.upper()
+    out = [f"`{nm}` is a **file** (SELECT ... ASSIGN, FD), not a data item - declared in {len(files)} "
+           f"program{'' if len(files) == 1 else 's'}:\n"]
+    out.append(table(["program", "ASSIGN TO", "organization", "FD record", "cite"],
+                     [(f["program_id"], f["assign_dd"] or "", f["organization"] or "", f["fd_record"] or "",
+                       cite(conn, f["pid"], f["line"])) for f in files[:shown]]))
+    if len(files) > shown:
+        out.append(f"_... {len(files) - shown} more_\n")
+    rec = next((f["fd_record"] for f in files if f["fd_record"]), None)
+    out.append(f"\n`program {files[0]['program_id']}` shows what the program does with the file (OPEN, READ, WRITE) "
+               "and the dataset each job step gives its DD"
+               + (f"; `field {rec}` the reads and writes of its record" if rec else "") + ".\n")
+    if conn.execute("SELECT 1 FROM field_ref WHERE UPPER(name)=? LIMIT 1", (nm,)).fetchone():
+        out.append("The references below are file statements (OPEN, CLOSE, START, DELETE) that an index built before "
+                   "ROADMAP re-parse item 26 recorded as reads of the file; a build of this toolkit records none.\n")
+    return "".join(out)
+
+
 def cmd_field(conn: sqlite3.Connection, name: str, show_all: bool = False,
               program: Optional[str] = None) -> str:
     defs = _field_defs(conn, name)
     out = [f"# Field {name.upper()}\n"]
     names = [name.upper()]
+    files: List[sqlite3.Row] = []            # the name is a SELECT / FD file and no data item
     if not defs:
         # An 88-level name (PM-LAPSED): the question is really about its
         # parent field and the value it stands for.
@@ -958,8 +1027,12 @@ def cmd_field(conn: sqlite3.Connection, name: str, show_all: bool = False,
                        f"for every value the code assumes.\n")
             defs = []
         else:
-            out.append("**NOT DEFINED** in any indexed copybook or program (check spelling, REPLACING renames, "
-                       "or an 88-level name - try `literal`).\n")
+            files = _file_decls(conn, name)
+            if files:
+                out.append(_file_not_field(conn, name, files))
+            else:
+                out.append("**NOT DEFINED** in any indexed copybook or program (check spelling, REPLACING renames, "
+                           "or an 88-level name - try `literal`).\n")
     # COPY ... REPLACING renamed it in some programs: their references are
     # indexed under the new name.
     for a in conn.execute("SELECT DISTINCT new_name FROM field_alias WHERE UPPER(orig_name)=?", (name.upper(),)):
@@ -1039,8 +1112,10 @@ def cmd_field(conn: sqlite3.Connection, name: str, show_all: bool = False,
         if cap and len(rows) > cap:
             dropped = sorted({r[2] for r in rows[cap:]})
             out.append(f"_...{len(rows) - cap} more (programs: {', '.join(dropped[:20])}); `--all` shows them_\n")
+    # a file's bytes travel as its record: `flow` follows the FD record, not the file name
+    flow_name = next((f["fd_record"] for f in files if f["fd_record"]), None) or name.upper()
     out.append(f"\n> Where the VALUE goes - group MOVEs, READ INTO / WRITE FROM, CALL USING positions, the file's "
-               f"bytes to the reader, DB2 columns: `flow {name.upper()} --program P` (`--up`: where it comes from).\n")
+               f"bytes to the reader, DB2 columns: `flow {flow_name} --program P` (`--up`: where it comes from).\n")
 
     # DB2 columns this field is loaded from / stored to (column-level lineage)
     sc = conn.execute("""SELECT c.tbl, c.col, c.mode, c.stmt, c.line, p.program_id, p.id AS pid
@@ -1905,12 +1980,15 @@ UNRESOLVED_MEANING = {
     "scheduler_symbol": ("a dataset name holding a scheduler symbol (%%ODATE, #JI, &DATE) that is only filled in at run "
                          "time, so the real name is not known",
                          "read the scheduler's own definition of that symbol; the index keeps the name with <VAR> in it"),
-    "exec_no_period": ("an EXEC SQL / CICS / DLI block before the PROCEDURE DIVISION whose END-EXEC has no period "
-                       "after it: the compiler rejects the member as written, so the source in the estate is not the "
-                       "one that compiled; the index read it as if the period were there",
+    "exec_no_period": ("an EXEC SQL / CICS / DLI block before the PROCEDURE DIVISION with no period after its "
+                       "END-EXEC: the index read it as if the period were there, and the member is partial because "
+                       "the facts after that line rest on it",
                        "look at the member at the line the note names - a period lost in an edit, or a copy that "
-                       "never compiled: the facts after that line are right only if the period was all that was "
-                       "missing"),
+                       "never compiled. Whether a compile accepted it depends on the step that read the block - a "
+                       "separate precompiler or translator (DB2's, CICS's) turns it into comment lines before the "
+                       "compiler runs, the compiler's own SQL / CICS option reads it itself: the program's compile "
+                       "JCL or listing says which. Nothing to fetch; the facts after that line are right when the "
+                       "period is all that is missing"),
     "no_program_id": ("a program with no PROGRAM-ID paragraph the parser could read - the member name stands in for it",
                       "check the member: a copybook or a card deck filed in a source library, or a PROGRAM-ID written "
                       "in a form the parser does not read (report the shape)"),
@@ -1928,15 +2006,20 @@ def _partial_members(conn: sqlite3.Connection, limit: int = COVERAGE_ROWS) -> st
     a COBOL member is `partial` mostly because a copybook it copies was not
     found, and then the fields of that copybook are missing from the index.
     The reason shown is the one that MADE it partial (a missing copybook, an
-    unrecognised map), not the first note the parser happened to write - and
-    never the resolver's chosen-among-several note, which does not make a
-    member partial (see _chosen_members: those members are not in this table)."""
+    EXEC block with no period after its END-EXEC, an unrecognised map), not
+    the first note the parser happened to write - and never the resolver's
+    chosen-among-several note, which does not make a member partial (see
+    _chosen_members: those members are not in this table). exec_no_period
+    ranked with the notes that make no member partial, so a CICS program's
+    no_commarea note, written before it, was given as the reason (LESSONS
+    212). The advice under the table speaks of the reasons the table shows."""
     rows = conn.execute(f"""
         SELECT m.kind, m.name, m.library, m.parse_error,
-               (SELECT u.kind || ': ' || SUBSTR(COALESCE(u.detail, ''), 1, 90) FROM unresolved u
+               (SELECT u.kind || ': ' || SUBSTR(COALESCE(u.detail, ''), 1, 200) FROM unresolved u
                 WHERE u.member_id = m.id
                 ORDER BY CASE WHEN u.kind = 'expand' AND instr(COALESCE(u.detail, ''), ?) = 0 THEN 0
-                              WHEN u.kind IN ('expand', 'screen') THEN 1 ELSE 2 END, u.id LIMIT 1) AS why,
+                              WHEN u.kind IN ('exec_no_period', 'expand', 'screen') THEN 1 ELSE 2 END,
+                         u.id LIMIT 1) AS why,
                (SELECT COUNT(*) FROM doc_image i WHERE i.member_id = m.id AND i.ocr_text IS NOT NULL
                 AND i.ocr_text <> '') AS ocr_read
         FROM member m WHERE m.parse_status = 'partial' AND NOT ({_CHOSEN_PRED})
@@ -1953,7 +2036,7 @@ def _partial_members(conn: sqlite3.Connection, limit: int = COVERAGE_ROWS) -> st
     out = [f"\n### Members parsed only in part ({len(rows)}) - their facts are incomplete to this extent\n"]
     out.append(table(["kind", "members", "most common reason"],
                      [(k, len(v), _top_reason(v)) for k, v in sorted(by_kind.items(), key=lambda kv: -len(kv[1]))]))
-    shown = [(r["kind"], r["name"], r["library"], (r["why"] or r["parse_error"] or "")[:110]
+    shown = [(r["kind"], r["name"], r["library"], clip(r["why"] or r["parse_error"] or "", 150)
               + (f" - {r['ocr_read']} picture(s) read by OCR since: text in sections 1001+" if r["ocr_read"] else ""))
              for r in rows[:limit]]
     out.append("\n" + table(["kind", "member", "library", "reason"], shown))
@@ -1964,11 +2047,20 @@ def _partial_members(conn: sqlite3.Connection, limit: int = COVERAGE_ROWS) -> st
     if len(rows) > limit:
         out.append(f"_... {len(rows) - limit} more; every one of them: `coverage --all`; the copybooks they miss "
                    "are the 'Copybooks not found' table below_\n")
-    out.append("\n> A COBOL member is usually partial because a copybook it copies is not in the index: fetch that "
-               "copybook library and build again - or, when the estate holds compiler listings or expanded "
-               "programs, `python -m atlas.recover --db atlas.db` rebuilds the missing copybooks from them. A "
-               "document is partial when no text could be extracted (a scan - run `OCR images`). A screen member "
-               "is partial when no map or format macro was recognised.\n")
+    # the advice speaks of the reasons the table holds: a member made partial by an EXEC block with no period after
+    # its END-EXEC has nothing to fetch, and the copybook advice alone sent the reader to fetch a library
+    no_period = sum(1 for r in rows if (r["why"] or "").startswith("exec_no_period:"))
+    if no_period < len(rows):
+        out.append("\n> A COBOL member is usually partial because a copybook it copies is not in the index: fetch that "
+                   "copybook library and build again - or, when the estate holds compiler listings or expanded "
+                   "programs, `python -m atlas.recover --db atlas.db` rebuilds the missing copybooks from them. A "
+                   "document is partial when no text could be extracted (a scan - run `OCR images`). A screen member "
+                   "is partial when no map or format macro was recognised.\n")
+    if no_period:
+        out.append(f"\n> {no_period} of the members above {'is' if no_period == 1 else 'are'} partial because an EXEC "
+                   "block before the PROCEDURE DIVISION has no period after its END-EXEC (exec_no_period): nothing to "
+                   "fetch - look at the member at the line its note names; its row in 'Unresolved by kind' below "
+                   "says what to check.\n")
     if any(r["kind"] in ("cobol", "copybook") for r in rows):
         arrived, misfiled, waiting = recover.arrival_scan(conn)
         clauses = []                                                    # only the clause whose count is not zero

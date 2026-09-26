@@ -224,8 +224,8 @@ class LogicalLine:
     charmap: Optional[List[int]] = None
     # (SQL | CICS | DLI, the line of its EXEC keyword) when cobol_statements
     # closed this statement at an END-EXEC with no period after it outside the
-    # PROCEDURE DIVISION - a compile error the parser reports, not a reason to
-    # let the EXEC block swallow the entries and the division header after it
+    # PROCEDURE DIVISION - a missing period the parser reports, never a reason
+    # to let the EXEC block swallow the entries and the division header after it
     no_period: Optional[Tuple[str, int]] = None
 
     def line_at(self, offset: int) -> int:
@@ -564,8 +564,9 @@ def cobol_statements(logical: Sequence[LogicalLine]) -> Iterator[LogicalLine]:
     One place the text lacks its period and the statement ends anyway: an
     EXEC SQL / CICS / DLI block outside the PROCEDURE DIVISION (a DECLARE
     CURSOR or an INCLUDE in WORKING-STORAGE) whose END-EXEC has no period
-    after it. The compiler rejects the member; read as one sentence, the
-    block swallowed the data entries after it and the PROCEDURE DIVISION
+    after it. Whether a compile accepted that depends on the step that read
+    the block (the DB2 precompiler or the SQL coprocessor); read as one
+    sentence here, the block swallowed the data entries after it and the PROCEDURE DIVISION
     header, and the program lost every paragraph while it read `parse: ok`
     (the synthetic reproduction F15). The statement is closed at the END-EXEC
     - before the PROCEDURE DIVISION header, or, with no division header yet

@@ -105,7 +105,12 @@ class GoTo(unittest.TestCase):
         t0 = time.time()
         m = cobol._GO_TO.search(text)
         self.assertLess(time.time() - t0, 0.5)
-        self.assertIsNone(m)
+        # the list ends at the MOVE, as at any statement verb (LESSONS 212): it gave no edge at all before
+        self.assertEqual((m.group(1), m.group(2)), ("ABCDEFGHIJKLMNOPQRSTUVWXYZ1234", "WS-IDX"))
+        text = "GO TO " + " ".join(f"PARA-{i:04d}-LONG-NAME" for i in range(400)) + " DEPENDING ON WS-IDX 'LIT'"
+        t0 = time.time()
+        self.assertIsNone(cobol._GO_TO.search(text))            # a literal after the clause ends no list
+        self.assertLess(time.time() - t0, 0.5)
         text = "GO TO PARA-ONE-LONG-NAME-HERE, PARA-TWO-LONG-NAME-HERE DEPENDING ON WS-IDX MOVE X(1) TO Y"
         t0 = time.time()
         cobol._GO_TO.search(text)

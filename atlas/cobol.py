@@ -133,8 +133,13 @@ _LEVEL_ENTRY = re.compile(rf"^\s*(\d{{1,2}})\s+({ID})\b(.*)$", re.IGNORECASE | r
 _SET_TRUE = re.compile(B + rf"SET\s+({ID})\s+TO\s+TRUE" + E, re.IGNORECASE)
 # target lists are identifiers separated by whitespace or a comma: with an
 # optional separator one word could be split at every character and an
-# unterminated `GO TO name MOVE ...` backtracked exponentially (LESSONS 146)
-_GO_TO = re.compile(B + r"GO\s+TO\s+(" + ID + r"(?:[\s,]+" + ID + r")*?)(?:[\s,]+DEPENDING\s+(?:ON\s+)?(" + ID + r"))?(?=\s*(?:$|\.|" + B + r"(?:" + _END + r"|ELSE|WHEN)" + E + "))",
+# unterminated `GO TO name MOVE ...` backtracked exponentially (LESSONS 146).
+# The list ends at every statement verb, as OPEN / CLOSE / SORT USING do: it
+# ended only at a period, a scope terminator, ELSE or WHEN, so `GO TO A B
+# DEPENDING ON IX` then `GO TO 9000-BAD.` in one sentence gave plain GO TO
+# edges to A, B, DEPENDING, ON, IX, GO, TO and 9000-BAD, all at the first line
+# (LESSONS 212)
+_GO_TO = re.compile(B + r"GO\s+TO\s+(" + ID + r"(?:[\s,]+" + ID + r")*?)(?:[\s,]+DEPENDING\s+(?:ON\s+)?(" + ID + r"))?(?=\s*(?:$|\.|" + B + r"(?:" + _END + r"|" + _STATEMENT_VERBS + r")" + E + "))",
                     re.IGNORECASE)
 MAX_RESOLVED = 40                         # candidate targets kept per dynamic CALL
 _ALTER = re.compile(B + rf"ALTER\s+({ID})\s+TO\s+(?:PROCEED\s+TO\s+)?({ID})", re.IGNORECASE)
@@ -375,10 +380,17 @@ def exec_no_period_note(kind: str, line: int, copybook: Optional[str] = None) ->
     """The note of an EXEC block outside the PROCEDURE DIVISION whose END-EXEC
     has no period after it (reader.cobol_statements closes it there): `kind`
     SQL / CICS / DLI, `line` the line of its EXEC keyword - in the copybook
-    named, when the block came from one."""
+    named, when the block came from one.
+
+    It says what the index did and nothing about the compile: whether a
+    compile rejects such a member depends on the step that read the block (the
+    DB2 precompiler turns it into comment lines before the compiler runs, the
+    SQL coprocessor hands it to the compiler), which the member does not say -
+    coverage's kinds table sends the reader to the compile JCL or listing.
+    Short enough to be read whole where `program` and coverage print it, with
+    a copybook's name in it (LESSONS 212)."""
     where = f"line {line}" + (f" of copybook {copybook}" if copybook else "")
-    return (f"EXEC {kind} at {where} ends without its period - the compiler would reject it; "
-            "the facts after it were read as if the period were there")
+    return f"EXEC {kind} at {where} has no period after its END-EXEC; what follows was read as if it had one"
 
 
 # --------------------------------------------------------------------------
@@ -1338,6 +1350,10 @@ def _dli_flow(f: ProgramFacts, ln: int, verb: str, func: Optional[str], io_area:
 def _extract_dli(f: ProgramFacts, st: LogicalLine, literal_map: Optional[Dict[str, Set[str]]] = None,
                  guards: Optional[List[Tuple[int, Optional[str]]]] = None) -> None:
     literal_map = literal_map or {}
+    if "DLI" not in st.upper:
+        # every statement of every division comes here: without a DL/I interface name (CBLTDLI, AIBTDLI,
+        # PLITDLI) or EXEC DLI there is nothing to split - the split made the whole parse ~10% slower
+        return
     # Every CALL 'CBLTDLI' of the sentence, each at its own line with its own USING list: an IMS program
     # writes GU, then CHKP, then GN without a period between them, and only the first was kept - cited at
     # the sentence's first line, the rest of the sentence read as its SSAs (the synthetic reproduction F01)
@@ -1573,20 +1589,50 @@ def _extract_performs(f: ProgramFacts, st: LogicalLine, here: str) -> None:
                            st.line_at(m.start()), "sort_proc"))
 
 
-_TERMINAL = re.compile(B + r"(?:GOBACK|STOP\s+RUN|EXIT\s+PROGRAM|GO\s+TO)" + E, re.IGNORECASE)
+_LITERAL = re.compile(r"'(?:[^']|'')*'|\"(?:[^\"]|\"\")*\"")
+# a phrase that makes the statements after it conditional: AT END, INVALID KEY, ON SIZE ERROR, ON EXCEPTION,
+# ON OVERFLOW, AT END-OF-PAGE / EOP (their NOT forms too) - reserved words, never a data name
+_CONDITIONAL_PHRASE = re.compile(B + r"(?:END|INVALID|ERROR|EXCEPTION|OVERFLOW|EOP|END-OF-PAGE)" + E, re.IGNORECASE)
+
+
+def _leaves(sentence: str) -> bool:
+    """The sentence leaves its paragraph whatever happens: one of its
+    statements is GOBACK, STOP RUN, EXIT PROGRAM or a GO TO without DEPENDING,
+    and no IF / EVALUATE / SEARCH / WHEN / ELSE, inline PERFORM UNTIL /
+    VARYING or conditional phrase (AT END, INVALID KEY, SIZE ERROR ...) may
+    skip it. Read statement by statement, literals and EXEC blocks aside: the
+    words anywhere in the sentence decided before, so `GO TO A B DEPENDING ON
+    IX` then `GO TO 9000-BAD.` fell through (DEPENDING was in the sentence)
+    although its last GO TO always leaves, `READ F AT END GO TO 999-EXIT.` did
+    not although the READ goes on when a record is read, and `DISPLAY 'GO TO
+    THE DESK'` left (LESSONS 212)."""
+    body = _EXEC_ANY.sub(lambda m: " " * len(m.group(0)), sentence.strip().rstrip("."))
+    body = _LITERAL.sub(lambda m: " " * len(m.group(0)), body)
+    parts = _split_verbs(body)
+    if any(v in ("IF", "EVALUATE", "SEARCH", "WHEN", "ELSE") for v, _fr, _o in parts) \
+            or any(v == "PERFORM" and fr.split()[:1] in (["UNTIL"], ["VARYING"], ["WITH"], ["TEST"])
+                   for v, fr, _o in parts) \
+            or _CONDITIONAL_PHRASE.search(body):
+        return False                     # conservative: a guarded exit, or one inside a loop that may not run
+    for verb, frag, _off in parts:
+        head = frag.split()[:1]
+        if verb == "GOBACK" or (verb == "STOP" and head == ["RUN"]) or (verb == "EXIT" and head == ["PROGRAM"]):
+            return True
+        if verb == "GO" and not re.search(B + r"DEPENDING" + E, frag, re.IGNORECASE):
+            return True                                   # GO TO ... DEPENDING ON falls through out of range
+    return False
 
 
 def _fallthrough_edges(f: ProgramFacts, last_stmt: Dict[str, str]) -> None:
-    """A paragraph whose last statement does not leave (GOBACK / STOP RUN /
-    EXIT PROGRAM / unconditional GO TO) runs straight into the next one.
-    Recorded as its own edge kind so `dead` and `paragraph` can say
+    """A paragraph whose last sentence does not leave (_leaves: GOBACK / STOP
+    RUN / EXIT PROGRAM / an unconditional GO TO) runs straight into the next
+    one. Recorded as its own edge kind so `dead` and `paragraph` can say
     "reached by fall-through" instead of "never performed"."""
     paras = [p for p in f.paragraphs if p.kind == "paragraph"]
     for a, b in zip(paras, paras[1:]):
         last = last_stmt.get(a.name, "")
-        if last and _TERMINAL.search(last) and not re.search(B + r"IF|WHEN|ELSE" + E, last, re.IGNORECASE) \
-                and not re.search(B + r"DEPENDING" + E, last, re.IGNORECASE):
-            continue                                      # GO TO ... DEPENDING ON falls through out of range
+        if last and _leaves(last):
+            continue
         f.performs.append((a.name, b.name, None, a.end_line, "fallthrough"))
 
 
@@ -2276,6 +2322,13 @@ def _extract_field_and_literal_refs(f: ProgramFacts, st: LogicalLine) -> List[Tu
             # START file KEY IS >= key / DELETE file RECORD: the file is not a data item (the synthetic
             # reproduction F14 - `field IN-FILE` answered with references); the KEY field is read
             _refs(f, _idents(frag)[1:], "read", verb, ln)
+
+        elif verb == "GO":
+            # GO TO A B C DEPENDING ON IX: the index picks the branch - a test, as an EVALUATE's subject is. No
+            # statement recorded it, so `field IX` said the dispatcher's index was never tested (LESSONS 212)
+            md = re.search(B + r"DEPENDING\s+(?:ON\s+)?(.+)$", frag, re.I | re.S)
+            if md:
+                _refs(f, _idents(md.group(1)), "test", "GO TO", ln)
 
         # OPEN / CLOSE name files only: no field reference (io_op records them)
 
