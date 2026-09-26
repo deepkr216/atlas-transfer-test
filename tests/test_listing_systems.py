@@ -884,8 +884,12 @@ class ContradictedChoicesMarkedForTheNextBuild(unittest.TestCase):
             self.assertEqual(used, self.policy)
             self.assertTrue(note.endswith(f"({LISTING}PROD.POLICY.COPYLIB)"), note)
             self.assertEqual(expanded_from(conn, "WRONGPK"), {self.policy})
+            # CHOSEN's listing names the copy the chain had picked: parsed again (build.picks_moved), its note says
+            # what a full parse says - before LESSONS 249 it kept '(same system)', so the index hung on the order the
+            # listings arrived in
             note, used = pick_of(conn, "CHOSEN")
-            self.assertTrue(note.endswith("(same system)"), note)              # not parsed again: nothing to correct
+            self.assertEqual(used, self.claims)
+            self.assertTrue(note.endswith(f"({LISTING}PROD.CLAIMS.COPYLIB)"), note)
         finally:
             conn.close()
         stats, text = self.run_it()
@@ -1045,21 +1049,26 @@ class ContradictedChoicesMarkedForTheNextBuild(unittest.TestCase):
         finally:
             conn.close()
         chosen = cov.split("### Complete, with a copybook chosen among several")[1].split("\n###")[0]
-        self.assertTrue(chosen.startswith(": 3 members - 1 choice decided by the program's compiler listing, 2 picked by system "
+        # CHOSEN is parsed again by the build that follows recover (build.picks_moved): its listing names the copy the
+        # chain had picked, and the note says so as a full parse does (LESSONS 249)
+        self.assertTrue(chosen.startswith(": 3 members - 2 choices decided by the program's compiler listing, 1 picked by system "
                                           "and library order; the 'ambiguous_copybook' rows name the copy used"), chosen[:160])
         self.assertIn("| cobol | WRONGPK | PROD.CLAIMS.SRC | DUPREC: 2 copies, used POLICY/PROD.POLICY.COPYLIB/DUPREC.cpy "
                       "(listing: PROD.POLICY.COPYLIB) |", chosen)
-        self.assertIn("| cobol | CHOSEN | PROD.CLAIMS.SRC | DUPREC: 2 copies, used CLAIMS/PROD.CLAIMS.COPYLIB/DUPREC.cpy (same system) |", chosen)
+        self.assertIn("| cobol | CHOSEN | PROD.CLAIMS.SRC | DUPREC: 2 copies, used CLAIMS/PROD.CLAIMS.COPYLIB/DUPREC.cpy "
+                      "(listing: PROD.CLAIMS.COPYLIB) |", chosen)
+        self.assertIn("| cobol | FETCHIT | PROD.CLAIMS.SRC | DUPREC: 2 copies, used CLAIMS/PROD.CLAIMS.COPYLIB/DUPREC.cpy "
+                      "(same system) |", chosen)
         self.assertIn("2 of these choices are confirmed by the program's listing, 0 contradicted by a current listing (see "
                       "work/recover.md), 0 named by an older listing, 1 name a library the index does not hold, 0 unknown", chosen)
-        self.assertIn("1 of the choices is the compiler's own: the program's listing names the library the copybook was read from, "
-                      "and that copy was expanded (`listing: DATASET` in the table) - nothing to declare for those. The other 2 "
-                      "follow `COPY ... OF`, then the member's own system in its declared copybook order, then the manifest's "
+        self.assertIn("2 of the choices are the compiler's own: the program's listing names the library the copybook was read from, "
+                      "and that copy was expanded (`listing: DATASET` in the table) - nothing to declare for those. The other 1 "
+                      "follows `COPY ... OF`, then the member's own system in its declared copybook order, then the manifest's "
                       "authoritative copy, and one of those is wrong only where the manifest's system or copybook order is; "
                       "1 copybook name(s) are involved - `ambiguous` lists them per department.", chosen)
         kinds = cov.split("### Unresolved by kind")[1].split("\n###")[0]
-        self.assertIn("| ambiguous_copybook (decided by the listing) | 1 |", kinds)
-        self.assertIn("| ambiguous_copybook | 2 | two copies of one copybook with different content; one was chosen | declare the "
+        self.assertIn("| ambiguous_copybook (decided by the listing) | 2 |", kinds)
+        self.assertIn("| ambiguous_copybook | 1 | two copies of one copybook with different content; one was chosen | declare the "
                       "department's copybook order (manifest `copylib_order`) or remove the stale copy |", kinds)
         self.assertNotIn("| expand (copybook chosen among several", kinds)     # no COPY warning repeats the choice (item 18)
 

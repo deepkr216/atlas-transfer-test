@@ -1,0 +1,11 @@
+{
+ "title": "a PL/I member with GO TO in a folder named like a dataset is filed as a copybook",
+ "recover": false,
+ "checks": [
+  {
+   "sql": "SELECT kind FROM member WHERE name='XQPLI'",
+   "truth": "unknown",
+   "symptom": "copybook"
+  }
+ ]
+}

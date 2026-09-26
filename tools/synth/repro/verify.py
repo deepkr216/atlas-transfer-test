@@ -7,11 +7,25 @@ scratch index and check that the symptom is still there.
 Each folder holds `estate/` (the smallest members that show the finding)
 and `expect.json`:
 
-    {"title": "...", "checks": [
+    {"title": "...", "steps": [...], "checks": [
         {"sql": "SELECT ...", "truth": <value>, "symptom": <value>},          # a scalar the index holds
         {"query": ["layout", "OUTER"], "truth_has": "...", "symptom_has": "..."},   # a report's text
         {"gate": "answer.md", "truth_rc": 0, "symptom_rc": 1}                  # the gate's verdict
     ]}
+
+The index is built with --rebuild; `"recover": true` runs atlas.recover
+and an incremental build after it. `steps`, when given, run after the first
+build instead, in order - for a finding that shows only after the estate
+changes between builds (a compiler listing that arrives, moves or goes):
+
+    {"put": ["later/CLAIMS/X.lst", "estate/CLAIMS/X.lst"]}   # a file of the folder dropped into the estate
+    {"move": ["estate/KVA/A.lst", "estate/SHARED/A.lst"]}    # within the estate
+    {"remove": "estate/KVA/A.lst"}
+    {"recover": true}                                        # atlas.recover over the index
+    {"build": true}                                          # an incremental build
+
+atlas.recover runs in the scratch folder, so its report (work\recover.md)
+is written there, never into the repository.
 
 A check prints REPRODUCED when the index gives the symptom, FIXED when it
 gives the truth, and OTHER with what it gave. A check whose truth and
@@ -39,8 +53,28 @@ PY = sys.executable
 
 
 def run(cmd, cwd=REPO):
-    p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    env = dict(os.environ, PYTHONPATH=REPO + os.pathsep + os.environ.get("PYTHONPATH", ""))
+    p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace", env=env)
     return p.returncode, (p.stdout or "") + (p.stderr or "")
+
+
+def step(folder: str, work: str, db: str, st: dict) -> None:
+    """One of expect.json's `steps` (see the module's notes)."""
+    estate = os.path.join(work, "estate")
+    if "put" in st:
+        src, dst = (os.path.join(folder, *st["put"][0].split("/")), os.path.join(work, *st["put"][1].split("/")))
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copy(src, dst)
+    elif "move" in st:
+        src, dst = (os.path.join(work, *p.split("/")) for p in st["move"])
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.move(src, dst)
+    elif "remove" in st:
+        os.remove(os.path.join(work, *st["remove"].split("/")))
+    elif st.get("recover"):
+        run([PY, "-m", "atlas.recover", "--db", db], cwd=work)
+    elif st.get("build"):
+        run([PY, "-m", "atlas.build", estate, "--db", db, "--quiet", "--no-current-file"])
 
 
 def verify(folder: str, out: str) -> list:
@@ -58,8 +92,10 @@ def verify(folder: str, out: str) -> list:
         results.append((rid, "BUILD FAILED", outp[-300:]))
         return results
     if spec.get("recover"):
-        run([PY, "-m", "atlas.recover", "--db", db])
+        run([PY, "-m", "atlas.recover", "--db", db], cwd=work)
         run([PY, "-m", "atlas.build", os.path.join(work, "estate"), "--db", db, "--quiet", "--no-current-file"])
+    for st in spec.get("steps", ()):
+        step(folder, work, db, st)
     conn = sqlite3.connect(db)
     for k, ck in enumerate(spec["checks"], 1):
         label = f"{rid} check {k}"

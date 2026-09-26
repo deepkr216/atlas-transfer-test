@@ -79,8 +79,9 @@ def earlier_rule(existing, found, kinds=build.RESOLVER_KINDS, again=True):
 def build_before_item_21():
     """A build that forces what the build before ROADMAP re-parse item 21 forced: the index it leaves is the one
     his estate holds until the re-parse night, which the stand-ins (recover's arrived step, the un-linked 'ok'
-    note) are written for."""
-    with mock.patch.object(build, "moved_names", earlier_rule):
+    note) are written for. That build did not ask the kept programs' choices among several again either
+    (build.picks_moved, LESSONS 249): a copy of such a choice that went left the program un-linked there too."""
+    with mock.patch.object(build, "moved_names", earlier_rule), mock.patch.object(build, "picks_moved", lambda ctx: []):
         yield
 
 

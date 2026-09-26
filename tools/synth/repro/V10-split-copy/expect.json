@@ -1,0 +1,16 @@
+{
+ "title": "a COPY with the copybook's name on the next line is silently not expanded",
+ "recover": false,
+ "checks": [
+  {
+   "sql": "SELECT COUNT(*) FROM copy_use c JOIN member m ON m.id=c.member_id WHERE m.name='KVSPLIT' AND c.copybook='KVBOOK' AND c.resolved_member_id IS NOT NULL",
+   "truth": 1,
+   "symptom": 0
+  },
+  {
+   "sql": "SELECT COUNT(*) FROM pfield f JOIN program p ON p.id=f.program_id WHERE p.program_id='KVSPLIT' AND f.name='KV-KEY'",
+   "truth": 1,
+   "symptom": 0
+  }
+ ]
+}

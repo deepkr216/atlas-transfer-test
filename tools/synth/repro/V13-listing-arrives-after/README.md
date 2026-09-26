@@ -1,0 +1,5 @@
+# V13-listing-arrives-after - a pick the build made by following a listing filed elsewhere stays after the program's own current listing arrives
+
+Found by the verifier of ROADMAP re-parse item 19, confirmed by the acceptance test (runner `arrive`). ARRNH's listing filed under SHARED names PROD.POLICY.COPYLIB; recover reads it and the build follows it. Then ARRNH's own current listing arrives in CLAIMS, naming the staging library STG.GONE.COPYLIB, which the estate does not hold: item 19's rule lets the program's own current listing decide, and a library not held keeps the chain's copy - CLAIMS's. The steps: recover, build, the listing dropped in, build, recover, build. Tool: POLICY's copy kept (nothing the program copies moved, so it was not parsed again); a full parse of the same index gives CLAIMS's - the index depended on the order the listings arrived.
+
+Fixed in LESSONS 249: each build asks the resolver again for the choices among several of the programs it keeps (`build.picks_moved`) and parses again those it would now make differently.

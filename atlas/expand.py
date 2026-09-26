@@ -45,6 +45,42 @@ _COPY_FULL = re.compile(
     r"(?:\s+SUPPRESS)?(?:\s+REPLACING\s+(.*))?\s*\.?\s*$", re.I | re.S)
 
 
+# the COPY keyword closing its line, outside a literal: the text-name is on the next line (`COPY` / `    XQBOOK.`)
+_COPY_AT_END = re.compile(B + r"COPY\s*$", re.I)
+# how many lines after the keyword the text-name may sit on (comment lines not counted)
+_COPY_NAME_LINES = 2
+
+
+def copy_over_lines(lines: Sequence[Line], i: int, code: str, masked: str,
+                    replacing: Sequence[Tuple[str, ...]] = ()):
+    """The COPY statement whose keyword closes line `i` (`masked`: its code
+    with the literals blanked) and whose text-name opens the next non-blank
+    code line - a COBOL statement may break between any two words - as a
+    match of find_copy_start over the two lines joined: its groups lie in
+    `code` for the keyword (so the text before it and where the statement
+    starts are read as for a one-line COPY) and in the next line for the
+    name. None when the next code line does not open with a text-name; the
+    lines are not consumed then. Before, the line was read as code: the
+    program said `parse: ok`, listed no copybook and had none of its fields
+    (LESSONS 251)."""
+    if not _COPY_AT_END.search(masked):
+        return None
+    k, taken = i, 0
+    while k + 1 < len(lines) and taken < _COPY_NAME_LINES:
+        k += 1
+        nxt = lines[k]
+        if nxt.is_comment:
+            continue
+        taken += 1
+        more = apply_replacing(nxt.code, replacing) if replacing else nxt.code
+        if not more.strip():
+            continue
+        lead = len(more) - len(more.lstrip())
+        m = find_copy_start(code + " " + more[lead:], masked + " " + _mask_literals(more)[lead:])
+        return m if m is not None and m.start(1) < len(code) else None
+    return None
+
+
 def find_copy_start(code: str, masked: str):
     """The COPY / ++INCLUDE / -INC statement in `code`, its name bare or in
     quotes. `masked` is `code` with its literals blanked: a bare name is found
@@ -403,7 +439,7 @@ def expand(lines: Sequence[Line], member_id: int, resolver: Resolver,
             continue
 
         masked = _mask_literals(code)
-        m = find_copy_start(code, masked)
+        m = find_copy_start(code, masked) or copy_over_lines(lines, i, code, masked, replacing)
         msql = _SQL_INCLUDE_START.search(masked)
         # the INCLUDE's name: on this line, or read over the lines after an `EXEC SQL` that ends it (F05)
         sql_name: Optional[str] = msql.group(1).upper() if msql else None

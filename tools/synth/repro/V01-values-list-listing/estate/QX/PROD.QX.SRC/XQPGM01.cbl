@@ -1,0 +1,10 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. XQPGM01.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01  WS-OUT              PIC X(5).
+       01  WS-REC.
+           COPY XQNAICS.
+       PROCEDURE DIVISION.
+           MOVE XQ-NAICS-CD TO WS-OUT.
+           GOBACK.

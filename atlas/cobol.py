@@ -65,7 +65,9 @@ _STATEMENT_VERBS = ("MOVE|COMPUTE|ADD|SUBTRACT|MULTIPLY|DIVIDE|STRING|UNSTRING|I
                     "EVALUATE|WHEN|ELSE|SEARCH|EXEC|GO|GOBACK|STOP|OPEN|CLOSE|DELETE|START|"
                     "CONTINUE|EXIT|SORT|MERGE|CANCEL|ALTER|ENTRY")
 
-_PROGRAM_ID = re.compile(rf"\bPROGRAM-ID\s*\.?\s+({ID})", re.IGNORECASE)
+# the paragraph's own word, never the tail of a data-name: `\b` matched after the hyphen of `05 CA-PROGRAM-ID PIC
+# X(8).`, and a copybook holding that field was taken for a program named PIC (LESSONS 248)
+_PROGRAM_ID = re.compile(rf"{B}PROGRAM-ID\s*\.?\s+({ID})", re.IGNORECASE)
 _DIVISION = re.compile(rf"\b({ID})\s+DIVISION\b", re.IGNORECASE)
 _SECTION = re.compile(rf"^({ID})\s+SECTION\s*\.", re.IGNORECASE)
 _PARAGRAPH = re.compile(rf"^({ID})\s*\.\s*$", re.IGNORECASE)
@@ -144,11 +146,15 @@ _SET_TRUE = re.compile(B + rf"SET\s+({ID})\s+TO\s+TRUE" + E, re.IGNORECASE)
 # qualifier, so the list swallowed the clause (plain GO TO edges to DEPENDING,
 # ON and the index), and a subscript matched nothing at all (no edge to any
 # target, so `dead` listed them) (LESSONS 213)
+# The separators are COBOL's: a comma or a semicolon stands for a space (`GO TO A, B DEPENDING ON WS-IX;`), and TO
+# may be left out (`GO 9000-ERR`, the verb's older form): either gave no edge at all, and `dead` listed the targets
+# (LESSONS 248). `GO TO.` alone (a paragraph ALTER sets) names no target.
 _NOT_DEPENDING = r"(?!DEPENDING" + E + ")"
 _GO_TO_INDEX = ID + r"(?:\s+(?:OF|IN)\s+" + ID + r")*(?:\s*\((?:[^()]|\([^()]*\))*\))*"
-_GO_TO = re.compile(B + r"GO\s+TO\s+(" + _NOT_DEPENDING + ID + r"(?:[\s,]+" + _NOT_DEPENDING + ID + r")*?)"
-                    r"(?:[\s,]+DEPENDING\s+(?:ON\s+)?(" + _GO_TO_INDEX + r"))?"
-                    r"(?=\s*(?:$|\.|" + B + r"(?:" + _END + r"|" + _STATEMENT_VERBS + r")" + E + "))",
+_GO_TO = re.compile(B + r"GO(?:\s+TO)?\s+(" + r"(?!TO" + E + ")" + _NOT_DEPENDING + ID + r"(?:[\s,;]+" + _NOT_DEPENDING + ID +
+                    r")*?)"
+                    r"(?:[\s,;]+DEPENDING\s+(?:ON\s+)?(" + _GO_TO_INDEX + r"))?"
+                    r"(?=[\s,;]*(?:$|\.|" + B + r"(?:" + _END + r"|" + _STATEMENT_VERBS + r")" + E + "))",
                     re.IGNORECASE)
 MAX_RESOLVED = 40                         # candidate targets kept per dynamic CALL
 _ALTER = re.compile(B + rf"ALTER\s+({ID})\s+TO\s+(?:PROCEED\s+TO\s+)?({ID})", re.IGNORECASE)
@@ -1664,15 +1670,32 @@ def _leaves(sentence: str) -> bool:
     phrase anywhere in the sentence made it fall through, a false edge that
     hid dead code (LESSONS 213). NEXT SENTENCE and EXIT PARAGRAPH / SECTION
     may skip what follows them. A GO TO in both branches of an IF ... ELSE is
-    still read as one that may not run."""
+    still read as one that may not run.
+
+    The words before the first verb the splitter knows are a statement too:
+    `XML PARSE ... ON EXCEPTION GO TO 9000-ERR END-XML` opening a sentence
+    lost its phrase, and the GO TO read as one that always runs - the next
+    paragraph 'reached by nothing'. And a scope terminator right after a
+    statement of its own verb that took no phrase ends that statement only:
+    in `CALL 'A' ... ON EXCEPTION CALL 'B' ... END-CALL GO TO X END-CALL`
+    the first END-CALL is B's, and the GO TO still runs only on the
+    exception (LESSONS 248)."""
     body = blank_exec(sentence.strip().rstrip("."))
     body = _LITERAL.sub(lambda m: " " * len(m.group(0)), body)
     if not _LEAVING_WORD.search(body):
         return False
     scopes: List[Tuple[Optional[str], bool]] = []      # (its terminator - None: the sentence's end, it may skip)
     skipped = False                                    # a NEXT SENTENCE / EXIT PARAGRAPH came before
-    for verb, frag, _off in _split_verbs(body):
+    parts = _split_verbs(body)
+    if parts and body[:parts[0][2]].strip():
+        parts.insert(0, ("", body[:parts[0][2]].strip(), 0))   # a statement the splitter does not know opens it
+    plain: Optional[str] = None                        # the verb of the statement just before, if it opened no scope
+    for verb, frag, _off in parts:
         words = frag.split()
+        if verb in SCOPE_TERMINATORS and plain is not None and verb == "END-" + plain:
+            plain = None
+            continue                                    # ends the statement just before it, which opened no scope
+        opened = len(scopes)
         if verb in SCOPE_TERMINATORS:
             # its own statement's scope ends here, with every scope opened inside it; a terminator of a
             # statement the splitter does not know (XML PARSE ... ON EXCEPTION ... END-XML) ends the phrase's
@@ -1706,6 +1729,8 @@ def _leaves(sentence: str) -> bool:
             # else: the NOT AT END / NOT INVALID KEY ... of a statement whose scope is open
         if _NEXT_SENTENCE.search(frag) or (verb == "EXIT" and head in ("PARAGRAPH", "SECTION")):
             skipped = True
+        plain = verb if verb and verb not in SCOPE_TERMINATORS and len(scopes) <= opened \
+            and "END-" + verb in SCOPE_TERMINATORS else None
     return False
 
 

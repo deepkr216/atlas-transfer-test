@@ -1,0 +1,16 @@
+{
+ "title": "a data copybook whose 88-level VALUES list of six-digit codes runs over three lines is filed as a compiler listing",
+ "recover": false,
+ "checks": [
+  {
+   "sql": "SELECT kind FROM member WHERE name='XQNAICS'",
+   "truth": "copybook",
+   "symptom": "listing"
+  },
+  {
+   "sql": "SELECT parse_status FROM member WHERE name='XQPGM01'",
+   "truth": "ok",
+   "symptom": "partial"
+  }
+ ]
+}

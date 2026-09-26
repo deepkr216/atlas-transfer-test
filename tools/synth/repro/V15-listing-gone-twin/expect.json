@@ -1,0 +1,25 @@
+{
+ "title": "a listing deleted while another system holds a program of its name forces no re-parse",
+ "recover": false,
+ "steps": [
+  {
+   "recover": true
+  },
+  {
+   "build": true
+  },
+  {
+   "remove": "estate/KVA/TST.KVA.LISTING/KVTPGM.lst"
+  },
+  {
+   "build": true
+  }
+ ],
+ "checks": [
+  {
+   "sql": "SELECT r.library FROM copy_use c JOIN member m ON m.id=c.member_id JOIN member r ON r.id=c.resolved_member_id WHERE m.name='KVTPGM' AND m.kind='cobol' AND m.system='KVA' AND c.copybook='DUPREC'",
+   "truth": "TST.KVA.COPYLIB",
+   "symptom": "TST.KVB.COPYLIB"
+  }
+ ]
+}

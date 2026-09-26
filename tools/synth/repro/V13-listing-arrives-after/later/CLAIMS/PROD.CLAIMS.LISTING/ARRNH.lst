@@ -1,0 +1,23 @@
+1PP 5655-EC6 IBM Enterprise COBOL for z/OS  6.3.0 P231102                 SAMPPGM   Date 09/28/2024  Time 14:31:41   Page   1
+0Invocation parameters:
+ TRUNC(BIN),DATA(24),XREF
+0Options in effect:
+    XREF(FULL)
+1PP 5655-EC6 IBM Enterprise COBOL for z/OS  6.3.0 P231102                 SAMPPGM   Date 09/28/2024  Time 14:31:41   Page   2
+   LineID  PL SL  ----+-*A-1-B--+----2----+----3----+----4----+----5----+----6----+----7-|--+----8 Map and Cross Reference
+   000001                IDENTIFICATION DIVISION.                                                 
+   000002                PROGRAM-ID. ARRNH.                                                       
+   000003                DATA DIVISION.                                                           
+   000004                WORKING-STORAGE SECTION.                                                 
+   000005                01  WS-OUT              PIC X(5).                                        
+   000006                01  WS-REC.                                                              
+   000007                    COPY DUPREC.                                                         
+   000008C                   05  DUP-FIELD-A   PIC X(5).                                          
+   000009                PROCEDURE DIVISION.                                                      
+   000010                    MOVE DUP-FIELD-A TO WS-OUT.                                          
+   000011                    GOBACK.                                                              
+
+   LineID  Message code  Message text
+
+0Copybook  Ddname    Library dataset                                Text  Created     Last modified
+  DUPREC    SYSLIB    STG.GONE.COPYLIB                                 1  1997/01/29  2018/11/11 08:00:27

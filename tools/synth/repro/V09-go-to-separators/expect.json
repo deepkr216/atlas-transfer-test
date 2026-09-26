@@ -1,0 +1,16 @@
+{
+ "title": "GO TO ... DEPENDING ON with a comma or a semicolon, and GO without TO, give no edge",
+ "recover": false,
+ "checks": [
+  {
+   "sql": "SELECT COUNT(*) FROM perform_edge WHERE from_para='2500-BRANCH' AND kind='goto_depending'",
+   "truth": 2,
+   "symptom": 0
+  },
+  {
+   "sql": "SELECT COUNT(*) FROM perform_edge WHERE from_para='2500-BRANCH' AND kind='goto' AND to_para='9000-ERR'",
+   "truth": 1,
+   "symptom": 0
+  }
+ ]
+}

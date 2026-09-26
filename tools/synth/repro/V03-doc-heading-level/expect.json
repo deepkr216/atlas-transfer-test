@@ -1,0 +1,11 @@
+{
+ "title": "a prose heading such as 02 Premium values files a document as a copybook",
+ "recover": false,
+ "checks": [
+  {
+   "sql": "SELECT kind FROM member WHERE name='NOTE'",
+   "truth": "doc",
+   "symptom": "copybook"
+  }
+ ]
+}

@@ -1,0 +1,11 @@
+{
+ "title": "XML PARSE ... ON EXCEPTION GO TO opening a sentence is read as always leaving the paragraph",
+ "recover": false,
+ "checks": [
+  {
+   "sql": "SELECT COUNT(*) FROM perform_edge WHERE kind='fallthrough' AND from_para='1000-MAIN' AND to_para='2000-CALLS'",
+   "truth": 1,
+   "symptom": 0
+  }
+ ]
+}

@@ -37,7 +37,7 @@ from __future__ import annotations
 
 import os
 import re
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 EXT_HINTS = {
     ".cbl": "cobol", ".cob": "cobol", ".cobol": "cobol", ".ccp": "cobol",
@@ -87,7 +87,10 @@ BINARY_EXTS = {".pdf", ".docx", ".xlsx", ".pptx", ".vsdx", ".zip", ".gz",
 # made the assembler signature cubic - 101 blank cards held the whole
 # process for 70 s (LESSONS 148).
 _SIG_COBOL = re.compile(r"^[ \t]*(IDENTIFICATION|ID)[ \t]+DIVISION", re.I | re.M)
-_SIG_PROGRAM_ID = re.compile(r"\bPROGRAM-ID\b", re.I)
+# PROGRAM-ID as the paragraph's own word: never the tail of a data-name. `\b` matched after the hyphen of
+# `05 CA-PROGRAM-ID PIC X(8).` - a field every CICS commarea and audit record carries - and the copybook was filed a
+# program (LESSONS 248)
+_SIG_PROGRAM_ID = re.compile(r"(?<![A-Z0-9\-])PROGRAM-ID(?![A-Z0-9\-])", re.I)
 _SIG_JOB = re.compile(r"^//\S{1,8}\s+JOB\b", re.M)
 _SIG_PROC = re.compile(r"^//\S{0,8}\s+PROC\b", re.M)
 _SIG_PEND = re.compile(r"^//\S{0,8}\s+PEND\b", re.M)
@@ -151,10 +154,24 @@ _DATA_NAME = r"(?=[A-Z0-9\-:@#$]*[A-Z])(?:[A-Z0-9]|:[A-Z0-9@#$\-]+:)(?:[A-Z0-9\-
 # A copybook written from column 1, with no sequence area (`05 WS-ID PIC X(10).`), is one by a level number in
 # column 1 with a data-name and a PIC, VALUE, REDEFINES, OCCURS or USAGE clause - no card, prose or Assembler line
 # starts so (an Assembler label never starts with a digit; `01 20260925` has no data-name) - LESSONS 200.
+# A clause WITH its operand, as a data description entry writes it: a picture string after PIC (one with a 9, X, A,
+# Z or N in it), a literal, a number or a figurative constant after VALUE, a data-name after REDEFINES, a number
+# after OCCURS, a usage after USAGE. A prose heading `02 Premium values` (a level-like number, a word, then the word
+# VALUES and nothing more) filed a document as a copybook (LESSONS 248): the column-1 form below, and every entry in
+# a library of documents (_SIG_DATA_ENTRY), need the operand.
+_CLAUSE_OPERAND = (r"(?:PIC(?:TURE)?(?:[ \t]+IS)?[ \t]+(?=[^ \t\n]*[9XAZN])[-+$*.,/()0-9ABEGNPSVXZ]+(?:[ \t.]|$)"
+                   r"|VALUES?(?:[ \t]+(?:IS|ARE))?[ \t]+(?:'|\"|[-+]?\.?\d|(?:ZEROS?|ZEROES|SPACES?|HIGH-VALUES?|"
+                   r"LOW-VALUES?|QUOTES?|NULLS?|ALL)(?![A-Z0-9\-]))"
+                   r"|REDEFINES[ \t]+" + _DATA_NAME +
+                   r"|OCCURS[ \t]+\d"
+                   r"|USAGE(?:[ \t]+IS)?[ \t]+(?:COMP|BINARY|PACKED-DECIMAL|DISPLAY|INDEX|POINTER|NATIONAL))")
 _SIG_DATA_LEVEL = re.compile(_CODE_AT + _LEVEL_NO + r"[ \t]+(?:" + _DATA_CLAUSE + r"|" + _DATA_NAME +
                              r"(?:[ \t]*\.|[ \t]*$|[ \t]+" + _DATA_CLAUSE + r"))"
-                             r"|^" + _LEVEL_NO + r"[ \t]+" + _DATA_NAME +
-                             r"[ \t]+(?:PIC|PICTURE|VALUES?|REDEFINES|OCCURS|USAGE)(?![A-Z0-9\-])", re.I | re.M)
+                             r"|^" + _LEVEL_NO + r"[ \t]+" + _DATA_NAME + r"[ \t]+" + _CLAUSE_OPERAND, re.I | re.M)
+# ... and in a library of documents: a level number, a data-name and a clause with its operand, where a COBOL line's
+# code begins or in column 1 - an indented numbered heading (`   01 Overview`, `   02 Premium values`) is prose
+_SIG_DATA_ENTRY = re.compile(r"(?:" + _CODE_AT + r"|^)" + _LEVEL_NO + r"[ \t]+" + _DATA_NAME + r"[ \t]+" +
+                             _CLAUSE_OPERAND, re.I | re.M)
 # Any level 01-49 plus 66/77/88. Level 49 is the DCLGEN VARCHAR structure and
 # 02/03/04/06/07/15/20 are all common; testing only 01/05/10 misfiles them.
 _SIG_LEVEL_NUMBER = re.compile(r"^.{0,6}.?[ \t]*(0[1-9]|[1-4]\d|66|77|88)[ \t]+[A-Z0-9][A-Z0-9\-]*", re.I | re.M)
@@ -222,8 +239,17 @@ _NDM_PROCESS = re.compile(r"^[A-Z@#$][A-Z0-9@#$]{0,7}[ \t]+PROCESS(?:[ \t]|$)", 
 _NDM_NODE = re.compile(r"\b[SP]NODE[ \t]*=", re.I)                                              # ... SNODE=QZREMOTE
 _NDM_STMT = re.compile(r"^(?:[A-Z@#$][A-Z0-9@#$]{0,7})?[ \t]+(?:COPY[ \t]+FROM[ \t]*\([ \t]*(?:DSN|PNODE|SNODE|FILE)\b"
                        r"|RUN[ \t]+(?:TASK|JOB)[ \t]*\(|EIF[ \t]*$)", re.I | re.M)
+# PL/I: a procedure's label and PROC (`XQPLI: PROC OPTIONS(MAIN);`) or a DECLARE with its structure level or its
+# attributes - its GO TO, IF, READ FILE(...) and CLOSE FILE(...) are no COBOL statements (LESSONS 248)
+_PLI_PROC = re.compile(r"^[ \t]*[A-Z@#$_][A-Z0-9@#$_]*[ \t]*:[ \t]*PROC(?:EDURE)?[ \t]*(?:OPTIONS|RECURSIVE|REORDER|"
+                       r"RETURNS|\(|;|$)", re.I | re.M)
+_PLI_DCL = re.compile(r"^[ \t]*(?:DCL|DECLARE)[ \t]+(?:\d{1,2}[ \t]+)?[A-Z@#$_][A-Z0-9@#$_]*[ \t]*(?:[,;(]|[ \t]+(?:"
+                      r"CHAR(?:ACTER)?|FIXED|FLOAT|BIN(?:ARY)?|DEC(?:IMAL)?|BIT|FILE|POINTER|PTR|ENTRY|BASED|STATIC|"
+                      r"AUTOMATIC|AUTO|EXTERNAL|EXT|BUILTIN|LIKE|PIC(?:TURE)?|INIT(?:IAL)?|CONTROLLED|CTL|LABEL|"
+                      r"AREA|OFFSET|VARYING|VAR)\b)", re.I | re.M)
 EZT_WORDS = "an Easytrieve program"
 NDM_WORDS = "a Connect:Direct process"
+PLI_WORDS = "a PL/I program"
 # A line of prose or Markdown: a letter in column 1 and, in column 7, neither a blank nor a COBOL indicator - no line
 # of a COBOL member in reference format has that (columns 1-6 are its sequence area, column 7 its indicator) - or a
 # Markdown heading or code fence. It makes a .txt a document for the COBOL statements (a .md, .html or .csv is one
@@ -252,13 +278,15 @@ def _is_prose(head: str) -> bool:
 
 
 def not_cobol(head: str) -> str:
-    """'an Easytrieve program' / 'a Connect:Direct process' when `head`
-    (normalized) has the shape of one - statements whose words are COBOL's
-    in a language that is not - or ''."""
+    """'an Easytrieve program' / 'a Connect:Direct process' / 'a PL/I
+    program' when `head` (normalized) has the shape of one - statements
+    whose words are COBOL's in a language that is not - or ''."""
     if _EZT_ACTIVITY.search(head) or (_EZT_FILE.search(head) and _EZT_FIELD.search(head)):
         return EZT_WORDS
     if (_NDM_PROCESS.search(head) and _NDM_NODE.search(head)) or _NDM_STMT.search(head):
         return NDM_WORDS
+    if _PLI_PROC.search(head) or _PLI_DCL.search(head):
+        return PLI_WORDS
     return ""
 
 
@@ -292,7 +320,8 @@ def library_says(path: str, head: str, declared: Optional[str] = None) -> str:
 
 def statement_lines(head: str) -> Tuple[int, int]:
     """(lines with a COBOL statement no other language has, lines with any
-    COBOL statement) in `head` (normalized) - every match starts a line."""
+    COBOL statement) in `head` (normalized, and read through code_view by
+    the caller) - every match starts a line."""
     strong = {m.start() for m in _SIG_COBOL_PROC.finditer(head)}
     if not strong:
         return 0, 0
@@ -340,7 +369,7 @@ MFS_SHAPES = ("a labelled MSG / FMT / DEV / DFLD / MFLD, TYPE= / POS= / LTH= ope
 # columns 1-6: two numbers, where a plain source record has one (one line at a time). The compiler's name alone is
 # no banner: a program's `DISPLAY 'BUILT WITH IBM ENTERPRISE COBOL'` or a copybook's VALUE literal names it too
 # (LESSONS 199).
-_LISTING_SHAPE = re.compile(r"^[ 01\-+]?\s*\d{6}[^\s\d]*\s+\d{6}[ *\-/D]")
+_LISTING_SHAPE = re.compile(r"^[ 01\-+]?\s*(\d{6})[^\s\d]*\s+\d{6}[ *\-/D]")
 # (one run of blanks before the carriage control and one after it: two stars over the same blanks made a 64 KB blank
 # line take 15 s - LESSONS 148, 200)
 _LISTING_HEAD = re.compile(r"^[ \t\f]*LineID[ \t]+PL[ \t]+SL\b|^[ \t\f]*(?:1[ \t]*)?PP[ \t]+5655-", re.I | re.M)
@@ -402,23 +431,83 @@ def listing_hit(head: str) -> Optional[Tuple[int, str]]:
     """(offset, words) of what makes `head` (normalized) a compiler listing -
     the compiler's banner on a line that is not a comment, a map heading at
     the start of a line, or the first of LISTING_LINES numbered source
-    lines - or None."""
+    lines - or None. The numbered lines are the listing's own: each one's
+    line number is the one before it plus one (the compiler numbers every
+    line it prints, copied lines too; a page heading or a message between
+    them changes nothing). Three lines of two six-digit numbers each were
+    enough before - and a data copybook's 88-level VALUES list of six-digit
+    codes run over three lines (`236118 236210 236220`) is that: the
+    copybook was filed a listing and every program copying it said COPY X
+    NOT FOUND (LESSONS 248)."""
     m = _code_hit(_LISTING_HEAD, head)
     if m:
         return m.start(), m.group(0).strip()
     m = _LISTING_MAP.search(head)
     if m:
         return m.start(), m.group(0).strip().lstrip("1").strip()
-    first, n, pos = -1, 0, 0
+    first, n, pos, prev = -1, 0, 0, -1
     for line in head.split("\n"):
-        if _LISTING_SHAPE.match(line):
-            n += 1
-            if first < 0:
-                first = pos
+        hit = _LISTING_SHAPE.match(line)
+        if hit:
+            no = int(hit.group(1))
+            if n and no == prev + 1:
+                n += 1
+            else:
+                first, n = pos, 1                                 # a run starts here
+            prev = no
             if n >= LISTING_LINES:
                 return first, "numbered source lines"
         pos += len(line) + 1
     return None
+
+
+def _open_quote(code: str) -> str:
+    """The quote a literal in `code` leaves open at its end, or ''."""
+    q = ""
+    for ch in code:
+        if q:
+            if ch == q:
+                q = ""
+        elif ch in "'\"":
+            q = ch
+    return q
+
+
+def code_view(head: str) -> str:
+    """`head` (normalized) with the text of a literal CONTINUED from the line
+    before blanked, as the compiler or the assembler reads it: text, never
+    a statement. An Assembler or MFS statement runs on to the next line when
+    column 72 holds a character, and a literal left open there goes on from
+    the continuation line's first column up to its closing quote; a COBOL
+    literal left open goes on after the quote that reopens it on a line with
+    '-' in column 7, up to its closing quote. Before this, the COBOL
+    statement signature read an MFS field's text `MOVE THE CURSOR TO THE
+    ACTION FIELD'` on its continuation line as a MOVE statement, filed the
+    format a copybook, and `screen` said NOT FOUND (LESSONS 248). Comment
+    lines are kept as they are; line numbers and lengths do not change."""
+    out: List[str] = []
+    carry, runs_on = "", False            # the quote the line before left open; its column 72 held a character
+    for line in head.split("\n"):
+        text = line
+        if carry and not _is_comment_line(line):
+            if len(line) > 6 and line[6] == "-":
+                reopen = line.find(carry, 7)
+                close = line.find(carry, reopen + 1) if reopen >= 0 else -1
+            elif runs_on:
+                close = line.find(carry)
+            else:
+                close = -2                                  # neither form of continuation: the literal was not continued
+            if close != -2:
+                end = close if close >= 0 else len(line) - 1
+                text = " " * (end + 1) + line[end + 1:]
+        if _is_comment_line(text) or text.lstrip().startswith(".*"):
+            out.append(text)
+            carry, runs_on = "", False
+            continue
+        runs_on = len(text) >= 72 and text[71] not in " \t"
+        carry = _open_quote(text[:71] if runs_on else text[:72])
+        out.append(text)
+    return "\n".join(out)
 
 
 def cobol_proc_hit(head: str, shared: bool = False):
@@ -499,14 +588,16 @@ def reading(path: str, head: str, declared: Optional[str] = None) -> Tuple[str, 
         return "jcl", "EXEC statement without a JOB card (JCL fragment)", "strong"
 
     # ---- a COBOL copybook by its own lines (ROADMAP re-parse items 20, 22) -
-    # never an Easytrieve program or a Connect:Direct process; the COBOL statements say as much as the library
-    # lets them (library_says, LESSONS 199)
+    # never an Easytrieve program, a Connect:Direct process or a PL/I program; the COBOL statements say as much as
+    # the library lets them (library_says, LESSONS 199), and a literal continued from the line before is text
+    # (code_view, LESSONS 248); in a library of documents a data entry needs a clause with its operand
     other = not_cobol(head)
     says = "" if other else library_says(path, head, declared)
+    code = code_view(head)
     if not other:
-        if _SIG_DATA_LEVEL.search(head):
+        if (_SIG_DATA_ENTRY if says == "doc" else _SIG_DATA_LEVEL).search(code):
             return "copybook", REASON_DATA, "cobol"
-        if _cobol_statements(head, says):
+        if _cobol_statements(code, says):
             return "copybook", REASON_PROC, "cobol"
     if rexx_after_cobol:
         return "rexx", "REXX comment header", "strong"
@@ -516,9 +607,9 @@ def reading(path: str, head: str, declared: Optional[str] = None) -> Tuple[str, 
         return "asm", REASON_ASM, "weak"
     if _MFS_SHAPE.search(head):
         return "mfs", REASON_MFS, "weak"
-    if not other and not says and cobol_proc_hit(head, shared=True):
+    if not other and not says and cobol_proc_hit(code, shared=True):
         return "copybook", REASON_PROC, "cobol"
-    if not other and not says and _SIG_LEVEL_NUMBER.search(head):
+    if not other and not says and _SIG_LEVEL_NUMBER.search(code):
         return "copybook", REASON_DATA, "cobol"
     also = f" - {other}, whose statements are not COBOL" if other else ""
 

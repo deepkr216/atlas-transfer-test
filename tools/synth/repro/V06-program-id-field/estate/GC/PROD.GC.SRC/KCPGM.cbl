@@ -1,0 +1,9 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. KCPGM.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01  WS-OUT              PIC X(8).
+       COPY KCCOMM1.
+       PROCEDURE DIVISION.
+           MOVE CA-PROGRAM-ID TO WS-OUT.
+           GOBACK.

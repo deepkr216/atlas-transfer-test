@@ -1,0 +1,11 @@
+{
+ "title": "a job running a PROC with its default sequential card dataset gets no card_seq_assumed row",
+ "recover": false,
+ "checks": [
+  {
+   "sql": "SELECT COUNT(*) FROM unresolved u JOIN member m ON m.id=u.member_id WHERE m.name='KVCJOB' AND u.kind='card_seq_assumed'",
+   "truth": 2,
+   "symptom": 1
+  }
+ ]
+}

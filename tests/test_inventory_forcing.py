@@ -1004,13 +1004,31 @@ class ASameNamedProgramArrivesOrGoes(_Forcing):
         self.as_parsed_again()
 
     def test_without_the_rule_the_program_kept_the_listings_copy(self):
-        # the verifier's case: 'to parse: programs 1' - the new member only; GC's TWPGM kept GC-TEST's copy
+        # the verifier's case: 'to parse: programs 1' - the new member only; GC's TWPGM kept GC-TEST's copy. Two rules
+        # parse it again now: twins_to_parse, and picks_moved (LESSONS 249), which asks every kept choice again -
+        # without both, the wrong state comes back
         self.listing_row()
         self.build()
         self.write(self.TWIN, data_program("TWPGM", "STARTBK", "START-DATE"))
-        with mock.patch.object(build, "twins_to_parse", lambda conn, names: set()):
+        with mock.patch.object(build, "twins_to_parse", lambda conn, names: set()), \
+                mock.patch.object(build, "picks_moved", lambda ctx: []):
             self.build()
         self.assertEqual(self.pick(), ("TEST.GC.COPYLIB", 15, build.LISTING_HOW + "TEST.GC.COPYLIB"))
+
+    def test_either_rule_alone_parses_it_again(self):
+        # twins_to_parse finds it by the twin's arrival; picks_moved by the choice the resolver would now make
+        for i, off in enumerate(("twins_to_parse", "picks_moved")):
+            with self.subTest(without=off):
+                if i:
+                    self.tearDown()
+                    self.setUp()                        # the estate as first built
+                self.listing_row()
+                self.build()
+                self.write(self.TWIN, data_program("TWPGM", "STARTBK", "START-DATE"))
+                stub = (lambda conn, names: set()) if off == "twins_to_parse" else (lambda ctx: [])
+                with mock.patch.object(build, off, stub):
+                    self.build()
+                self.assertEqual(self.pick(), ("PROD.GC.COPYLIB", 5, "same system"))
 
     def test_no_current_listing_of_the_name_nothing_else_is_parsed_again(self):
         # with no listing row, or an older compile's only, which systems hold the name decides nothing: the program

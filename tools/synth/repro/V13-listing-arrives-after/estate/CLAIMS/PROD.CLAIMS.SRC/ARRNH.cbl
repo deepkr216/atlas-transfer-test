@@ -1,0 +1,10 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. ARRNH.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01  WS-OUT              PIC X(5).
+       01  WS-REC.
+           COPY DUPREC.
+       PROCEDURE DIVISION.
+           MOVE DUP-FIELD-A TO WS-OUT.
+           GOBACK.

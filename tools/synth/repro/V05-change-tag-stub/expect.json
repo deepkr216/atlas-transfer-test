@@ -1,0 +1,16 @@
+{
+ "title": "a copybook whose lines carry a change tag in columns 1-6 and hold one line of digits is filed as a stub",
+ "recover": false,
+ "checks": [
+  {
+   "sql": "SELECT kind FROM member WHERE name='QXTAG'",
+   "truth": "copybook",
+   "symptom": "stub"
+  },
+  {
+   "sql": "SELECT parse_status FROM member WHERE name='QXPGM'",
+   "truth": "ok",
+   "symptom": "partial"
+  }
+ ]
+}

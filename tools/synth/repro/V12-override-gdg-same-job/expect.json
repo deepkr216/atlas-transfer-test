@@ -1,0 +1,16 @@
+{
+ "title": "a job step's //PS.DD override naming a (+1) an earlier PROC step writes stays output [gdg_relative]",
+ "recover": false,
+ "checks": [
+  {
+   "sql": "SELECT d.mode || ' [' || d.mode_source || ']' FROM dd d JOIN step s ON s.id=d.step_id WHERE s.step_name='S1' AND d.dd_name='PS2.KVIN'",
+   "truth": "input [gdg_same_job]",
+   "symptom": "output [gdg_relative]"
+  },
+  {
+   "sql": "SELECT d.mode || ' [' || d.mode_source || ']' FROM dd d JOIN step s ON s.id=d.step_id WHERE s.step_name='S1.PS2' AND d.dd_name='KVIN'",
+   "truth": "input [gdg_same_job]",
+   "symptom": "input [gdg_same_job]"
+  }
+ ]
+}

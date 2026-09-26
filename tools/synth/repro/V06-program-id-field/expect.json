@@ -1,0 +1,26 @@
+{
+ "title": "a copybook with a field named CA-PROGRAM-ID is taken for a program and dropped from the choice",
+ "recover": false,
+ "checks": [
+  {
+   "sql": "SELECT kind FROM member WHERE name='KCCOMM1' AND library='PROD.GC.COPYLIB'",
+   "truth": "copybook",
+   "symptom": "cobol"
+  },
+  {
+   "sql": "SELECT COUNT(*) FROM unresolved u JOIN member m ON m.id=u.member_id WHERE m.name='KCPGM' AND u.kind='ambiguous_copybook'",
+   "truth": 1,
+   "symptom": 0
+  },
+  {
+   "sql": "SELECT COUNT(*) FROM pfield f JOIN program p ON p.id=f.program_id WHERE p.program_id='KCPGM' AND f.name='CA-PROGRAM-ID'",
+   "truth": 1,
+   "symptom": 0
+  },
+  {
+   "sql": "SELECT COUNT(*) FROM program WHERE program_id='PIC'",
+   "truth": 0,
+   "symptom": 1
+  }
+ ]
+}

@@ -130,9 +130,15 @@ def stub_count(text: str, data: bytes = b"", enc: str = "utf-8") -> int:
     in the indicator and one in column 8, which the reader takes for code,
     so such a record counts as numbers (LESSONS 206) - or a record whose
     first non-blank character is '*' with text other than digits where the
-    compiler reads (a floating `*>` remark from column 1: never the text of
-    a member); in free format '*' as the first non-blank character or '*'
-    / '/' in column 7. NULs, an end-of-file mark and form feeds count as
+    compiler reads and a character in column 7 that is no indicator the
+    reader keeps as code (a floating `*>` remark from column 1 runs through
+    column 7: never the text of a member); in free format '*' as the first
+    non-blank character or '*' / '/' in column 7. A '*' in the sequence
+    area with a blank, 'D' or '-' in column 7 is a change tag (`*CR01 `):
+    the reader reads columns 8-72 as code, and so they are read here - a
+    tagged copybook with one continuation line of digits alone (`004 005`
+    under an 88-level VALUES) was filed a stub, never expanded, every
+    program copying it partial (LESSONS 248). NULs, an end-of-file mark and form feeds count as
     blanks. 0 for a member with no record holding a digit in those columns
     (blank or comments only: `empty`) and for one with any record holding
     anything else there. Records split as the reader splits them."""
@@ -163,9 +169,9 @@ def stub_count(text: str, data: bytes = b"", enc: str = "utf-8") -> int:
         if not area.strip():
             continue                     # a sequence number, a stamp - nothing the compiler reads: a blank line
         if area.strip(_STUB_DIGITS):
-            if fixed and rec.lstrip().startswith("*"):
-                continue                 # '*' first, words where the compiler reads: a remark, never the member's text
-            return 0
+            if fixed and rec.lstrip().startswith("*") and len(rec) > 6 and rec[6] not in " Dd-":
+                continue                 # '*' first, words through column 7: a floating remark, never the member's text
+            return 0                     # words the reader reads as code - a change tag in 1-6 included: no stub
         n += 1                           # digits where the compiler reads - `*0000100` too: the reader's code '0'
     return n
 

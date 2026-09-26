@@ -1874,8 +1874,12 @@ def recovered_home(system: Optional[str]) -> str:
     return "" if s == SHARED_SYSTEM else s
 
 
-# a DIVISION header: with a PROGRAM-ID paragraph, what makes a member a program (index_cobol, holds_program)
-_DIVISION_HEADER = re.compile(r"\b(?:IDENTIFICATION|ID|DATA|PROCEDURE)\s+DIVISION\b", re.IGNORECASE)
+# a DIVISION header: with a PROGRAM-ID paragraph, what makes a member a program (index_cobol, holds_program) - the
+# words themselves, never the tail of a data-name (LESSONS 248)
+_DIVISION_HEADER = re.compile(r"(?<![A-Z0-9\-])(?:IDENTIFICATION|ID|DATA|PROCEDURE)\s+DIVISION(?![A-Z0-9\-])",
+                              re.IGNORECASE)
+# a literal, blanked before those words are looked for: `VALUE 'PROCEDURE DIVISION'` in a message table is text
+_HEADER_LITERAL = re.compile(r"'[^'\n]*'|\"[^\"\n]*\"")
 
 
 def holds_program(lines: Sequence[Line]) -> bool:
@@ -1885,8 +1889,12 @@ def holds_program(lines: Sequence[Line]) -> bool:
     neither is 'skipped' as not a program (a copybook filed in a source
     library). atlas.recover and query._recovered_shadowing read the same
     fact from the index: a member of kind cobol not 'skipped' (one not
-    parsed to the end - failed, pending - is taken for a program there)."""
-    text = "\n".join(ln.code for ln in lines if not ln.is_comment)
+    parsed to the end - failed, pending - is taken for a program there).
+    The words are the paragraph's and the header's own, outside literals: a
+    copybook with a `05 CA-PROGRAM-ID PIC X(8).` field was taken for a
+    program and dropped from the choice - the program silently expanded
+    another system's copy, with no 'ambiguous_copybook' row (LESSONS 248)."""
+    text = _HEADER_LITERAL.sub(" ", "\n".join(ln.code for ln in lines if not ln.is_comment))
     return bool(cobol._PROGRAM_ID.search(text) or _DIVISION_HEADER.search(text))
 
 
@@ -1937,70 +1945,166 @@ def recovered_gives_way(cands: List[Mem], prog: Mem) -> List[Mem]:
     return [c for c in cands if not is_recovered(c) or c in stand]
 
 
+def choose(ctx: Ctx, prog: Mem, name: str, lib: Optional[str]) -> Optional[Tuple[Optional[Mem], Optional[str], Optional[str]]]:
+    """What the resolver makes of `COPY name [OF lib]` in program `prog`:
+    None (no member of the name: NOT FOUND); (None, the stub note, None)
+    when only a stub carries it; else (the copy expanded, None, the
+    'ambiguous_copybook' note or None - the note when the candidates differ
+    in content). One function for make_resolver and for picks_moved, which
+    asks it again for the programs a build keeps."""
+    cands = [c for c in ctx.by_name.get(name.upper(), [])
+             if c.kind in RESOLVER_KINDS and c.id != prog.id]
+    if not cands:
+        # a stub of the name is never a candidate: any real copy in another library came first (ROADMAP
+        # re-parse item 23). With none, nothing is expanded and the note says what the member holds - the
+        # program is partial, its own lines kept
+        stubs = [c for c in ctx.by_name.get(name.upper(), []) if c.kind == STUB_KIND and c.id != prog.id]
+        if stubs:
+            return None, expand.stub_note([(c.library, _stub_lines(ctx, c)) for c in stubs]), None
+        return None
+    # A program is never a copybook: a member of kind cobol whose own lines hold a PROGRAM-ID or a DIVISION
+    # header (holds_program) is a candidate only when no other member of the name is. A callee whose parameter
+    # copybook has its own name (COPY QACALC20 in QACALC20's LINKAGE) is not that copybook: the chain's 'same
+    # system' or 'first found' took it over the copybook or a recovered copy, and the whole callee was expanded
+    # into its caller, 'skipped - recursive' at its own COPY (LESSONS 210). The only member of the name is still
+    # taken, as before
+    if len(cands) > 1 and any(c.kind == "cobol" for c in cands):
+        copies = [c for c in cands if not _holds_program(ctx, c)]
+        if copies:
+            cands = copies
+    # A copy atlas.recover rebuilt from the listings stands in for a missing member: once a real member of the
+    # name sits in the program's own system or in SHARED, the copy is no candidate - the real copybook is
+    # expanded the moment it arrives, whatever the chain below would say (the same folder, first found), and a
+    # stand-in replaced is never counted as a second library in a choice among several. Before, the chain could
+    # keep the recovered copy until atlas.recover removed it, and coverage warned meanwhile (ROADMAP re-parse
+    # item 11, LESSONS 168). A real member only another system holds replaces neither the program's own
+    # system's recovered copy nor SHARED's: they stay, the chain takes them first and records the choice
+    # (LESSONS 209, 210); a copy written for another system gives way to it
+    cands = recovered_gives_way(cands, prog)
+    pick = cands[0]
+    note: Optional[str] = None
+    if len(cands) > 1:
+        # The precedence chain's pick, then the program's compiler
+        # listing: it names the library dataset the compiler read this
+        # copybook from (atlas.recover's listing_copy_source). Only the
+        # rows that speak for THIS program count (rows_that_count): when
+        # another system holds a program of its name, its own system's
+        # listing only - GC and GC-TEST each hold GCPGM1 with its own
+        # listing, and one's listing must not decide for the other's copy;
+        # else its own system's listings when one of them is current for
+        # this copybook, and every listing of its name, wherever filed,
+        # when none is. Only a
+        # CURRENT listing (its source is the program as indexed) decides,
+        # and only where the copy it names is held with a different text
+        # from the chain's pick (listing_pick). Everywhere else - none
+        # read, no table, no row, an older or undated listing, a library
+        # not held - the chain decides as before.
+        pick, how = _chain_pick(ctx, prog, cands, lib)
+        named = current_datasets(ctx.listing_sources.get((prog.name.upper(), name.upper()), ()), prog.system,
+                                 twin_systems(ctx, prog))
+        if named:
+            pick, how = listing_pick(ctx, prog, cands, lib, pick, how, named)
+        if len({c.norm_sha for c in cands}) > 1:
+            # A choice, recorded once: the 'ambiguous_copybook' row names the
+            # copy and says how. It is NOT handed back to the expander as a COPY
+            # warning - a warning is a gap (NOT FOUND, skipped), and the repeat
+            # made every such program 'partial' although every COPY expanded
+            # (his 701 'partial' programs with ~60 copybooks missing - LESSONS
+            # 181, ROADMAP re-parse item 18).
+            note = f"{len(cands)} copies of {name} with different content; used {pick.path} ({how})"
+    return pick, None, note
+
+
 def make_resolver(ctx: Ctx, prog: Mem, notes: List[Tuple[str, str, int]]):
     def resolve(name: str, lib: Optional[str]):
-        cands = [c for c in ctx.by_name.get(name.upper(), [])
-                 if c.kind in RESOLVER_KINDS and c.id != prog.id]
-        if not cands:
-            # a stub of the name is never a candidate: any real copy in another library came first (ROADMAP
-            # re-parse item 23). With none, nothing is expanded and the note says what the member holds - the
-            # program is partial, its own lines kept
-            stubs = [c for c in ctx.by_name.get(name.upper(), []) if c.kind == STUB_KIND and c.id != prog.id]
-            if stubs:
-                return None, [], expand.stub_note([(c.library, _stub_lines(ctx, c)) for c in stubs])
+        got = choose(ctx, prog, name, lib)
+        if got is None:
             return None
-        # A program is never a copybook: a member of kind cobol whose own lines hold a PROGRAM-ID or a DIVISION
-        # header (holds_program) is a candidate only when no other member of the name is. A callee whose parameter
-        # copybook has its own name (COPY QACALC20 in QACALC20's LINKAGE) is not that copybook: the chain's 'same
-        # system' or 'first found' took it over the copybook or a recovered copy, and the whole callee was expanded
-        # into its caller, 'skipped - recursive' at its own COPY (LESSONS 210). The only member of the name is still
-        # taken, as before
-        if len(cands) > 1 and any(c.kind == "cobol" for c in cands):
-            copies = [c for c in cands if not _holds_program(ctx, c)]
-            if copies:
-                cands = copies
-        # A copy atlas.recover rebuilt from the listings stands in for a missing member: once a real member of the
-        # name sits in the program's own system or in SHARED, the copy is no candidate - the real copybook is
-        # expanded the moment it arrives, whatever the chain below would say (the same folder, first found), and a
-        # stand-in replaced is never counted as a second library in a choice among several. Before, the chain could
-        # keep the recovered copy until atlas.recover removed it, and coverage warned meanwhile (ROADMAP re-parse
-        # item 11, LESSONS 168). A real member only another system holds replaces neither the program's own
-        # system's recovered copy nor SHARED's: they stay, the chain takes them first and records the choice
-        # (LESSONS 209, 210); a copy written for another system gives way to it
-        cands = recovered_gives_way(cands, prog)
-        pick = cands[0]
-        if len(cands) > 1:
-            # The precedence chain's pick, then the program's compiler
-            # listing: it names the library dataset the compiler read this
-            # copybook from (atlas.recover's listing_copy_source). Only the
-            # rows that speak for THIS program count (rows_that_count): when
-            # another system holds a program of its name, its own system's
-            # listing only - GC and GC-TEST each hold GCPGM1 with its own
-            # listing, and one's listing must not decide for the other's copy;
-            # else its own system's listings when one of them is current for
-            # this copybook, and every listing of its name, wherever filed,
-            # when none is. Only a
-            # CURRENT listing (its source is the program as indexed) decides,
-            # and only where the copy it names is held with a different text
-            # from the chain's pick (listing_pick). Everywhere else - none
-            # read, no table, no row, an older or undated listing, a library
-            # not held - the chain decides as before.
-            pick, how = _chain_pick(ctx, prog, cands, lib)
-            named = current_datasets(ctx.listing_sources.get((prog.name.upper(), name.upper()), ()), prog.system,
-                                     twin_systems(ctx, prog))
-            if named:
-                pick, how = listing_pick(ctx, prog, cands, lib, pick, how, named)
-            if len({c.norm_sha for c in cands}) > 1:
-                # A choice, recorded once: the 'ambiguous_copybook' row names the
-                # copy and says how. It is NOT handed back to the expander as a COPY
-                # warning - a warning is a gap (NOT FOUND, skipped), and the repeat
-                # made every such program 'partial' although every COPY expanded
-                # (his 701 'partial' programs with ~60 copybooks missing - LESSONS
-                # 181, ROADMAP re-parse item 18).
-                notes.append(("ambiguous_copybook",
-                              f"{len(cands)} copies of {name} with different content; used {pick.path} ({how})", 0))
+        pick, stub, note = got
+        if pick is None:
+            return None, [], stub
+        if note:
+            notes.append(("ambiguous_copybook", note, 0))
         return pick.id, ctx.lines_for(pick), None
     return resolve
+
+
+# the copybook an 'ambiguous_copybook' note is about: "N copies of NAME with different content; used PATH (HOW)"
+_AMBIGUOUS_NAME = re.compile(r"^\d+ copies of (\S+) with different content; used ")
+
+
+def picks_moved(ctx: Ctx) -> List[Mem]:
+    """The programs this build keeps (their bytes and every member they copy
+    unchanged) whose choice among several copies of a copybook the resolver
+    would now make differently - read again with choose() for each of their
+    'ambiguous_copybook' notes, as the COPY statements the program's copy_use
+    rows hold (the name, and the library of a COPY ... OF). What decides such
+    a choice besides the members is the compiler listings: atlas.recover's
+    listing_copy_source rows (a listing read since, dated again) and the
+    system of the listing member each row names (a listing moved to
+    SHARED\\LISTINGS, or deleted, speaks for another system or none). Before
+    this, an incremental build kept a pick a listing filed elsewhere had
+    made after the program's own current listing arrived, and one its own
+    listing had made after that listing moved away or went while a program
+    of the name sat in another system - the index then depended on the order
+    the listings arrived and differed from a full parse of the same estate
+    (LESSONS 249). A pick made the same way with other words (the chain's
+    'same system' where the listing now confirms the copy) counts too: the
+    note is a fact of the index. Linear in the kept programs' notes."""
+    kept = {m.id: m for m in ctx.members if m.skip and m.kind == "cobol"}
+    if not kept:
+        return []
+    stored: Dict[int, Dict[str, Set[str]]] = {}
+    for mid, detail in ctx.conn.execute("SELECT member_id, detail FROM unresolved WHERE kind='ambiguous_copybook'"):
+        m = _AMBIGUOUS_NAME.match(detail or "")
+        if mid in kept and m:
+            stored.setdefault(mid, {}).setdefault(m.group(1).upper(), set()).add(detail)
+    if not stored:
+        return []
+    libs: Dict[int, Dict[str, Set[Optional[str]]]] = {}
+    ids = sorted(stored)
+    for k in range(0, len(ids), 500):
+        chunk = ids[k:k + 500]
+        for mid, book, lib in ctx.conn.execute(
+                f"SELECT member_id, copybook, of_library FROM copy_use WHERE member_id IN ({','.join('?' * len(chunk))})",
+                chunk):
+            libs.setdefault(mid, {}).setdefault(str(book).upper(), set()).add(lib or None)
+    moved: List[Mem] = []
+    for mid, by_name in stored.items():
+        prog = kept[mid]
+        for name, notes in by_name.items():
+            now: Set[str] = set()
+            for lib in libs.get(mid, {}).get(name, {None}):
+                got = choose(ctx, prog, name, lib)
+                if got is not None and got[2]:
+                    now.add(got[2])
+            if not notes <= now:
+                moved.append(prog)
+                break
+    return moved
+
+
+def parse_again(ctx: Ctx, progs: Sequence[Mem]) -> int:
+    """Parse `progs` again in this build, with every kept member copying one
+    of their names (copiers_to_parse - such a member expanded the program's
+    own lines, and the program's old facts go): each one's facts are cleared
+    in place (same id), it is set pending - a build stopped before it is
+    parsed leaves it to the next - and its 'declared_kind' rows stay. The
+    number of members set to parse."""
+    if not progs:
+        return 0
+    by_path = {m.path: m for m in ctx.members}
+    paths = {m.path for m in progs} | copiers_to_parse(ctx.conn, {m.name.upper() for m in progs})
+    again = [by_path[p] for p in sorted(paths) if p in by_path and by_path[p].skip]
+    for mem in again:
+        declared = ctx.conn.execute("SELECT detail, line FROM unresolved WHERE member_id=? AND kind='declared_kind'",
+                                    (mem.id,)).fetchall()
+        _clear_facts(ctx.conn, mem.id)
+        ctx.conn.execute("UPDATE member SET parse_status='pending', parse_error=NULL WHERE id=?", (mem.id,))
+        ctx.conn.executemany("INSERT INTO unresolved(member_id,kind,detail,line) VALUES(?,'declared_kind',?,?)",
+                             [(mem.id, d, ln) for d, ln in declared])
+        mem.skip = False
+    return len(again)
 
 
 # --------------------------------------------------------------------------
@@ -3398,6 +3502,16 @@ def _build(args: argparse.Namespace, progress: Progress, t0: float) -> int:
     if ctx.listing_sources:
         ctx.say(f"  copybook libraries named by the compiler listings: {len(ctx.listing_sources):,} (program, copybook) "
                 f"row(s) for {len({p for p, _c in ctx.listing_sources}):,} program(s) - read before the resolver guesses")
+    # a program kept by this build whose copybook choice the listings now decide differently - a listing read,
+    # dated, moved or gone since it was parsed - is parsed again, so the index is what a full parse gives (LESSONS 249)
+    moved_picks = picks_moved(ctx)
+    if moved_picks:
+        n = parse_again(ctx, moved_picks)
+        conn.commit()
+        ctx.bump("picks_moved", len(moved_picks))
+        ctx.say(f"  {len(moved_picks):,} program(s) parsed again: the compiler listings now decide a copybook chosen among "
+                f"several differently (a listing read, moved or gone since they were parsed)"
+                + (f" - with {n - len(moved_picks):,} member(s) copying them" if n > len(moved_picks) else ""))
 
     # Copybooks first so field rows exist; programs; then everything else -
     # grouped by kind, so the screen says when one kind is done.

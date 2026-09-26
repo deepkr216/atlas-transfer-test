@@ -1400,7 +1400,32 @@ def expand_job(job: JclFacts, proc_lookup: Callable[[str], Optional["JclFacts"]]
         for s in out:
             _read_again(s, job, member_lookup)
         _same_job_generations(out)
+        _overrides_follow(out, job)
     return out
+
+
+def _overrides_follow(steps: List[StepFact], job: JclFacts) -> None:
+    """A job step's `//PS.DD` override row - the row where the job codes it,
+    beside the PROC step it overrides - reads the generation the way the
+    effective DD built from it does: `//PS2.KVIN DD DSN=PROD.X(+1),DISP=SHR`
+    naming the (+1) an earlier step of the job wrote is input
+    'gdg_same_job' in S1.PS2 (_same_job_generations), and the override row
+    on S1 said output [gdg_relative] - `dataset` listed the job step as a
+    second writer of the generation (LESSONS 250). Matched by the line the
+    override is coded on, its concatenation entry and its DD name; a row
+    already input (SORTIN, SYSUT1) keeps its own reason."""
+    callers = {s.step_name.upper(): s for s in job.steps}
+    for e in steps:
+        caller = callers.get((e.parent_step or "").upper()) if e.from_proc else None
+        if caller is None:
+            continue
+        for d in e.dds:
+            if not d.is_override or d.mode_source != "gdg_same_job":
+                continue
+            for i, o in enumerate(caller.dds):
+                if (o.line == d.line and o.concat_seq == d.concat_seq and o.mode != "input"
+                        and o.dd_name.upper().split(".")[-1] == d.dd_name.upper().split(".")[-1]):
+                    caller.dds[i] = replace(o, mode="input", mode_source="gdg_same_job")
 
 
 def _read_again(step: StepFact, facts: JclFacts,
@@ -1477,9 +1502,14 @@ def _resolve_dd(d: DdFact, symbols: Dict[str, str], job: JclFacts, step: StepFac
         # member was read with and that text is there, the text stays (the
         # PROC's own department chose among same-named members).
         member, text = name, body
-        if by_last and name != d.card_member:
-            job.unresolved.append(("card_seq_assumed", f"{step.step_name} {d.dd_name}: cards taken from member "
-                                                       f"{name} matching the last qualifier of {resolved}", d.line))
+    if by_last:
+        # the job's row, whether its symbols name another member or the PROC's default: a job running the PROC
+        # with its default sequential card dataset had none, while the same PROC run with an override had one
+        # (LESSONS 250)
+        entry = ("card_seq_assumed", f"{step.step_name} {d.dd_name}: cards taken from member {member} matching the "
+                                     f"last qualifier of {resolved}", d.line)
+        if entry not in job.unresolved:
+            job.unresolved.append(entry)
     return replace(d, dsn_resolved=resolved, gdg_rel=gdg, mode=mode, mode_source=src,
                    is_temp=resolved.startswith("&&"), referback=None, card_member=member, sysin_text=text)
 

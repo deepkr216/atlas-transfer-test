@@ -1,0 +1,16 @@
+{
+ "title": "an MFS field literal continued on the next line with the words MOVE ... TO files the format as a copybook",
+ "recover": false,
+ "checks": [
+  {
+   "sql": "SELECT kind FROM member WHERE name='XQFM3'",
+   "truth": "mfs",
+   "symptom": "copybook"
+  },
+  {
+   "sql": "SELECT COUNT(*) FROM screen WHERE name='XQFM3'",
+   "truth": 1,
+   "symptom": 0
+  }
+ ]
+}

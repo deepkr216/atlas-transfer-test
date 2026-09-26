@@ -1,0 +1,34 @@
+{
+ "title": "a pick the build made by following a listing filed elsewhere stays after the program's own current listing arrives",
+ "recover": false,
+ "steps": [
+  {
+   "recover": true
+  },
+  {
+   "build": true
+  },
+  {
+   "put": [
+    "later/CLAIMS/PROD.CLAIMS.LISTING/ARRNH.lst",
+    "estate/CLAIMS/PROD.CLAIMS.LISTING/ARRNH.lst"
+   ]
+  },
+  {
+   "build": true
+  },
+  {
+   "recover": true
+  },
+  {
+   "build": true
+  }
+ ],
+ "checks": [
+  {
+   "sql": "SELECT r.library FROM copy_use c JOIN member m ON m.id=c.member_id JOIN member r ON r.id=c.resolved_member_id WHERE m.name='ARRNH' AND m.kind='cobol' AND c.copybook='DUPREC'",
+   "truth": "PROD.CLAIMS.COPYLIB",
+   "symptom": "PROD.POLICY.COPYLIB"
+  }
+ ]
+}
