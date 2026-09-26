@@ -916,6 +916,14 @@ wrong member or line.
   cited as `DLIBATCH:line` with the job's line.** Its DDs are the job's overrides and are cited in the job
   (LESSONS 231); the step's own cite is not. Next: cite the job's member for a step whose PROC has no
   `proc_def` row - query-side.
+- **A row an expanded step's DD gives the job is cited with the PROC's line.** `jcl._resolve_dd` writes a
+  card_seq_assumed row ('cards taken from member X matching the last qualifier of ...') and an unresolved symbol
+  ('&RUNID still unresolved in ...') onto the job's list with the line of the PROC's DD, and `job KVCJOB`'s
+  Unresolved table prints `| KVCJOB | card_seq_assumed | S2.SRT010 SYSIN: ... | 5 |` for a job of four lines. Found
+  while fixing LESSONS 250, which gives such a row to every job step running a PROC's default sequential card
+  dataset, not only to one whose symbols name another member. The row's detail names the expanded step, so it can be
+  cited in the PROC its step came from, as `cite_iface` cites an expanded step's interface row. Next: cite such a
+  row in the PROC member the step's `from_proc` names - query-side, no re-parse.
 
 ## What the tool was not built for - scenario audit (2026-09-21)
 
