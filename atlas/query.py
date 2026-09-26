@@ -439,15 +439,15 @@ def cmd_program(conn: sqlite3.Connection, name: str) -> str:
         # job's member.
         cards = [c for c in conn.execute("""
             SELECT j.job_name, s.step_name, s.from_proc, d.dd_name, d.dsn_resolved, d.card_member, m.name AS jm,
-                   d.line, pd.proc_name, d.is_override, s.job_id, s.parent_step,
+                   d.line, pd.proc_name, d.is_override, s.job_id, s.parent_step, d.gdg_rel,
                    d.sysin_text IS NOT NULL AS has_text
             FROM dd d JOIN step s ON s.id=d.step_id LEFT JOIN job j ON j.id=s.job_id
             LEFT JOIN member m ON m.id=j.member_id LEFT JOIN proc_def pd ON pd.id=s.proc_id
-            WHERE (UPPER(d.card_member)=? OR UPPER(d.dsn_resolved) LIKE ?)
+            WHERE (UPPER(d.card_member)=? OR UPPER(d.dsn_resolved) LIKE ? OR UPPER(d.dsn_resolved) LIKE ?)
               AND NOT (s.proc_id IS NOT NULL AND EXISTS (SELECT 1 FROM step x WHERE x.from_proc=pd.proc_name))
               AND NOT (s.proc_called IS NOT NULL AND EXISTS (SELECT 1 FROM step x WHERE x.job_id=s.job_id
                                                             AND x.parent_step=s.step_name))
-            ORDER BY j.job_name, s.ordinal, d.line""", (n, f"%({n}%")).fetchall()
+            ORDER BY j.job_name, s.ordinal, d.line""", (n, f"%({n}%", f"%.{n}")).fetchall()
                  if card_member_of_row(conn, c) == n]
         other = conn.execute("SELECT kind, path FROM member WHERE UPPER(name)=? ORDER BY authoritative DESC",
                              (n,)).fetchall()
@@ -1439,14 +1439,21 @@ def card_member_read(dd_name: Optional[str], dsn_resolved: Optional[str],
     CMNSRT1 (LESSONS 222, 227). A row with no dataset reads no member: that
     build kept the PROC default's on a DD whose referback names no dataset
     in the job (`DSN=*.SRT1.SYSIN` after `//SRT1.SYSIN DD DUMMY` - LESSONS
-    229); a build of the item writes none there."""
+    229); a build of the item writes none there. Cards taken by the last
+    qualifier are that qualifier's: a card_member that is not the last
+    qualifier of a sequential dataset is the older build's PROC default
+    (`DSN=PROD.CMN.CARDS.&CARDS` read as KVDEFC beside the job's
+    PROD.CMN.CARDS.KVJOBC - LESSONS 234), and none is returned for it;
+    card_member_of_row reads the dataset's own last qualifier."""
     if not dsn_resolved:
         return None
     m = jcl._MEMBER_REF.search(dsn_resolved)
     if (m and not m.group(1)[0].isdigit()
             and (dd_name or "").upper().split(".")[-1] not in jcl._NOT_CARD_DDS):
         return m.group(1).upper()
-    return card_member.upper() if card_member else None
+    if card_member and card_member.upper() == dsn_resolved.rsplit(".", 1)[-1].upper():
+        return card_member.upper()
+    return None
 
 
 def card_member_of_row(conn: sqlite3.Connection, r: sqlite3.Row) -> Optional[str]:
@@ -1457,8 +1464,18 @@ def card_member_of_row(conn: sqlite3.Connection, r: sqlite3.Row) -> Optional[str
     kept the PROC's dataset and card member beside the instream cards
     (LESSONS 224); the job step's own override row - the same statement:
     the same line, the same DD name - has no dataset and says so. An index
-    built by the item has no member on that row to begin with."""
+    built by the item has no member on that row to begin with. A card DD
+    naming a sequential dataset (no generation) whose last qualifier is a
+    member the card lookup reads reads that member - the build takes cards
+    so (card_seq_assumed); on an index built before the item an expanded
+    step's row kept the PROC default's member there, or none (LESSONS 234).
+    `r` also holds gdg_rel."""
     name = card_member_read(r["dd_name"], r["dsn_resolved"], r["card_member"])
+    if name is None and r["dsn_resolved"] and r["gdg_rel"] is None \
+            and str(r["dd_name"] or "").upper().split(".")[-1] in jcl._CARD_DDS:
+        last = str(r["dsn_resolved"]).rsplit(".", 1)[-1].upper()
+        if 1 <= len(last) <= 8 and card_member_state(conn, last) == "read":
+            name = last
     if name and r["is_override"] and r["parent_step"] and r["job_id"] is not None:
         dd = str(r["dd_name"] or "").upper().split(".")[-1]
         if conn.execute("""SELECT 1 FROM dd d JOIN step s ON s.id=d.step_id
@@ -1535,7 +1552,7 @@ def card_members_not_indexed(conn: sqlite3.Connection, limit: int = 30) -> List[
     states: Dict[str, str] = {}
     expands: Dict[Tuple[int, str], bool] = {}
     counts: Dict[str, int] = {}
-    for r in conn.execute("""SELECT d.dd_name, d.dsn_resolved, d.card_member, d.sysin_text IS NULL AS no_text,
+    for r in conn.execute("""SELECT d.dd_name, d.dsn_resolved, d.card_member, d.sysin_text IS NULL AS no_text, d.gdg_rel,
                                     d.is_override, d.line, pd.proc_name, s.proc_called, s.job_id, s.step_name,
                                     s.parent_step
                              FROM dd d JOIN step s ON s.id=d.step_id LEFT JOIN proc_def pd ON pd.id=s.proc_id

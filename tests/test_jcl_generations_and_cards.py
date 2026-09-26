@@ -29,6 +29,9 @@ the JCL parser, and one found on the way.
       an override row is cited in the member that codes it; a PROC's USS file
       keeps its PATHOPTS direction in the job; `interfaces` leaves out a PROC's
       own default rows when a job runs the PROC.
+  LESSONS 234 - on an index built before item 29, a sequential card dataset
+      named by a PROC's symbolic is read by its last qualifier, not as the
+      PROC default the older build kept on the row.
 
 Every name here is fictional.
 """
@@ -898,7 +901,7 @@ class TheDocsSayIt(unittest.TestCase):
 
     def test_lessons_rows(self):
         text = self.read("LESSONS.md")
-        for n in range(222, 234):
+        for n in range(222, 235):
             row = next((ln for ln in text.splitlines() if ln.startswith(f"| {n} |")), "")
             self.assertIn("tests/test_jcl_generations_and_cards.py", row, n)
             self.assertEqual(row.replace("\\|", "").count("|") - 1, 5, n)     # number + four cells
@@ -921,7 +924,7 @@ class TheDocsSayIt(unittest.TestCase):
             self.assertIn("dataset", text, where)
         item = self.read("ROADMAP.md").split("29. **Delivered in the batch")[1].split("\n\n")[0]
         self.assertIn("take the member from the dataset", item)
-        self.assertIn("LESSONS 222-233", item)
+        self.assertIn("LESSONS 222-234", item)
 
     def test_the_loaded_sentence_says_what_the_code_does(self):
         # LESSONS 230. Wrong words guarded: 'says a member's text is loaded only when it is' - a copybook's stub
@@ -1498,6 +1501,86 @@ class InterfacesOfExpandedSteps(unittest.TestCase):
         self.assertIn("PROD.KV.LONE.FILE", out)             # a PROC no job runs: its own rows are what it does
         self.assertNotIn("Crosses the mainframe boundary", query.cmd_dataset(self.conn, "PROD.KV.DEFAULT.FILE"))
         self.assertIn("Crosses the mainframe boundary", query.cmd_dataset(self.conn, "PROD.KV.JOB.FILE"))
+
+
+# ===========================================================================
+# LESSONS 234 - a sequential card dataset named by a PROC's symbolic, on an
+# index built before item 29: the member is the dataset's last qualifier
+# ===========================================================================
+
+KVSEQ_PROC = SEQ_PROC.replace("//KVSORT   PROC", "//KVSEQ    PROC")
+SEQ_JOBS = {
+    "KVQJ01": "//S1       EXEC KVSEQ,CARDS=KVJOBC",                  # reads KVJOBC by the last qualifier
+    "KVQJ02": "//S1       EXEC KVSEQ",                               # reads the default KVDEFC
+    "KVQJ03": "//S1       EXEC KVSEQ,CARDS=KVQMISS",                 # a dataset no member is named like
+}
+
+
+def seq_card_estate(root):
+    _write(root, "SHARED/PROD.CMN.PROCLIB/KVSEQ.prc", KVSEQ_PROC)
+    _write(root, "SHARED/PROD.CMN.PARMLIB/KVJOBC.ctl", CARDS["KVJOBC"])
+    _write(root, "SHARED/PROD.CMN.PARMLIB/KVDEFC.ctl", CARDS["KVDEFC"])
+    for name, body in SEQ_JOBS.items():
+        _write(root, f"POLICY/PROD.KV.JCLLIB/{name}.jcl", f"//{name:<8} JOB (ACCT),'SEQ CARDS',CLASS=A\n{body}\n//\n")
+
+
+class SequentialCardsOnAnOlderIndex(unittest.TestCase):
+    """LESSONS 234. The PROC's `//SYSIN DD DSN=PROD.CMN.CARDS.&CARDS` with CARDS=KVDEFC, the cards taken by the last
+    qualifier. On an index aged to what the build before ROADMAP re-parse item 29 wrote (age_to_before_item_29,
+    checked against a real f93c60c build of seq_card_estate) every job's row kept the default KVDEFC and its text
+    beside the job's dataset. Wrong answer guarded, on that index: `program KVDEFC` listing KVQJ01 and KVQJ03, which
+    read PROD.CMN.CARDS.KVJOBC and PROD.CMN.CARDS.KVQMISS, and `program KVJOBC` not listing KVQJ01."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.td = tempfile.mkdtemp()
+        root = os.path.join(cls.td, "estate")
+        seq_card_estate(root)
+        cls.db = os.path.join(cls.td, "t.db")
+        _run_build(root, cls.db, "--rebuild")
+        cls.aged_db = os.path.join(cls.td, "aged.db")
+        shutil.copyfile(cls.db, cls.aged_db)
+        age_to_before_item_29(cls.aged_db)
+        cls.conn = query.connect(cls.db)
+        cls.aged = query.connect(cls.aged_db)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.conn.close()
+        cls.aged.close()
+        shutil.rmtree(cls.td, ignore_errors=True)
+
+    def _sysin(self, conn):
+        return {r[0]: tuple(r[1:]) for r in conn.execute(
+            """SELECT j.job_name, d.dsn_resolved, d.card_member, d.sysin_text IS NOT NULL FROM dd d
+               JOIN step s ON s.id=d.step_id JOIN job j ON j.id=s.job_id WHERE d.dd_name='SYSIN'""")}
+
+    def test_the_rows(self):
+        self.assertEqual(self._sysin(self.conn), {"KVQJ01": ("PROD.CMN.CARDS.KVJOBC", "KVJOBC", 1),
+                                                  "KVQJ02": ("PROD.CMN.CARDS.KVDEFC", "KVDEFC", 1),
+                                                  "KVQJ03": ("PROD.CMN.CARDS.KVQMISS", None, 0)})
+        self.assertEqual(self._sysin(self.aged), {"KVQJ01": ("PROD.CMN.CARDS.KVJOBC", "KVDEFC", 1),
+                                                  "KVQJ02": ("PROD.CMN.CARDS.KVDEFC", "KVDEFC", 1),
+                                                  "KVQJ03": ("PROD.CMN.CARDS.KVQMISS", "KVDEFC", 1)})
+
+    def test_program_lists_the_jobs_that_read_the_member(self):
+        for conn in (self.conn, self.aged):
+            for name, jobs in (("KVJOBC", ["KVQJ01"]), ("KVDEFC", ["KVQJ02"])):
+                out = query.cmd_program(conn, name)
+                section = out.split("### Used as control cards by")[1].split("###")[0]
+                got = sorted({ln.split("|")[1].strip() for ln in section.splitlines() if ln.startswith("| KVQJ")})
+                self.assertEqual(got, jobs, (name, section))
+                self.assertIn("Its text is loaded as that step's cards", out)
+
+    def test_coverage_is_the_same(self):
+        self.assertEqual(query.card_members_not_indexed(self.conn), [])
+        self.assertEqual(query.card_members_not_indexed(self.aged), [])
+
+    def test_the_member_a_row_reads(self):
+        read = query.card_member_read
+        self.assertEqual(read("SYSIN", "PROD.CMN.CARDS.KVJOBC", "KVJOBC"), "KVJOBC")
+        self.assertIsNone(read("SYSIN", "PROD.CMN.CARDS.KVJOBC", "KVDEFC"))       # the older build's default
+        self.assertEqual(read("SYSIN", "PROD.CMN.PARMLIB(KVJOBC)", "KVDEFC"), "KVJOBC")
 
 
 if __name__ == "__main__":

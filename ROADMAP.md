@@ -786,7 +786,7 @@ shipped alone and cost one such night; these still wait for the next one:
 29. **Delivered in the batch - a PROC's card member named by a symbolic is the calling job's, and a (+1) named again
    later in the same job is read, not written again.** The synthetic estate's findings in the JCL parser
    (docs/SYNTH-findings-2026-09-25.md; the reproductions F09 and F10 under tools/synth/repro, which verify.py now
-   reports FIXED; LESSONS 222-233). (F10) The shared sort PROC's `//SYSIN DD DSN=PROD.CMN.PARMLIB(&CARDS)`, run with
+   reports FIXED; LESSONS 222-234). (F10) The shared sort PROC's `//SYSIN DD DSN=PROD.CMN.PARMLIB(&CARDS)`, run with
    `EXEC PROC=CMNSORT,...,CARDS=BILSORT1`: the effective step's DSN was the job's, but its card member, the member's
    text, the program read from the cards and the sort byte positions stayed the PROC default's (CMNSRT1, not in the
    estate) - `job` said 'card member NOT indexed' for a member the estate holds, coverage had a 'SORT with no cards'
@@ -799,8 +799,9 @@ shipped alone and cost one such night; these still wait for the next one:
    instead of sitting beside it (LESSONS 224). Coverage's table (`query.card_members_not_indexed`) counts a PROC's
    own rows only when no indexed job expands the PROC, and a job step's //PS.DD override once. On an index built
    before the item an expanded step's card_member and text can still be the PROC default's while its dataset names
-   the job's member: the table and `program NAME` take the member from the dataset and ask whether a card member of
-   that name is in the index (LESSONS 227); `program NAME` says a member's text is loaded only where the build
+   the job's member: the table and `program NAME` take the member from the dataset - its `(member)`, or the last
+   qualifier of a sequential card dataset - and ask whether a card member of that name is in the index (LESSONS
+   227, 234); `program NAME` says a member's text is loaded only where the build
    loaded it - never for a copybook's stub named like the member - as coverage counts it (LESSONS 228, 230). A
    card DD naming its dataset by a referback (`//SYSIN DD DSN=*.S1.SYSIN`) reads that dataset's cards, and every
    step is read from its cards after its referbacks are resolved - a job step naming a PROC step's DD is read
@@ -822,7 +823,7 @@ shipped alone and cost one such night; these still wait for the next one:
    module). tests/test_jcl_generations_and_cards.py (SameJobGenerations, ProcCardMember, InTheIndex,
    ProcInterfaceRows, ProcInterfaceRowsInTheIndex, AnIndexBuiltBeforeTheItem, CardReferbacks,
    CardReferbacksInTheIndex, StubNamedLikeACardMember, OverrideCites, ProcUssFiles, InterfacesOfExpandedSteps,
-   TheReproductions).
+   SequentialCardsOnAnOlderIndex, TheReproductions).
 
 ### flow: known limits (open after review)
 
