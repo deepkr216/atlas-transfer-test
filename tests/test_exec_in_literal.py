@@ -10,6 +10,9 @@ open and ate the rest of the program. In the PROCEDURE DIVISION, cobol.py's EXEC
 `MOVE 'EXEC SQL FAILED' TO WS-MSG` before `EXEC SQL ROLLBACK END-EXEC` was one block from the literal on - the SQL
 statement read "FAILED' TO WS-MSG ...", a CICS RETURN was recorded as a LINK, and the MOVE was blanked with the block.
 Error-message literals like these are common in CICS and DB2 programs. The names below are fictional.
+
+More of the family, found by the verifier's second round on item 27 and the same on main: the OF / IN qualifier
+blanking of cobol.py ran inside literals, so `MOVE 'END OF FILE' TO WS-M` stored the literal 'END ' (LESSONS 220).
 """
 
 import contextlib
@@ -78,6 +81,29 @@ ONESENT = program("ONESENT", [
     "    DISPLAY 'EXEC SQL INCLUDE NOSUCH END-EXEC'.",
     "    GOBACK.",
 ])
+# message literals holding OF / IN, and a real qualifier beside them (LESSONS 220)
+OFLIT = program("OFLIT", [
+    "01  WS-M             PIC X(40).",
+    "01  WS-N             PIC X(20) VALUE 'END OF FILE'.",
+    "01  WS-REC.",
+    "    05  WS-K         PIC X(02).",
+    "01  WS-X             PIC X.",
+], [
+    "0000-MAIN.",
+    "    MOVE 'END OF FILE' TO WS-M",
+    "    IF WS-M = 'LACK OF FUNDS'",
+    "        DISPLAY 'CHECK IN PROGRESS'",
+    "    END-IF",
+    "    EVALUATE WS-X",
+    "        WHEN 'A'",
+    "            MOVE 'RECORD NOT IN FILE' TO WS-M",
+    "    END-EVALUATE",
+    "    MOVE 'THE CALL OF EXEC CICS LINK FAILED ON THE PROGRAM KY",
+    "-    'SUB01 TODAY' TO WS-M",
+    "    MOVE 'IN' TO WS-K OF WS-REC",
+    "    MOVE WS-K IN WS-REC TO WS-M.",
+    "    GOBACK.",
+]).replace("       -    'SUB01", "      -    'SUB01")      # the hyphen in column 7: a continuation line
 MSGBOOK = ("       01  MSG-TABLE.\n"
            "           05  MSG-1              PIC X(20) VALUE 'EXEC DLI GU FAILED'.\n"
            "           05  MSG-2              PIC X(20) VALUE 'EXEC SQL'.\n"
@@ -150,6 +176,40 @@ class TheProgramFacts(unittest.TestCase):
                          [("MSG-1", 0, 20), ("MSG-2", 20, 20), ("MSG-3", 40, 4)])
 
 
+class QualifierWordsInALiteral(unittest.TestCase):
+    """The OF / IN qualifier blanking ran over the literals too: `MOVE 'END OF FILE' TO WS-M` kept the literal 'END ',
+    `literal "END OF FILE"` found no MOVE of it (LESSONS 220)."""
+
+    def test_blank_qualifiers(self):
+        text = "MOVE 'END OF FILE' TO WS-K OF WS-REC"
+        self.assertEqual(cobol.blank_qualifiers(text), text[:-len("OF WS-REC")] + " " * len("OF WS-REC"))
+        self.assertEqual(cobol.blank_qualifiers("IF A = \"CHECK IN PROGRESS\" OR B IN C"),
+                         "IF A = \"CHECK IN PROGRESS\" OR B     ")
+        # a literal the text leaves open (it goes on, on a continuation line) is text to its end
+        self.assertEqual(cobol.blank_qualifiers("DISPLAY 'RECORD NOT IN FILE"), "DISPLAY 'RECORD NOT IN FILE")
+        self.assertEqual(cobol.blank_qualifiers("MOVE WS-Q-IN TO WM-STAT"), "MOVE WS-Q-IN TO WM-STAT")
+        self.assertEqual(cobol.blank_qualifiers("MOVE 'IT''S IN' TO X IN Y"), "MOVE 'IT''S IN' TO X     ")
+
+    def test_the_literals_keep_their_words(self):
+        f = cobol.parse_program(OFLIT)
+        got = [(lit, how, tgt, ln) for lit, how, tgt, ln in f.literal_refs]
+        self.assertIn(("END OF FILE", "move_to", "WS-M", line_of(OFLIT, "MOVE 'END OF FILE'")), got)
+        self.assertIn(("LACK OF FUNDS", "compare", "WS-M", line_of(OFLIT, "'LACK OF FUNDS'")), got)
+        self.assertIn(("CHECK IN PROGRESS", "display", None, line_of(OFLIT, "'CHECK IN PROGRESS'")), got)
+        self.assertIn(("RECORD NOT IN FILE", "move_to", "WS-M", line_of(OFLIT, "'RECORD NOT IN FILE'")), got)
+        long = [lit for lit, how, tgt, _ln in got if lit.startswith("THE CALL")]
+        self.assertEqual(len(long), 1, got)
+        self.assertTrue(long[0].startswith("THE CALL OF EXEC CICS LINK FAILED ON THE PROGRAM KY"), long)
+        self.assertTrue(long[0].endswith("SUB01 TODAY"), long)
+        self.assertIn(("IN", "move_to", "WS-K", line_of(OFLIT, "MOVE 'IN' TO WS-K")), got)
+        # a real qualifier is still no reference of its own
+        refs = [(n, mode) for n, mode, _v, _ln in f.field_refs]
+        self.assertIn(("WS-K", "write"), refs)
+        self.assertIn(("WS-K", "read"), refs)
+        self.assertNotIn("WS-REC", [n for n, _m in refs])
+        self.assertEqual(f.cics, [], "the words EXEC CICS LINK in the literal are text (LESSONS 217)")
+
+
 class InTheIndex(unittest.TestCase):
 
     @classmethod
@@ -157,7 +217,8 @@ class InTheIndex(unittest.TestCase):
         cls.td = tempfile.mkdtemp()
         root = os.path.join(cls.td, "estate")
         for rel, text in (("GC/PROD.GC.SRC/LNKMSG.cbl", LNKMSG), ("GC/PROD.GC.SRC/SQLMSG.cbl", SQLMSG),
-                          ("GC/PROD.GC.SRC/ONESENT.cbl", ONESENT), ("GC/PROD.GC.COPYLIB/MSGBOOK.cpy", MSGBOOK)):
+                          ("GC/PROD.GC.SRC/ONESENT.cbl", ONESENT), ("GC/PROD.GC.COPYLIB/MSGBOOK.cpy", MSGBOOK),
+                          ("GC/PROD.GC.SRC/OFLIT.cbl", OFLIT)):
             p = os.path.join(root, *rel.split("/"))
             os.makedirs(os.path.dirname(p), exist_ok=True)
             with open(p, "w", encoding="utf-8") as fh:
@@ -186,6 +247,20 @@ class InTheIndex(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_a_literal_holding_of(self):
+        # `literal "END OF FILE"` showed only the VALUE clause and 'Set (MOVE / STRING): _none_' (LESSONS 220)
+        conn = query.connect(self.db)
+        try:
+            page = query.cmd_literal(conn, "END OF FILE")
+            moves = page.split("### Set (MOVE / STRING)\n")[1].split("\n### ")[0]
+            self.assertNotIn("_none_", moves)
+            self.assertIn("WS-M", moves)
+            self.assertIn(f"OFLIT:{line_of(OFLIT, 'MOVE ' + chr(39) + 'END OF FILE')}", moves)
+            self.assertIn("OFLIT", query.cmd_literal(conn, "LACK OF FUNDS"))
+            self.assertIn("OFLIT", query.cmd_literal(conn, "RECORD NOT IN FILE"))
+        finally:
+            conn.close()
+
 
 class TheDocsSayIt(unittest.TestCase):
 
@@ -201,6 +276,12 @@ class TheDocsSayIt(unittest.TestCase):
         self.assertIn("the words `EXEC CICS` in an error-message literal opening a block", read("README.md"))
         self.assertIn("LESSONS 217", read("atlas", "reader.py"))
         self.assertIn("LESSONS 217", read("atlas", "cobol.py"))
+        # the qualifier blanking (LESSONS 220)
+        self.assertIn("**More of the family, found by the verifier's second round on item 27 (LESSONS 220)", roadmap)
+        self.assertIn("| 220 | Not seen on his estate - found by the verifier in passing on ROADMAP re-parse item 27",
+                      lessons)
+        self.assertIn("Rule for me: the rule of row 217 holds for every blanking pass", lessons)
+        self.assertIn("LESSONS 220", read("atlas", "cobol.py"))
 
 
 if __name__ == "__main__":

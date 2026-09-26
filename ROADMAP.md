@@ -773,6 +773,11 @@ shipped alone and cost one such night; these still wait for the next one:
    searched outside literals and matched back over the text as written (`cobol.exec_blocks`, `cobol.blank_exec`: a
    block's own literals are kept). A program holding such a literal gets its paragraphs, items and statements back
    on the re-parse night. tests/test_exec_in_literal.py (TheStatements, TheProgramFacts, InTheIndex, TheDocsSayIt).
+   **More of the family, found by the verifier's second round on item 27 (LESSONS 220), the same on main.** The OF /
+   IN qualifier blanking of cobol.py ran inside literals: `MOVE 'END OF FILE' TO WS-M` stored the literal 'END
+   ', `IF WS-M = 'LACK OF FUNDS'` 'LACK ', and `literal "END OF FILE"` found no MOVE of it. `cobol.blank_qualifiers`
+   blanks a qualifier only outside literals; every such program's literal rows are right after the re-parse night.
+   tests/test_exec_in_literal.py (QualifierWordsInALiteral, InTheIndex.test_a_literal_holding_of).
 
 ### flow: known limits (open after review)
 

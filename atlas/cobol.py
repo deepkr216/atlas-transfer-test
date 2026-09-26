@@ -2154,6 +2154,32 @@ def _exec_refs(f: ProgramFacts, kind: str, inner: str, ln: int) -> None:
             _refs(f, names, "read", stmt, ln)
 
 
+_QUALIFIER = re.compile(r"(?<![\w-])(?:OF|IN)\s+[A-Z0-9][A-Z0-9\-]*", re.IGNORECASE)
+
+
+def blank_qualifiers(text: str) -> str:
+    """`text` with every OF / IN qualifier (`OF WS-REC`) blanked to the same
+    length - outside literals only. Found on the literal-blanked text (a
+    literal the text leaves open blanked to its end) and blanked on those
+    spans: `MOVE 'END OF FILE' TO WS-M` kept 'END        ' as its literal,
+    `IF WS-M = 'LACK OF FUNDS'` 'LACK         ', and `literal "END OF
+    FILE"` found no MOVE of it (LESSONS 220)."""
+    masked = _LIT_MASK.sub(lambda mm: " " * len(mm.group(0)), text)
+    opened = [i for i in (masked.find("'"), masked.find('"')) if i >= 0]
+    if opened:
+        masked = masked[:min(opened)]
+    spans = [m.span() for m in _QUALIFIER.finditer(masked)]
+    if not spans:
+        return text
+    out, last = [], 0
+    for a, b in spans:
+        out.append(text[last:a])
+        out.append(" " * (b - a))
+        last = b
+    out.append(text[last:])
+    return "".join(out)
+
+
 def _extract_field_and_literal_refs(f: ProgramFacts, st: LogicalLine) -> List[Tuple[int, Optional[str]]]:
     """field_refs / literal_refs from the qualifier-blanked text (unchanged),
     and one FlowFact per (source, target) from the text as written, each with
@@ -2174,9 +2200,9 @@ def _extract_field_and_literal_refs(f: ProgramFacts, st: LogicalLine) -> List[Tu
     # `WS-KEY OF WS-REC = 'B'` tests WS-KEY; the qualifier is blanked (same
     # length, so line attribution is unchanged) before verbs are read.
     # A name ending in -IN / -OF (WS-Q-IN) is not a qualifier: `\b` matched after its
-    # hyphen and blanked `IN TO`, so `MOVE WS-Q-IN TO WM-STAT` vanished.
-    body = re.sub(r"(?<![\w-])(?:OF|IN)\s+[A-Z0-9][A-Z0-9\-]*", lambda m: " " * len(m.group(0)), body,
-                  flags=re.IGNORECASE)
+    # hyphen and blanked `IN TO`, so `MOVE WS-Q-IN TO WM-STAT` vanished. A
+    # literal's words are text: 'END OF FILE' keeps its OF FILE (LESSONS 220).
+    body = blank_qualifiers(body)
     # EVALUATE A ALSO B ... WHEN 3 ALSO 'M': one subject per ALSO position, and
     # each WHEN literal attaches to the subject at ITS position.
     eval_subjects: List[Optional[str]] = []
