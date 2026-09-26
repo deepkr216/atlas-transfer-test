@@ -875,7 +875,7 @@ class CoverageGivesTheReasonThatMadeItPartial(_RoundOne):
         self.assertNotIn("no_commarea", part)
         # the advice speaks of both reasons the table holds
         self.assertIn("usually partial because a copybook it copies is not in the index", part)
-        self.assertIn("2 of the members above are partial because an EXEC block before the PROCEDURE DIVISION has no "
+        self.assertIn("2 of these 3 members are partial because an EXEC block before the PROCEDURE DIVISION has no "
                       "period after its END-EXEC (exec_no_period): nothing to fetch", part)
         # the note the CICS program also carries is still said, as what it is
         self.assertEqual(self.q("""SELECT u.kind FROM unresolved u JOIN member m ON m.id = u.member_id
@@ -971,7 +971,7 @@ class OnlyTheExecReason(_Built):
         cov = self.page(query.cmd_coverage)
         part = cov.split("### Members parsed only in part")[1].split("\n### ")[0]
         self.assertNotIn("usually partial because a copybook", part)
-        self.assertIn("2 of the members above are partial because an EXEC block", part)
+        self.assertIn("Both members are partial because an EXEC block", part)
         page = self.page(query.cmd_program, "BOOKPGM")
         self.assertRegex(page, r"\| BOOKPGM \| exec_no_period \| EXEC SQL at line 1 of copybook NOBOOK has no period "
                                r"after its END-EXEC; what follows was read as if it had one \| (?:\w+/)?NOBOOK:1 "

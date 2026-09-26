@@ -2057,10 +2057,14 @@ def _partial_members(conn: sqlite3.Connection, limit: int = COVERAGE_ROWS) -> st
                    "document is partial when no text could be extracted (a scan - run `OCR images`). A screen member "
                    "is partial when no map or format macro was recognised.\n")
     if no_period:
-        out.append(f"\n> {no_period} of the members above {'is' if no_period == 1 else 'are'} partial because an EXEC "
-                   "block before the PROCEDURE DIVISION has no period after its END-EXEC (exec_no_period): nothing to "
-                   "fetch - look at the member at the line its note names; its row in 'Unresolved by kind' below "
-                   "says what to check.\n")
+        # counted over every partial member, not only the rows shown (the table names COVERAGE_ROWS of them)
+        if no_period == len(rows):
+            lead = {1: "This member is", 2: "Both members are"}.get(no_period, f"All {no_period} of these members are")
+        else:
+            lead = f"{no_period} of these {len(rows)} members {'is' if no_period == 1 else 'are'}"
+        out.append(f"\n> {lead} partial because an EXEC block before the PROCEDURE DIVISION has no period after its "
+                   "END-EXEC (exec_no_period): nothing to fetch - look at the member at the line its note names; its "
+                   "row in 'Unresolved by kind' below says what to check.\n")
     if any(r["kind"] in ("cobol", "copybook") for r in rows):
         arrived, misfiled, waiting = recover.arrival_scan(conn)
         clauses = []                                                    # only the clause whose count is not zero
