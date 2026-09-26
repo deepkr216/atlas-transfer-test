@@ -1,3 +1,5 @@
 # F16-dfhaid-missing - COPY DFHAID (a CICS-supplied copybook no shop keeps in its own COPYLIB) makes every CICS program partial
 
 DFHAID, DFHBMSCA and DFHEIBLK come from the CICS SDFHCOB library, as SQLCA comes from DB2; SQLCA is excluded by name, these are not. Every CICS program is 'parsed only in part' and coverage sends the owner to fetch a library the estate never holds.
+
+Fixed by ROADMAP re-parse item 27 (LESSONS 214): a COPY of a copybook IBM supplies (CICS DFHAID, DFHBMSCA, DFHEIBLK, DFHEIVAR, DFHMSRCA; MQ CMQV, CMQXV and the CMQ*V / CMQ*L structures) or one the manifest's `system_includes` names, when no member of the index carries the name, is recorded with no member and no note: R16CIC is `ok`. Coverage lists DFHAID under 'IBM-supplied copybooks, not in the estate' (`| DFHAID | 0 | 1 | CICS (SDFHCOB) |`: no program parsed only in part for it, one copying it), not under 'Copybooks not found'; `program R16CIC` and `copybook DFHAID` say it is read from CICS's own library and nothing is to fetch. A copy the shop keeps in its COPYLIB is expanded like any copybook.

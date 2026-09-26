@@ -67,6 +67,7 @@ WHEN WHERE WITH WORKING-STORAGE WRITE WRITEQ X XCTL XREF Y YES ZERO ZEROS ZEROES
 POLICY CLAIMS BILLING SHARED PROD STG TEST DOCS RECOVERED-COPYBOOKS EBCDIC ASCII UTF-8 CRLF LF README ROADMAP LESSONS FACTS INFERENCE
 INTRDR CNTL PARMLIB PROCLIB LOADLIB JCLLIB COPYBOOK COPYBOOKS PLUS MINUS MAX MIN ODO CICSCSD1 IMSGEN1 EIBCALEN EIBAID DFHCICST ENABLED
 NORMAL LTERM MOD MID FOP FIP OSVS INTEGER-OF-DATE SMALLINT INTEGER CMPAT IOPCB ALT ULU DBB IFP JBP JMP GHU GHN GHNP ROLB XRST
+SDFHCOB SCSQCOBC DFHENTER DFHBMSCA DFHEIBLK DFHEIVAR DFHMSRCA CMQV CMQXV IBM-SUPPLIED SYSTEM_INCLUDES
 """.split())
 
 
@@ -1621,12 +1622,27 @@ class Checker:
             else:
                 self.ok("coverage partial split adds up")
         nf = {row[0]: int(row[1]) for h, hdr, rows_ in md_tables(section(text, "Copybooks not found")) for row in rows_ if len(row) >= 2 and row[1].isdigit()}
-        want_nf = {"POLSTUBB": 1, "POLSTUBC": 1, "DFHAID": 3}
+        want_nf = {"POLSTUBB": 1, "POLSTUBC": 1}
         for k, v in want_nf.items():
             if nf.get(k) != v:
                 self.find("query", "coverage", f"Copybooks not found {k}", f"{v} use(s)", f"{nf.get(k)}", facts=1)
             else:
                 self.ok("coverage not-found row exact")
+        # DFHAID comes with CICS (SDFHCOB), which the estate never holds: not a copybook not found, and no program is
+        # partial for it (repro F16) - its own table: copybook, programs parsed only in part for it, programs copying it
+        cics = sorted(p["name"] for p in self.truth["programs"].values() if any(w["copybook"] == "DFHAID" for w in p["copies"]))
+        if "DFHAID" in nf:
+            self.find("query", "coverage", "Copybooks not found DFHAID", "not listed (IBM-supplied, not in the estate)",
+                      f"listed with {nf['DFHAID']} use(s)", facts=1)
+        else:
+            self.ok("coverage: DFHAID not a copybook not found")
+        ibm = {row[0]: row[1:] for h, hdr, rows_ in md_tables(section(text, "IBM-supplied copybooks, not in the estate"))
+               for row in rows_ if row}
+        if cics and ibm.get("DFHAID", [])[:2] != ["0", str(len(cics))]:
+            self.find("query", "coverage", "IBM-supplied DFHAID", f"0 programs partial for it, {len(cics)} copying it",
+                      f"{ibm.get('DFHAID')}", facts=1)
+        elif cics:
+            self.ok("coverage: DFHAID in the IBM-supplied table")
         for k in ("CMNDATEA", "CMNCUSTP", "POLPROCB", "POLMISSB", "POLARRVB"):
             if k in nf:
                 self.find("recover", "coverage", f"Copybooks not found {k}", "not listed (a copybook in the index, or healed by recover "

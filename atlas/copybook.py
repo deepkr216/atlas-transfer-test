@@ -204,7 +204,7 @@ _USAGE_CLAUSE = re.compile(
     r"PACKED-DECIMAL|BINARY|DISPLAY-1|DISPLAY|INDEX|POINTER|NATIONAL)\b", re.IGNORECASE)
 # TIMES is optional, and so is the blank before DEPENDING only when TIMES is there: `\s*(?:TIMES)?` took the blank
 # and the DEPENDING clause after it was never tried - `OCCURS 1 TO 10 DEPENDING ON WS-CNT` was a fixed table of 10
-# with no word of its variable length (found while writing ROADMAP re-parse item 27; LESSONS 214)
+# with no word of its variable length (found while writing ROADMAP re-parse item 27; LESSONS 215)
 _OCCURS = re.compile(
     r"\bOCCURS\s+(?:(\d+)\s+TO\s+)?(\d+)(?:\s+TIMES)?"
     r"(?:\s+DEPENDING\s+(?:ON\s+)?(" + DATA_NAME + r"))?", re.IGNORECASE)

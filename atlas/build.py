@@ -2267,7 +2267,7 @@ def index_cobol(ctx: Ctx, mem: Mem) -> None:
     for w in exp.warnings:          # each one a gap: a COPY NOT FOUND, or skipped (recursive, nested too deep)
         notes.append(("expand", w, 0))
     # exp.supplied (a copybook IBM supplies, not in the estate) is no gap and no note: the row with no member says it,
-    # and the query side tells it from a copy not found by the name and the absent note (query.supplied_row)
+    # and the query side tells it from a copy not found by the name no member carries (recover.supplied_copybooks)
     conn.executemany(
         "INSERT INTO unresolved(member_id,kind,detail,line) VALUES(?,?,?,?)",
         [(mem.id, k, d, ln or None) for (k, d, ln) in notes])
@@ -2592,9 +2592,10 @@ def nested_copy_notes(exp: expand.Expansion, system_includes: Dict[str, str]) ->
     for s in exp.supplied:
         name = s.rsplit(" ", 1)[-1]
         product = system_includes.get(name, expand.MANIFEST_PRODUCT)
+        who = ("supplied by a product library (the manifest's system_includes)" if product == expand.MANIFEST_PRODUCT
+               else f"IBM-supplied ({product})")
         m = _WARN_LINE.match(s)
-        out.append((f"{s} is IBM-supplied ({product}), not in the estate - {NESTED_NOT_COUNTED}",
-                    int(m.group(1)) if m else None))
+        out.append((f"{s} is {who}, not in the estate - {NESTED_NOT_COUNTED}", int(m.group(1)) if m else None))
     return out
 
 

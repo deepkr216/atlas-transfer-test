@@ -464,7 +464,8 @@ def expand(lines: Sequence[Line], member_id: int, resolver: Resolver,
                 if lines[k].is_comment:
                     continue
                 more = (apply_replacing(lines[k].code, replacing) if replacing else lines[k].code).strip()
-                if _SQL_INCLUDE_WORDS.match(" ".join(_mask_literals(stmt).split()))                         and not more.upper().startswith("END-EXEC"):
+                if _SQL_INCLUDE_WORDS.search(" ".join(_mask_literals(stmt).split())) \
+                        and not more.upper().startswith("END-EXEC"):
                     break
                 stmt += " " + more
                 j = k

@@ -26,7 +26,7 @@ DFHBMSCA, DFHEIBLK, DFHEIVAR, DFHMSRCA; MQ CMQV, CMQXV and the CMQ*V / CMQ*L str
 manifest's `system_includes` adds, are 'IBM-supplied, not in the estate' when no member carries the name: no gap, no
 fetch, their own table in coverage. A shop that keeps one has it expanded like any copybook.
 
-Found while writing F07: `OCCURS 1 TO 10 DEPENDING ON WS-CNT` without TIMES was read as a fixed table - the DEPENDING
+Found while writing F07 (LESSONS 215): `OCCURS 1 TO 10 DEPENDING ON WS-CNT` without TIMES was read as a fixed table - the
 clause after the number was never tried.
 
 The stand-ins of this week (partial_kind, is_truly_partial, the chosen-among-several row, recover's arrived / misfiled
@@ -675,9 +675,20 @@ class FiledAsAnotherKind(_Built):
 VNDPGM = program("VNDPGM", ["01  WS-A   PIC X.", "    COPY VNDRBOOK."], ["0000-MAIN.", "    GOBACK."])
 
 
+VNDOUTR = ("       05  VND-KEY                PIC X(04).\n"
+           "           COPY VNDRBOOK.\n"
+           "       05  VND-AFTER              PIC X(02).\n")
+
+
 class TheManifestAddsNames(_Built):
-    files = (("GC/PROD.GC.SRC/VNDPGM.cbl", VNDPGM),)
+    files = (("GC/PROD.GC.SRC/VNDPGM.cbl", VNDPGM), ("GC/PROD.GC.COPYLIB/VNDOUTR.cpy", VNDOUTR))
     manifest = {"system_includes": ["vndrbook", "NOT A NAME!", "VNDRBOOK"]}
+
+    def test_a_copybook_copying_one(self):
+        self.assertEqual(self.warnings("VNDOUTR"), [(
+            "L2: COPY VNDRBOOK is supplied by a product library (the manifest's system_includes), not in the estate - "
+            "its bytes are not in this layout: an item after it in the same record sits further on by its length", 2)])
+        self.assertIn("- L2: COPY VNDRBOOK is supplied by a product library", self.page(query.cmd_layout, "VNDOUTR"))
 
     def test_the_name_is_supplied_and_recorded(self):
         self.assertEqual(self.status("VNDPGM"), "ok")
@@ -920,6 +931,36 @@ class TheReproductions(unittest.TestCase):
             shutil.rmtree(out, ignore_errors=True)
         self.assertEqual([v for _l, v, _d in got], ["FIXED", "FIXED", "FIXED"], got)
         self.assertIn("a control", got[1][2])
+
+
+class TheDocsSayIt(unittest.TestCase):
+    """ROADMAP 27, LESSONS 214 and 215, README's Copybook and Expansion rows, the manifest example, the four
+    reproductions' READMEs and the findings report say what changed."""
+
+    def read(self, *path):
+        with open(os.path.join(ROOT, *path), encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_the_docs(self):
+        roadmap = " ".join(self.read("ROADMAP.md").split())
+        self.assertIn("27. **Delivered in the batch - an INCLUDE over three lines, a copybook's own layout with its nested "
+                      "COPY in place, names with a :TAG:, the copybooks IBM supplies.**", roadmap)
+        self.assertIn("310 findings (315 facts) before, 62 (65) after, 11,053 facts matched before and 11,358 after", roadmap)
+        lessons = self.read("LESSONS.md")
+        self.assertIn("| 214 | Not seen on his estate - the synthetic estate's comparison", lessons)
+        self.assertIn("Rule for me: a copybook is read the way the compiler reads it", lessons)
+        self.assertIn("| 215 | Not seen on his estate - found while writing row 214's tests", lessons)
+        self.assertIn("Rule for me: an optional group behind a greedy blank never runs", lessons)
+        readme = self.read("README.md")
+        self.assertIn("a copybook that COPYs another is laid out with the nested copybook in place", readme)
+        self.assertIn("is 'IBM-supplied, not in the estate' - never a gap", readme)
+        self.assertIn('"system_includes": []', self.read("manifest.example.json"))
+        for rid in ("F05-include-three-lines", "F06-nested-copy-offsets", "F07-tag-copybook-no-rows", "F16-dfhaid-missing"):
+            self.assertIn("Fixed by ROADMAP re-parse item 27 (LESSONS 214)", self.read("tools", "synth", "repro", rid,
+                                                                                     "README.md"), rid)
+        report = self.read("docs", "SYNTH-findings-2026-09-25.md")
+        self.assertIn("verify.py reports FIXED for every check of F05, F06, F07 and F16", report)
+        self.assertIn("LESSONS 215", self.read("atlas", "copybook.py"))
 
 
 if __name__ == "__main__":

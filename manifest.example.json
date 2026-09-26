@@ -12,6 +12,8 @@
     "PROD.POLICY.SRC": "POLICY",
     "PROD.BILLING.SRC": "BILLING"
   },
+  "_system_includes_comment": "Copybook names your compiles read from a product library you do not fetch, beside the ones IBM supplies that the build knows already (CICS DFHAID, DFHBMSCA, DFHEIBLK, DFHEIVAR, DFHMSRCA; MQ CMQV, CMQXV and the CMQ*V / CMQ*L structures). A COPY of one that no member of the index carries is 'supplied by a product library, not in the estate': never NOT FOUND, never a partial program. A copy you do keep in a COPYLIB is expanded like any copybook. In sources.json the same key reaches the manifest the UI writes.",
+  "system_includes": [],
   "_external_interfaces_comment": "What crosses the mainframe boundary and with whom - no source file states the peer. kind: ndm|ftp|mq|ddf|webservice|zosconnect|file|other; direction: in|out|both; one of dataset|queue|table|transaction|program|path. Shown by `interfaces` and on `dataset X`.",
   "external_interfaces": [
     {"kind": "ndm", "peer": "REINSURER-X", "direction": "out", "dataset": "PROD.POLICY.EXTRACT", "note": "nightly bordereau"},

@@ -4644,14 +4644,14 @@ def nested_copy_lines(conn: sqlite3.Connection, member_id: int) -> List[str]:
     for c in rows:
         book = str(c["copybook"]).upper()
         if c["resolved_member_id"]:
-            texts = conn.execute("SELECT COUNT(DISTINCT norm_sha) FROM member WHERE UPPER(name) = ? AND kind IN "
+            texts = conn.execute("SELECT COUNT(DISTINCT norm_sha) FROM member WHERE name = ? AND kind IN "
                                  "('copybook', 'cobol', 'sql', 'unknown')", (book,)).fetchone()[0]
             chosen = (f" - the copy in `{c['path']}`, one of {texts} texts of the name (`copybook {book}`)"
                       if texts > 1 else "")
             out.append(f"- `COPY {book}` at line {c['line']}: its bytes are counted in the offsets above; its items are "
                        f"{book}'s own rows, not listed here (`layout {book}`){chosen}\n")
             continue
-        said = next((w for w in warned if w.startswith(f"L{c['line']}: COPY {book}")), None)
+        said = next((w for w in warned if re.match(rf"L{c['line']}: COPY {re.escape(book)}[ :]", w)), None)
         if said:
             out.append(f"- {said}\n")
         else:

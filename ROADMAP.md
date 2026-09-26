@@ -682,6 +682,51 @@ shipped alone and cost one such night; these still wait for the next one:
    CoverageGivesTheReasonThatMadeItPartial, OnlyTheExecReason, FallThroughAfterAScopeTerminator,
    GoToDependingOnAQualifiedIndex, TheReadLoopInTheIndex, FieldOfAFileNameUsedAsADataItem,
    TheMoreLineSaysWhatTheHiddenMembersMiss, TheVerbSplitIsATrie, TheReproductions).
+27. **Delivered in the batch - an INCLUDE over three lines, a copybook's own layout with its nested COPY in place,
+   names with a :TAG:, the copybooks IBM supplies.** The synthetic estate's findings in the expander and the
+   copybook parser (docs/SYNTH-findings-2026-09-25.md; the reproductions F05, F06, F07 and F16 under
+   tools/synth/repro, which verify.py now reports FIXED; LESSONS 214). (F05) `EXEC SQL` / `INCLUDE BILTBL` /
+   `END-EXEC.` on three lines, the way DCLGEN-era programs write it, was not expanded - no copy_use row, the
+   DCLGEN's items not the program's, `copybook BILTBL` listing none of them: `expand.sql_include_over_lines` reads
+   the words over the lines after an `EXEC SQL` that ends its line, and once they are all there only END-EXEC may
+   follow (a statement without one ends there and the next line stays the program's). (F06) A copybook that COPYs
+   another: its own rows left the nested bytes out, so every item after the COPY sat that many bytes early in
+   `layout` and `field` (58 offsets 121 bytes short) while the program's view was right. `build.index_copybook`
+   now computes the layout over the copybook's text with every COPY in it put in place by `make_resolver` (the
+   programs' resolver; a copybook copying itself is 'skipped - recursive'); its rows are its own items at their
+   own lines and the nested items stay the nested member's rows; its copy_use rows name the member expanded (NULL
+   for ever before - LESSONS 184; the scans that read a row as found or not take programs only, so nothing reads
+   these as one); a COPY whose text is not in a data copybook's layout (NOT FOUND, skipped, a stub, IBM-supplied)
+   is a 'layout_warning' on the copybook, which stays `ok`; `layout COPYBOOK` says under its table where each
+   nested COPY's bytes are (`query.nested_copy_lines`) - on an index built before the item, that they are NOT
+   counted. An incremental build parses such a copybook again with the programs when a name it copies moves
+   (copiers_to_parse always took copybook copiers), so its layout follows the nested one. (F07) A name with a
+   `:TAG:` of pseudo-text (`:PCB:-STATUS`, the PCB mask every IMS program copies with `REPLACING ==:PCB:== BY
+   ==BIL==`) was no name: the mask had no rows, no 88s and no layout, and no field_alias row tied BIL-STATUS back
+   (164 facts). `copybook.DATA_NAME` takes a tag anywhere in a name - levels, REDEFINES and DEPENDING ON operands
+   - and the expander's alias pattern the same. (F16) `COPY DFHAID` made every CICS program `partial` and coverage
+   sent him to fetch a library the estate never holds. `expand.IBM_COPYBOOKS` (CICS DFHAID, DFHBMSCA, DFHEIBLK,
+   DFHEIVAR, DFHMSRCA; MQ CMQV, CMQXV, CMQODV/L, CMQMDV/L, CMQGMOV/L, CMQPMOV/L) and the manifest's
+   `system_includes` (`build.load_system_includes`, recorded in `build_run.system_includes`; sources.json's key
+   reaches the manifest the UI writes): a COPY of one that no member of the index carries is recorded with no
+   member and no note, and the program stays `ok`; a copy the shop keeps is expanded like any copybook, and a
+   member of the name filed as another kind stays NOT FOUND with the misfiled advice. Query and recover read the
+   same test (`recover.supplied_copybooks`): coverage lists such names under 'IBM-supplied copybooks, not in the
+   estate' (copybook, programs parsed only in part for it, programs copying it, supplied with), never under
+   'Copybooks not found'; `program`'s cell and `copybook` say the compile reads it from the product's library and
+   nothing is to fetch; recover counts none missing and none un-linked. On the index he has, built before the
+   item, the same pages say it, and the table counts the programs that build marked partial for one, with the
+   sentence that the next build does not. Found on the way: `OCCURS 1 TO 10 DEPENDING ON X` without TIMES lost its
+   DEPENDING clause (LESSONS 215). The stand-ins of this week find nothing to do on an index holding these
+   members; on one built before the item they read it as it is (partial_kind still calls a program partial for
+   DFHAID there). The synth harness over the whole estate: 310 findings (315 facts) before, 62 (65) after, 11,053
+   facts matched before and 11,358 after, none new; its truth for the CICS programs follows F16 (`ok`, DFHAID in
+   the new table), and verify.py prints FIXED for a control check the index still gives. The first build of this
+   toolkit re-parses every member. tests/test_copybook_expansion.py (IncludeOverLines, TaggedNames,
+   OccursDependingWithoutTimes, ThreeLineInclude, NestedCopybookLayout, TaggedCopybookInTheIndex,
+   IbmSuppliedCopybooks, TheStandInsFindNothingToDo, TheShopKeepsItsOwnCopy, FiledAsAnotherKind,
+   TheManifestAddsNames, AnIndexBuiltBeforeTheItem, ANestedCopybookChanges, TheReproductions, TheDocsSayIt);
+   tests/test_arrived_copybooks.py (the three nested-copybook cases: a copybook's own row names the member).
 
 ### flow: known limits (open after review)
 

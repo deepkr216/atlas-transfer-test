@@ -1823,9 +1823,10 @@ def missing_copybooks(conn: sqlite3.Connection) -> Dict[str, int]:
     name counts as missing too; a COPYBOOK copying its own name does not -
     it is the member, and the expander skips that COPY as recursive). A
     copybook IBM supplies that no member carries is not missing
-    (supplied_copybooks): there is no library of the shop's to fetch it from
-    and no listing to write it from - on an index built before ROADMAP
-    re-parse item 27 too, where its programs still say NOT FOUND."""
+    (supplied_copybooks): the compile reads it from the product's library,
+    so there is nothing of the shop's to fetch and nothing to write from the
+    listings - on an index built before ROADMAP re-parse item 27 too, where
+    its programs still say NOT FOUND."""
     supplied = supplied_copybooks(conn)
     kinds = ",".join("?" * len(RESOLVER_KINDS))
     out: Dict[str, int] = {}
