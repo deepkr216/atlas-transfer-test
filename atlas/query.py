@@ -587,7 +587,8 @@ def cmd_program(conn: sqlite3.Connection, name: str) -> str:
         for f in files:
             ddn = (f["assign_dd"] or "").upper()
             dsns = conn.execute("""
-                SELECT DISTINCT d.dsn_resolved, d.mode, d.mode_source, j.job_name, pd.proc_name
+                SELECT DISTINCT d.dsn_resolved, CASE WHEN d.dsn_resolved IS NULL THEN d.dsn END AS dsn_written,
+                       d.mode, d.mode_source, j.job_name, pd.proc_name
                 FROM dd d JOIN step s ON s.id = d.step_id LEFT JOIN job j ON j.id = s.job_id
                 LEFT JOIN proc_def pd ON pd.id = s.proc_id
                 WHERE UPPER(s.effective_pgm)=? AND (UPPER(d.dd_name)=? OR UPPER(d.dd_name) LIKE ?)""",
@@ -599,7 +600,8 @@ def cmd_program(conn: sqlite3.Connection, name: str) -> str:
                                  (pid, f["select_name"])).fetchall()
             frows.append((f["select_name"], f["assign_dd"], f["organization"] or "",
                           ", ".join(o["op"] for o in opens),
-                          "; ".join(f"{d['dsn_resolved'] or NO_DSN} [{d['mode']}/{d['mode_source']}] "
+                          "; ".join(f"{dd_dataset_cell(d['dsn_resolved'], d['dsn_written'])} "
+                                    f"[{d['mode']}/{d['mode_source']}] "
                                     + (d["job_name"] or (f"(PROC {d['proc_name']} defaults - no indexed job runs it)"
                                                          if d["proc_name"] else ""))
                                     for d in shown) or "_no JCL found_",
@@ -1312,6 +1314,7 @@ def cmd_field(conn: sqlite3.Connection, name: str, show_all: bool = False,
     hits = []
     expanded = expanded_procs(conn)
     card_hidden, seen_hits = set(), set()
+    hidden_steps: List[Tuple[str, str]] = []
     for d in defs:
         if d["kind"] != "copybook":
             continue
@@ -1323,6 +1326,7 @@ def cmd_field(conn: sqlite3.Connection, name: str, show_all: bool = False,
         for r in rows:
             if r["job_name"] is None and r["proc_name"] and r["proc_name"].upper() in expanded:
                 card_hidden.add(r["id"])
+                hidden_steps.append((r["proc_name"], r["step_name"]))
                 continue
             job = r["job_name"] or (f"(PROC {r['proc_name']} defaults - no indexed job runs it)" if r["proc_name"] else "")
             hit = (d["member_name"], f"{lo}-{hi}", job, r["step_name"], r["card_kind"], f"{r['pos']}-{r['pos']+r['length']-1}")
@@ -1332,8 +1336,13 @@ def cmd_field(conn: sqlite3.Connection, name: str, show_all: bool = False,
     if hits:
         out.append("\n### Sort/control cards addressing these bytes (any dataset - verify the record type matches)\n")
         out.append(table(["copybook", "field bytes", "job", "step", "card", "card bytes"], hits[:40]))
-    if card_hidden:
-        out.append("\n" + proc_rows_hidden(len(card_hidden)))
+        if card_hidden:
+            out.append("\n" + proc_rows_hidden(len(card_hidden)))
+    elif card_hidden:
+        # every card row on these bytes was a PROC's own step's, its default cards, while a job runs the PROC: no
+        # table is printed, so the sentence names what was left out, under its own heading (LESSONS 246)
+        out.append("\n### Sort/control cards addressing these bytes\n")
+        out.append(proc_rows_only(len(card_hidden), hidden_steps, "card"))
     out.append(_docs_section(conn, name.upper()))
     return "".join(out)
 
@@ -1463,12 +1472,60 @@ CARD_KINDS = ("ctlcard", "unknown", "stub", "sql", "jcl", "proc")
 NO_DSN = "(no DSN: DUMMY, SYSOUT or instream)"
 
 
+def dd_dataset_cell(dsn_resolved: Optional[str], dsn: Optional[str]) -> str:
+    """A DD's dataset as a Files table prints it: the resolved name; a
+    referback the index could not follow as written - `*.S1.X010.OUT
+    (referback not followed)`, the step it names being in a PROC the estate
+    does not hold, or naming no dataset (LESSONS 242); any other name left
+    unresolved as written; NO_DSN only for a DD that names no dataset."""
+    if dsn_resolved:
+        return dsn_resolved
+    if dsn and dsn.startswith("*."):
+        return f"{dsn} (referback not followed)"
+    if dsn:
+        return f"{dsn} (not resolved)"
+    return NO_DSN
+
+
 def proc_rows_hidden(n: int) -> str:
     """The sentence under a table that left out n rows of PROC members' own
     steps (expanded_procs): every row of such a step - a literal DSN, a
     DUMMY, a card - not only the ones a default symbolic names (LESSONS 242)."""
     return (f"> {n} row(s) of PROC members' own steps (read with the PROC's defaults) hidden: the jobs that expand "
             f"those PROCs are listed with the real names.\n")
+
+
+def _proc_steps_named(steps: Iterable[Tuple[str, str]]) -> str:
+    """'PROC QXSRT (step SRT)', several joined: the PROC members' own
+    steps a page left out, named."""
+    by: Dict[str, List[str]] = {}
+    for proc, step in steps:
+        got = by.setdefault(str(proc).upper(), [])
+        if step and step not in got:
+            got.append(step)
+    return ", ".join(f"PROC {p} (step{'s' if len(st) > 1 else ''} {', '.join(st)})" if st else f"PROC {p}"
+                     for p, st in sorted(by.items()))
+
+
+def proc_rows_only(n: int, steps: Iterable[Tuple[str, str]], what: str, name: str = "") -> str:
+    """The sentence of a page whose every row was a PROC member's own step
+    while a job expands the PROC (LESSONS 246). Nothing is listed, so it
+    cannot say, as proc_rows_hidden does, that the jobs 'are listed': it
+    names the PROC steps left out and says what the jobs running them
+    read. `what` is 'card' (`field`: the sort cards on the field's bytes)
+    or 'dataset' (`dataset NAME`: the DDs naming it)."""
+    steps = list(steps)
+    named = _proc_steps_named(steps)
+    one = len({(str(p).upper(), s) for p, s in steps}) == 1
+    own = "the PROC's own step" if one else "the PROCs' own steps"
+    it = "it" if len({str(p).upper() for p, _s in steps}) == 1 else "them"
+    if what == "card":
+        return (f"> No sort card of an indexed job addresses these bytes. {n} card row(s) of {named} do: {own}, "
+                f"read with the default cards. The jobs that run {it} read the cards they name, and none of the "
+                f"indexed ones addresses these bytes (`job NAME` shows each job's cards).\n")
+    return (f"> No step of an indexed job names {name.upper() or 'this dataset'}. {n} row(s) of {named} do: {own}, "
+            f"read with the defaults. The jobs that run {it} give {'that DD' if n == 1 else 'those DDs'} another "
+            f"dataset (`job NAME` shows theirs).\n")
 
 
 def expanded_procs(conn: sqlite3.Connection) -> set:
@@ -1699,9 +1756,11 @@ def cmd_dataset(conn: sqlite3.Connection, dsn: str) -> str:
     # EXEC PROC= step itself.
     expanded = expanded_procs(conn)
     kept, proc_hidden, ov_hidden = [], 0, 0
+    hidden_steps: List[Tuple[str, str]] = []
     for r in rows:
         if r["job_name"] is None and r["proc_name"] and r["proc_name"].upper() in expanded:
             proc_hidden += 1
+            hidden_steps.append((r["proc_name"], r["step_name"]))
             continue
         if r["proc_called"] and r["job_id"] and conn.execute(
                 "SELECT 1 FROM step WHERE job_id=? AND parent_step=? LIMIT 1",
@@ -1710,7 +1769,11 @@ def cmd_dataset(conn: sqlite3.Connection, dsn: str) -> str:
             continue
         kept.append(r)
     rows = kept
-    if proc_hidden:
+    if proc_hidden and not rows and not ov_hidden and not hidden:
+        # every row naming the dataset was a PROC's own step's - a default symbolic's TEST.* name, a literal the
+        # jobs override: no job's row is listed, so the sentence cannot say they are (LESSONS 246)
+        out.append(proc_rows_only(proc_hidden, hidden_steps, "dataset", dsn))
+    elif proc_hidden:
         out.append(proc_rows_hidden(proc_hidden))
     # Every row carries the DD line it comes from: "job X writes DSN Y" is a
     # claim about one JCL/PROC line, and the gate needs that line.
@@ -6686,7 +6749,10 @@ def _transfer_notes(detail: str) -> Tuple[str, List[Tuple[str, str, str, str]]]:
 
 def interface_edge_steps(conn: sqlite3.Connection) -> Dict[int, sqlite3.Row]:
     """interface_edge id -> the step it stands for (id, step_name,
-    from_proc, job_name), for every FTP / Connect:Direct / USS-shell row.
+    from_proc, job_name; for a PROC's own step, which has no job, the
+    PROC's proc_name and default symbolics - an instream PROC's own step
+    too, whose row sits on the job's member), for every FTP /
+    Connect:Direct / USS-shell row.
     build.insert_step writes the row right after the step: on the member
     the step belongs to (the job's for a PROC step expanded into it), at
     the step's line (the PROC's line for such a step), its detail the notes
@@ -6698,7 +6764,7 @@ def interface_edge_steps(conn: sqlite3.Connection) -> Dict[int, sqlite3.Row]:
     step answers is left out: its reader keeps the member and the line."""
     steps: Dict[Tuple[int, int, str], List[sqlite3.Row]] = defaultdict(list)
     for s in conn.execute("""SELECT s.id, s.step_name, s.from_proc, s.parm, s.line, s.effective_pgm, j.job_name,
-                                    COALESCE(j.member_id, pd.member_id) AS mem_id
+                                    COALESCE(j.member_id, pd.member_id) AS mem_id, pd.proc_name, pd.symbolics
                              FROM step s LEFT JOIN job j ON j.id=s.job_id LEFT JOIN proc_def pd ON pd.id=s.proc_id
                              WHERE s.effective_pgm IN ('*FTP*','*NDM*','*USSSH*') ORDER BY s.id"""):
         steps[(s["mem_id"], s["line"], s["effective_pgm"])].append(s)
@@ -6721,6 +6787,25 @@ def interface_edge_steps(conn: sqlite3.Connection) -> Dict[int, sqlite3.Row]:
         for e, s in zip(left, free):
             out[e["id"]] = s
     return out
+
+
+def _proc_default_peer(peer: str, symbolics: Optional[str]) -> str:
+    """The peer a PROC's own FTP / Connect:Direct step names, said with the
+    PROC's default: jcl.py keeps a PROC member's PARM as written (the job
+    expanding it substitutes its own values), so the notes of the PROC's own
+    step name the symbolic - `&HOST` - while its DSNs were read with the
+    PROC statement's defaults (LESSONS 247). '&HOST (PROC default
+    qzlone.example)'; '&HOST (no PROC default)' when the PROC statement
+    gives none. A peer with no symbolic is returned as it is."""
+    if not peer or "&" not in peer:
+        return peer
+    try:
+        defaults = {str(k).upper(): str(v) for k, v in (json.loads(symbolics) if symbolics else {}).items()
+                    if v is not None}
+    except (ValueError, AttributeError):
+        defaults = {}
+    got = jcl.substitute_symbols(peer, defaults)
+    return f"{peer} (PROC default {got})" if "&" not in got else f"{peer} (no PROC default)"
 
 
 def _interface_rows(conn: sqlite3.Connection, system: Optional[str] = None,
@@ -6777,7 +6862,15 @@ def _interface_rows(conn: sqlite3.Connection, system: Optional[str] = None,
         # the step the row stands for: an expanded PROC step's row sits on the job with the PROC's line - cited in
         # the PROC, as its pseudo-DDs are (dd_cite_member) and as flow's cite_iface does
         st = tied.get(r["id"])
-        where_step = f"{st['job_name'] or where} {st['step_name']}" if st else where
+        own = st is not None and st["job_name"] is None          # a PROC's own step: no job
+        if own and (st["proc_name"] or "").upper() in expanded:
+            # read with the PROC's defaults while a job expands the PROC: that job's step is listed. Decided per
+            # step - an instream PROC's own step has its row on the JOB's member, beside the job's run of it, and
+            # the member-level test above never sees it (LESSONS 245)
+            continue
+        # a PROC's own step no job runs is the PROC's, named by it - an instream PROC's too, not by the job
+        # holding its text (the cite is that member's line)
+        where_step = f"{st['job_name'] or st['proc_name'] or where} {st['step_name']}" if st else where
         at = f"{st['from_proc'] if st and st['from_proc'] else r['mem']}:{r['line']}"
         if r["kind"] == "usssh":
             rows.append((r["kind"], r["direction"] or "?", "", r["detail"][:90], where_step, r["system"] or "?", at))
@@ -6791,13 +6884,17 @@ def _interface_rows(conn: sqlite3.Connection, system: Optional[str] = None,
         rest = [t for t in transfers if t[1].upper() not in held]
         if not rest and held:
             continue
+        # a PROC's own step names its host by the symbolic its PARM codes: said with the PROC's default (LESSONS 247)
+        defaults = st["symbolics"] if own else None
         if not rest:
             # no transfer in its notes (no cards indexed, only a host): the step itself is the interface
-            rows.append((r["kind"], r["direction"] or "?", host, r["detail"][:90], where_step, r["system"] or "?", at))
+            rows.append((r["kind"], r["direction"] or "?", _proc_default_peer(host, defaults) if own else host,
+                         r["detail"][:90], where_step, r["system"] or "?", at))
             continue
         for (verb, name, direction, peer) in rest:
             mvs = "." in name and "/" not in name
-            rows.append((r["kind"], direction, peer or host, name if mvs else f"{verb} {name}", where_step,
+            peer_cell = _proc_default_peer(peer or host, defaults) if own else peer or host
+            rows.append((r["kind"], direction, peer_cell, name if mvs else f"{verb} {name}", where_step,
                          r["system"] or "?", at))
     for r in pseudo:
         if system and (r["system"] or "").upper() != system.upper():

@@ -420,7 +420,10 @@ own step and `values` counts no card of one while a job expands that PROC.
   mainframe: FTP / Connect:Direct steps, one row per file sent or received,
   with the peer the step names (the FTP PARM's host, the Connect:Direct SNODE;
   a job running one FTP PROC twice gives each step its own) - a step whose
-  cards name no file is one row of its own; MQ queues with the
+  cards name no file is one row of its own. A PROC's own step, an instream
+  PROC's too, is listed only when no indexed job runs that PROC, named by the
+  PROC and with the host its PROC statement defaults to
+  (`&HOST (PROC default x.example)`); MQ queues with the
   message layout, IMS message switches, CICS TD queues and web entry points,
   and the peers you declare in the manifest (`"external_interfaces":
   [{"kind":"ndm","peer":"REINSURER-X","direction":"out","dataset":"PROD.POLICY.EXTRACT"}]`)

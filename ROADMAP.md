@@ -871,10 +871,21 @@ wrong member or line.
   `cite_iface` does, with its step named. Several steps of one job can stand at that line (one PROC run twice, two
   PROCs with the FTP step on the same line, the job's own step beside an expanded one): each row is tied to its
   own step by the notes the step's parm ends with, so each step keeps its own peer and its own row (LESSONS
-  240-241). Query-side, no re-parse.
+  240-241). Whether a PROC's own step is listed is decided per step (no job, its proc_def through
+  `step.proc_id`), so an instream PROC's own step - whose row sits on the job's member - is left out while the
+  job runs that PROC, and named by the PROC when no job does (LESSONS 245). Query-side, no re-parse.
+- **Decided (LESSONS 247) - a PROC's own FTP step names its host by the symbolic; the query says the PROC's
+  default beside it.** jcl.py keeps a PROC member's PARM as written, because expand_job substitutes the calling
+  job's values into that text; the PROC's own step's DSNs are read with the PROC statement's defaults, its PARM
+  and the notes built from it are not. `interfaces` and `dataset`'s boundary line print such a peer as
+  `&HOST (PROC default qzlone.example)`, or `&HOST (no PROC default)`, from proc_def.symbolics. Substituting the
+  defaults into the stored PARM of the PROC's own step in jcl.py was not taken into the re-parse batch: it would
+  change a fact module for a row shown only when no job runs the PROC, an index built before the re-parse would
+  still print `&HOST`, and the query's reading says both the symbolic the PROC codes and the value it defaults to.
 - **A step of an instream PROC is cited under the PROC's name.** `// PROC ... // PEND` lives in the job's own
-  member, but the step and DD cites print `from_proc` - the PROC's name, which is no member. Next: cite the
-  job's member when `proc_def.instream` is set for that name in it - query-side.
+  member, but the step and DD cites print `from_proc` - the PROC's name, which is no member (`interfaces` cites
+  QZJOB4's run of its instream QZIPR4 as `QZIPR4:3`). Next: cite the job's member when `proc_def.instream` is set
+  for that name in it - query-side.
 - **A step built for a system PROC that is not indexed (DLIBATCH, IMSBMP, DSNUPROC: `proc_synthesised`) is
   cited as `DLIBATCH:line` with the job's line.** Its DDs are the job's overrides and are cited in the job
   (LESSONS 231); the step's own cite is not. Next: cite the job's member for a step whose PROC has no

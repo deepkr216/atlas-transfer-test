@@ -34,6 +34,16 @@ The verifier's round on these (LESSONS 240-244):
   244 - a fact of jcl.py (ROADMAP re-parse item 30): a condition's operator,
       OR / AND and a BUILD list's X were stored as the card's format.
 
+The verifier's second round (LESSONS 245-247, 242 extended):
+  245 - an instream PROC's own FTP step, whose row sits on the job's member,
+      was listed beside the job's run of that PROC: decided per step now.
+  246 - `field` and `dataset` printed the hidden-rows sentence where every row
+      was hidden, saying the jobs 'are listed'.
+  242 - a DD named by a referback the index could not follow printed as
+      '(no DSN: DUMMY, SYSOUT or instream)'.
+  247 - a PROC's own FTP step named its host by the symbolic (`&HOST`); the
+      peer is said with the PROC's default.
+
 Every name here is fictional.
 """
 
@@ -889,6 +899,258 @@ class RelationalOperatorIsNoFormat(unittest.TestCase):
 
 
 # ===========================================================================
+# the verifier's second round (LESSONS 245-247, row 242 extended)
+# ===========================================================================
+
+def _instream(job, proc, head, parm, card, *runs):
+    """A job holding an instream FTP PROC (its PROC statement on line 2, the FTP step on line 3) and the steps
+    that run it."""
+    return (f"//{job:<8} JOB (ACCT),'FTP',CLASS=A\n"
+            f"//{proc:<8} PROC{(' ' + head) if head else ''}\n"
+            f"//F010     EXEC PGM=FTP,PARM='{parm} (EXIT'\n"
+            f"//INPUT    DD   DSN=PROD.CMN.PARMLIB({card}),DISP=SHR\n"
+            "//         PEND\n" + "".join(runs) + "//\n")
+
+
+class InstreamProcOwnStep(unittest.TestCase):
+    """An instream PROC's own FTP step has its interface_edge row on the JOB's member, at the PROC step's line,
+    beside the job's run of the PROC; the step has no job and its proc_id is the instream proc_def. KVXJOB1 runs
+    KVXIP1 (host and card by symbolics) with its own host, KVXJOB2 runs KVXIP2 (literals only) once, KVXJOB3 runs
+    KVXIP3 with another card than its default, KVXJOB4 runs KVXIP4 twice with two hosts, KVXJOB5 holds KVXIP5 and
+    never runs it; KVXLONE and KVXNODF are cataloged FTP PROCs no job runs, KVXNODF's PROC statement giving its
+    host no default. The verifier's estate estA."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.td = tempfile.mkdtemp()
+        root = os.path.join(cls.td, "estate")
+        jcl_ = "POLICY/PROD.KV.JCLLIB/"
+        _write(root, jcl_ + "KVXJOB1.jcl", _instream("KVXJOB1", "KVXIP1", "HOST=kvxdef1.example,FT=KVXCRDA", "&HOST",
+                                                      "&FT", "//S1       EXEC KVXIP1,HOST=kvxone.example\n"))
+        _write(root, jcl_ + "KVXJOB2.jcl", _instream("KVXJOB2", "KVXIP2", "", "kvxtwo.example", "KVXCRDB",
+                                                      "//S1       EXEC KVXIP2\n"))
+        _write(root, jcl_ + "KVXJOB3.jcl", _instream("KVXJOB3", "KVXIP3", "HOST=kvxdef3.example,FT=KVXCRDD", "&HOST",
+                                                      "&FT", "//S1       EXEC KVXIP3,HOST=kvxthree.example,FT=KVXCRDA\n"))
+        _write(root, jcl_ + "KVXJOB4.jcl", _instream("KVXJOB4", "KVXIP4", "HOST=kvxdef4.example", "&HOST", "KVXCRDB",
+                                                      "//S1       EXEC KVXIP4,HOST=kvxfour1.example\n",
+                                                      "//S2       EXEC KVXIP4,HOST=kvxfour2.example\n"))
+        _write(root, jcl_ + "KVXJOB5.jcl", _instream("KVXJOB5", "KVXIP5", "HOST=kvxdef5.example", "&HOST", "KVXCRDE",
+                                                      "//S1       EXEC PGM=IEFBR14\n"))
+        _write(root, "SHARED/PROD.CMN.PROCLIB/KVXLONE.prc", "//KVXLONE  PROC HOST=kvxlone.example\n"
+               "//Z010     EXEC PGM=FTP,PARM='&HOST (EXIT'\n//INPUT    DD   DSN=PROD.CMN.PARMLIB(KVXCRDL),DISP=SHR\n")
+        _write(root, "SHARED/PROD.CMN.PROCLIB/KVXNODF.prc", "//KVXNODF  PROC\n"
+               "//Y010     EXEC PGM=FTP,PARM='&HOST (EXIT'\n//INPUT    DD   DSN=PROD.CMN.PARMLIB(KVXCRDN),DISP=SHR\n")
+        for card, dsn in (("A", "A"), ("B", "B"), ("D", "DEF"), ("E", "E"), ("L", "LONE"), ("N", "NODF")):
+            _write(root, f"SHARED/PROD.CMN.PARMLIB/KVXCRD{card}.ctl", f"put 'PROD.KVX.{dsn}' {card.lower()}.txt\nquit\n")
+        cls.db = os.path.join(cls.td, "t.db")
+        _build(root, cls.db)
+        # an index built before this batch (main's): the expanded step held the PROC's own reading as a second
+        # pseudo-DD `unknown [undetermined]` beside the job's (LESSONS 226); the instream PROC's own step as here
+        cls.aged_db = os.path.join(cls.td, "aged.db")
+        shutil.copyfile(cls.db, cls.aged_db)
+        c = sqlite3.connect(cls.aged_db)
+        for sid, dsn, line in c.execute("SELECT s.id, d.dsn_resolved, d.line FROM step s JOIN dd d ON d.step_id=s.id "
+                                        "WHERE s.from_proc LIKE 'KVXIP%' AND d.dd_name='*FTP*'").fetchall():
+            c.execute("INSERT INTO dd(step_id,dd_name,concat_seq,dsn,dsn_resolved,mode,mode_source,is_override,line) "
+                      "VALUES(?,'*FTP*',0,?,?,'unknown','undetermined',0,?)", (sid, dsn, dsn, line))
+        c.commit()
+        c.close()
+        cls.conn = query.connect(cls.db)
+        cls.aged = query.connect(cls.aged_db)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.conn.close()
+        cls.aged.close()
+        shutil.rmtree(cls.td, ignore_errors=True)
+
+    def rows(self, job, conn=None):
+        """(kind, dir, peer, what, where, cite) of the FTP rows on the job's member or named by it."""
+        return sorted(r[:5] + r[6:] for r in query._interface_rows(conn or self.conn)
+                      if r[0] == "ftp" and (r[4].split()[0] == job or r[6].split(":")[0] == job))
+
+    def both(self):
+        return ((self.conn, "this batch"), (self.aged, "before this batch"))
+
+    def test_the_instream_proc_s_own_step_is_in_the_index(self):
+        # what the report listed beside the job's run: the own step (no job, the instream proc_def) with its row on
+        # the job's member at the PROC step's line
+        got = self.conn.execute("""SELECT s.job_id, pd.instream, s.line, i.line FROM step s
+                                   JOIN proc_def pd ON pd.id=s.proc_id JOIN member m ON m.id=pd.member_id
+                                   JOIN interface_edge i ON i.member_id=m.id AND i.line=s.line
+                                   WHERE pd.proc_name='KVXIP2' AND s.effective_pgm='*FTP*'""").fetchall()
+        self.assertEqual([tuple(g) for g in got], [(None, 1, 3, 3), (None, 1, 3, 3)])      # two rows at line 3
+        tied = query.interface_edge_steps(self.conn)
+        own = [s for s in tied.values() if s["job_name"] is None and s["proc_name"] == "KVXIP2"]
+        self.assertEqual(len(own), 1)
+
+    def test_literals_only_run_once_is_one_row(self):
+        for conn, tag in self.both():
+            with self.subTest(tag):
+                self.assertEqual(self.rows("KVXJOB2", conn),
+                                 [("ftp", "out", "kvxtwo.example", "PROD.KVX.B", "KVXJOB2 S1.F010", "KVXIP2:3")])
+
+    def test_a_symbolic_host_run_once_is_the_job_s_host_once(self):
+        for conn, tag in self.both():
+            with self.subTest(tag):
+                got = self.rows("KVXJOB1", conn)
+                self.assertEqual(got, [("ftp", "out", "kvxone.example", "PROD.KVX.A", "KVXJOB1 S1.F010", "KVXIP1:3")])
+                self.assertNotIn("&HOST", str(got))
+
+    def test_run_twice_is_two_rows(self):
+        for conn, tag in self.both():
+            with self.subTest(tag):
+                self.assertEqual(self.rows("KVXJOB4", conn), [
+                    ("ftp", "out", "kvxfour1.example", "PROD.KVX.B", "KVXJOB4 S1.F010", "KVXIP4:3"),
+                    ("ftp", "out", "kvxfour2.example", "PROD.KVX.B", "KVXJOB4 S2.F010", "KVXIP4:3")])
+
+    def test_the_default_card_of_a_proc_the_job_runs_is_not_listed(self):
+        self.assertEqual(self.rows("KVXJOB3"),
+                         [("ftp", "out", "kvxthree.example", "PROD.KVX.A", "KVXJOB3 S1.F010", "KVXIP3:3")])
+        self.assertNotIn("PROD.KVX.DEF", query.cmd_interfaces(self.conn))
+
+    def test_an_instream_proc_no_job_runs_is_the_proc_s(self):
+        for conn, tag in self.both():
+            with self.subTest(tag):
+                self.assertEqual(self.rows("KVXJOB5", conn), [
+                    ("ftp", "out", "&HOST (PROC default kvxdef5.example)", "PROD.KVX.E", "KVXIP5 F010", "KVXJOB5:3")])
+
+    def test_a_cataloged_proc_no_job_runs_says_its_default_host(self):
+        for conn, tag in self.both():
+            with self.subTest(tag):
+                self.assertEqual(self.rows("KVXLONE", conn), [
+                    ("ftp", "out", "&HOST (PROC default kvxlone.example)", "PROD.KVX.LONE", "KVXLONE Z010",
+                     "KVXLONE:2")])
+                self.assertEqual(self.rows("KVXNODF", conn), [
+                    ("ftp", "out", "&HOST (no PROC default)", "PROD.KVX.NODF", "KVXNODF Y010", "KVXNODF:2")])
+
+    def test_the_peer_said_with_the_default(self):
+        self.assertEqual(query._proc_default_peer("&HOST", '{"HOST": "a.example"}'), "&HOST (PROC default a.example)")
+        self.assertEqual(query._proc_default_peer("ftp.&ENV..example", '{"ENV": "prod"}'),
+                         "ftp.&ENV..example (PROC default ftp.prod.example)")
+        self.assertEqual(query._proc_default_peer("&HOST", None), "&HOST (no PROC default)")
+        self.assertEqual(query._proc_default_peer("&HOST", '{"FT": "X"}'), "&HOST (no PROC default)")
+        self.assertEqual(query._proc_default_peer("b.example", '{"HOST": "a.example"}'), "b.example")
+        self.assertEqual(query._proc_default_peer("", None), "")
+
+    def test_dataset_s_boundary_line_names_the_job_s_step_only(self):
+        for conn, tag in self.both():
+            with self.subTest(tag):
+                out = query.cmd_dataset(conn, "PROD.KVX.A")
+                line = next(ln for ln in out.splitlines() if ln.startswith("**Crosses the mainframe boundary**"))
+                self.assertEqual(line, "**Crosses the mainframe boundary**: ftp out to/from kvxone.example "
+                                       "(KVXJOB1 S1.F010); ftp out to/from kvxthree.example (KVXJOB3 S1.F010) - see "
+                                       "`interfaces --dsn`.")
+        out = query.cmd_dataset(self.conn, "PROD.KVX.LONE")
+        self.assertIn("ftp out to/from &HOST (PROC default kvxlone.example) (KVXLONE Z010)", out)
+
+    def test_the_report_counts_each_put_once(self):
+        for conn, tag in self.both():
+            with self.subTest(tag):
+                out = query.cmd_interfaces(conn, system="POLICY")
+                # KVXJOB1 1, KVXJOB2 1, KVXJOB3 1, KVXJOB4 2, KVXIP5 (no job runs it) 1
+                self.assertEqual(out.count("| ftp |"), 6, out)
+                self.assertNotIn("| KVXJOB2 F010 |", out)
+                self.assertNotIn("| KVXJOB4 F010 |", out)
+                self.assertEqual(query.cmd_interfaces(conn, system="SHARED").count("| ftp |"), 2)
+
+
+NL_REC = ("       01  KVZ-REC.\n"
+          "           05  KVZ-KEY             PIC X(12).\n"
+          "           05  KVZ-STATUS          PIC X(02).\n"
+          "           05  KVZ-AMT             PIC 9(05).\n")
+NL_WRT = _cbl("KVZWRT", [("OUT-FILE", "KVZOUT")], [], ["WS-B"],
+              ["OPEN OUTPUT OUT-FILE.", "WRITE KVZ-REC.", "CLOSE OUT-FILE."]).replace(
+    "       FILE SECTION.\n", "       FILE SECTION.\n       FD  OUT-FILE.\n           COPY KVZREC.\n")
+NL_RDR = _cbl("KVZRDR", [("IN-FILE", "KVZIN"), ("DUM-FILE", "KVZDUM")],
+              [("IN-FILE", "IN-REC", "IN-CODE"), ("DUM-FILE", "DUM-REC", "DM-CODE")], ["WS-A"],
+              ["OPEN INPUT IN-FILE DUM-FILE.", "READ IN-FILE.", "READ DUM-FILE.", "CLOSE IN-FILE DUM-FILE."])
+
+
+class NothingListedSaysSo(unittest.TestCase):
+    """Only the default card KVZDEF of PROC KVZSRT addresses KVZ-AMT's bytes 15-19; KVZJOB1 runs the PROC with its
+    own card KVZJ1 (bytes 1-14) and its own input, so `field KVZ-AMT` and `dataset TEST.KVZ.IN` (the PROC's
+    default input) are left with no row at all. KVZJOB2 reads `DSN=*.S1.X010.OUT` after `//S1 EXEC KVZMISS`, a
+    PROC the estate does not hold. The verifier's estates estB2 and estC."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.td = tempfile.mkdtemp()
+        root = os.path.join(cls.td, "estate")
+        _write(root, "POLICY/PROD.KV.COPYLIB/KVZREC.cpy", NL_REC)
+        _write(root, "POLICY/PROD.KV.COBOL/KVZWRT.cbl", NL_WRT)
+        _write(root, "POLICY/PROD.KV.COBOL/KVZRDR.cbl", NL_RDR)
+        _write(root, "POLICY/PROD.KV.JCLLIB/KVZJOBW.jcl", _job(
+            "KVZJOBW", "//W010     EXEC PGM=KVZWRT\n//KVZOUT   DD   DSN=PROD.KVZ.IN,DISP=(NEW,CATLG,DELETE)\n"))
+        _write(root, "SHARED/PROD.CMN.PROCLIB/KVZSRT.prc", "//KVZSRT   PROC CARDS=KVZDEF,IN=TEST.KVZ.IN\n"
+               "//SRT      EXEC PGM=SORT\n//SORTIN   DD   DSN=&IN,DISP=SHR\n"
+               "//SORTOUT  DD   DSN=PROD.KVZ.SORTED,DISP=(NEW,CATLG,DELETE)\n"
+               "//SYSIN    DD   DSN=PROD.CMN.PARMLIB(&CARDS),DISP=SHR\n")
+        _write(root, "POLICY/PROD.KV.JCLLIB/KVZJOB1.jcl",
+               _job("KVZJOB1", "//S1       EXEC KVZSRT,CARDS=KVZJ1,IN=PROD.KVZ.IN\n"))
+        _write(root, "SHARED/PROD.CMN.PARMLIB/KVZDEF.ctl", "  SORT FIELDS=COPY\n  INCLUDE COND=(15,5,ZD,GT,0)\n")
+        _write(root, "SHARED/PROD.CMN.PARMLIB/KVZJ1.ctl", "  SORT FIELDS=(1,12,CH,A)\n  INCLUDE COND=(13,2,CH,EQ,C'AC')\n")
+        _write(root, "POLICY/PROD.KV.JCLLIB/KVZJOB2.jcl", _job(
+            "KVZJOB2", "//S1       EXEC KVZMISS\n", "//S2       EXEC PGM=KVZRDR\n"
+                       "//KVZIN    DD   DSN=*.S1.X010.OUT,DISP=SHR\n//KVZDUM   DD   DUMMY\n"))
+        cls.db = os.path.join(cls.td, "t.db")
+        _build(root, cls.db)
+        cls.conn = query.connect(cls.db)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.conn.close()
+        shutil.rmtree(cls.td, ignore_errors=True)
+
+    LISTED = "the jobs that expand those PROCs are listed with the real names"
+
+    def test_only_the_proc_s_default_card_addresses_the_bytes(self):
+        got = self.conn.execute("""SELECT j.job_name, pd.proc_name, c.card_kind, c.pos, c.length FROM card_field_ref c
+                                   JOIN step s ON s.id=c.step_id LEFT JOIN job j ON j.id=s.job_id
+                                   LEFT JOIN proc_def pd ON pd.id=s.proc_id WHERE c.pos+c.length-1>=15""").fetchall()
+        self.assertEqual([tuple(g) for g in got], [(None, "KVZSRT", "INCLUDE", 15, 5)])
+
+    def test_field_says_what_it_left_out_when_no_row_is_left(self):
+        out = query.cmd_field(self.conn, "KVZ-AMT")
+        sec = out.split("### Sort/control cards addressing these bytes", 1)[1].split("\n### ", 1)[0]
+        self.assertIn("> No sort card of an indexed job addresses these bytes. 1 card row(s) of PROC KVZSRT (step SRT) "
+                      "do: the PROC's own step, read with the default cards. The jobs that run it read the cards they "
+                      "name, and none of the indexed ones addresses these bytes", sec)
+        self.assertNotIn("| KVZREC |", sec)
+        self.assertNotIn(self.LISTED, out)
+
+    def test_field_with_a_job_s_row_keeps_its_table(self):
+        out = query.cmd_field(self.conn, "KVZ-STATUS")
+        sec = out.split("### Sort/control cards addressing these bytes", 1)[1].split("\n### ", 1)[0]
+        self.assertIn("| KVZREC | 13-14 | KVZJOB1 | S1.SRT | INCLUDE | 13-14 |", sec)
+        self.assertNotIn("No sort card of an indexed job", out)
+
+    def test_dataset_named_by_the_proc_s_own_step_only(self):
+        out = query.cmd_dataset(self.conn, "TEST.KVZ.IN")
+        self.assertIn("> No step of an indexed job names TEST.KVZ.IN. 1 row(s) of PROC KVZSRT (step SRT) do: the "
+                      "PROC's own step, read with the defaults. The jobs that run it give that DD another dataset", out)
+        self.assertNotIn(self.LISTED, out)
+        # the job's input is listed as ever, and nothing of the PROC's own step names it
+        out = query.cmd_dataset(self.conn, "PROD.KVZ.IN")
+        self.assertIn("| PROD.KVZ.IN | input", out)
+        self.assertNotIn("No step of an indexed job", out)
+
+    def test_a_referback_not_followed_is_said_as_written(self):
+        got = self.conn.execute("SELECT d.dsn, d.dsn_resolved FROM dd d WHERE d.dd_name='KVZIN'").fetchall()
+        self.assertEqual([tuple(g) for g in got], [("*.S1.X010.OUT", None)])
+        files = query.cmd_program(self.conn, "KVZRDR").split("### Files", 1)[1].split("\n### ", 1)[0]
+        self.assertIn("| IN-FILE | KVZIN |  | OPEN INPUT, READ, CLOSE | *.S1.X010.OUT (referback not followed) "
+                      "[input/open_verb] KVZJOB2 |", files)
+        self.assertIn("| DUM-FILE | KVZDUM |  | OPEN INPUT, READ, CLOSE | (no DSN: DUMMY, SYSOUT or instream) "
+                      "[input/open_verb] KVZJOB2 |", files)
+
+    def test_the_cell(self):
+        self.assertEqual(query.dd_dataset_cell("PROD.X", "*.S1.OUT"), "PROD.X")
+        self.assertEqual(query.dd_dataset_cell(None, "*.S1.OUT"), "*.S1.OUT (referback not followed)")
+        self.assertEqual(query.dd_dataset_cell(None, None), query.NO_DSN)
+
+
+# ===========================================================================
 # the reproductions and the documents
 # ===========================================================================
 
@@ -994,6 +1256,22 @@ class TheDocsSayIt(unittest.TestCase):
                       self.read("docs", "SYNTH-findings-2026-09-25.md"))
         self.assertIn("so the third check is a control",
                       self.read("tools", "synth", "repro", "F12-values-sort-length", "README.md"))
+
+    def test_the_verifier_s_second_round(self):
+        text = self.read("LESSONS.md")
+        for n in range(245, 248):
+            row = next((ln for ln in text.splitlines() if ln.startswith(f"| {n} |")), "")
+            self.assertIn("tests/test_synth_query_findings.py", row, n)
+            self.assertEqual(row.replace("\\|", "").count("|") - 1, 5, n)
+        row = next(ln for ln in text.splitlines() if ln.startswith("| 242 |"))
+        self.assertIn("(referback not followed)", row)
+        self.assertEqual(row.replace("\\|", "").count("|") - 1, 5)
+        roadmap = " ".join(self.read("ROADMAP.md").split())
+        self.assertIn("**Decided (LESSONS 247) - a PROC's own FTP step names its host by the symbolic", roadmap)
+        self.assertIn("an instream PROC's own step - whose row sits on the job's member - is left out", roadmap)
+        self.assertIn("(`&HOST (PROC default x.example)`)", " ".join(self.read("README.md").split()))
+        self.assertIn("**The verifier's second round on the query side (LESSONS 245-247, row 242 extended).**",
+                      self.read("docs", "SYNTH-findings-2026-09-25.md"))
 
     def test_roadmap_closes_its_known_limit(self):
         self.assertIn("**Closed (LESSONS 237) - `interfaces` cited an expanded step's `interface_edge` row",
