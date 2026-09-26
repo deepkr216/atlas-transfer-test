@@ -373,6 +373,10 @@ MFS_SHAPES = ("a labelled MSG / FMT / DEV / DFLD / MFLD, TYPE= / POS= / LTH= ope
 _LISTING_SHAPE = re.compile(r"^[ 01\-+]?\s*(\d{6})[^\s\d]*\s+\d{6}[ *\-/D]")
 # (one run of blanks before the carriage control and one after it: two stars over the same blanks made a 64 KB blank
 # line take 15 s - LESSONS 148, 200)
+# a source record numbered in its OWN sequence area, columns 1-6, with one number: `000003     88  X VALUES 236115`,
+# `000007*  A REMARK`, a numbered blank line - where a listing's line numbered in column 1 holds the record's
+# number after its own (listing_hit)
+_OWN_NUMBERED = re.compile(r"^(\d{6})(?:[ *\-/Dd]|$)(?![ \t]*\d{6}(?:[ \t]|$))")
 _LISTING_HEAD = re.compile(r"^[ \t\f]*LineID[ \t]+PL[ \t]+SL\b|^[ \t\f]*(?:1[ \t]*)?PP[ \t]+5655-", re.I | re.M)
 # ... and, in a text already known to be a listing (atlas.recover reading one: its page headers, its sections),
 # the compiler's name anywhere on a line counts as the banner as well
@@ -439,26 +443,43 @@ def listing_hit(head: str) -> Optional[Tuple[int, str]]:
     enough before - and a data copybook's 88-level VALUES list of six-digit
     codes run over three lines (`236118 236210 236220`) is that: the
     copybook was filed a listing and every program copying it said COPY X
-    NOT FOUND (LESSONS 248)."""
+    NOT FOUND (LESSONS 248).
+
+    Nor is a run the listing's when its numbers stand in columns 1-6 and
+    the line numbered one before it, or one after it, stands there with
+    ONE number (_OWN_NUMBERED): the numbers are then the member's own
+    sequence area, numbered by one (ISPF's NUM ON, renumbered by 1), and the
+    second number on the run's lines is the member's text - that VALUES
+    list again, in a copybook numbered 000001, 000002, ... (LESSONS 253). A
+    listing's own line numbers never stand alone before a record: every
+    line it numbers holds the record's own number too, and the compiler
+    prints the carriage control in column 1."""
     m = _code_hit(_LISTING_HEAD, head)
     if m:
         return m.start(), m.group(0).strip()
     m = _LISTING_MAP.search(head)
     if m:
         return m.start(), m.group(0).strip().lstrip("1").strip()
-    first, n, pos, prev = -1, 0, 0, -1
+    runs: List[List[int]] = []                  # [offset of the first line, first number, last number, lines, column 1?]
+    own: set = set()                            # the numbers standing alone in columns 1-6
+    pos = 0
     for line in head.split("\n"):
         hit = _LISTING_SHAPE.match(line)
         if hit:
             no = int(hit.group(1))
-            if n and no == prev + 1:
-                n += 1
+            if runs and no == runs[-1][2] + 1:
+                runs[-1][2] = no
+                runs[-1][3] += 1
             else:
-                first, n = pos, 1                                 # a run starts here
-            prev = no
-            if n >= LISTING_LINES:
-                return first, "numbered source lines"
+                runs.append([pos, no, no, 1, int(hit.start(1) == 0)])     # a run starts here
+        else:
+            alone = _OWN_NUMBERED.match(line)
+            if alone:
+                own.add(int(alone.group(1)))
         pos += len(line) + 1
+    for first, lo, hi, n, col1 in runs:
+        if n >= LISTING_LINES and not (col1 and (lo - 1 in own or hi + 1 in own)):
+            return first, "numbered source lines"
     return None
 
 

@@ -62,12 +62,22 @@ NAICS = "\n".join([
 # the same entry with ISPF NUM ON COBOL sequence numbers in columns 1-6: two six-digit numbers on each line, counting
 # up by 100 - still no listing's own numbering
 NAICS_NUMBERED = "\n".join(f"{(k + 1) * 100:06d}{line[6:]}" for k, line in enumerate(NAICS.splitlines())) + "\n"
+# the same entry numbered by ONE in columns 1-6 (ISPF's NUM ON, renumbered by 1): the lines of codes hold the member's
+# own number and a code - two numbers, counting up by one - and the lines around them hold the number alone
+NAICS_BY_ONE = "\n".join(f"{k + 1:06d}{line[6:]}" for k, line in enumerate(NAICS.splitlines())) + "\n"
+XQPGM16 = "".join(f"       {ln}\n" for ln in (
+    "IDENTIFICATION DIVISION.", "PROGRAM-ID. XQPGM16.", "DATA DIVISION.", "WORKING-STORAGE SECTION.",
+    "01  WS-OUT              PIC X(6).", "01  WS-REC.", "    COPY XQNAIC1.", "PROCEDURE DIVISION.",
+    "    MOVE XQ-NAICS-CD TO WS-OUT.", "    GOBACK."))
 # numbered source lines of a listing whose heading is gone: the listing's line number, then the source record with its
 # own sequence number - the listing's numbers count up by one, a message line between them changes nothing
 LISTED = "\n".join(["   000040  004000     MOVE A TO B.",
                     "   000041  004100     MOVE C TO D.",
                     "==000041==> IGYPS2121-S  \"C\" was not defined as a data-name.",
                     "   000042  004200     GOBACK."]) + "\n"
+# the same with the listing's numbers in column 1 (no carriage control): every line it numbers holds the record's own
+# number after its own
+LISTED_COL1 = "\n".join(ln[3:] if ln.startswith("   ") else ln for ln in LISTED.splitlines()) + "\n"
 MFS_CONTINUED = "\n".join([
     "XQFM3    FMT",
     "         DEV   TYPE=(3270,2),FEAT=IGNORE",
@@ -131,6 +141,31 @@ class TheClassifier(unittest.TestCase):
         # three numbered lines that do not count up by one are no run
         jumbled = LISTED.replace("000041  004100", "000047  004100")
         self.assertIsNone(classify.listing_hit(jumbled))
+
+    def test_a_values_list_in_a_copybook_numbered_by_one_is_no_listing(self):
+        # Wrong answer guarded: ('listing', 'compiler listing ...') after the V01 fix - every program copying XQNAIC1
+        # said COPY XQNAIC1 NOT FOUND (LESSONS 253, tools/synth/repro/V16)
+        self.assertEqual(NAICS_BY_ONE.splitlines()[3][:14], "000004        ")
+        self.assertIsNone(classify.listing_hit(NAICS_BY_ONE))
+        self.assertEqual(kind(r"C:\e\XQ\PROD.XQ.COPYLIB\XQNAIC1.cpy", NAICS_BY_ONE), "copybook")
+        self.assertEqual(kind(r"C:\e\XQ\PROD.XQ.DATA\XQNAIC1.txt", NAICS_BY_ONE), "copybook")
+        # the line after the run standing alone decides too (the line before it renumbered out of the count)
+        self.assertIsNone(classify.listing_hit(NAICS_BY_ONE.replace("000003 ", "000009 ")))
+        # with CR LF line ends, as a download may leave them
+        self.assertEqual(kind(r"C:\e\XQ\PROD.XQ.DATA\XQNAIC1.txt", NAICS_BY_ONE.replace("\n", "\r\n")), "copybook")
+        # a numbered blank line or a comment line numbered in columns 1-6 stands alone too
+        for alone in ("000003", "000003*  THE CONSTRUCTION CODES"):
+            text = "\n".join(alone if k == 2 else ln for k, ln in enumerate(NAICS_BY_ONE.splitlines())) + "\n"
+            self.assertIsNone(classify.listing_hit(text), alone)
+
+    def test_a_listing_numbered_in_column_1_is_still_a_listing(self):
+        # every line a listing numbers holds the record's own number after its own: none stands alone
+        self.assertEqual(classify.listing_hit(LISTED_COL1), (0, "numbered source lines"))
+        self.assertEqual(kind(r"C:\e\XQ\PROD.XQ.DATA\XQPGM.txt", LISTED_COL1), "listing")
+        # the rule reads column 1 only: a listing with its carriage control, one line of it numbering a record that
+        # has no number of its own, is a listing as before
+        partly = "   000039               MOVE X TO Y.\n" + LISTED
+        self.assertEqual(classify.listing_hit(partly), (len(partly) - len(LISTED), "numbered source lines"))
 
     def test_a_continued_literal_is_text(self):
         # Wrong answer guarded: ('copybook', 'COBOL procedure statements ...') - `screen XQFM3` said NOT FOUND
@@ -417,6 +452,8 @@ class InTheIndex(unittest.TestCase):
             "QX/PROD.QX.SRC/QXPGM.cbl": QXPGM,
             "QX/PROD.QX.COPYLIB/QXTAG.cpy": TAGGED,
             "QX/PROD.QX.COPYLIB/XQNAICS.cpy": NAICS,
+            "QX/PROD.QX.COPYLIB/XQNAIC1.cpy": NAICS_BY_ONE,
+            "QX/PROD.QX.SRC/XQPGM16.cbl": XQPGM16,
             "QX/PROD.QX.SRC/KVSPLIT.cbl": SPLIT_PROG,
             "QX/PROD.QX.COPYLIB/KVBOOK.cpy": KVBOOK,
             "QX/PROD.QX.SCREENS/XQFM3.txt": MFS_CONTINUED,
@@ -441,6 +478,10 @@ class InTheIndex(unittest.TestCase):
         self.assertEqual(kinds["KCCOMM1@PROD.GC.COPYLIB"], "copybook")
         self.assertEqual(kinds["QXTAG@PROD.QX.COPYLIB"], "copybook")
         self.assertEqual(kinds["XQNAICS@PROD.QX.COPYLIB"], "copybook")
+        self.assertEqual(kinds["XQNAIC1@PROD.QX.COPYLIB"], "copybook")
+        self.assertEqual(self.q("SELECT m.parse_status, r.name FROM copy_use c JOIN member m ON m.id=c.member_id "
+                                "LEFT JOIN member r ON r.id=c.resolved_member_id WHERE m.name='XQPGM16'"),
+                         [("ok", "XQNAIC1")])
         self.assertEqual(kinds["XQFM3@PROD.QX.SCREENS"], "mfs")
         self.assertEqual(self.q("SELECT program_id FROM program WHERE program_id='PIC'"), [])
         self.assertEqual(self.q("SELECT kind, parse_status, parse_error FROM member WHERE name='KVLIT'"),

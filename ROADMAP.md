@@ -857,6 +857,13 @@ shipped alone and cost one such night; these still wait for the next one:
      LESSONS 250; V11, V12).
    selfcheck's counts and the synthetic estate's findings do not change (seed 20260925, scale 12: the same 15
    findings, all the checker's own, and 11,394 facts matched).
+32. **Delivered in the batch - what the second acceptance test found in the fact modules.** The second acceptance
+   test (docs/SYNTH-findings-2026-09-25-after-batch.md, on 5e63965) found the synthetic estate unchanged and all 30
+   reproductions FIXED, and probed the shapes around item 31's fixes. What it found wrong in a fact module is fixed,
+   with its test and a minimal reproduction (`python tools/synth/repro/verify.py`):
+   - classify: a copybook numbered by one in columns 1-6 whose VALUES list of six-digit codes runs over three lines
+     is no listing - a run whose numbers stand in columns 1-6 is the member's own sequence area when the line
+     numbered one before it or one after it stands there alone (LESSONS 253; V16).
 
 ### flow: known limits (open after review)
 

@@ -1,0 +1,21 @@
+{
+ "title": "a copybook numbered by one in columns 1-6 whose 88-level VALUES list of six-digit codes runs over three lines is still filed as a compiler listing",
+ "recover": false,
+ "checks": [
+  {
+   "sql": "SELECT kind FROM member WHERE name='XQNAIC1'",
+   "truth": "copybook",
+   "symptom": "listing"
+  },
+  {
+   "sql": "SELECT parse_status FROM member WHERE name='XQPGM16'",
+   "truth": "ok",
+   "symptom": "partial"
+  },
+  {
+   "sql": "SELECT COUNT(*) FROM pfield f JOIN program p ON p.id=f.program_id WHERE p.program_id='XQPGM16' AND f.name='XQ-NAICS1-DESC'",
+   "truth": 1,
+   "symptom": 0
+  }
+ ]
+}
