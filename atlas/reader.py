@@ -351,6 +351,7 @@ def read_cobol_lines(text: str, fixed: Optional[bool] = None,
     out: List[Line] = []
     in_id_comment = False        # inside AUTHOR. / REMARKS. ... (a comment-entry)
     in_sql = False               # inside EXEC SQL ... END-EXEC
+    in_note = False              # inside an SQL `/* ... */` comment that a line before opened
     division = None
     for i, rec in enumerate(records, start=1):
         rec = rec.replace("\t", "    ")  # tabs in a column-sensitive format
@@ -379,21 +380,33 @@ def read_cobol_lines(text: str, fixed: Optional[bool] = None,
         # SQL `--` comments live inside EXEC SQL ... END-EXEC. Once the lines
         # are joined into one statement their end-of-line is gone, so a
         # comment ending in a period (`-- get the policy.`) would terminate
-        # the statement here and the SELECT would never be seen.
+        # the statement here and the SELECT would never be seen. The comments
+        # are taken out outside the SQL's literals (sql_comments_out): cut at
+        # ' --' inside `SET D = ' -- '` the literal was left open and ate the
+        # rest of the program; an apostrophe in a comment - on the EXEC SQL
+        # line itself, or in a `/* ... */` one - opened a literal the same way
+        # (LESSONS 221).
         if indicator == " " and in_sql:
-            if code.lstrip().startswith("--"):
-                indicator = "*"
-            elif " --" in code:
-                code = code.split(" --", 1)[0].rstrip()
+            had = code.strip()
+            code, in_note = sql_comments_out(code, 0, in_note)
+            if had and not code.strip():
+                indicator = "*"                  # a line of SQL comment only
+            up = code.strip().upper()
         if indicator == " " and "EXEC" in up:
             # the words outside literals: `VALUE 'EXEC SQL'` opens no block - read as one, every later line holding
             # ' --' (a heading literal `' -- END -- '`) was cut there as an SQL comment, the literal left open ate
             # the rest of the program (LESSONS 217). A line without the word changes nothing: not masked at all
+            if not in_sql:
+                # the line opening the block: an SQL comment after the words EXEC SQL is one too
+                opened = _EXEC_SQL_WORDS.search(code_outside_literals(code))
+                if opened:
+                    code, in_note = sql_comments_out(code, opened.end(), False)
+                    up = code.strip().upper()
             words = code_outside_literals(up)
             if "EXEC SQL" in words and "END-EXEC" not in words:
                 in_sql = True
             elif "END-EXEC" in words:
-                in_sql = False
+                in_sql = in_note = False
         # IDENTIFICATION DIVISION comment-entries (AUTHOR. PAT O'BRIEN.) are
         # free text: an apostrophe there is not a literal, and left as code it
         # opens a string that never closes and silently eats the program.
@@ -699,6 +712,73 @@ def code_outside_literals(line: str) -> str:
     t = blank_literals(line)
     cut = [i for i in (t.find("'"), t.find('"')) if i >= 0]
     return t[:min(cut)] if cut else t
+
+
+_EXEC_SQL_WORDS = re.compile(r"(?<![A-Z0-9\-])EXEC\s+SQL(?![A-Z0-9\-])", re.IGNORECASE)
+
+
+def _end_exec_at(code: str, i: int) -> bool:
+    """The word END-EXEC starts at position i of `code`."""
+    if code[i:i + 8].upper() != "END-EXEC":
+        return False
+    before = code[i - 1] if i > 0 else " "
+    after = code[i + 8] if i + 8 < len(code) else " "
+    return not (before.isalnum() or before == "-") and not (after.isalnum() or after == "-")
+
+
+def sql_comments_out(code: str, start: int = 0, in_note: bool = False) -> Tuple[str, bool]:
+    """One line of an EXEC SQL block with its SQL comments taken out, from
+    position `start` (the text before it - `EXEC SQL` on the line opening the
+    block - is kept): `--` after a blank or at the start of the line cuts the
+    line there; a `/* ... */` comment is blanked to the same length, and one
+    the line leaves open cuts it and goes on to the next lines (returned
+    True, passed back as `in_note`) until `*/` - or END-EXEC, which ends the
+    block and anything left open in it. A comment's words are never code: an
+    apostrophe in one opened no literal. Nothing inside an SQL literal is a
+    comment: `SET D = ' -- '` keeps its text. A literal the line leaves open
+    goes on, on a continuation line: the scan stops there. Nothing after
+    END-EXEC is looked at (LESSONS 221)."""
+    if not in_note and "--" not in code[start:] and "/*" not in code[start:]:
+        return code.rstrip(), False              # no comment can start here: most SQL lines, read at no cost
+    chars = list(code)
+    n = len(code)
+    i = start
+    quote = ""
+    while i < n:
+        c = code[i]
+        if in_note:
+            if code.startswith("*/", i):
+                chars[i] = chars[i + 1] = " "
+                in_note = False
+                i += 2
+                continue
+            if _end_exec_at(code, i):
+                in_note = False
+                break
+            chars[i] = " "
+            i += 1
+            continue
+        if quote:
+            if c == quote:
+                if code.startswith(quote * 2, i):
+                    i += 2                       # a doubled quote inside the literal
+                    continue
+                quote = ""
+            i += 1
+            continue
+        if c in ("'", '"'):
+            quote = c
+        elif code.startswith("--", i) and (i == 0 or code[i - 1] in " \t"):
+            return "".join(chars[:i]).rstrip(), False
+        elif code.startswith("/*", i):
+            chars[i] = chars[i + 1] = " "
+            in_note = True
+            i += 2
+            continue
+        elif _end_exec_at(code, i):
+            break
+        i += 1
+    return "".join(chars).rstrip(), in_note
 
 
 def _division_entered(text: str, division: Optional[str]) -> Optional[str]:

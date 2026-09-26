@@ -12,7 +12,9 @@ statement read "FAILED' TO WS-MSG ...", a CICS RETURN was recorded as a LINK, an
 Error-message literals like these are common in CICS and DB2 programs. The names below are fictional.
 
 More of the family, found by the verifier's second round on item 27 and the same on main: the OF / IN qualifier
-blanking of cobol.py ran inside literals, so `MOVE 'END OF FILE' TO WS-M` stored the literal 'END ' (LESSONS 220).
+blanking of cobol.py ran inside literals, so `MOVE 'END OF FILE' TO WS-M` stored the literal 'END ' (LESSONS 220);
+and the reader cut an EXEC SQL line at ' --' inside an SQL literal, and never cut a comment on the EXEC SQL line or a
+`/* */` one - the open literal, or an apostrophe in the comment, ate the rest of the program (LESSONS 221).
 """
 
 import contextlib
@@ -210,6 +212,70 @@ class QualifierWordsInALiteral(unittest.TestCase):
         self.assertEqual(f.cics, [], "the words EXEC CICS LINK in the literal are text (LESSONS 217)")
 
 
+def sql_program(name, block):
+    """A program whose 0000-MAIN holds `block` (an EXEC SQL statement, one row a line), then PERFORM 1000-X; 1000-X
+    moves WS-B to WS-C - lost when the block eats the rest of the program."""
+    return program(name, ["01  WS-B  PIC X(02).", "01  WS-C  PIC X(02)."],
+                   ["0000-MAIN."] + block + ["    PERFORM 1000-X.", "    GOBACK.", "1000-X.", "    MOVE WS-B TO WS-C."])
+
+
+# the verifier's three (LESSONS 221), and more of the same
+SQLLIT = sql_program("SQLLIT", ["    EXEC SQL", "        UPDATE KV.TBL SET D = ' -- ' WHERE C = :WS-C", "    END-EXEC."])
+SQLOPEN = sql_program("SQLOPEN", ["    EXEC SQL -- get the customer's row", "        SELECT A INTO :WS-B FROM KY.TBL",
+                                  "    END-EXEC."])
+SQLNOTE = sql_program("SQLNOTE", ["    EXEC SQL", "        SELECT A INTO :WS-B FROM KY.TBL",
+                                  "    /* the customer's row */ END-EXEC."])
+SQLLONG = sql_program("SQLLONG", ["    EXEC SQL /* the customer's row,", "       read once -- it's the master's */",
+                                  "        SELECT A INTO :WS-B FROM KY.TBL WHERE C = 'IT''S -- X' -- the key's",
+                                  "    END-EXEC."])
+
+
+class SqlCommentsOutsideLiterals(unittest.TestCase):
+    """The reader cut an EXEC SQL line at ' --' inside an SQL literal, and never cut a comment on the EXEC SQL line or
+    a `/* */` one: the apostrophe or the open literal ate the rest of the program, which read 'parse: ok' (LESSONS
+    221)."""
+
+    def test_sql_comments_out(self):
+        out = reader.sql_comments_out
+        self.assertEqual(out("    UPDATE T SET D = ' -- ' WHERE C = :X"), ("    UPDATE T SET D = ' -- ' WHERE C = :X", False))
+        self.assertEqual(out("    WHERE C = 'X' -- the customer's code"), ("    WHERE C = 'X'", False))
+        self.assertEqual(out("    -- a comment line"), ("", False))
+        self.assertEqual(out("EXEC SQL -- get the customer's row", 8), ("EXEC SQL", False))
+        self.assertEqual(out("EXEC SQL -- a comment", 0), ("EXEC SQL", False))
+        self.assertEqual(out("    /* the customer's row */ END-EXEC."), ("                             END-EXEC.", False))
+        self.assertEqual(out("    SELECT A /* the customer's"), ("    SELECT A", True))
+        self.assertEqual(out("    row, it's */ FROM T", 0, True), ("                 FROM T", False))
+        self.assertEqual(out("    still a note's words", 0, True), ("", True))
+        self.assertEqual(out("    no close'here END-EXEC.", 0, True), ("                  END-EXEC.", False),
+                         "END-EXEC ends the block and a comment left open in it")
+        self.assertEqual(out("    SET D = 'IT''S -- X' -- the key's"), ("    SET D = 'IT''S -- X'", False))
+        self.assertEqual(out("    SET D = 'OPEN -- ON THE NEXT LINE"), ("    SET D = 'OPEN -- ON THE NEXT LINE", False),
+                         "a literal the line leaves open goes on: nothing after its quote is looked at")
+        self.assertEqual(out("    END-EXEC -- not SQL any more"), ("    END-EXEC -- not SQL any more", False))
+        self.assertEqual(out("    A--B"), ("    A--B", False), "`--` after no blank is not a comment, as before")
+
+    def test_the_program_after_the_block(self):
+        for text in (SQLLIT, SQLOPEN, SQLNOTE, SQLLONG):
+            f = cobol.parse_program(text)
+            name = f.program_id
+            self.assertEqual([p.name for p in f.paragraphs], ["0000-MAIN", "1000-X"], name)
+            self.assertIn(("WS-C", "write", "MOVE", line_of(text, "MOVE WS-B TO WS-C")),
+                          [tuple(r) for r in f.field_refs], name)
+            self.assertEqual(len(f.sql), 1, name)
+        self.assertIn("' -- '", cobol.parse_program(SQLLIT).sql[0].text)
+        self.assertEqual(cobol.parse_program(SQLOPEN).sql[0].stmt_type, "SELECT")
+        self.assertIn("WS-B", cobol.parse_program(SQLNOTE).sql[0].host_vars)
+        long = cobol.parse_program(SQLLONG).sql[0]
+        self.assertIn("'IT''S -- X'", long.text)
+        self.assertNotIn("master", long.text)
+        self.assertNotIn("key's", long.text)
+        # the comment lines and words are gone from the code, the source lines stay as written
+        lines = reader.read_cobol_lines(SQLLONG)[0]
+        second = lines[line_of(SQLLONG, "read once") - 1]
+        self.assertTrue(second.is_comment)
+        self.assertIn("it's the master's", second.raw)
+
+
 class InTheIndex(unittest.TestCase):
 
     @classmethod
@@ -282,6 +348,13 @@ class TheDocsSayIt(unittest.TestCase):
                       lessons)
         self.assertIn("Rule for me: the rule of row 217 holds for every blanking pass", lessons)
         self.assertIn("LESSONS 220", read("atlas", "cobol.py"))
+        # the SQL comment cut (LESSONS 221)
+        self.assertIn("The reader's SQL comment cut (LESSONS 221) ignored literals too", roadmap)
+        self.assertIn("| 221 | Not seen on his estate - found by the verifier in passing on ROADMAP re-parse item 27",
+                      lessons)
+        self.assertIn("Rule for me: a cut made on a line's text is made outside its literals", lessons)
+        self.assertIn("LESSONS 221", read("atlas", "reader.py"))
+        self.assertIn("an SQL `--` read inside an SQL literal (`SET D = ' -- '`)", read("README.md"))
 
 
 if __name__ == "__main__":

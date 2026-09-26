@@ -777,7 +777,12 @@ shipped alone and cost one such night; these still wait for the next one:
    IN qualifier blanking of cobol.py ran inside literals: `MOVE 'END OF FILE' TO WS-M` stored the literal 'END
    ', `IF WS-M = 'LACK OF FUNDS'` 'LACK ', and `literal "END OF FILE"` found no MOVE of it. `cobol.blank_qualifiers`
    blanks a qualifier only outside literals; every such program's literal rows are right after the re-parse night.
-   tests/test_exec_in_literal.py (QualifierWordsInALiteral, InTheIndex.test_a_literal_holding_of).
+   tests/test_exec_in_literal.py (QualifierWordsInALiteral, InTheIndex.test_a_literal_holding_of). The reader's SQL
+   comment cut (LESSONS 221) ignored literals too: `SET D = ' -- '` inside a real EXEC SQL block was cut at ' --',
+   and the literal left open ate the rest of the program, which read 'parse: ok'; a comment on the EXEC SQL line
+   itself was never cut, and a `/* ... */` one never read, so an apostrophe in either did the same.
+   `reader.sql_comments_out` takes the comments out outside the SQL's literals, on the opening line too, a `/* */`
+   one over several lines until `*/` or END-EXEC. tests/test_exec_in_literal.py (SqlCommentsOutsideLiterals).
 
 ### flow: known limits (open after review)
 
