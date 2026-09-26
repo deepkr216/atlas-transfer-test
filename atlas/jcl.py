@@ -1255,9 +1255,10 @@ def expand_job(job: JclFacts, proc_lookup: Callable[[str], Optional["JclFacts"]]
 
         for ps in proc.steps:
             psn = ps.step_name.upper()
-            # effective_pgm / launcher / submits are re-derived below by
-            # _resolve_effective_pgm from THIS job's cards: the PROC's own
-            # reading came from its default card member (LESSONS 222).
+            # effective_pgm / launcher / submits - and the *FTP* / *NDM* /
+            # *DBD* rows - are re-derived below by _resolve_effective_pgm
+            # from THIS job's cards: the PROC's own reading came from its
+            # default card member (LESSONS 222, 226).
             eff = replace(ps,
                           step_name=f"{s.step_name}.{ps.step_name}",
                           from_proc=s.proc_called.upper(), parent_step=s.step_name,
@@ -1279,6 +1280,13 @@ def expand_job(job: JclFacts, proc_lookup: Callable[[str], Optional["JclFacts"]]
                 eff.cond = so["COND"]
 
             for d in ps.dds:
+                if d.dd_name.startswith("*"):
+                    # *FTP* / *NDM* / *DBD*: rows _resolve_effective_pgm made
+                    # from the PROC's own cards or PARM (its default card
+                    # member, its default DBD). They are made again below
+                    # from this job's; copied, they stood beside the job's
+                    # as 'unknown [undetermined]' (LESSONS 226).
+                    continue
                 key = (psn, d.dd_name.upper(), d.concat_seq)
                 o = ov.get(key)
                 if o is not None:

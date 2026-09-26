@@ -16,6 +16,12 @@ the JCL parser, and one found on the way.
       decides where the generation number says the other way.
   LESSONS 224 - `//PS.SYSIN DD *` overriding a PROC's `SYSIN DD DSN=LIB(MEMBER)`
       kept the PROC's dataset and member beside the instream cards.
+  LESSONS 226-228 - the verifier's first round: a PROC's FTP / Connect:Direct /
+      IMS utility step kept the rows its own default cards or PARM gave beside
+      the job's; coverage and `program NAME` on an index built before the item
+      read the member from the row's dataset, tested on rows the older build
+      really wrote; `program NAME` says a member's text is loaded only when it
+      is indexed.
 
 Every name here is fictional.
 """
@@ -518,23 +524,304 @@ class InTheIndex(unittest.TestCase):
         self.assertIn("| KVLONEC | 1 |", section)        # a PROC no job runs: its own rows are what it reads
         self.assertNotIn("KVDEFC", section)
 
-    def test_an_index_built_before_the_item_is_read_as_it_is(self):
-        # the older build stored the PROC default on the effective step: the stand-in counts that row, once
+    def test_an_index_built_before_the_item_names_the_same_members(self):
+        # LESSONS 227. The older build kept the job's dataset with the PROC default as card member - aged to that
+        # shape (age_to_before_item_29, checked against a real build of that code), the table names what the jobs
+        # read, as on this index. Wrong answer guarded: KVDEFC counted for WEEK3 and WEEK4, which do not read it.
         db = os.path.join(self.td, "aged.db")
         shutil.copyfile(self.db, db)
-        conn = sqlite3.connect(db)
-        try:
-            conn.execute("""UPDATE dd SET card_member='KVDEFC', sysin_text=NULL,
-                                          dsn_resolved='PROD.CMN.PARMLIB(KVDEFC)'
-                            WHERE dd_name='SYSIN' AND step_id IN (SELECT id FROM step WHERE step_name='WEEK3.SRT010')""")
-            conn.commit()
-        finally:
-            conn.close()
+        age_to_before_item_29(db)
         aged = query.connect(db)
         try:
-            self.assertEqual(query.card_members_not_indexed(aged), [("KVDEFC", 1), ("KVLONEC", 1), ("KVMISS", 1)])
+            row = aged.execute("""SELECT d.dsn_resolved, d.card_member, d.sysin_text FROM dd d
+                                  JOIN step s ON s.id=d.step_id
+                                  WHERE s.step_name='WEEK3.SRT010' AND d.dd_name='SYSIN'""").fetchone()
+            self.assertEqual(tuple(row), ("PROD.CMN.PARMLIB(KVJOBC)", "KVDEFC", None))
+            self.assertEqual(query.card_members_not_indexed(aged), [("KVLONEC", 1), ("KVMISS", 1)])
         finally:
             aged.close()
+
+
+# ===========================================================================
+# LESSONS 226 - a PROC's FTP / Connect:Direct / IMS utility step: the rows
+# read from its cards or its PARM are the calling job's, once
+# ===========================================================================
+
+FTP_PROC = """//KVFTP    PROC FT=KVFTPD
+//F010     EXEC PGM=FTP,PARM='kvhost.example'
+//INPUT    DD   DSN=PROD.CMN.PARMLIB(&FT),DISP=SHR
+//OUTPUT   DD   SYSOUT=*
+"""
+NDM_PROC = """//KVNDM    PROC NP=KVNDMD
+//N010     EXEC PGM=DMBATCH
+//SYSIN    DD   DSN=PROD.CMN.PARMLIB(&NP),DISP=SHR
+"""
+ULU_PROC = """//KVULL    PROC
+//G        EXEC PGM=DFSRRC00,PARM=(ULU,DFSURGU0,KVDBDL)
+//DFSURGU1 DD   DSN=PROD.KV.UNLOAD,DISP=(NEW,CATLG)
+"""
+ULU_SYM_PROC = """//KVULU    PROC DBD=KVDBDD
+//G        EXEC PGM=DFSRRC00,PARM=(ULU,DFSURGU0,&DBD)
+//DFSURGU1 DD   DSN=PROD.KV.UNLOAD2,DISP=(NEW,CATLG)
+"""
+IFACE_CARDS = {
+    "KVFTPD": "put 'PROD.KV.DEFAULT.FILE' default.txt\nquit\n",
+    "KVFTPJ": "put 'PROD.KV.JOB.FILE' job.txt\nquit\n",
+    "KVNDMD": "  SUBMIT PROC=KVPRD1 &DSN=PROD.KV.NDM.DEFAULT\n",
+    "KVNDMJ": "  SUBMIT PROC=KVPRJ1 &DSN=PROD.KV.NDM.JOBFILE\n",
+}
+IFACE_JOB = """//KVIFJOB  JOB (ACCT),'INTERFACES',CLASS=A
+//S1       EXEC KVFTP,FT=KVFTPJ
+//S2       EXEC KVNDM,NP=KVNDMJ
+//S3       EXEC KVULL
+//S4       EXEC KVULL,PARM.G=(ULU,DFSURRL0,KVDBDJ)
+//S5       EXEC KVULU,DBD=KVDBDJ
+//S6       EXEC KVFTP
+//S7       EXEC KVNDM
+//
+"""
+IFACE_PROCS = {"KVFTP": FTP_PROC, "KVNDM": NDM_PROC, "KVULL": ULU_PROC, "KVULU": ULU_SYM_PROC}
+
+
+def _rows(step, name):
+    return [(d.dsn_resolved, d.mode, d.mode_source) for d in step.dds if d.dd_name == name]
+
+
+class ProcInterfaceRows(unittest.TestCase):
+    """LESSONS 226. Wrong answer guarded: beside the job's own *FTP* / *NDM* / *DBD* row, the one the PROC's own
+    cards or PARM gave (its default card member, its default database), as 'unknown [undetermined]'."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.job, cls.by = _expand(IFACE_JOB, IFACE_PROCS, IFACE_CARDS)
+
+    def test_ftp_puts_the_jobs_file_once(self):
+        self.assertEqual(_rows(self.by["S1.F010"], "*FTP*"), [("PROD.KV.JOB.FILE", "input", "ftp_put")])
+
+    def test_ftp_without_an_override_puts_the_default_once(self):
+        self.assertEqual(_rows(self.by["S6.F010"], "*FTP*"), [("PROD.KV.DEFAULT.FILE", "input", "ftp_put")])
+
+    def test_connect_direct_names_the_jobs_file_once(self):
+        # the process parameter of the job's cards - the default's used to stand in its place, 'undetermined'
+        self.assertEqual(_rows(self.by["S2.N010"], "*NDM*"), [("PROD.KV.NDM.JOBFILE", "unknown", "ndm_symbolic")])
+
+    def test_connect_direct_without_an_override_names_the_default_once(self):
+        # the copy of the PROC's row, 'undetermined', stood where the process parameter's row belongs
+        self.assertEqual(_rows(self.by["S7.N010"], "*NDM*"), [("PROD.KV.NDM.DEFAULT", "unknown", "ndm_symbolic")])
+
+    def test_an_ims_utility_step_names_one_database(self):
+        self.assertEqual(_rows(self.by["S3.G"], "*DBD*"), [("KVDBDL", "input", "ims_utility")])
+        # PARM.G= on the job's EXEC: the reload writes the job's database, and the PROC's is not there at all
+        self.assertEqual(_rows(self.by["S4.G"], "*DBD*"), [("KVDBDJ", "output", "ims_utility")])
+        self.assertEqual(_rows(self.by["S5.G"], "*DBD*"), [("KVDBDJ", "input", "ims_utility")])
+
+    def test_the_procs_own_rows_keep_its_default(self):
+        own = jcl.parse_jcl(FTP_PROC, member_lookup=IFACE_CARDS.get)
+        self.assertEqual(_rows(own.steps[0], "*FTP*"), [("PROD.KV.DEFAULT.FILE", "input", "ftp_put")])
+        own = jcl.parse_jcl(ULU_PROC)
+        self.assertEqual(_rows(own.steps[0], "*DBD*"), [("KVDBDL", "input", "ims_utility")])
+
+
+class ProcInterfaceRowsInTheIndex(unittest.TestCase):
+    """LESSONS 226 in the reports: `dataset` of the PROC's default file named the job's step as its reader,
+    'unknown [undetermined]', and said it crosses the mainframe boundary there."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.td = tempfile.mkdtemp()
+        root = os.path.join(cls.td, "estate")
+        _write(root, "POLICY/PROD.KV.JCLLIB/KVIFJOB.jcl", IFACE_JOB.replace("//S6       EXEC KVFTP\n//S7       EXEC KVNDM\n", ""))
+        _write(root, "SHARED/PROD.CMN.PROCLIB/KVFTP.prc", FTP_PROC)
+        _write(root, "SHARED/PROD.CMN.PROCLIB/KVNDM.prc", NDM_PROC)
+        _write(root, "SHARED/PROD.CMN.PROCLIB/KVULL.prc", ULU_PROC)
+        _write(root, "SHARED/PROD.CMN.PROCLIB/KVULU.prc", ULU_SYM_PROC)
+        for name, text in IFACE_CARDS.items():
+            _write(root, f"SHARED/PROD.CMN.PARMLIB/{name}.ctl", text)
+        cls.db = os.path.join(cls.td, "t.db")
+        _run_build(root, cls.db, "--rebuild")
+        cls.conn = query.connect(cls.db)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.conn.close()
+        shutil.rmtree(cls.td, ignore_errors=True)
+
+    def test_one_row_per_file_and_database(self):
+        got = self.conn.execute("""SELECT s.step_name, d.dd_name, d.dsn_resolved, d.mode, d.mode_source
+                                   FROM dd d JOIN step s ON s.id=d.step_id JOIN job j ON j.id=s.job_id
+                                   WHERE j.job_name='KVIFJOB' AND d.dd_name LIKE '*%' ORDER BY s.step_name""").fetchall()
+        self.assertEqual([tuple(r) for r in got], [
+            ("S1.F010", "*FTP*", "PROD.KV.JOB.FILE", "input", "ftp_put"),
+            ("S2.N010", "*NDM*", "PROD.KV.NDM.JOBFILE", "unknown", "ndm_symbolic"),
+            ("S3.G", "*DBD*", "KVDBDL", "input", "ims_utility"),
+            ("S4.G", "*DBD*", "KVDBDJ", "output", "ims_utility"),
+            ("S5.G", "*DBD*", "KVDBDJ", "input", "ims_utility")])
+
+    def test_the_default_file_is_no_job_steps(self):
+        out = query.cmd_dataset(self.conn, "PROD.KV.DEFAULT.FILE")
+        self.assertNotIn("KVIFJOB", out)
+        self.assertNotIn("undetermined]", out.split("> Direction marked")[0])
+
+    def test_the_jobs_file_crosses_the_boundary_at_its_step(self):
+        out = query.cmd_dataset(self.conn, "PROD.KV.JOB.FILE")
+        self.assertIn("| PROD.KV.JOB.FILE | input [ftp_put] |", out)
+        self.assertIn("ftp out (KVIFJOB S1.F010)", out)
+        self.assertNotIn("ftp unknown", out)
+        job = query.cmd_job(self.conn, "KVIFJOB")
+        self.assertNotIn("PROD.KV.DEFAULT.FILE", job)
+        self.assertNotIn("PROD.KV.NDM.DEFAULT", job)
+        self.assertEqual(job.count("| *DBD* |"), 3, job)
+
+
+# ===========================================================================
+# LESSONS 227 - coverage and `program NAME` on an index built before the
+# item: the member a row reads is the one its dataset names
+# ===========================================================================
+
+KVSORTN_PROC = SORT_PROC.replace("//KVSORT   PROC", "//KVSORTN  PROC").replace("CARDS=KVDEFC", "CARDS=KVDEFN")
+OLD_JOBS = {
+    "KVOJ01": "//S1       EXEC KVSORT,CARDS=KVJOBC",                 # the job's member indexed, the default too
+    "KVOJ02": "//S1       EXEC KVSORT,CARDS=KVJMISS",                # the job's member missing
+    "KVOJ03": "//S1       EXEC KVSORT,CARDS=KVJOBC\n"                # an override naming a member not in the estate
+              "//SRT010.SYSIN DD DSN=PROD.CMN.PARMLIB(KVOMISS),DISP=SHR",
+    "KVOJ04": "//S1       EXEC KVSORT",                              # reads the default, indexed
+    "KVOJ05": "//S1       EXEC KVSORTN,CARDS=KVJOBC",                # the default missing, the job's member indexed
+    "KVOJ06": "//S1       EXEC KVSORTN",                             # reads the default, missing
+    "KVOJ07": "//S1       EXEC KVSORTN\n//SRT010.SYSIN DD *\n  SORT FIELDS=(20,6,CH,A)\n/*",   # instream cards
+    "KVOJ08": "//S1       EXEC KVSORTN,CARDS=KVJMIS2",               # both missing
+}
+# what the jobs read and the estate does not hold, one DD each
+OLD_MISSING = [("KVDEFN", 1), ("KVJMIS2", 1), ("KVJMISS", 1), ("KVOMISS", 1)]
+
+
+def old_card_estate(root):
+    _write(root, "SHARED/PROD.CMN.PROCLIB/KVSORT.prc", SORT_PROC)
+    _write(root, "SHARED/PROD.CMN.PROCLIB/KVSORTN.prc", KVSORTN_PROC)
+    _write(root, "SHARED/PROD.CMN.PARMLIB/KVJOBC.ctl", CARDS["KVJOBC"])
+    _write(root, "SHARED/PROD.CMN.PARMLIB/KVDEFC.ctl", CARDS["KVDEFC"])
+    for name, body in OLD_JOBS.items():
+        _write(root, f"POLICY/PROD.KV.JCLLIB/{name}.jcl", f"//{name:<8} JOB (ACCT),'CARDS',CLASS=A\n{body}\n//\n")
+
+
+def age_to_before_item_29(db):
+    """Rewrite the card DDs of the expanded PROC steps of an index built by this code into what the build before
+    ROADMAP re-parse item 29 wrote (checked against a real build of that code - f93c60c - on old_card_estate):
+      - a DD the job does not override: dsn_resolved the job's (resolved with its symbols), card_member and text the
+        PROC's own row's - its default member's;
+      - a //PS.DD override naming a dataset: its own card_member, its own text or else the PROC default's;
+      - a //PS.DD DD * override: the PROC's dataset and card member beside the instream cards (LESSONS 224) - the
+        estate's one such job sets no CARDS=, so the PROC's own resolution is the job's."""
+    conn = sqlite3.connect(db)
+    try:
+        own = {}
+        for r in conn.execute("""SELECT pd.proc_name, s.step_name, d.dd_name, d.concat_seq, d.dsn, d.dsn_resolved,
+                                        d.card_member, d.sysin_text
+                                 FROM dd d JOIN step s ON s.id=d.step_id JOIN proc_def pd ON pd.id=s.proc_id"""):
+            own[(r[0].upper(), r[1].upper(), r[2].upper(), r[3])] = r[4:]
+        for r in conn.execute("""SELECT d.id, s.from_proc, s.step_name, s.parent_step, d.dd_name, d.concat_seq, d.dsn,
+                                        d.is_override, d.sysin_text
+                                 FROM dd d JOIN step s ON s.id=d.step_id WHERE s.from_proc IS NOT NULL""").fetchall():
+            p = own.get((r[1].upper(), r[2][len(r[3]) + 1:].upper(), r[4].upper(), r[5]))
+            if p is None:
+                continue
+            pdsn, pres, pmember, ptext = p
+            if not r[7]:
+                conn.execute("UPDATE dd SET card_member=?, sysin_text=? WHERE id=?", (pmember, ptext, r[0]))
+            elif r[6]:
+                conn.execute("UPDATE dd SET sysin_text=? WHERE id=?", (r[8] if r[8] is not None else ptext, r[0]))
+            elif r[8] is not None:
+                conn.execute("UPDATE dd SET dsn=?, dsn_resolved=?, card_member=? WHERE id=?",
+                             (pdsn, pres, pmember, r[0]))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+class AnIndexBuiltBeforeTheItem(unittest.TestCase):
+    """LESSONS 227. Coverage's table of card members 'referenced by JCL but NOT indexed' and `program NAME`'s 'Used
+    as control cards by', on an index built by this code and on one aged to what the build before ROADMAP re-parse
+    item 29 wrote. Wrong answers guarded, on the older index: the override's missing member KVOMISS gone from the
+    table (the effective row carried the default's text, the job step's own row was skipped), and the PROC default
+    counted for the jobs whose dataset names their own member."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.td = tempfile.mkdtemp()
+        root = os.path.join(cls.td, "estate")
+        old_card_estate(root)
+        cls.db = os.path.join(cls.td, "t.db")
+        _run_build(root, cls.db, "--rebuild")
+        cls.aged_db = os.path.join(cls.td, "aged.db")
+        shutil.copyfile(cls.db, cls.aged_db)
+        age_to_before_item_29(cls.aged_db)
+        cls.conn = query.connect(cls.db)
+        cls.aged = query.connect(cls.aged_db)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.conn.close()
+        cls.aged.close()
+        shutil.rmtree(cls.td, ignore_errors=True)
+
+    def _sysin(self, conn, job):
+        return conn.execute("""SELECT d.dsn_resolved, d.card_member, d.sysin_text FROM dd d JOIN step s ON s.id=d.step_id
+                               JOIN job j ON j.id=s.job_id WHERE j.job_name=? AND s.step_name='S1.SRT010'
+                               AND d.dd_name='SYSIN'""", (job,)).fetchone()
+
+    def test_the_aged_rows_are_the_older_builds(self):
+        # the shape the build before the item wrote (its real build: `ZQC01 S1.SRT SYSIN PROD.ZQ.PARMLIB(ZQC01C)
+        # ... ZQDEFC`) - not the default's dataset, which it never wrote
+        self.assertEqual(tuple(self._sysin(self.aged, "KVOJ01")),
+                         ("PROD.CMN.PARMLIB(KVJOBC)", "KVDEFC", CARDS["KVDEFC"]))
+        self.assertEqual(tuple(self._sysin(self.aged, "KVOJ03")),
+                         ("PROD.CMN.PARMLIB(KVOMISS)", "KVOMISS", CARDS["KVDEFC"]))
+        self.assertEqual(tuple(self._sysin(self.aged, "KVOJ05")), ("PROD.CMN.PARMLIB(KVJOBC)", "KVDEFN", None))
+        self.assertEqual(tuple(self._sysin(self.aged, "KVOJ07"))[:2], ("PROD.CMN.PARMLIB(KVDEFN)", "KVDEFN"))
+        # and this build's
+        self.assertEqual(tuple(self._sysin(self.conn, "KVOJ01")),
+                         ("PROD.CMN.PARMLIB(KVJOBC)", "KVJOBC", CARDS["KVJOBC"]))
+        self.assertEqual(tuple(self._sysin(self.conn, "KVOJ03")), ("PROD.CMN.PARMLIB(KVOMISS)", "KVOMISS", None))
+
+    def test_coverage_names_what_the_jobs_read_on_both(self):
+        self.assertEqual(query.card_members_not_indexed(self.conn), OLD_MISSING)
+        self.assertEqual(query.card_members_not_indexed(self.aged), OLD_MISSING)
+        for conn in (self.conn, self.aged):
+            section = query.cmd_coverage(conn).split("### Control-card members referenced by JCL but NOT indexed")[1]
+            self.assertIn("| KVOMISS | 1 |", section)
+            self.assertNotIn("KVDEFC", section.split("###")[0])
+
+    def test_program_lists_the_jobs_that_read_the_member(self):
+        want = {"KVJOBC": ["KVOJ01", "KVOJ05"], "KVDEFC": ["KVOJ04"], "KVDEFN": ["KVOJ06"], "KVOMISS": ["KVOJ03"],
+                "KVJMISS": ["KVOJ02"]}
+        for conn in (self.conn, self.aged):
+            for name, jobs in want.items():
+                out = query.cmd_program(conn, name)
+                section = out.split("### Used as control cards by")[1].split("###")[0]
+                got = sorted({ln.split("|")[1].strip() for ln in section.splitlines() if ln.startswith("| KVOJ")})
+                self.assertEqual(got, jobs, (name, section))
+
+    def test_program_says_whether_the_text_is_loaded(self):
+        # LESSONS 228. Wrong words guarded: 'Its text is loaded as that step's cards' under 'Source not indexed'
+        for conn in (self.conn, self.aged):
+            out = query.cmd_program(conn, "KVDEFN")
+            self.assertIn("**Source not indexed**", out)
+            self.assertIn("**Not in the estate as control cards**", out)
+            self.assertNotIn("Its text is loaded", out)
+            out = query.cmd_program(conn, "KVJOBC")
+            self.assertIn("Its text is loaded as that step's cards", out)
+            self.assertNotIn("Not in the estate as control cards", out)
+
+    def test_the_card_kinds_are_the_builds(self):
+        self.assertEqual(query.CARD_KINDS, build.CARD_KINDS)
+
+    def test_the_member_a_row_reads(self):
+        read = query.card_member_read
+        self.assertEqual(read("SYSIN", "PROD.CMN.PARMLIB(KVJOBC)", "KVDEFC"), "KVJOBC")
+        self.assertEqual(read("SRT010.SYSIN", "PROD.CMN.PARMLIB(KVJOBC)", None), "KVJOBC")
+        self.assertEqual(read("SYSIN", "PROD.CMN.CARDS.KVJOBC", "KVJOBC"), "KVJOBC")        # by the last qualifier
+        self.assertIsNone(read("STEPLIB", "PROD.CMN.LOADLIB(KVPGM)", None))
+        self.assertIsNone(read("SYSIN", "PROD.CMN.PARMLIB(<VAR>)", None))
+        self.assertIsNone(read("SYSIN", None, None))
 
 
 class TheReproductions(unittest.TestCase):
@@ -604,7 +891,7 @@ class TheDocsSayIt(unittest.TestCase):
 
     def test_lessons_rows(self):
         text = self.read("LESSONS.md")
-        for n in (222, 223, 224, 225):
+        for n in (222, 223, 224, 225, 226, 227, 228):
             row = next((ln for ln in text.splitlines() if ln.startswith(f"| {n} |")), "")
             self.assertIn("tests/test_jcl_generations_and_cards.py", row, n)
             self.assertEqual(row.replace("\|", "").count("|") - 1, 5, n)      # number + four cells
@@ -615,6 +902,19 @@ class TheDocsSayIt(unittest.TestCase):
         self.assertIn("recorded `input [gdg_same_job]` - never a second writer", readme)
         self.assertIn("the one the calling job's `EXEC PROC=...,CARDS=` names", readme)
         self.assertIn('<td class="mono">gdg_same_job</td>', self.read("docs", "FieldManual.html"))
+
+    def test_the_older_index_sentence(self):
+        # LESSONS 227. Wrong words guarded: 'an effective step still names the default and is counted as it is' -
+        # the older build kept the job's dataset beside the default's card member and text
+        said = "counted as it is"
+        row = next(ln for ln in self.read("LESSONS.md").splitlines() if ln.startswith("| 222 |"))
+        for where, text in (("row 222", row), ("ROADMAP", self.read("ROADMAP.md")),
+                            ("docstring", query.card_members_not_indexed.__doc__)):
+            self.assertNotIn(said, text, where)
+            self.assertIn("dataset", text, where)
+        item = self.read("ROADMAP.md").split("29. **Delivered in the batch")[1].split("\n\n")[0]
+        self.assertIn("take the member from the dataset", item)
+        self.assertIn("LESSONS 222-228", item)
 
     def test_card_seq_assumed_says_what_the_row_records(self):
         # LESSONS 225. Wrong words guarded: 'a card deck with no sequence field; the order on disk was assumed'

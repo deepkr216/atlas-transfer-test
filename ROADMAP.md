@@ -786,18 +786,22 @@ shipped alone and cost one such night; these still wait for the next one:
 29. **Delivered in the batch - a PROC's card member named by a symbolic is the calling job's, and a (+1) named again
    later in the same job is read, not written again.** The synthetic estate's findings in the JCL parser
    (docs/SYNTH-findings-2026-09-25.md; the reproductions F09 and F10 under tools/synth/repro, which verify.py now
-   reports FIXED; LESSONS 222-224). (F10) The shared sort PROC's `//SYSIN DD DSN=PROD.CMN.PARMLIB(&CARDS)`, run with
+   reports FIXED; LESSONS 222-228). (F10) The shared sort PROC's `//SYSIN DD DSN=PROD.CMN.PARMLIB(&CARDS)`, run with
    `EXEC PROC=CMNSORT,...,CARDS=BILSORT1`: the effective step's DSN was the job's, but its card member, the member's
    text, the program read from the cards and the sort byte positions stayed the PROC default's (CMNSRT1, not in the
    estate) - `job` said 'card member NOT indexed' for a member the estate holds, coverage had a 'SORT with no cards'
    row, the step had no card_field_ref rows, and coverage's table of members 'referenced by JCL but NOT indexed'
    named the default no job reads. `jcl._resolve_dd` resolves the card member with the job's symbols (EXEC override >
    PROC default > SET, `jcl.PROC_DEFAULT_BEATS_SET` as it is) and loads its text (`jcl._card_source`, the reading
-   `_build_dd` uses); the effective step's program, launcher and submits are read again from those cards; an
-   override naming a dataset brings its own cards; `//PS.SYSIN DD *` replaces the PROC's dataset instead of sitting
-   beside it (LESSONS 224). Coverage's table (`query.card_members_not_indexed`) counts a PROC's own rows only when no
-   indexed job expands the PROC, and a job step's //PS.DD override once; on an index built before the item an
-   effective step still names the default, and is counted as it is. (F09) JES resolves relative generation numbers
+   `_build_dd` uses); the effective step's program, launcher and submits are read again from those cards - and its
+   FTP / Connect:Direct / IMS utility rows, which the PROC's own default cards and PARM gave beside the job's before
+   (LESSONS 226); an override naming a dataset brings its own cards; `//PS.SYSIN DD *` replaces the PROC's dataset
+   instead of sitting beside it (LESSONS 224). Coverage's table (`query.card_members_not_indexed`) counts a PROC's
+   own rows only when no indexed job expands the PROC, and a job step's //PS.DD override once. On an index built
+   before the item an expanded step's card_member and text can still be the PROC default's while its dataset names
+   the job's member: the table and `program NAME` take the member from the dataset and ask whether a card member of
+   that name is in the index (LESSONS 227); `program NAME` says a member's text is loaded only when it is (LESSONS
+   228). (F09) JES resolves relative generation numbers
    once per job: `jcl._same_job_generations` reads a (+n) an earlier step of the job wrote, named again by a DD that
    reads it (SORTIN, SYSUT1, an input of the sort / ICETOOL / JOINKEYS / Easytrieve cards, DISP=SHR or OLD on a DD
    whose name is not a writing one), as input 'gdg_same_job', not a second writer; the program's OPEN still decides
@@ -810,7 +814,7 @@ shipped alone and cost one such night; these still wait for the next one:
    facts matched and 11,393, none new; the one JCL finding left is `crud --job POLNIGHT` (the sorted extract absent),
    a query-side question of its own. The first build of this toolkit re-parses every member (jcl.py is a fact
    module). tests/test_jcl_generations_and_cards.py (SameJobGenerations, ProcCardMember, InTheIndex,
-   TheReproductions).
+   ProcInterfaceRows, ProcInterfaceRowsInTheIndex, AnIndexBuiltBeforeTheItem, TheReproductions).
 
 ### flow: known limits (open after review)
 

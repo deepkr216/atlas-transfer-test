@@ -39,7 +39,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import re
 
-from . import cobol, expand, reader, screens
+from . import cobol, expand, jcl, reader, screens
 from . import flow   # the `flow` engine; it imports this module back, both at run time only
 
 
@@ -432,16 +432,22 @@ def cmd_program(conn: sqlite3.Connection, name: str) -> str:
         # "where is SRTCLM used" is a job question, not a program question.
         # Effective (expanded) steps carry the job name; a bare PROC row is
         # shown only when no job expands that PROC; a job step's own
-        # //PROCSTEP.DD override is shown once, on the effective step.
-        cards = conn.execute("""
-            SELECT j.job_name, s.step_name, s.from_proc, d.dd_name, d.dsn_resolved, m.name AS jm, d.line, pd.proc_name
+        # //PROCSTEP.DD override is shown once, on the effective step. The
+        # member is the one the row reads (card_member_of_row): on an index
+        # built before ROADMAP re-parse item 29 an expanded step's
+        # card_member can be the PROC's default while its dataset names the
+        # job's member.
+        cards = [c for c in conn.execute("""
+            SELECT j.job_name, s.step_name, s.from_proc, d.dd_name, d.dsn_resolved, d.card_member, m.name AS jm,
+                   d.line, pd.proc_name, d.is_override, s.job_id, s.parent_step
             FROM dd d JOIN step s ON s.id=d.step_id LEFT JOIN job j ON j.id=s.job_id
             LEFT JOIN member m ON m.id=j.member_id LEFT JOIN proc_def pd ON pd.id=s.proc_id
-            WHERE UPPER(d.card_member)=?
+            WHERE (UPPER(d.card_member)=? OR UPPER(d.dsn_resolved) LIKE ?)
               AND NOT (s.proc_id IS NOT NULL AND EXISTS (SELECT 1 FROM step x WHERE x.from_proc=pd.proc_name))
               AND NOT (s.proc_called IS NOT NULL AND EXISTS (SELECT 1 FROM step x WHERE x.job_id=s.job_id
                                                             AND x.parent_step=s.step_name))
-            ORDER BY j.job_name, s.ordinal, d.line""", (n,)).fetchall()
+            ORDER BY j.job_name, s.ordinal, d.line""", (n, f"%({n}%")).fetchall()
+                 if card_member_of_row(conn, c) == n]
         other = conn.execute("SELECT kind, path FROM member WHERE UPPER(name)=? ORDER BY authoritative DESC",
                              (n,)).fetchall()
         if not steps and not callers and not tx and not cards and not other:
@@ -466,7 +472,15 @@ def cmd_program(conn: sqlite3.Connection, name: str) -> str:
                              [(c["job_name"] or f"(PROC {c['proc_name']})", c["step_name"], c["dd_name"],
                                c["dsn_resolved"], f"{c['from_proc'] or c['jm'] or c['proc_name']}:{c['line']}")
                               for c in cards]))
-            out.append("Its text is loaded as that step's cards: `job <JOB>` shows the resolved program / sort fields.\n")
+            if card_member_indexed(conn, n):
+                out.append("\nIts text is loaded as that step's cards: `job <JOB>` shows the resolved program / "
+                           "sort fields.\n")
+            else:
+                # The heading above says what the index holds of the name; a member the card lookup never reads
+                # (a copybook, a program) is no step's cards either (LESSONS 228).
+                out.append("\n**Not in the estate as control cards**: no member of this name that a job's cards are "
+                           "read from is indexed, so these steps' cards, the programs they run and their sort "
+                           "fields are unknown. Fetch the library in the `library(member)` column, then build.\n")
         if steps:
             out.append("\n### Runs in\n")
             out.append(table(["job", "step", "launcher", "cite"],
@@ -1398,6 +1412,57 @@ def cmd_literal(conn: sqlite3.Connection, value: str, field: Optional[str] = Non
 # dataset / copybook impact
 # --------------------------------------------------------------------------
 
+# The member kinds a job's card lookup reads (build.CARD_KINDS - a test pins
+# the two equal; this module does not import the build).
+CARD_KINDS = ("ctlcard", "unknown", "stub", "sql", "jcl", "proc")
+
+
+def card_member_read(dd_name: Optional[str], dsn_resolved: Optional[str],
+                     card_member: Optional[str]) -> Optional[str]:
+    """The control-card member a dd row names: the member in its dataset's
+    parentheses, by the rule jcl._card_source reads a DD with (never a
+    STEPLIB's, never a generation number), else the member the build took by
+    the dataset's last qualifier (card_member). On an index built by ROADMAP
+    re-parse item 29 the two agree. On one built before it, an expanded PROC
+    step's card_member is still the PROC's default (none, when the PROC
+    statement gives the symbolic no default) while dsn_resolved names the
+    member the calling job reads - `PROD.CMN.PARMLIB(BILSORT1)` beside
+    CMNSRT1 (LESSONS 222, 227)."""
+    if dsn_resolved:
+        m = jcl._MEMBER_REF.search(dsn_resolved)
+        if (m and not m.group(1)[0].isdigit()
+                and (dd_name or "").upper().split(".")[-1] not in jcl._NOT_CARD_DDS):
+            return m.group(1).upper()
+    return card_member.upper() if card_member else None
+
+
+def card_member_of_row(conn: sqlite3.Connection, r: sqlite3.Row) -> Optional[str]:
+    """The control-card member a dd row reads, or None. `r` holds dd_name,
+    dsn_resolved, card_member, is_override, line and the step's job_id and
+    parent_step. An expanded step's row for a job's `//PS.SYSIN DD *` reads
+    no member: on an index built before ROADMAP re-parse item 29 that row
+    kept the PROC's dataset and card member beside the instream cards
+    (LESSONS 224); the job step's own override row - the same statement:
+    the same line, the same DD name - has no dataset and says so. An index
+    built by the item has no member on that row to begin with."""
+    name = card_member_read(r["dd_name"], r["dsn_resolved"], r["card_member"])
+    if name and r["is_override"] and r["parent_step"] and r["job_id"] is not None:
+        dd = str(r["dd_name"] or "").upper().split(".")[-1]
+        if conn.execute("""SELECT 1 FROM dd d JOIN step s ON s.id=d.step_id
+                           WHERE s.job_id=? AND UPPER(s.step_name)=? AND s.proc_called IS NOT NULL AND d.line=?
+                             AND (UPPER(d.dd_name)=? OR UPPER(d.dd_name) LIKE ?) AND d.dsn IS NULL LIMIT 1""",
+                        (r["job_id"], str(r["parent_step"]).upper(), r["line"], dd, f"%.{dd}")).fetchone():
+            return None
+    return name
+
+
+def card_member_indexed(conn: sqlite3.Connection, name: str) -> bool:
+    """Is a member of this name in the index, of a kind the jobs' card
+    lookup reads (CARD_KINDS)?"""
+    return conn.execute(f"SELECT 1 FROM member WHERE UPPER(name)=? AND kind IN ({','.join('?' * len(CARD_KINDS))}) "
+                        "LIMIT 1", (name.upper(), *CARD_KINDS)).fetchone() is not None
+
+
 def card_members_not_indexed(conn: sqlite3.Connection, limit: int = 30) -> List[Tuple[str, int]]:
     """[(card member, DDs)] - the control-card members the jobs' DDs name
     (`DSN=LIB(MEMBER)`) whose text the index does not hold, most DDs first.
@@ -1406,21 +1471,46 @@ def card_members_not_indexed(conn: sqlite3.Connection, limit: int = 30) -> List[
     count only when no indexed job expands that PROC - each job's effective
     step names the member that job reads (EXEC override > PROC default >
     SET). A job step's own //PS.DD override counts once, on the effective
-    step. The rule `dataset` and `program NAME` show rows by. On an index
-    built before ROADMAP re-parse item 29 an effective step still names the
-    PROC's default member, and is counted as it is."""
+    step. The rule `dataset` and `program NAME` show rows by.
+
+    The member is the one the row reads (card_member_of_row). It is not
+    indexed when no member of that name is in the index as a kind the card
+    lookup reads (card_member_indexed), or when the row's card_member is
+    that member and its text is empty - the build's own answer. On an index
+    built before ROADMAP re-parse item 29 an expanded PROC step's
+    card_member and text can be the PROC default's while dsn_resolved names
+    the calling job's member, and a //PS.SYSIN override naming a member not
+    in the estate carries the default's text; the text is not read there,
+    so the table names the member each job reads when it is missing, and
+    never the PROC's default for a job that does not read it (LESSONS
+    227)."""
     expanded = {str(r[0]).upper() for r in conn.execute(
         "SELECT DISTINCT from_proc FROM step WHERE from_proc IS NOT NULL")}
+    indexed: Dict[str, bool] = {}
+    expands: Dict[Tuple[int, str], bool] = {}
     counts: Dict[str, int] = {}
-    for r in conn.execute("""SELECT d.card_member, pd.proc_name, s.proc_called, s.job_id, s.step_name
+    for r in conn.execute("""SELECT d.dd_name, d.dsn_resolved, d.card_member, d.sysin_text IS NULL AS no_text,
+                                    d.is_override, d.line, pd.proc_name, s.proc_called, s.job_id, s.step_name,
+                                    s.parent_step
                              FROM dd d JOIN step s ON s.id=d.step_id LEFT JOIN proc_def pd ON pd.id=s.proc_id
-                             WHERE d.card_member IS NOT NULL AND d.sysin_text IS NULL"""):
-        if r[1] and str(r[1]).upper() in expanded:
+                             WHERE d.card_member IS NOT NULL OR d.dsn_resolved LIKE '%(%'"""):
+        if r["proc_name"] and str(r["proc_name"]).upper() in expanded:
             continue
-        if r[2] and r[3] and conn.execute("SELECT 1 FROM step WHERE job_id=? AND parent_step=? LIMIT 1",
-                                          (r[3], r[4])).fetchone():
+        if r["proc_called"] and r["job_id"]:
+            key = (r["job_id"], r["step_name"])
+            if key not in expands:
+                expands[key] = conn.execute("SELECT 1 FROM step WHERE job_id=? AND parent_step=? LIMIT 1",
+                                            key).fetchone() is not None
+            if expands[key]:
+                continue
+        name = card_member_of_row(conn, r)
+        if not name:
             continue
-        counts[str(r[0])] = counts.get(str(r[0]), 0) + 1
+        if name not in indexed:
+            indexed[name] = card_member_indexed(conn, name)
+        if indexed[name] and not ((r["card_member"] or "").upper() == name and r["no_text"]):
+            continue
+        counts[name] = counts.get(name, 0) + 1
     return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:limit]
 
 

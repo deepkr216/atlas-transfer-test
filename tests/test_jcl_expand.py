@@ -59,6 +59,8 @@ class ProcExpansion(unittest.TestCase):
         d = self._dd("NIGHT.PS010", "SYSIN")
         self.assertIn("RUNMODE=FULL", d.sysin_text or "")
         self.assertTrue(d.is_override)
+        # LESSONS 224: the instream cards replace the PROC's DD DUMMY - read, no longer 'dummy'
+        self.assertEqual((d.mode, d.mode_source, d.dsn), ("input", "dd_convention", None))
 
     def test_temporary_dataset_is_not_a_symbolic(self):
         d = self._dd("NIGHT.PS010", "TEMP1")
