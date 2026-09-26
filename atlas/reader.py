@@ -385,10 +385,10 @@ def read_cobol_lines(text: str, fixed: Optional[bool] = None,
                 indicator = "*"
             elif " --" in code:
                 code = code.split(" --", 1)[0].rstrip()
-        if indicator == " ":
+        if indicator == " " and "EXEC" in up:
             # the words outside literals: `VALUE 'EXEC SQL'` opens no block - read as one, every later line holding
             # ' --' (a heading literal `' -- END -- '`) was cut there as an SQL comment, the literal left open ate
-            # the rest of the program (LESSONS 217)
+            # the rest of the program (LESSONS 217). A line without the word changes nothing: not masked at all
             words = code_outside_literals(up)
             if "EXEC SQL" in words and "END-EXEC" not in words:
                 in_sql = True
