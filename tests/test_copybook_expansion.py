@@ -148,6 +148,20 @@ GAPPGM = program("GAPPGM", ["01  GAP-RECORD.", "    COPY NSTGAP."], ["0000-MAIN.
 NSTSELF = ("       05  SLF-A                  PIC X(02).\n"
            "           COPY NSTSELF.\n"
            "       05  SLF-B                  PIC X(02).\n")
+# OS/VS `01 X COPY Y.` inside a copybook: X is the copybook's own item, at the COPY line, with Y's bytes
+OSVOUT = ("      * TWO RECORDS\n"
+          "       01  OSV-REC COPY OSVIN.\n"
+          "       01  OSV-TAIL.\n"
+          "           05  OSV-T    PIC X(03).\n")
+OSVIN = ("       01  OSVIN-REC.\n"
+         "           05  OSV-A    PIC X(02).\n"
+         "           05  OSV-B    PIC 9(04).\n")
+# an own item under a group the nested copybook opens: it hangs from its nearest own ancestor (none: a root)
+NSTHEAD = ("           COPY NSTHDRG.\n"
+           "               10  HDR-ITEM       PIC X(03).\n"
+           "       05  HDR-NEXT               PIC X(01).\n")
+NSTHDRG = ("       05  HDR-GRP.\n"
+           "           10  HDR-FIRST          PIC X(02).\n")
 NSTIBM = ("       05  IBM-KEY                PIC X(04).\n"
           "           COPY DFHBMSCA.\n"
           "       05  IBM-AFTER              PIC X(02).\n")
@@ -198,6 +212,8 @@ ESTATE = (("GC/PROD.GC.SRC/INCPGM3.cbl", INCPGM3), ("GC/PROD.GC.SRC/INCPGM1.cbl"
           ("GC/PROD.GC.COPYLIB/NSTADDR.cpy", NSTADDR),
           ("GC/PROD.GC.SRC/GAPPGM.cbl", GAPPGM), ("GC/PROD.GC.COPYLIB/NSTGAP.cpy", NSTGAP),
           ("GC/PROD.GC.COPYLIB/NSTSELF.cpy", NSTSELF), ("GC/PROD.GC.COPYLIB/NSTIBM.cpy", NSTIBM),
+          ("GC/PROD.GC.COPYLIB/OSVOUT.cpy", OSVOUT), ("GC/PROD.GC.COPYLIB/OSVIN.cpy", OSVIN),
+          ("GC/PROD.GC.COPYLIB/NSTHEAD.cpy", NSTHEAD), ("GC/PROD.GC.COPYLIB/NSTHDRG.cpy", NSTHDRG),
           ("GC/PROD.GC.SRC/TAGPGM.cbl", TAGPGM), ("SHARED/PROD.CMN.COPYLIB/TAGPCB.cpy", TAGPCB),
           ("GC/PROD.GC.SRC/CICSPGM.cbl", CICSPGM), ("GC/PROD.GC.SRC/MQPGM.cbl", MQPGM))
 
@@ -502,6 +518,19 @@ class NestedCopybookLayout(_Built):
         self.assertIn("a copybook's own layout without the text of a COPY in it - not found, skipped, a stub, "
                       "IBM-supplied", row[0])
         self.assertIn("for a COPY not found, fetch that copybook's library and build again", row[0])
+
+    def test_an_osvs_01_copy_inside_a_copybook(self):
+        # `01 OSV-REC COPY OSVIN.`: OSV-REC is this copybook's item, written on the COPY line, as long as OSVIN's record
+        # (it was a 0-byte item before); OSVIN's items stay OSVIN's rows
+        self.assertEqual(self.rows("OSVOUT"), [("OSV-REC", 1, 0, 6, 1, 2), ("OSV-TAIL", 1, 0, 3, 1, 3),
+                                               ("OSV-T", 5, 0, 3, 0, 4)])
+        self.assertEqual(self.copy_row("OSVOUT", "OSVIN"), [(self.member_id("OSVIN"),)])
+        self.assertEqual(self.warnings("OSVOUT"), [])
+
+    def test_an_own_item_under_a_group_the_nested_copybook_opens(self):
+        self.assertEqual(self.rows("NSTHEAD"), [("HDR-ITEM", 10, 2, 3, 0, 2), ("HDR-NEXT", 5, 5, 1, 0, 3)])
+        self.assertEqual(self.q("SELECT f.parent_id FROM field f JOIN member m ON m.id = f.member_id "
+                                "WHERE m.name='NSTHEAD' ORDER BY f.id"), [(None,), (None,)])
 
     def test_a_copybook_copying_itself_and_one_copying_an_ibm_copybook(self):
         self.assertEqual(self.warnings("NSTSELF"), [(
