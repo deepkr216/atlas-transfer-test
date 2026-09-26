@@ -138,8 +138,17 @@ _SET_TRUE = re.compile(B + rf"SET\s+({ID})\s+TO\s+TRUE" + E, re.IGNORECASE)
 # ended only at a period, a scope terminator, ELSE or WHEN, so `GO TO A B
 # DEPENDING ON IX` then `GO TO 9000-BAD.` in one sentence gave plain GO TO
 # edges to A, B, DEPENDING, ON, IX, GO, TO and 9000-BAD, all at the first line
-# (LESSONS 212)
-_GO_TO = re.compile(B + r"GO\s+TO\s+(" + ID + r"(?:[\s,]+" + ID + r")*?)(?:[\s,]+DEPENDING\s+(?:ON\s+)?(" + ID + r"))?(?=\s*(?:$|\.|" + B + r"(?:" + _END + r"|" + _STATEMENT_VERBS + r")" + E + "))",
+# (LESSONS 212). The DEPENDING ON index is an identifier as COBOL writes one -
+# qualified (`WS-IX OF WS-GRP`) and subscripted (`WS-TIX (WS-SUB)`) - and the
+# word DEPENDING is never a target: a single name failed the lookahead after a
+# qualifier, so the list swallowed the clause (plain GO TO edges to DEPENDING,
+# ON and the index), and a subscript matched nothing at all (no edge to any
+# target, so `dead` listed them) (LESSONS 213)
+_NOT_DEPENDING = r"(?!DEPENDING" + E + ")"
+_GO_TO_INDEX = ID + r"(?:\s+(?:OF|IN)\s+" + ID + r")*(?:\s*\((?:[^()]|\([^()]*\))*\))*"
+_GO_TO = re.compile(B + r"GO\s+TO\s+(" + _NOT_DEPENDING + ID + r"(?:[\s,]+" + _NOT_DEPENDING + ID + r")*?)"
+                    r"(?:[\s,]+DEPENDING\s+(?:ON\s+)?(" + _GO_TO_INDEX + r"))?"
+                    r"(?=\s*(?:$|\.|" + B + r"(?:" + _END + r"|" + _STATEMENT_VERBS + r")" + E + "))",
                     re.IGNORECASE)
 MAX_RESOLVED = 40                         # candidate targets kept per dynamic CALL
 _ALTER = re.compile(B + rf"ALTER\s+({ID})\s+TO\s+(?:PROCEED\s+TO\s+)?({ID})", re.IGNORECASE)
@@ -428,7 +437,8 @@ def parse_program(text: str, data: bytes = b"", enc: str = "utf-8") -> ProgramFa
         body = st.text.strip()
         if st.no_period:
             # the reader closed an EXEC block at its END-EXEC although no period followed (the synthetic
-            # reproduction F15): said, and the member is partial - the source is not what compiled
+            # reproduction F15): said, and the member is partial - the facts after it rest on a period the
+            # source does not hold
             f.unresolved.append(("exec_no_period", exec_no_period_note(*st.no_period), st.no_period[1]))
 
         # `PROGRAM-ID. MULTILN.` on one line, or `PROGRAM-ID.` with the name
@@ -1592,34 +1602,82 @@ def _extract_performs(f: ProgramFacts, st: LogicalLine, here: str) -> None:
 _LITERAL = re.compile(r"'(?:[^']|'')*'|\"(?:[^\"]|\"\")*\"")
 # a phrase that makes the statements after it conditional: AT END, INVALID KEY, ON SIZE ERROR, ON EXCEPTION,
 # ON OVERFLOW, AT END-OF-PAGE / EOP (their NOT forms too) - reserved words, never a data name
-_CONDITIONAL_PHRASE = re.compile(B + r"(?:END|INVALID|ERROR|EXCEPTION|OVERFLOW|EOP|END-OF-PAGE)" + E, re.IGNORECASE)
+_CONDITIONAL_PHRASE = re.compile(B + r"(?:END-OF-PAGE|END|INVALID|ERROR|EXCEPTION|OVERFLOW|EOP)" + E, re.IGNORECASE)
+# the verbs that take each phrase: the phrase governs the statements after it up to the verb's own scope
+# terminator (END-READ, END-ADD, END-CALL ...), or up to the sentence's end when it has none
+_PHRASE_VERBS = {
+    "READ": ("END", "INVALID"), "RETURN": ("END",), "WRITE": ("INVALID", "EOP", "END-OF-PAGE"),
+    "REWRITE": ("INVALID",), "START": ("INVALID",), "DELETE": ("INVALID",),
+    "ADD": ("ERROR",), "SUBTRACT": ("ERROR",), "MULTIPLY": ("ERROR",), "DIVIDE": ("ERROR",), "COMPUTE": ("ERROR",),
+    "STRING": ("OVERFLOW",), "UNSTRING": ("OVERFLOW",), "CALL": ("OVERFLOW", "EXCEPTION"),
+    "ACCEPT": ("EXCEPTION",), "DISPLAY": ("EXCEPTION",),
+}
+# a word of a statement that can leave the paragraph: a sentence without one never does, and is not split
+_LEAVING_WORD = re.compile(B + r"(?:GO|GOBACK|STOP|EXIT)" + E, re.IGNORECASE)
+# NEXT SENTENCE skips the rest of the sentence (EXIT PARAGRAPH / SECTION, the verb split off, the paragraph's): a GO
+# TO after it may never run
+_NEXT_SENTENCE = re.compile(B + r"NEXT\s+SENTENCE" + E, re.IGNORECASE)
 
 
 def _leaves(sentence: str) -> bool:
     """The sentence leaves its paragraph whatever happens: one of its
     statements is GOBACK, STOP RUN, EXIT PROGRAM or a GO TO without DEPENDING,
-    and no IF / EVALUATE / SEARCH / WHEN / ELSE, inline PERFORM UNTIL /
-    VARYING or conditional phrase (AT END, INVALID KEY, SIZE ERROR ...) may
-    skip it. Read statement by statement, literals and EXEC blocks aside: the
-    words anywhere in the sentence decided before, so `GO TO A B DEPENDING ON
-    IX` then `GO TO 9000-BAD.` fell through (DEPENDING was in the sentence)
-    although its last GO TO always leaves, `READ F AT END GO TO 999-EXIT.` did
-    not although the READ goes on when a record is read, and `DISPLAY 'GO TO
-    THE DESK'` left (LESSONS 212)."""
+    and no open scope may skip it. Read statement by statement, literals and
+    EXEC blocks aside (the words anywhere in the sentence decided before, so
+    `GO TO A B DEPENDING ON IX` then `GO TO 9000-BAD.` fell through, and
+    `DISPLAY 'GO TO THE DESK'` left - LESSONS 212). A scope opens at IF,
+    EVALUATE, SEARCH, an inline PERFORM (UNTIL / VARYING / WITH TEST / n
+    TIMES) and a conditional phrase of its verb (READ ... AT END or INVALID
+    KEY, WRITE ... INVALID KEY or END-OF-PAGE, ADD ... ON SIZE ERROR, CALL ...
+    ON EXCEPTION ...), and closes at its own scope terminator - which closes
+    every scope opened inside it - or at the sentence's end. So `READ F AT END
+    GO TO X.` goes on when a record is read, while in `READ F AT END MOVE 'Y'
+    TO EOF END-READ GO TO 1000-READ.` the GO TO after END-READ always runs: a
+    phrase anywhere in the sentence made it fall through, a false edge that
+    hid dead code (LESSONS 213). NEXT SENTENCE and EXIT PARAGRAPH / SECTION
+    may skip what follows them. A GO TO in both branches of an IF ... ELSE is
+    still read as one that may not run."""
     body = _EXEC_ANY.sub(lambda m: " " * len(m.group(0)), sentence.strip().rstrip("."))
     body = _LITERAL.sub(lambda m: " " * len(m.group(0)), body)
-    parts = _split_verbs(body)
-    if any(v in ("IF", "EVALUATE", "SEARCH", "WHEN", "ELSE") for v, _fr, _o in parts) \
-            or any(v == "PERFORM" and fr.split()[:1] in (["UNTIL"], ["VARYING"], ["WITH"], ["TEST"])
-                   for v, fr, _o in parts) \
-            or _CONDITIONAL_PHRASE.search(body):
-        return False                     # conservative: a guarded exit, or one inside a loop that may not run
-    for verb, frag, _off in parts:
-        head = frag.split()[:1]
-        if verb == "GOBACK" or (verb == "STOP" and head == ["RUN"]) or (verb == "EXIT" and head == ["PROGRAM"]):
-            return True
-        if verb == "GO" and not re.search(B + r"DEPENDING" + E, frag, re.IGNORECASE):
-            return True                                   # GO TO ... DEPENDING ON falls through out of range
+    if not _LEAVING_WORD.search(body):
+        return False
+    scopes: List[Tuple[Optional[str], bool]] = []      # (its terminator - None: the sentence's end, it may skip)
+    skipped = False                                    # a NEXT SENTENCE / EXIT PARAGRAPH came before
+    for verb, frag, _off in _split_verbs(body):
+        words = frag.split()
+        if verb in SCOPE_TERMINATORS:
+            # its own statement's scope ends here, with every scope opened inside it; a terminator of a
+            # statement the splitter does not know (XML PARSE ... ON EXCEPTION ... END-XML) ends the phrase's
+            at = next((i for i in range(len(scopes) - 1, -1, -1) if scopes[i][0] == verb), None)
+            if at is None:
+                at = next((i for i in range(len(scopes) - 1, -1, -1) if scopes[i][0] is None), None)
+            if at is not None:
+                del scopes[at:]
+        elif verb in ("IF", "EVALUATE", "SEARCH"):
+            scopes.append(("END-" + verb, True))
+        elif verb == "PERFORM":
+            if not words:
+                scopes.append(("END-PERFORM", False))       # an inline PERFORM with no loop phrase runs once
+            elif words[0].upper() in ("UNTIL", "VARYING", "WITH", "TEST") \
+                    or (len(words) > 1 and words[1].upper() == "TIMES"):
+                scopes.append(("END-PERFORM", True))        # a loop that may not run
+        elif verb in ("WHEN", "ELSE") and not scopes:
+            scopes.append((None, True))                     # no statement of the sentence opened it
+        head = words[0].upper() if words else ""
+        if not skipped and not any(may_skip for _t, may_skip in scopes):
+            if verb == "GOBACK" or (verb == "STOP" and head == "RUN") or (verb == "EXIT" and head == "PROGRAM"):
+                return True
+            if verb == "GO" and not re.search(B + r"DEPENDING" + E, frag, re.IGNORECASE):
+                return True                                 # GO TO ... DEPENDING ON falls through out of range
+        phrases = {p.upper() for p in _CONDITIONAL_PHRASE.findall(frag)}
+        if phrases:
+            if phrases & set(_PHRASE_VERBS.get(verb, ())):
+                scopes.append(("END-" + verb, True))
+            elif not scopes:
+                scopes.append((None, True))                 # a statement the splitter does not know took it
+            # else: the NOT AT END / NOT INVALID KEY ... of a statement whose scope is open
+        if _NEXT_SENTENCE.search(frag) or (verb == "EXIT" and head in ("PARAGRAPH", "SECTION")):
+            skipped = True
     return False
 
 
@@ -1703,7 +1761,32 @@ _TOKEN = re.compile(r"'(?:[^']|'')*'|\"(?:[^\"]|\"\")*\"|[A-Z0-9][A-Z0-9\-]*(?:\
 # `CANCEL WS-PGM` after it one more. SORT / MERGE / CANCEL / ALTER / ENTRY fragments name files, programs and
 # paragraphs: no field reference of their own, as when such a statement starts its sentence
 _VERBS = _STATEMENT_VERBS + "|" + _END[3:-1]
-_SPLIT = re.compile(r"'(?:[^']|'')*'|\"(?:[^\"]|\"\")*\"|" + B + "(" + _VERBS + ")" + E, re.I)
+
+
+def word_trie(words: Sequence[str]) -> str:
+    """A regex alternation of plain words written as a trie - `(?:A(?:CCEPT|DD|LTER)|C(?:ALL|...))` - that
+    matches exactly the words `words` matches: the engine tries a letter or two at each position instead of
+    every word. _split_verbs runs on every statement (and again on a paragraph's last sentence when it holds
+    GO, GOBACK, STOP or EXIT); the alternation of 65 verbs and terminators made it the parser's costliest call,
+    and a large program parsed 8-10% slower than before ROADMAP re-parse item 26 (LESSONS 213). Followed by a
+    word boundary, one word at most can match at a position, so the order of the branches does not matter."""
+    words = sorted(set(words))
+    if not words:
+        return "(?!)"
+    groups: Dict[str, List[str]] = {}
+    ends_here = False
+    for w in words:
+        if w:
+            groups.setdefault(w[0], []).append(w[1:])
+        else:
+            ends_here = True
+    branches = [re.escape(ch) + ("" if rest == [""] else word_trie(rest)) for ch, rest in sorted(groups.items())]
+    if len(branches) == 1 and not ends_here:
+        return branches[0]                    # one path on: a sequence, no group (it holds no top-level '|')
+    return "(?:" + "|".join(branches) + ")" + ("?" if ends_here else "")
+
+
+_SPLIT = re.compile(r"'(?:[^']|'')*'|\"(?:[^\"]|\"\")*\"|" + B + "(" + word_trie(_VERBS.split("|")) + ")" + E, re.I)
 
 _MOVE_TO = re.compile(r"^(?:CORR(?:ESPONDING)?\s+)?(.+?)\s+" + B + "TO" + E + r"\s+(.+)$", re.I | re.S)
 _LEADING_LIT = re.compile(r"^(?:" + LIT + r")$", re.I)

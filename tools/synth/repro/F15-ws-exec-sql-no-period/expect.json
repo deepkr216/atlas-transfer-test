@@ -1,5 +1,5 @@
 {
- "title": "an EXEC SQL in WORKING-STORAGE without its period (a compile error) erases every procedure-division fact while the member reads ok",
+ "title": "an EXEC SQL in WORKING-STORAGE with no period after its END-EXEC erases every procedure-division fact while the member reads ok",
  "recover": false,
  "checks": [
   {

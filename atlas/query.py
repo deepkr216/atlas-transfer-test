@@ -978,17 +978,61 @@ def _file_decls(conn: sqlite3.Connection, name: str) -> List[sqlite3.Row]:
                            WHERE UPPER(f.select_name) = ? ORDER BY p.program_id, f.line""", (name.upper(),)).fetchall()
 
 
-def _file_not_field(conn: sqlite3.Connection, name: str, files: Sequence[sqlite3.Row], shown: int = 12) -> str:
+# the statements an index built before ROADMAP re-parse item 26 recorded as reads of the file they name
+_OLD_FILE_STMTS = ("OPEN", "CLOSE", "START", "DELETE")
+
+
+def _file_name_uses(conn: sqlite3.Connection, name: str, files: Sequence[sqlite3.Row]
+                    ) -> Tuple[List[Tuple[str, str]], List[Tuple[str, List[str], List[str]]]]:
+    """The field references of a name the index holds as a SELECT / FD file:
+    ([(program, statement)] - the file statements of a program that declares
+    the file, which an index built before ROADMAP re-parse item 26 recorded as
+    reads of it; [(program, [statements], [copybooks it misses])] - the
+    programs that declare no such file, where the name is a data item whose
+    definition the index does not hold). A file and a data item of one
+    program cannot share a name, but two programs can: FLTBAT02's `MOVE SPACES
+    TO VOY-FILE` read as a file statement of an older index (LESSONS 213)."""
+    from . import recover
+    declaring = {f["pid"] for f in files}
+    old: set = set()
+    data: Dict[str, Tuple[int, set]] = {}
+    for r in conn.execute("""SELECT r.program_id AS pid, p.program_id AS prog, p.member_id, r.stmt, r.mode
+                             FROM field_ref r JOIN program p ON p.id = r.program_id WHERE UPPER(r.name) = ?""",
+                          (name.upper(),)):
+        stmt = (r["stmt"] or "").upper()
+        if r["pid"] in declaring:
+            if stmt in _OLD_FILE_STMTS and r["mode"] == "read":
+                old.add((r["prog"], stmt))
+        else:
+            data.setdefault(r["prog"], (r["member_id"], set()))[1].add(stmt)
+    missing = recover.not_found_copies(conn, [mid for mid, _s in data.values()]) if data else set()
+    users = [(prog, sorted(stmts), sorted(book for mid2, book in missing if mid2 == mid))
+             for prog, (mid, stmts) in sorted(data.items())]
+    return sorted(old), users
+
+
+def _file_not_field(conn: sqlite3.Connection, name: str, files: Sequence[sqlite3.Row],
+                    uses: Optional[Tuple[List[Tuple[str, str]], List[Tuple[str, List[str], List[str]]]]] = None,
+                    shown: int = 12) -> str:
     """`field` for a name the index holds as a SELECT / FD file and nowhere
     as a data item. Since ROADMAP re-parse item 26 no statement records a file
     as a field reference (OPEN / CLOSE recorded it as a read), and `field
     VOY-FILE` answered only NOT DEFINED with 'check spelling' - wrong advice
     for a name the index holds (LESSONS 212). Says where it is declared and
-    which report answers for a file; on an index built before item 26 the
-    file statements it recorded as reads are listed below, and said to be so."""
+    which report answers for a file. The file statements an index built
+    before item 26 recorded as reads are said to be so - those of a program
+    that declares the file, and only those: another program's `MOVE SPACES
+    TO VOY-FILE` names a data item of its own, and the page said the name was
+    no data item and called that MOVE an older index's OPEN (LESSONS 213)."""
     nm = name.upper()
-    out = [f"`{nm}` is a **file** (SELECT ... ASSIGN, FD), not a data item - declared in {len(files)} "
-           f"program{'' if len(files) == 1 else 's'}:\n"]
+    old, users = uses if uses is not None else _file_name_uses(conn, nm, files)
+    n = len(files)
+    if users:
+        out = [f"`{nm}` is a **file** (SELECT ... ASSIGN, FD) in {n} program{'' if n == 1 else 's'}, and a data item "
+               f"in {len(users)} other{'' if len(users) == 1 else 's'} (below) - declared as a file in:\n"]
+    else:
+        out = [f"`{nm}` is a **file** (SELECT ... ASSIGN, FD), not a data item - declared in {n} "
+               f"program{'' if n == 1 else 's'}:\n"]
     out.append(table(["program", "ASSIGN TO", "organization", "FD record", "cite"],
                      [(f["program_id"], f["assign_dd"] or "", f["organization"] or "", f["fd_record"] or "",
                        cite(conn, f["pid"], f["line"])) for f in files[:shown]]))
@@ -998,9 +1042,26 @@ def _file_not_field(conn: sqlite3.Connection, name: str, files: Sequence[sqlite3
     out.append(f"\n`program {files[0]['program_id']}` shows what the program does with the file (OPEN, READ, WRITE) "
                "and the dataset each job step gives its DD"
                + (f"; `field {rec}` the reads and writes of its record" if rec else "") + ".\n")
-    if conn.execute("SELECT 1 FROM field_ref WHERE UPPER(name)=? LIMIT 1", (nm,)).fetchone():
-        out.append("The references below are file statements (OPEN, CLOSE, START, DELETE) that an index built before "
-                   "ROADMAP re-parse item 26 recorded as reads of the file; a build of this toolkit records none.\n")
+    if old:
+        by_prog: Dict[str, List[str]] = defaultdict(list)
+        for prog, stmt in old:
+            by_prog[prog].append(stmt)
+        said = ", ".join(f"{prog} ({', '.join(stmts)})" for prog, stmts in sorted(by_prog.items())[:8]) \
+            + (f", +{len(by_prog) - 8} more" if len(by_prog) > 8 else "")
+        one = len(old) == 1
+        out.append(f"\nThe {'read' if one else 'reads'} below by {said} {'is a file statement' if one else 'are file statements'} "
+                   "(OPEN, CLOSE, START, DELETE) that an index built before ROADMAP re-parse item 26 recorded as "
+                   f"{'a read' if one else 'reads'} of the file; a build of this toolkit records none.\n")
+    if users:
+        said = ", ".join(f"{prog} ({', '.join(stmts)})" for prog, stmts, _b in users[:8]) \
+            + (f", +{len(users) - 8} more" if len(users) > 8 else "")
+        why = "; ".join(f"{prog} copies {', '.join(books)}" for prog, _s, books in users if books)
+        books = sorted({b for _p, _s, bs in users for b in bs})
+        out.append(f"\nIn {said} `{nm}` names a data item, not this file, and no indexed program or copybook defines it"
+                   + (f": {why}, which the index does not hold - `copybook {books[0]}` says what to fetch, and the "
+                      "build after that reads the item's definition if it is there" if books else "")
+                   + f". The references below from {'that program' if len(users) == 1 else 'those programs'} are the "
+                   "data item's.\n")
     return "".join(out)
 
 
@@ -1010,6 +1071,7 @@ def cmd_field(conn: sqlite3.Connection, name: str, show_all: bool = False,
     out = [f"# Field {name.upper()}\n"]
     names = [name.upper()]
     files: List[sqlite3.Row] = []            # the name is a SELECT / FD file and no data item
+    file_uses: Tuple[List[Tuple[str, str]], List[Tuple[str, List[str], List[str]]]] = ([], [])
     if not defs:
         # An 88-level name (PM-LAPSED): the question is really about its
         # parent field and the value it stands for.
@@ -1029,7 +1091,8 @@ def cmd_field(conn: sqlite3.Connection, name: str, show_all: bool = False,
         else:
             files = _file_decls(conn, name)
             if files:
-                out.append(_file_not_field(conn, name, files))
+                file_uses = _file_name_uses(conn, name, files)
+                out.append(_file_not_field(conn, name, files, file_uses))
             else:
                 out.append("**NOT DEFINED** in any indexed copybook or program (check spelling, REPLACING renames, "
                            "or an 88-level name - try `literal`).\n")
@@ -1112,10 +1175,15 @@ def cmd_field(conn: sqlite3.Connection, name: str, show_all: bool = False,
         if cap and len(rows) > cap:
             dropped = sorted({r[2] for r in rows[cap:]})
             out.append(f"_...{len(rows) - cap} more (programs: {', '.join(dropped[:20])}); `--all` shows them_\n")
-    # a file's bytes travel as its record: `flow` follows the FD record, not the file name
+    # a file's bytes travel as its record: `flow` follows the FD record, not the file name - and a program where
+    # the name is a data item follows the name itself
     flow_name = next((f["fd_record"] for f in files if f["fd_record"]), None) or name.upper()
+    where = f"`flow {flow_name} --program P`"
+    if file_uses[1]:
+        where = (f"`flow {flow_name} --program {files[0]['program_id']}` for the file's record, `flow {name.upper()} "
+                 f"--program {file_uses[1][0][0]}` for the data item")
     out.append(f"\n> Where the VALUE goes - group MOVEs, READ INTO / WRITE FROM, CALL USING positions, the file's "
-               f"bytes to the reader, DB2 columns: `flow {flow_name} --program P` (`--up`: where it comes from).\n")
+               f"bytes to the reader, DB2 columns: {where} (`--up`: where it comes from).\n")
 
     # DB2 columns this field is loaded from / stored to (column-level lineage)
     sc = conn.execute("""SELECT c.tbl, c.col, c.mode, c.stmt, c.line, p.program_id, p.id AS pid
@@ -2045,17 +2113,29 @@ def _partial_members(conn: sqlite3.Connection, limit: int = COVERAGE_ROWS) -> st
         out.append(f"\n_{scanned} of the documents above are scans whose pictures OCR has read since the build: their "
                    "text is in the index (sections 1001+); the partial mark is only the build's history_\n")
     if len(rows) > limit:
-        out.append(f"_... {len(rows) - limit} more; every one of them: `coverage --all`; the copybooks they miss "
-                   "are the 'Copybooks not found' table below_\n")
+        # the copybooks clause only for the members not shown that a copybook made partial: an EXEC block with no
+        # period after its END-EXEC misses none, and 22 such members were promised missing copybooks (LESSONS 213)
+        hidden = rows[limit:]
+        by_book = sum(1 for r in hidden if (r["why"] or "").startswith("expand:"))
+        clause = ("" if not by_book else "; the copybooks they miss are the 'Copybooks not found' table below"
+                  if by_book == len(hidden) else
+                  f"; the copybooks {by_book} of them miss are the 'Copybooks not found' table below")
+        out.append(f"_... {len(hidden)} more; every one of them: `coverage --all`{clause}_\n")
     # the advice speaks of the reasons the table holds: a member made partial by an EXEC block with no period after
     # its END-EXEC has nothing to fetch, and the copybook advice alone sent the reader to fetch a library
     no_period = sum(1 for r in rows if (r["why"] or "").startswith("exec_no_period:"))
     if no_period < len(rows):
-        out.append("\n> A COBOL member is usually partial because a copybook it copies is not in the index: fetch that "
-                   "copybook library and build again - or, when the estate holds compiler listings or expanded "
-                   "programs, `python -m atlas.recover --db atlas.db` rebuilds the missing copybooks from them. A "
-                   "document is partial when no text could be extracted (a scan - run `OCR images`). A screen member "
-                   "is partial when no map or format macro was recognised.\n")
+        others = len(rows) - no_period
+        # beside exec_no_period members the advice is said of the others alone: it opened 'A COBOL member is usually
+        # partial because a copybook ...' when 22 of the 24 were partial for their EXEC block (LESSONS 213)
+        lead = ("" if not no_period else
+                f"The other {others} member{'' if others == 1 else 's'} {'is' if others == 1 else 'are'} partial for "
+                "another reason. ")
+        out.append(f"\n> {lead}A COBOL member is usually partial because a copybook it copies is not in the index: "
+                   "fetch that copybook library and build again - or, when the estate holds compiler listings or "
+                   "expanded programs, `python -m atlas.recover --db atlas.db` rebuilds the missing copybooks from "
+                   "them. A document is partial when no text could be extracted (a scan - run `OCR images`). A screen "
+                   "member is partial when no map or format macro was recognised.\n")
     if no_period:
         # counted over every partial member, not only the rows shown (the table names COVERAGE_ROWS of them)
         if no_period == len(rows):

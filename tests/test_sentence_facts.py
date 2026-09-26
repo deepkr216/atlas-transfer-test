@@ -46,6 +46,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import shutil
 import sqlite3
 import sys
@@ -942,8 +943,8 @@ class CoverageGivesTheReasonThatMadeItPartial(_RoundOne):
             finally:
                 conn.close()
             self.assertIn("is a **file**", page)
-            self.assertIn("file statements (OPEN, CLOSE, START, DELETE) that an index built before ROADMAP re-parse "
-                          "item 26 recorded as reads", page)
+            self.assertIn("The read below by FILEPGM (OPEN) is a file statement (OPEN, CLOSE, START, DELETE) that an "
+                          "index built before ROADMAP re-parse item 26 recorded as a read of the file", page)
         finally:
             shutil.rmtree(td, ignore_errors=True)
 
@@ -976,6 +977,401 @@ class OnlyTheExecReason(_Built):
         self.assertRegex(page, r"\| BOOKPGM \| exec_no_period \| EXEC SQL at line 1 of copybook NOBOOK has no period "
                                r"after its END-EXEC; what follows was read as if it had one \| (?:\w+/)?NOBOOK:1 "
                                r"\(via COPY NOBOOK\) \|")
+
+
+# ---------------------------------------------------------------------------
+# the verifier's second round on this stage (LESSONS 213)
+# ---------------------------------------------------------------------------
+
+SCOPES = program("SCOPEPGM", [
+    "WORKING-STORAGE SECTION.",
+    "01  WS-EOF           PIC X.",
+    "01  WS-ERR           PIC X.",
+    "01  WS-CNT           PIC 9(5).",
+    "01  WS-KEY           PIC X(10).",
+    "01  WS-A             PIC X(10).",
+], [
+    "0000-MAIN.",
+    "    OPEN INPUT IN-FILE",
+    "    GO TO 1000-READ.",
+    "1000-READ.",
+    "    READ IN-FILE AT END MOVE 'Y' TO WS-EOF END-READ",
+    "    GO TO 1000-READ.",
+    "1100-AT-END.",
+    "    READ IN-FILE AT END GO TO 9000-END.",
+    "1200-NOT-AT-END.",
+    "    READ IN-FILE AT END MOVE 'Y' TO WS-EOF",
+    "        NOT AT END ADD 1 TO WS-CNT GO TO 1000-READ.",
+    "1300-WRITE.",
+    "    WRITE OUT-REC INVALID KEY DISPLAY 'DUP' END-WRITE",
+    "    GO TO 9000-END.",
+    "1400-REWRITE.",
+    "    REWRITE OUT-REC INVALID KEY MOVE 'Y' TO WS-ERR",
+    "    END-REWRITE GO TO 9000-END.",
+    "1500-START.",
+    "    START IN-FILE KEY >= WS-KEY INVALID KEY",
+    "        MOVE 'Y' TO WS-EOF END-START GO TO 1000-READ.",
+    "1600-DELETE.",
+    "    DELETE IN-FILE RECORD INVALID KEY MOVE 'Y' TO WS-ERR",
+    "    END-DELETE GO TO 9000-END.",
+    "1700-ADD.",
+    "    ADD 1 TO WS-CNT ON SIZE ERROR MOVE ZERO TO WS-CNT",
+    "    END-ADD GO TO 1000-READ.",
+    "1800-SIZE-ERROR.",
+    "    ADD 1 TO WS-CNT ON SIZE ERROR GO TO 9000-END.",
+    "1900-CALL.",
+    "    CALL 'SUBPGM' USING WS-A ON EXCEPTION",
+    "        DISPLAY 'NO SUBPGM' END-CALL GO TO 9000-END.",
+    "2000-RETURN.",
+    "    RETURN SRT-FILE AT END MOVE 'Y' TO WS-EOF END-RETURN",
+    "    GO TO 9000-END.",
+    "2100-IF.",
+    "    IF WS-EOF = 'Y' MOVE ZERO TO WS-CNT END-IF",
+    "    GO TO 9000-END.",
+    "2200-NEXT-SENTENCE.",
+    "    IF WS-EOF = 'Y' NEXT SENTENCE END-IF",
+    "    GO TO 9000-END.",
+    "2300-LOOP.",
+    "    PERFORM UNTIL WS-EOF = 'Y'",
+    "        READ IN-FILE AT END MOVE 'Y' TO WS-EOF END-READ",
+    "    END-PERFORM",
+    "    GO TO 9000-END.",
+    "2400-NESTED.",
+    "    IF WS-EOF = 'Y' IF WS-CNT = 0 GO TO 9000-END END-IF",
+    "    GO TO 1000-READ.",
+    "9000-END.",
+    "    CLOSE IN-FILE",
+    "    GOBACK.",
+])
+
+
+class FallThroughAfterAScopeTerminator(unittest.TestCase):
+    """A conditional phrase (AT END, INVALID KEY, SIZE ERROR, EXCEPTION ...) anywhere in a paragraph's last sentence
+    made it fall through, so `READ F AT END ... END-READ GO TO X.` - the COBOL-85 READ loop - recorded a fall-through
+    that never happens: `dead` lost the paragraph after it, `walk` and `paragraph` read an order that never runs. The
+    phrase governs the statements up to its verb's scope terminator, or up to the sentence's end when there is none."""
+
+    def setUp(self):
+        self.f = cobol.parse_program(SCOPES)
+
+    def falls(self):
+        return {fr for (fr, _t, _th, _ln, k) in self.f.performs if k == "fallthrough"}
+
+    def test_a_go_to_after_the_scope_terminator_always_leaves(self):
+        falls = self.falls()
+        for para in ("1000-READ", "1300-WRITE", "1400-REWRITE", "1500-START", "1600-DELETE", "1700-ADD", "1900-CALL",
+                     "2000-RETURN", "2100-IF", "2300-LOOP"):
+            self.assertNotIn(para, falls, para)
+
+    def test_a_go_to_the_phrase_governs_may_not_run(self):
+        falls = self.falls()
+        # plain `READ F AT END GO TO X.` still goes on when a record is read; NOT AT END is the phrase's too; a phrase
+        # without its terminator runs to the sentence's end; NEXT SENTENCE skips the GO TO; the second IF's END-IF
+        # leaves the first IF open
+        for para in ("1100-AT-END", "1200-NOT-AT-END", "1800-SIZE-ERROR", "2200-NEXT-SENTENCE", "2400-NESTED"):
+            self.assertIn(para, falls, para)
+        self.assertEqual(len(falls), 5, falls)
+
+    def test_the_sentences_one_by_one(self):
+        leaves = {
+            "READ IN-FILE AT END MOVE 'Y' TO WS-X END-READ GO TO 0100-READ.": True,
+            "READ CROP-FILE AT END MOVE 'Y' TO WS-EOF END-READ ADD 1 TO WS-CNT GO TO 1000-EXIT.": True,
+            "READ F AT END GO TO X.": False,
+            "COMPUTE X = Y * 2 ON SIZE ERROR MOVE 0 TO X END-COMPUTE GO TO Z.": True,
+            "STRING A DELIMITED BY SIZE INTO B ON OVERFLOW MOVE 1 TO X END-STRING GO TO Z.": True,
+            "WRITE R AT END-OF-PAGE PERFORM 9000-HDR END-WRITE GO TO Z.": True,
+            "WRITE R AT EOP GO TO Z.": False,
+            "CALL 'SUB' USING A ON EXCEPTION GO TO Z.": False,
+            "IF A IF B GO TO X END-IF GO TO Y END-IF GO TO Z.": True,
+            "IF A READ F AT END MOVE 1 TO X END-IF GO TO Z.": True,        # END-IF ends the READ inside it too
+            "IF A EXIT PARAGRAPH END-IF GO TO X.": False,
+            "PERFORM 1000-X UNTIL EOF GO TO X.": True,                    # an out-of-line PERFORM returns
+            "PERFORM WS-CNT TIMES GO TO X END-PERFORM.": False,
+            "PERFORM 1000-X 3 TIMES GO TO X.": True,
+            "EVALUATE X WHEN 1 MOVE 1 TO Y WHEN OTHER MOVE 2 TO Y END-EVALUATE GO TO Z.": True,
+            "SEARCH T AT END MOVE 1 TO X WHEN T-K (IX) = K MOVE 2 TO X END-SEARCH GO TO Z.": True,
+            "SEARCH T AT END GO TO Z WHEN T-K (IX) = K MOVE 2 TO X.": False,
+            # a statement the splitter does not know: its phrase runs to its terminator
+            "MOVE A TO B XML PARSE DOC PROCESSING PROCEDURE P ON EXCEPTION DISPLAY 'E' END-XML GO TO Z.": True,
+            "MOVE A TO B XML PARSE DOC PROCESSING PROCEDURE P ON EXCEPTION GO TO Z.": False,
+        }
+        for sentence, want in leaves.items():
+            self.assertEqual(cobol._leaves(sentence), want, sentence)
+
+
+DEPENDS = program("DEPPGM", [
+    "WORKING-STORAGE SECTION.",
+    "01  WS-GRP.",
+    "    05  WS-IX        PIC 9.",
+    "01  WS-TAB.",
+    "    05  WS-TIX       PIC 9 OCCURS 3.",
+    "01  WS-SUB           PIC 9.",
+], [
+    "0000-MAIN.",
+    "    GO TO 3100-A 3200-B DEPENDING ON WS-IX OF WS-GRP.",
+    "0100-NEXT.",
+    "    GO TO 4100-A 4200-B DEPENDING ON WS-TIX (WS-SUB)",
+    "    GO TO 9000-END.",
+    "3100-A.",
+    "    GO TO 9000-END.",
+    "3200-B.",
+    "    GO TO 9000-END.",
+    "4100-A.",
+    "    GO TO 9000-END.",
+    "4200-B.",
+    "    GO TO 9000-END.",
+    "9000-END.",
+    "    GOBACK.",
+])
+
+
+class GoToDependingOnAQualifiedIndex(unittest.TestCase):
+    """`DEPENDING ON WS-IX OF WS-GRP` failed the lookahead after the single name the clause took, so the target list
+    swallowed the clause - plain GO TO edges to 3100-A, 3200-B, DEPENDING, ON and 'WS-IX OF WS-GRP'; `DEPENDING ON
+    WS-TIX (WS-SUB)` matched nothing, so 4100-A and 4200-B were reached by nothing and `dead` listed them."""
+
+    def setUp(self):
+        self.f = cobol.parse_program(DEPENDS)
+        self.at = lambda needle: line_of(DEPENDS, needle)
+
+    def edges(self, frm):
+        return [(t, k, ln) for (fr, t, _th, ln, k) in self.f.performs if fr == frm]
+
+    def test_the_targets_and_their_kind(self):
+        q, s = self.at("DEPENDING ON WS-IX OF WS-GRP"), self.at("DEPENDING ON WS-TIX (WS-SUB)")
+        self.assertEqual(self.edges("0000-MAIN"), [("3100-A", "goto_depending", q), ("3200-B", "goto_depending", q),
+                                                   ("0100-NEXT", "fallthrough", q)])
+        self.assertEqual(self.edges("0100-NEXT"), [("4100-A", "goto_depending", s), ("4200-B", "goto_depending", s),
+                                                   ("9000-END", "goto", self.at("    GO TO 9000-END.")),
+                                                   ])
+        targets = {t for (_fr, t, _th, _ln, _k) in self.f.performs}
+        self.assertFalse({t for t in targets if not t[0].isdigit()}, targets)     # no DEPENDING, ON or index
+
+    def test_the_index_is_tested(self):
+        r = refs(self.f)
+        self.assertIn(("WS-IX", "test", "GO TO", self.at("WS-IX OF WS-GRP")), r)
+        self.assertIn(("WS-TIX", "test", "GO TO", self.at("WS-TIX (WS-SUB)")), r)
+        self.assertIn(("WS-SUB", "test", "GO TO", self.at("WS-TIX (WS-SUB)")), r)
+        self.assertFalse({n for (n, _m, _s, _ln) in r if n == "WS-GRP"})              # a qualifier, no reference
+
+    def test_the_pattern(self):
+        for text, targets, index in (
+                ("GO TO 3100-A 3200-B DEPENDING ON WS-IX OF WS-GRP.", "3100-A 3200-B", "WS-IX OF WS-GRP"),
+                ("GO TO 4100-A 4200-B DEPENDING ON WS-TIX (WS-SUB).", "4100-A 4200-B", "WS-TIX (WS-SUB)"),
+                ("GO TO A B DEPENDING ON WS-TIX IN T-GRP (WS-SUB, 2) MOVE 1 TO X.", "A B", "WS-TIX IN T-GRP (WS-SUB, 2)"),
+                ("GO TO PARA-X OF SEC-A.", "PARA-X OF SEC-A", None)):
+            m = cobol._GO_TO.search(text)
+            self.assertEqual((m.group(1), m.group(2)), (targets, index), text)
+        # a clause the pattern cannot read gives no edge rather than DEPENDING and ON as targets
+        self.assertIsNone(cobol._GO_TO.search("GO TO A B DEPENDING ON WS-IDX 'LIT'"))
+
+
+ORCBAT = program("ORCBAT01", [
+    "FILE SECTION.",
+    "FD  CROP-FILE.",
+    "01  CROP-REC         PIC X(80).",
+    "WORKING-STORAGE SECTION.",
+    "01  WS-EOF           PIC X.",
+    "01  WS-CNT           PIC 9(5).",
+], [
+    "0000-MAIN.",
+    "    OPEN INPUT CROP-FILE",
+    "    GO TO 1000-READ.",
+    "1000-READ.",
+    "    READ CROP-FILE AT END MOVE 'Y' TO WS-EOF END-READ",
+    "    ADD 1 TO WS-CNT",
+    "    GO TO 1000-EXIT.",
+    "2000-NEVER.",
+    "    DISPLAY 'NEVER REACHED'.",
+    "1000-EXIT.",
+    "    CLOSE CROP-FILE",
+    "    GOBACK.",
+], env=[
+    "ENVIRONMENT DIVISION.",
+    "INPUT-OUTPUT SECTION.",
+    "FILE-CONTROL.",
+    "    SELECT CROP-FILE ASSIGN TO CROPIN.",
+])
+
+FLTBAT01 = program("FLTBAT01", [
+    "FILE SECTION.",
+    "FD  VOY-FILE.",
+    "01  VOY-REC          PIC X(80).",
+    "WORKING-STORAGE SECTION.",
+    "01  WS-EOF           PIC X.",
+], [
+    "0000-MAIN.",
+    "    OPEN INPUT VOY-FILE",
+    "    READ VOY-FILE AT END MOVE 'Y' TO WS-EOF END-READ",
+    "    CLOSE VOY-FILE",
+    "    GOBACK.",
+], env=[
+    "ENVIRONMENT DIVISION.",
+    "INPUT-OUTPUT SECTION.",
+    "FILE-CONTROL.",
+    "    SELECT VOY-FILE ASSIGN TO VOYIN.",
+])
+
+# a data item named VOY-FILE, defined in a copybook the estate does not hold
+FLTBAT02 = program("FLTBAT02", ["WORKING-STORAGE SECTION.", "    COPY FLTMISS.", "01  WS-X PIC X."],
+                   ["0000-MAIN.", "    MOVE SPACES TO VOY-FILE", "    GOBACK."])
+AABAT09 = program("AABAT09", ["WORKING-STORAGE SECTION.", "    COPY AAGONE.", "01  WS-X PIC X."],
+                  ["0000-MAIN.", "    GOBACK."])
+
+
+def no_period_program(name):
+    return program(name, [
+        "WORKING-STORAGE SECTION.",
+        "01  WS-STATUS        PIC X(02).",
+        f"    EXEC SQL DECLARE {name}C CURSOR FOR",
+        "        SELECT STATUS_CD FROM PRD.NO_TBL",
+        "    END-EXEC",
+        "01  WS-AFTER         PIC X(04).",
+    ], ["0000-MAIN.", f"    EXEC SQL OPEN {name}C END-EXEC", "    GOBACK."])
+
+
+class _RoundTwo(_Built):
+
+    files = (("ORCHARD/PROD.ORC.SRC/ORCBAT01.cbl", ORCBAT), ("FLEET/PROD.FLT.SRC/FLTBAT01.cbl", FLTBAT01),
+             ("FLEET/PROD.FLT.SRC/FLTBAT02.cbl", FLTBAT02), ("FLEET/PROD.FLT.SRC/AABAT09.cbl", AABAT09)) \
+        + tuple((f"FLEET/PROD.FLT.SRC/NOPA0{i}.cbl", no_period_program(f"NOPA0{i}")) for i in range(1, 5))
+
+
+class TheReadLoopInTheIndex(_RoundTwo):
+    """ORCBAT01's 1000-READ is `READ CROP-FILE AT END MOVE 'Y' TO WS-EOF END-READ ADD 1 TO WS-CNT GO TO 1000-EXIT.`:
+    `paragraph ORCBAT01 2000-NEVER` said 'Reached by 1000-READ | fallthrough', and `program` did not list it among
+    the paragraphs reached by nothing."""
+
+    def test_the_paragraph_after_it_is_reached_by_nothing(self):
+        self.assertEqual(self.q("""SELECT e.from_para, e.to_para FROM perform_edge e JOIN program p ON p.id = e.program_id
+                                   WHERE p.program_id = 'ORCBAT01' AND e.kind = 'fallthrough'"""),
+                         [("2000-NEVER", "1000-EXIT")])               # its DISPLAY goes on; 1000-READ's GO TO leaves
+        page = self.page(query.cmd_paragraph, "ORCBAT01", "2000-NEVER")
+        self.assertIn("_never reached by PERFORM / GO TO / fall-through / THRU range_", page)
+        self.assertIn("**1 reached by nothing** (no PERFORM, GO TO, fall-through or THRU range): 2000-NEVER",
+                      self.page(query.cmd_program, "ORCBAT01"))
+
+
+class FieldOfAFileNameUsedAsADataItem(_RoundTwo):
+    """FLTBAT01 declares the file VOY-FILE; FLTBAT02 copies FLTMISS, which the estate does not hold, and moves SPACES to
+    a data item called VOY-FILE. `field VOY-FILE` said the name was no data item, called FLTBAT02's MOVE one of the file
+    statements an older index recorded as reads, and sent the reader to `flow VOY-REC` alone: any field reference of the
+    name, in any program, triggered the older-index sentence."""
+
+    def test_on_this_index(self):
+        page = self.page(query.cmd_field, "VOY-FILE")
+        self.assertIn("`VOY-FILE` is a **file** (SELECT ... ASSIGN, FD) in 1 program, and a data item in 1 other "
+                      "(below) - declared as a file in:", page)
+        self.assertNotIn("not a data item", page)
+        self.assertNotIn("an index built before", page)
+        self.assertIn("In FLTBAT02 (MOVE) `VOY-FILE` names a data item, not this file, and no indexed program or "
+                      "copybook defines it: FLTBAT02 copies FLTMISS, which the index does not hold - `copybook "
+                      "FLTMISS` says what to fetch", page)
+        self.assertIn(f"FLTBAT02 MOVE x1 @FLEET/FLTBAT02:{line_of(FLTBAT02, 'MOVE SPACES TO VOY-FILE')}", page)
+        self.assertIn("`flow VOY-REC --program FLTBAT01` for the file's record, `flow VOY-FILE --program FLTBAT02` for "
+                      "the data item", page)
+
+    def test_on_an_index_built_before_item_26(self):
+        # an index built before ROADMAP re-parse item 26 recorded FLTBAT01's OPEN and CLOSE as reads of the file
+        td = tempfile.mkdtemp()
+        try:
+            db = os.path.join(td, "old.db")
+            shutil.copy(self.db, db)
+            conn = sqlite3.connect(db)
+            pid = conn.execute("SELECT id FROM program WHERE program_id = 'FLTBAT01'").fetchone()[0]
+            for stmt, needle in (("OPEN", "OPEN INPUT VOY-FILE"), ("CLOSE", "CLOSE VOY-FILE")):
+                conn.execute("INSERT INTO field_ref(program_id, name, mode, stmt, line) VALUES(?, 'VOY-FILE', 'read', "
+                             "?, ?)", (pid, stmt, line_of(FLTBAT01, needle)))
+            conn.commit()
+            conn.close()
+            conn = query.connect(db)
+            try:
+                page = query.cmd_field(conn, "VOY-FILE")
+            finally:
+                conn.close()
+            self.assertIn("The reads below by FLTBAT01 (CLOSE, OPEN) are file statements (OPEN, CLOSE, START, DELETE) "
+                          "that an index built before ROADMAP re-parse item 26 recorded as reads of the file", page)
+            self.assertIn("In FLTBAT02 (MOVE) `VOY-FILE` names a data item", page)
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
+
+    def test_a_file_no_other_program_names(self):
+        page = self.page(query.cmd_field, "CROP-FILE")
+        self.assertIn("`CROP-FILE` is a **file** (SELECT ... ASSIGN, FD), not a data item - declared in 1 program:", page)
+        self.assertNotIn("names a data item", page)
+        self.assertIn("`flow CROP-REC --program P`", page)
+
+
+class TheMoreLineSaysWhatTheHiddenMembersMiss(_RoundTwo):
+    """Four members partial for their EXEC block and two for a missing copybook: the line under a table that names
+    fewer than all of them promised missing copybooks for members that miss none, and the copybook advice opened 'A
+    COBOL member is usually partial because a copybook it copies is not in the index'."""
+
+    def part(self, limit):
+        conn = query.connect(self.db)
+        try:
+            return query._partial_members(conn, limit)
+        finally:
+            conn.close()
+
+    def test_the_more_line(self):
+        # rows by name: AABAT09 and FLTBAT02 miss a copybook, NOPA01-NOPA04 are exec_no_period
+        self.assertIn("_... 4 more; every one of them: `coverage --all`_", self.part(2))
+        self.assertIn("_... 5 more; every one of them: `coverage --all`; the copybooks 1 of them miss are the "
+                      "'Copybooks not found' table below_", self.part(1))
+
+    def test_the_advice_is_said_of_the_others(self):
+        part = self.part(15)
+        self.assertNotIn(" more; every one of them", part)
+        self.assertIn("> The other 2 members are partial for another reason. A COBOL member is usually partial because "
+                      "a copybook it copies is not in the index", part)
+        self.assertIn("4 of these 6 members are partial because an EXEC block before the PROCEDURE DIVISION", part)
+
+    def test_the_stand_ins(self):
+        conn = query.connect(self.db)
+        try:
+            for name in ("FLTBAT02", "AABAT09", "NOPA01"):
+                self.assertEqual(query.partial_kind(conn, self.member_id(name)), "partial", name)
+            for name in ("ORCBAT01", "FLTBAT01"):
+                self.assertIsNone(query.partial_kind(conn, self.member_id(name)), name)
+        finally:
+            conn.close()
+
+
+class TheVerbSplitIsATrie(unittest.TestCase):
+    """The alternation of 65 verbs and scope terminators the statement split scans made a large program parse 8-10%
+    slower than before ROADMAP re-parse item 26; written as a trie it matches the same words at the same places."""
+
+    def plain(self):
+        return re.compile(r"'(?:[^']|'')*'|\"(?:[^\"]|\"\")*\"|" + cobol.B + "(" + cobol._VERBS + ")" + cobol.E, re.I)
+
+    def test_the_same_matches(self):
+        plain = self.plain()
+        texts = [SCOPES, DEPENDS, DISPATCH, FILES, DLI, SQL, ENDS, ORCBAT]
+        fixtures = os.path.join(HERE, "fixtures")
+        for fn in sorted(os.listdir(fixtures)):
+            if fn.lower().endswith((".cbl", ".cpy")):
+                with open(os.path.join(fixtures, fn), encoding="utf-8", errors="replace") as fh:
+                    texts.append(fh.read())
+        for text in texts:
+            self.assertEqual([(m.group(0), m.group(1), m.start()) for m in cobol._SPLIT.finditer(text)],
+                             [(m.group(0), m.group(1), m.start()) for m in plain.finditer(text)])
+        for word in cobol._VERBS.split("|"):
+            self.assertEqual([m.group(1) for m in cobol._SPLIT.finditer(f"X {word.lower()} Y")], [word.lower()], word)
+        for word in ("END-DATE", "GOING", "MOVES", "WS-READ", "READ-FLAG", "EXITS", "ENDING", "IFS", "GOBACKS"):
+            self.assertEqual([m.group(1) for m in cobol._SPLIT.finditer(word)], [], word)
+
+    def test_the_trie(self):
+        self.assertEqual(cobol.word_trie(["GO", "GOBACK", "GIVING"]), "G(?:IVING|O(?:BACK)?)")
+        self.assertEqual(cobol.word_trie(["READ"]), "READ")
+        for words in (["A", "AB", "ABC"], ["END-IF", "END-READ", "ENTRY", "ELSE"], ["X"]):
+            rx = re.compile("(?:" + cobol.word_trie(words) + r")$")
+            for w in words:
+                self.assertTrue(rx.match(w), (words, w))
+            for w in ("", "Z", "ABCD", "END-", "EN"):
+                if w not in words:
+                    self.assertFalse(rx.match(w), (words, w))
+        self.assertIsNone(re.match(cobol.word_trie([]), "A"))
 
 
 # ---------------------------------------------------------------------------

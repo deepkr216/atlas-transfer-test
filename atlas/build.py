@@ -2226,8 +2226,9 @@ def index_cobol(ctx: Ctx, mem: Mem) -> None:
 
     # 'partial' only for a gap the expander reported; a copybook chosen among several is its own
     # 'ambiguous_copybook' row and leaves the program 'ok' (ROADMAP re-parse item 18). An EXEC block whose
-    # END-EXEC lacks its period outside the PROCEDURE DIVISION makes it partial too: the source in the estate
-    # is not the one that compiled, and the facts after it rest on the period the reader supplied
+    # END-EXEC lacks its period outside the PROCEDURE DIVISION makes it partial too: the facts after it rest on
+    # a period the reader supplied and the source does not hold (whether a compile accepted the member depends
+    # on the step that read the block, which the member does not say - LESSONS 212)
     status = "partial" if any(k in ("expand", "exec_no_period") for (k, _d, _l) in notes) else "ok"
     conn.execute("UPDATE member SET parse_status=? WHERE id=?", (status, mem.id))
 
