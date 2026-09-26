@@ -79,6 +79,10 @@ def load_config(path: str) -> Dict:
             if user.get(k):
                 cfg[k] = user[k]
         cfg["extra_roots"] = [p for p in (user.get("extra_roots") or []) if str(p).strip()]
+        # copybook names the compiles read from a product library the shop does not keep (beside the IBM ones the
+        # build knows): written into the manifest, where build.load_system_includes reads them. Kept only when given
+        if isinstance(user.get("system_includes"), list) and user["system_includes"]:
+            cfg["system_includes"] = [str(n).strip().upper() for n in user["system_includes"] if str(n).strip()]
         cfg["sources"] = [dict(new_source(s.get("dataset", ""), s.get("kind", "other")), **s)
                           for s in user.get("sources", [])]
     cfg[CONFIG_DIR_KEY] = os.path.dirname(os.path.abspath(path))
@@ -728,6 +732,10 @@ def write_manifest(cfg: Dict, path: str) -> Dict:
             # match wins when the same copybook name exists in several.
             if src.get("kind") == "copybook":
                 man["copylib_order"].setdefault(sysname, []).append(lp)
+    if cfg.get("system_includes"):
+        # sources.json's copybook names supplied by a product library (ROADMAP re-parse item 27): a COPY of one no
+        # member carries is not in the estate - never NOT FOUND, never a partial program
+        man["system_includes"] = sorted({str(n).strip().upper() for n in cfg["system_includes"] if str(n).strip()})
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(man, fh, indent=2)
     return man

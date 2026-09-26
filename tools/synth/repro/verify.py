@@ -14,7 +14,11 @@ and `expect.json`:
     ]}
 
 A check prints REPRODUCED when the index gives the symptom, FIXED when it
-gives the truth, and OTHER with what it gave. Standard library only; the
+gives the truth, and OTHER with what it gave. A check whose truth and
+symptom are the same is a control - a fact the tool gave right before the
+fix too (the program's own view beside the copybook's) - and prints FIXED
+when the index still gives it: read first as the symptom, every control
+stayed REPRODUCED after its finding was fixed. Standard library only; the
 toolkit is run from the repository root as the owner runs it.
 """
 
@@ -40,7 +44,8 @@ def run(cmd, cwd=REPO):
 
 
 def verify(folder: str, out: str) -> list:
-    spec = json.load(open(os.path.join(folder, "expect.json"), encoding="utf-8"))
+    with open(os.path.join(folder, "expect.json"), encoding="utf-8") as fh:
+        spec = json.load(fh)
     rid = os.path.basename(folder)
     work = os.path.join(out, rid)
     if os.path.isdir(work):
@@ -62,7 +67,9 @@ def verify(folder: str, out: str) -> list:
             got = conn.execute(ck["sql"]).fetchall()
             got = [list(r) if len(r) > 1 else r[0] for r in got]
             got = got[0] if len(got) == 1 and ck.get("scalar", True) else got
-            if got == ck["symptom"]:
+            if got == ck["truth"] == ck["symptom"]:
+                results.append((label, "FIXED", f"{got} (a control: right before the fix too)"))
+            elif got == ck["symptom"]:
                 results.append((label, "REPRODUCED", f"{got}"))
             elif got == ck["truth"]:
                 results.append((label, "FIXED", f"{got}"))
@@ -71,13 +78,18 @@ def verify(folder: str, out: str) -> list:
         elif "query" in ck:
             path = os.path.join(work, f"q{k}.md")
             run([PY, "-m", "atlas.query", "--db", db, "--out", path, *ck["query"]])
-            text = open(path, encoding="utf-8").read() if os.path.exists(path) else ""
+            text = ""
+            if os.path.exists(path):
+                with open(path, encoding="utf-8") as fh:
+                    text = fh.read()
             if "count" in ck:
                 n = text.count(ck["count"])
                 verdict = "REPRODUCED" if n == ck["symptom"] else "FIXED" if n == ck["truth"] else "OTHER"
                 results.append((label, verdict, f"'{ck['count']}' x{n} (truth {ck['truth']}, symptom {ck['symptom']})"))
                 continue
-            if ck.get("symptom_has") and ck["symptom_has"] in text and not (ck.get("truth_has") and ck["truth_has"] in text):
+            if ck.get("truth_has") and ck["truth_has"] == ck.get("symptom_has") and ck["truth_has"] in text:
+                results.append((label, "FIXED", f"{ck['truth_has']} (a control: right before the fix too)"))
+            elif ck.get("symptom_has") and ck["symptom_has"] in text and not (ck.get("truth_has") and ck["truth_has"] in text):
                 results.append((label, "REPRODUCED", ck["symptom_has"]))
             elif ck.get("truth_has") and ck["truth_has"] in text:
                 results.append((label, "FIXED", ck["truth_has"]))

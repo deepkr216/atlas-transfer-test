@@ -185,6 +185,8 @@ THE SETTINGS (sources.json, written by this window)
    sources            one row per dataset: dataset, type (pds or seq), kind, system (the department),
                       local (its folder under local_root), ext, authoritative (the production copy),
                       enabled, extra_args
+   system_includes    (by hand, optional) copybook names your compiles read from a product library you do
+                      not fetch, beside the IBM ones the build knows (DFHAID, CMQV ...): never NOT FOUND
 
 WHERE THINGS ARE
    atlas.db           the index - every answer comes from here

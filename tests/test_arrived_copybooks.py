@@ -647,10 +647,13 @@ class DataCopybookIsTheControl(_Estate):
 class NestedCopybookIsNotArrived(_Estate):
     """Case D (LESSONS 184): NESTPGM copies OUTBOOK, which copies INBOOK, both
     present in a COPYLIB folder from the first build - nothing is wrong. The
-    copybook's own COPY INBOOK row is recorded with no resolved_member_id
-    (the build never resolves a copybook's copies), and reading it as
-    'unresolved' called INBOOK 'arrived', marked OUTBOOK pending, and the next
-    build re-inserted OUTBOOK under a new id and nulled the program's link."""
+    copybook's own COPY INBOOK row was recorded with no resolved_member_id
+    (the build before ROADMAP re-parse item 27 never resolved a copybook's
+    copies), and reading it as 'unresolved' called INBOOK 'arrived', marked
+    OUTBOOK pending, and the next build re-inserted OUTBOOK under a new id and
+    nulled the program's link. Since item 27 the row names INBOOK (the
+    copybook's layout is computed with it in place); only a program's row is
+    read for 'not found', on either shape of the index."""
 
     def first_files(self):
         self.write("GC/PROD.GC.SRC/NESTPGM.cbl", program("NESTPGM", book="OUTBOOK"))
@@ -662,10 +665,11 @@ class NestedCopybookIsNotArrived(_Estate):
 
     def test_nothing_is_reported_marked_or_broken(self):
         self.assertEqual(self.status("NESTPGM"), "ok")
-        # the program carries its own row for the nested COPY, resolved; the copybook's own row is NULL by construction
+        # the program carries its own row for the nested COPY, resolved; the copybook's own row names INBOOK since
+        # ROADMAP re-parse item 27 (NULL by construction before it)
         self.assertIsNotNone(self.copy_use("OUTBOOK", "NESTPGM")[0][0])
         self.assertIsNotNone(self.copy_use("INBOOK", "NESTPGM")[0][0])
-        self.assertEqual(self.copy_use("INBOOK", "OUTBOOK"), [(None,)])
+        self.assertEqual(self.copy_use("INBOOK", "OUTBOOK"), [(self.member_id("INBOOK", "copybook"),)])
         before = self.ids()
         cov, nf, prog, book = self.outputs("NESTPGM", "INBOOK")
         self.assertIn("_none_", nf, "a copybook every program found is not 'not found'")
@@ -700,13 +704,14 @@ class NestedCopybookIsNotArrived(_Estate):
 class NestedCopybookArrivesLater(_Estate):
     """Case E: OUTBOOK is present, INBOOK absent: the program is partial and carries its own unresolved row for
     INBOOK. INBOOK (COBOL statements) arrives in a folder with no COPY hint: a copybook by its content now, so the
-    build parses the program again and it is whole (ROADMAP re-parse item 20), OUTBOOK untouched."""
+    build parses the program again and it is whole (ROADMAP re-parse item 20); OUTBOOK is parsed again with it, and its
+    own row names INBOOK (ROADMAP re-parse item 27)."""
 
     def first_files(self):
         self.write("GC/PROD.GC.SRC/NESTPGM.cbl", program("NESTPGM", book="OUTBOOK"))
         self.write("GC/PROD.GC.COPYLIB/OUTBOOK.cpy", OUTBOOK)
 
-    def test_the_build_makes_the_program_whole_and_leaves_the_copybook_alone(self):
+    def test_the_build_makes_the_program_whole_and_the_copybook_names_it(self):
         self.assertEqual(self.status("NESTPGM"), "partial")
         self.assertEqual(self.copy_use("INBOOK", "NESTPGM"), [(None,)])
         self.assertEqual(self.copy_use("INBOOK", "OUTBOOK"), [(None,)])
@@ -718,7 +723,11 @@ class NestedCopybookArrivesLater(_Estate):
         self.assertEqual(self.book("INBOOK"), [("copybook", "PROD.GC.CPYLIB")])
         self.assertEqual(self.status("NESTPGM"), "ok")
         self.assertIsNotNone(self.copy_use("INBOOK", "NESTPGM")[0][0])
-        self.assertEqual(self.q("SELECT id FROM member WHERE name='OUTBOOK'"), outbook_id, "the copybook was not touched")
+        self.assertEqual(self.q("SELECT id FROM member WHERE name='OUTBOOK'"), outbook_id,
+                         "the copybook's id comes back (SQLite gives back the ids of the highest rows removed)")
+        # the copybook copying the name that arrived is parsed again with the program (copiers_to_parse) - it always
+        # was - and since ROADMAP re-parse item 27 its own row names the member expanded
+        self.assertEqual(self.copy_use("INBOOK", "OUTBOOK"), [(self.member_id("INBOOK", "copybook"),)])
         self.assertIn(("A-150-SUB", "paragraph", "A-100-BEGIN"), [(p[0], p[1], p[2]) for p in self.paragraphs("NESTPGM")])
         stats, said = self.recover()
         self.assertEqual((stats["arrived"], stats["misfiled"], stats["marked"]), (0, 0, 0), said)
@@ -737,7 +746,9 @@ class NestedLiteralArrivesLater(_Estate):
         self.assertEqual((self.status("NESTPGM"), self.status("OUTLIT", "copybook")), ("ok", "ok"))
         self.assertEqual(self.copy_use("LITBOOK", "NESTPGM"), [(self.member_id("LITBOOK", "unknown"),)])
         self.assertEqual(self.copy_use("OUTLIT", "NESTPGM"), [(self.member_id("OUTLIT", "copybook"),)])
-        self.assertEqual(self.copy_use("LITBOOK", "OUTLIT"), [(None,)], "a copybook's own COPY rows are never resolved")
+        # the copybook's own row names the member its layout expanded (ROADMAP re-parse item 27; NULL before it) - OUTLIT
+        # was parsed again with its program, as every member copying a name that arrived is (copiers_to_parse)
+        self.assertEqual(self.copy_use("LITBOOK", "OUTLIT"), [(self.member_id("LITBOOK", "unknown"),)])
         stats, said = self.recover()
         self.assertEqual((stats["arrived"], stats["misfiled"], stats["marked"]), (0, 0, 0), said)
 

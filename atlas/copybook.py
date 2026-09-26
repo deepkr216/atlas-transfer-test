@@ -186,7 +186,14 @@ class Field:
     warnings: List[str] = dc_field(default_factory=list)
 
 
-_LEVEL = re.compile(r"^\s*(\d{1,2})\s+([A-Z0-9][A-Z0-9\-_]*|FILLER)\b(.*)$", re.IGNORECASE)
+# A data name - or one as a copybook written for COPY REPLACING writes it, with a :TAG: of pseudo-text in it
+# (`:PCB:-STATUS`, `WS-:SFX:-AMT`, `PM-:SFX:`) that the including program's `REPLACING ==:PCB:== BY ==POL==` turns
+# into its own name. Before, a tagged name was no name: the PCB mask every IMS program copies had no field row, no 88
+# and no layout (`layout` said NOT FOUND) while each program's own view was right (tools/synth/repro/F07, ROADMAP
+# re-parse item 27). The copybook's rows keep the tagged names; field_alias ties each program's name to them.
+DATA_NAME = r"(?:[A-Z0-9]|:[A-Z0-9\-_]+:)(?:[A-Z0-9\-_]|:[A-Z0-9\-_]+:)*"
+_TAG = re.compile(r":[A-Z0-9\-_]+:", re.IGNORECASE)
+_LEVEL = re.compile(r"^\s*(\d{1,2})\s+(" + DATA_NAME + r")(?![A-Z0-9\-_:])(.*)$", re.IGNORECASE)
 _LEVEL_ANON = re.compile(r"^\s*(\d{1,2})\s*\.?\s*$")
 # A picture string may itself contain periods (ZZZ,ZZ9.99 / 99.99.99), so the
 # match runs to the next blank; the statement terminator was already stripped
@@ -195,10 +202,13 @@ _PIC_CLAUSE = re.compile(r"\b(?:PIC|PICTURE)\s+(?:IS\s+)?(\S+)", re.IGNORECASE)
 _USAGE_CLAUSE = re.compile(
     r"\b(?:USAGE\s+(?:IS\s+)?)?(COMPUTATIONAL-[12345]|COMPUTATIONAL|COMP-[12345]|COMP|"
     r"PACKED-DECIMAL|BINARY|DISPLAY-1|DISPLAY|INDEX|POINTER|NATIONAL)\b", re.IGNORECASE)
+# TIMES is optional, and so is the blank before DEPENDING only when TIMES is there: `\s*(?:TIMES)?` took the blank
+# and the DEPENDING clause after it was never tried - `OCCURS 1 TO 10 DEPENDING ON WS-CNT` was a fixed table of 10
+# with no word of its variable length (found while writing ROADMAP re-parse item 27; LESSONS 214)
 _OCCURS = re.compile(
-    r"\bOCCURS\s+(?:(\d+)\s+TO\s+)?(\d+)\s*(?:TIMES)?"
-    r"(?:\s+DEPENDING\s+(?:ON\s+)?([A-Z0-9][A-Z0-9\-_]*))?", re.IGNORECASE)
-_REDEFINES = re.compile(r"\bREDEFINES\s+([A-Z0-9][A-Z0-9\-_]*)", re.IGNORECASE)
+    r"\bOCCURS\s+(?:(\d+)\s+TO\s+)?(\d+)(?:\s+TIMES)?"
+    r"(?:\s+DEPENDING\s+(?:ON\s+)?(" + DATA_NAME + r"))?", re.IGNORECASE)
+_REDEFINES = re.compile(r"\bREDEFINES\s+(" + DATA_NAME + r")", re.IGNORECASE)
 _VALUE = re.compile(r"\bVALUES?\s+(?:IS\s+|ARE\s+)?(.+?)(?:\s*\.\s*$|$)", re.IGNORECASE)
 _SIGN = re.compile(r"\bSIGN\s+(?:IS\s+)?(LEADING|TRAILING)(\s+SEPARATE(\s+CHARACTER)?)?",
                    re.IGNORECASE)
@@ -336,7 +346,7 @@ def _usage_in(rest: str) -> Optional[str]:
     """The USAGE keyword as a WORD of the clause text - not `COMP` inside
     WS-COMP-CNT, not inside a VALUE literal, and not the operand of
     REDEFINES / DEPENDING ON / INDEXED BY (those are data-names)."""
-    text = _LITERAL.sub(" ", rest)
+    text = _TAG.sub(lambda m: "X" * len(m.group(0)), _LITERAL.sub(" ", rest))   # `REDEFINES :P:-COMP` names no usage
     skip_next = False
     for tok in re.findall(r"[A-Z0-9][A-Z0-9\-]*", text, re.IGNORECASE):
         up = tok.upper()

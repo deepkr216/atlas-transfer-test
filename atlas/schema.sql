@@ -862,6 +862,8 @@ CREATE TABLE IF NOT EXISTS build_run (
     tool_version TEXT,
     fingerprint TEXT,                     -- sha256 of the parser source: a change re-parses everything
     manifest_sha TEXT,                    -- sha256 of the manifest used
-    declared_kinds TEXT                   -- JSON {library folder: kind} the inventory typed members with (the
+    declared_kinds TEXT,                  -- JSON {library folder: kind} the inventory typed members with (the
                                           -- manifest kinds): a declared kind told from a rule of the build's own
+    system_includes TEXT                  -- JSON [name, ...] the manifest's system_includes added to the copybooks IBM
+                                          -- supplies: a COPY of one no member carries is not in the estate
 );

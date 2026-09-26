@@ -1778,11 +1778,55 @@ def choice_report(checks: Sequence[Dict[str, object]], root: Optional[str]) -> L
 # the index side
 # --------------------------------------------------------------------------
 
+def system_copybooks(conn: sqlite3.Connection) -> Dict[str, str]:
+    """{COPYBOOK: product} - the copybooks IBM supplies (expand.IBM_COPYBOOKS:
+    CICS's DFHAID, DFHBMSCA ..., MQ's CMQV ...) and the names the manifest's
+    `system_includes` added for the last build (build_run.system_includes;
+    an index built before ROADMAP re-parse item 27 recorded none)."""
+    out = dict(expand.IBM_COPYBOOKS)
+    try:
+        if "system_includes" in {r[1] for r in conn.execute("PRAGMA table_info(build_run)")}:
+            row = conn.execute("SELECT system_includes FROM build_run ORDER BY id DESC LIMIT 1").fetchone()
+            for n in (json.loads(row[0]) if row and row[0] else []):
+                out.setdefault(str(n).upper(), expand.MANIFEST_PRODUCT)
+    except (sqlite3.Error, ValueError, TypeError):
+        pass
+    return out
+
+
+def supplied_copybooks(conn: sqlite3.Connection) -> Dict[str, str]:
+    """{COPYBOOK: product} for the system_copybooks() no member of the index
+    carries, of any kind: a COPY of one is IBM-supplied, not in the estate -
+    the compile reads it from the product's own library (CICS's SDFHCOB, MQ's
+    SCSQCOBC). The build of ROADMAP re-parse item 27 records such a COPY with
+    no member and no note, and the program stays `ok` (build.supplied_names
+    makes the same test); a build before it wrote 'COPY DFHAID NOT FOUND'
+    and marked every CICS program partial (tools/synth/repro/F16). Nothing
+    here is missing: no fetch, no recovery, no 'no longer linked'. A name a
+    member carries is an ordinary copybook."""
+    names = system_copybooks(conn)
+    # the build stores every member name in upper case: `name IN` walks ix_member_name, not 121k rows per page
+    carried = {str(r[0]).upper() for r in conn.execute(
+        f"SELECT DISTINCT name FROM member WHERE name IN ({','.join('?' * len(names))})", tuple(names))}
+    return {n: p for n, p in names.items() if n not in carried}
+
+
+def supplied_where(product: str) -> str:
+    """'CICS (SDFHCOB)' / 'MQ (SCSQCOBC)' / the manifest's words."""
+    lib = expand.IBM_LIBRARY.get(product)
+    return f"{product} ({lib})" if lib else product
+
+
 def missing_copybooks(conn: sqlite3.Connection) -> Dict[str, int]:
     """{copybook name: programs copying it} for the copybooks no member of an
     accepted kind carries (a program copying a name that is only its own
     name counts as missing too; a COPYBOOK copying its own name does not -
-    it is the member, and the expander skips that COPY as recursive)."""
+    it is the member, and the expander skips that COPY as recursive). A
+    copybook IBM supplies that no member carries is not missing
+    (supplied_copybooks): there is no library of the shop's to fetch it from
+    and no listing to write it from - on an index built before ROADMAP
+    re-parse item 27 too, where its programs still say NOT FOUND."""
+    supplied = supplied_copybooks(conn)
     kinds = ",".join("?" * len(RESOLVER_KINDS))
     out: Dict[str, int] = {}
     for name, n in conn.execute(
@@ -1791,7 +1835,7 @@ def missing_copybooks(conn: sqlite3.Connection) -> Dict[str, int]:
                   AND NOT EXISTS (SELECT 1 FROM member m WHERE UPPER(m.name)=UPPER(c.copybook)
                                   AND m.kind IN ({kinds}) AND (m.id != c.member_id OR m.kind = 'copybook'))
                 GROUP BY 1""", RESOLVER_KINDS):
-        if name and name not in expand._SYSTEM_INCLUDES:
+        if name and name not in expand._SYSTEM_INCLUDES and name not in supplied:
             out[name] = int(n)
     return out
 
@@ -2044,9 +2088,12 @@ def unlinked_ok_programs(conn: sqlite3.Connection, member_id: Optional[int] = No
     if not rows:
         return out
     skipped = skipped_copies(conn, member_id)
+    # a copybook IBM supplies that no member carries: the build of ROADMAP re-parse item 27 records the COPY with no
+    # member and leaves the program `ok` - nothing was un-linked (every CICS program read 'no longer linked')
+    supplied = supplied_copybooks(conn)
     for mid, name, book in rows:
         key = (int(mid), (book or "").upper())
-        if key in skipped:
+        if key in skipped or key[1] in supplied:
             continue
         entry = out.setdefault(int(mid), (str(name), []))
         if key[1] not in entry[1]:

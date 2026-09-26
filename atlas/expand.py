@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field as dc_field
-from typing import Callable, List, Optional, Sequence, Tuple
+from typing import AbstractSet, Callable, List, Optional, Sequence, Tuple
 
 from .reader import Line, find_terminator
 
@@ -33,6 +33,13 @@ E = r"(?![A-Z0-9\-])"
 # (LESSONS 173): groups are (keyword, quote, name); the quote, if any, must close
 _COPY_START = re.compile(B + r"(COPY|\+\+INCLUDE|-INC)\s+(['\"]?)([A-Z0-9@#$][A-Z0-9@#$\-_]{0,9})\2", re.I)
 _SQL_INCLUDE_START = re.compile(B + r"EXEC\s+SQL\s+INCLUDE\s+([A-Z0-9@#$][A-Z0-9@#$\-_]{0,9})", re.I)
+# the INCLUDE written over several lines - `EXEC SQL` / `INCLUDE R05TBL` / `END-EXEC.`, the way DCLGEN-era programs
+# write it (tools/synth/repro/F05): the first line holds EXEC and nothing of the statement after SQL, the words are
+# read across the lines that follow (sql_include_over_lines)
+_EXEC_WORD = re.compile(B + r"EXEC" + E, re.I)
+_SQL_INCLUDE_WORDS = re.compile(r"EXEC\s+SQL\s+INCLUDE\s+([A-Z0-9@#$][A-Z0-9@#$\-_]{0,9})" + E, re.I)
+# how many lines after EXEC the words of the INCLUDE may run over (comment lines not counted)
+_INCLUDE_LINES = 4
 _COPY_FULL = re.compile(
     B + r"COPY\s+(['\"]?)([A-Z0-9@#$][A-Z0-9@#$\-_]{0,9})\1(?:\s+(?:OF|IN)\s+(['\"]?)([A-Z0-9@#$\-_]+)\3)?"
     r"(?:\s+SUPPRESS)?(?:\s+REPLACING\s+(.*))?\s*\.?\s*$", re.I | re.S)
@@ -52,7 +59,58 @@ def find_copy_start(code: str, masked: str):
         return m
     return None
 _PSEUDO = re.compile(r"==(.*?)==", re.S)
+# `EXEC SQL INCLUDE SQLCA` / `SQLDA`: the DB2 precompiler writes the area into the program itself - never expanded,
+# the row recorded with no member and no note (LESSONS 203)
 _SYSTEM_INCLUDES = {"SQLCA", "SQLDA"}
+
+# The copybooks IBM ships with its products, copied by a plain COPY. The compile's SYSLIB names the product's own
+# library for them - CICS's SDFHCOB, MQ's SCSQCOBC - which no shop keeps among its own copybook libraries, so an
+# estate fetched from the shop's libraries holds no member of the name; counted as NOT FOUND, DFHAID made every CICS
+# program `partial` and coverage sent him to fetch a library the estate never holds (tools/synth/repro/F16, ROADMAP
+# re-parse item 27). The build passes expand() the names of this list, and of the manifest's `system_includes`
+# (build.load_system_includes), that NO member of the index carries: such a COPY is recorded with no member and no
+# note - IBM-supplied, not in the estate - and never makes the program partial. A shop that keeps one in its own
+# COPYLIB has it expanded like any copybook (the resolver finds it first). The value is the product, as the reports
+# say it.
+IBM_COPYBOOKS = {
+    "DFHAID": "CICS", "DFHBMSCA": "CICS", "DFHEIBLK": "CICS", "DFHEIVAR": "CICS", "DFHMSRCA": "CICS",
+    "CMQV": "MQ", "CMQXV": "MQ", "CMQODV": "MQ", "CMQODL": "MQ", "CMQMDV": "MQ", "CMQMDL": "MQ",
+    "CMQGMOV": "MQ", "CMQGMOL": "MQ", "CMQPMOV": "MQ", "CMQPMOL": "MQ",
+}
+# the product library a report names beside the product (IBM_COPYBOOKS' values; a name the manifest adds has none)
+IBM_LIBRARY = {"CICS": "SDFHCOB", "MQ": "SCSQCOBC"}
+# the product word for a name the manifest's `system_includes` adds
+MANIFEST_PRODUCT = "the manifest's system_includes"
+
+
+def sql_include_over_lines(lines: Sequence[Line], i: int, code: str, masked: str,
+                           replacing: Sequence[Tuple[str, ...]] = ()) -> Optional[str]:
+    """The copybook an `EXEC SQL INCLUDE` names when its words run over
+    several lines - `EXEC SQL` / `INCLUDE R05TBL` / `END-EXEC.` (or `EXEC SQL
+    INCLUDE` / `R05TBL`): line `i` holds EXEC outside a literal (`masked`)
+    and the words after it are read from the next non-comment lines, at most
+    _INCLUDE_LINES of them, until the name or END-EXEC. None when the
+    statement is anything else - EXEC SQL SELECT, EXEC CICS - or the words
+    are not there; the lines are not consumed then. Before, only the
+    one-line form was expanded: the three-line one got no copy_use row, the
+    DCLGEN's fields were not the program's and `copybook NAME` did not list
+    it (tools/synth/repro/F05; the synthetic estate's F05, F08, F13, F39,
+    F41, F49)."""
+    m = _EXEC_WORD.search(masked)
+    if not m:
+        return None
+    text = masked[m.start():]
+    k, taken = i, 0
+    while taken < _INCLUDE_LINES and len(text.split()) < 4 and "END-EXEC" not in text.upper() and k + 1 < len(lines):
+        k += 1
+        nxt = lines[k]
+        if nxt.is_comment:
+            continue
+        taken += 1
+        more = apply_replacing(nxt.code, replacing) if replacing else nxt.code
+        text += " " + _mask_literals(more)
+    mm = _SQL_INCLUDE_WORDS.match(" ".join(text.split()))
+    return mm.group(1).upper() if mm else None
 
 MAX_DEPTH = 12
 
@@ -137,6 +195,12 @@ class Expansion:
     # expanded lines of a copied 01/77 renamed by "01 X COPY Y." (OS/VS): the
     # entry carries the program's name, so it is the program's field
     renamed: List[int] = dc_field(default_factory=list)
+    # the COPYs written in the expanded member's OWN lines (depth 0), as in `copies`: a copybook's own copy_use
+    # rows are its own statements, and index_copybook links them to the member expanded (ROADMAP re-parse item 27)
+    own_copies: List[Tuple[str, Optional[str], Optional[str], int, Optional[int]]] = dc_field(default_factory=list)
+    # "L6: COPY DFHAID" per COPY of a name IBM supplies that no member carries (IBM_COPYBOOKS): recorded with no
+    # member and no warning - not a gap in this program; "(in COPY X) " before one written in a copybook
+    supplied: List[str] = dc_field(default_factory=list)
 
     def run_at(self, exp_line: int) -> Optional["Run"]:
         """The run holding an expanded line - by bisection over the runs'
@@ -242,7 +306,9 @@ def apply_replacing(code: str, pairs: Sequence[Tuple[str, ...]]) -> str:
     return out
 
 
-_LEVEL_NAME = re.compile(r"^\s*\d{1,2}\s+([A-Z0-9][A-Z0-9\-_]*)", re.I)
+# a data name as a copybook written for COPY REPLACING writes it: a :TAG: of pseudo-text anywhere in it -
+# `:PCB:-STATUS`, `WS-:SFX:` - before REPLACING makes it the program's name (copybook.DATA_NAME)
+_LEVEL_NAME = re.compile(r"^\s*\d{1,2}\s+((?:[A-Z0-9]|:[A-Z0-9\-_]+:)(?:[A-Z0-9\-_]|:[A-Z0-9\-_]+:)*)", re.I)
 
 # OS/VS COBOL "01 data-name COPY text." (also 77, FD, SD): the compiler copies the
 # library text and puts data-name in place of the library's own 01 / 77 / FD / SD
@@ -285,13 +351,25 @@ def _osvs_rename(sub: Expansion, kind: str, new_name: str, copybook: str,
 
 def expand(lines: Sequence[Line], member_id: int, resolver: Resolver,
            depth: int = 0, stack: Tuple[str, ...] = (),
-           replacing: Sequence[Tuple[str, ...]] = ()) -> Expansion:
+           replacing: Sequence[Tuple[str, ...]] = (),
+           supplied: AbstractSet[str] = frozenset()) -> Expansion:
+    """`lines` with every COPY / EXEC SQL INCLUDE the resolver finds put in
+    place. `supplied`: the names IBM supplies (IBM_COPYBOOKS, and the
+    manifest's system_includes) that no member of the index carries - a
+    COPY of one the resolver does not find is recorded with no member and
+    no warning, in `supplied` (ROADMAP re-parse item 27)."""
     out: List[Line] = []
     runs: List[Run] = []
     warnings: List[str] = []
     copies: List[Tuple[str, Optional[str], Optional[str], int, Optional[int]]] = []
+    own_copies: List[Tuple[str, Optional[str], Optional[str], int, Optional[int]]] = []
     aliases: List[Tuple[str, str, str, int]] = []
     renamed: List[int] = []
+    supplied_out: List[str] = []
+
+    def copied(row: Tuple[str, Optional[str], Optional[str], int, Optional[int]]) -> None:
+        copies.append(row)
+        own_copies.append(row)
 
     def emit(src_line: Line, code: str, src_member: int, src_no: int, d: int,
              indicator: Optional[str] = None, via: Optional[str] = None) -> None:
@@ -327,7 +405,11 @@ def expand(lines: Sequence[Line], member_id: int, resolver: Resolver,
         masked = _mask_literals(code)
         m = find_copy_start(code, masked)
         msql = _SQL_INCLUDE_START.search(masked)
+        # the INCLUDE's name: on this line, or read over the lines after an `EXEC SQL` that ends it (F05)
+        sql_name: Optional[str] = msql.group(1).upper() if msql else None
         if not m and not msql:
+            sql_name = sql_include_over_lines(lines, i, code, masked, replacing)
+        if not m and not sql_name:
             emit(ln, code, member_id, ln.no, depth)
             last_live = len(out) - 1
             i += 1
@@ -343,7 +425,7 @@ def expand(lines: Sequence[Line], member_id: int, resolver: Resolver,
         # COPY statement is replaced. It stays live on its own line number, the
         # COPY part blanked, so the line map is unchanged (LESSONS 178).
         prefix: Optional[str] = None
-        if m and not msql and m.group(1).upper() == "COPY":
+        if m and not sql_name and m.group(1).upper() == "COPY":
             before = code[:m.start(1)]
             if before.strip():
                 h = _OSVS_HEAD.search(before)
@@ -373,13 +455,22 @@ def expand(lines: Sequence[Line], member_id: int, resolver: Resolver,
                 if nxt.is_comment:
                     continue
                 stmt += " " + (apply_replacing(nxt.code, replacing) if replacing else nxt.code).strip()
-        elif msql:
-            while "END-EXEC" not in stmt.upper() and j + 1 < n:
-                j += 1
-                stmt += " " + lines[j].code.strip()
+        elif sql_name:
+            # through the line holding END-EXEC: the INCLUDE's words may run over several lines (F05), and once they
+            # are all there only END-EXEC may follow - a statement without one ends there, the next line is kept
+            k = i
+            while "END-EXEC" not in _mask_literals(stmt).upper() and k + 1 < n:
+                k += 1
+                if lines[k].is_comment:
+                    continue
+                more = (apply_replacing(lines[k].code, replacing) if replacing else lines[k].code).strip()
+                if _SQL_INCLUDE_WORDS.match(" ".join(_mask_literals(stmt).split()))                         and not more.upper().startswith("END-EXEC"):
+                    break
+                stmt += " " + more
+                j = k
 
-        if msql:
-            name, lib, rep_text = msql.group(1).upper(), None, None
+        if sql_name:
+            name, lib, rep_text = sql_name, None, None
         else:
             mf = _COPY_FULL.search(stmt)
             if mf:
@@ -398,23 +489,30 @@ def expand(lines: Sequence[Line], member_id: int, resolver: Resolver,
         for k in range(first, j + 1):
             emit(lines[k], lines[k].code, member_id, lines[k].no, depth, indicator="*")
 
-        if name in _SYSTEM_INCLUDES and msql:
-            copies.append((name, lib, rep_text, ln.no, None))
+        if name in _SYSTEM_INCLUDES and sql_name:
+            copied((name, lib, rep_text, ln.no, None))
             i = j + 1
             continue
 
         if depth >= MAX_DEPTH or name in stack:
             warnings.append(f"L{ln.no}: COPY {name} skipped - "
                             + ("recursive" if name in stack else f"nesting deeper than {MAX_DEPTH}"))
-            copies.append((name, lib, rep_text, ln.no, None))
+            copied((name, lib, rep_text, ln.no, None))
             i = j + 1
             continue
 
         resolved = resolver(name, lib)
+        if not resolved and name in supplied:
+            # IBM supplies it and no member of the index carries the name: the compile reads it from the product's
+            # own library - no member, no warning, never a gap in this program (ROADMAP re-parse item 27)
+            supplied_out.append(f"L{ln.no}: COPY {name}")
+            copied((name, lib, rep_text, ln.no, None))
+            i = j + 1
+            continue
         if not resolved:
             warnings.append(f"L{ln.no}: COPY {name} NOT FOUND - fields/code from it are missing "
                             f"from this program's facts")
-            copies.append((name, lib, rep_text, ln.no, None))
+            copied((name, lib, rep_text, ln.no, None))
             i = j + 1
             continue
 
@@ -423,16 +521,17 @@ def expand(lines: Sequence[Line], member_id: int, resolver: Resolver,
             # no member to expand - a stub of numbers (stub_note): the note says so where NOT FOUND would, the
             # program's own lines stay as they are
             warnings.append(f"L{ln.no}: COPY {name}: {note or 'no member to expand'}")
-            copies.append((name, lib, rep_text, ln.no, None))
+            copied((name, lib, rep_text, ln.no, None))
             i = j + 1
             continue
         if note:
             warnings.append(f"L{ln.no}: COPY {name}: {note}")
-        copies.append((name, lib, rep_text, ln.no, cb_member))
+        copied((name, lib, rep_text, ln.no, cb_member))
 
         inner_pairs = list(replacing) + parse_replacing(rep_text or "")
-        sub = expand(cb_lines, cb_member, resolver, depth + 1, stack + (name,), inner_pairs)
+        sub = expand(cb_lines, cb_member, resolver, depth + 1, stack + (name,), inner_pairs, supplied)
         warnings.extend(f"(in COPY {name}) {w}" for w in sub.warnings)
+        supplied_out.extend(f"(in COPY {name}) {w}" for w in sub.supplied)
         copies.extend(sub.copies)
         aliases.extend(sub.aliases)
         at = None
@@ -469,7 +568,8 @@ def expand(lines: Sequence[Line], member_id: int, resolver: Resolver,
                             is_debug=sl.is_debug, is_blank=sl.is_blank))
         i = j + 1
 
-    return Expansion(lines=out, runs=runs, warnings=warnings, copies=copies, aliases=aliases, renamed=renamed)
+    return Expansion(lines=out, runs=runs, warnings=warnings, copies=copies, aliases=aliases, renamed=renamed,
+                     own_copies=own_copies, supplied=supplied_out)
 
 
 def expanded_text(exp: Expansion) -> str:

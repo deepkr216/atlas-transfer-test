@@ -1646,6 +1646,25 @@ def cmd_copybook(conn: sqlite3.Connection, name: str) -> str:
                     + f"\n### Programs including it ({len({u[0] for u in users})})\n"
                     + (", ".join(f"{u[1]} @{u[1]}:{u[2]}" for u in users) or "_none_") + "\n")
     if not copies:
+        from . import recover
+        product = recover.supplied_copybooks(conn).get(name.upper())
+        if product:
+            # a copybook IBM supplies (or the manifest's system_includes names) and no member of any kind carries: the
+            # compile reads it from the product's library - no NOT FOUND, no disk check, no library to fetch (ROADMAP
+            # re-parse item 27). On an index built before the item its programs still say NOT FOUND: said, not advised
+            users = conn.execute("SELECT DISTINCT m.id, m.name, c.line FROM copy_use c JOIN member m ON m.id = c.member_id "
+                                 "WHERE UPPER(c.copybook) = ? AND c.resolved_member_id IS NULL AND m.kind = 'cobol' "
+                                 "ORDER BY m.name, c.line", (name.upper(),)).fetchall()
+            noted = recover.not_found_copies(conn, [u[0] for u in users])
+            before = sorted({u[1] for u in users if (u[0], name.upper()) in noted})
+            return (out[0] + f"\n**{_cap(supplied_label(product))}** - {supplied_why(name, product)}. A copy the shop "
+                    "keeps in its own COPYLIB would be expanded like any copybook.\n"
+                    + (f"\n{len(before)} of the programs below {'is' if len(before) == 1 else 'are'} still `partial` "
+                       f"for it ({', '.join(before[:8])}{', ...' if len(before) > 8 else ''}): "
+                       f"{supplied_before(len(before))}.\n"
+                       if before else "")
+                    + f"\n### Programs including it ({len({u[0] for u in users})})\n"
+                    + (", ".join(f"{u[1]} @{u[1]}:{u[2]}" for u in users) or "_none_") + "\n")
         other = _exists_as_other_kind(conn, name)
         from . import recover
         if not other and recover.stubs_named(conn, name):
@@ -2531,9 +2550,47 @@ def precompiler_row(copybook: str, noted: bool) -> bool:
     return (copybook or "").upper() in expand._SYSTEM_INCLUDES and not noted
 
 
+def supplied_before(programs: int = 1) -> str:
+    """Said beside such a row on an index built before ROADMAP re-parse item
+    27, whose build wrote NOT FOUND for it and marked the program partial."""
+    one = programs == 1
+    return (f"the build that made this index counted it as not found and marked {'the program' if one else 'them'} "
+            f"partial for it; the next build parses every program again (the toolkit changed) and does not")
+
+
+def supplied_label(product: str) -> str:
+    """The bold words for a copybook no member carries that the compile reads
+    from a product library: IBM's (expand.IBM_COPYBOOKS), or one the
+    manifest's system_includes names (whose product this tool cannot name)."""
+    return ("supplied by a product library (the manifest's system_includes), not in the estate"
+            if product == expand.MANIFEST_PRODUCT else "IBM-supplied, not in the estate")
+
+
+def supplied_why(copybook: str, product: str) -> str:
+    """What supplied_cell says after its bold words; `copybook` says it too."""
+    lib = expand.IBM_LIBRARY.get(product)
+    where = ("a product library the manifest names" if product == expand.MANIFEST_PRODUCT
+             else f"{product}'s own library" + (f" ({lib})" if lib else ""))
+    return (f"`COPY {copybook.upper()}` is read by the compile from {where}, not from the shop's copybook libraries: "
+            "nothing is to fetch, and its items are not in the index")
+
+
+def supplied_cell(copybook: str, product: str, noted: bool) -> str:
+    """`program`'s 'resolved to' cell for a COPY of a copybook IBM supplies
+    that no member of the index carries (recover.supplied_copybooks): the
+    build of ROADMAP re-parse item 27 records it with no member and no note
+    and leaves the program `ok`. Read as a row with no note, it said 'no
+    longer linked ... run recover, then the build' on every CICS program;
+    before the item the build wrote NOT FOUND (`noted`) - said as the old
+    index's, since nothing is missing either way."""
+    return (f"**{supplied_label(product)}** - {supplied_why(copybook, product)}"
+            + (f"; {supplied_before()}" if noted else ""))
+
+
 def _not_found_cell(conn: sqlite3.Connection, copybook: str, member_id: int) -> str:
     """`program`'s 'resolved to' cell for an unresolved COPY: the skip reason
-    when the expander skipped it; the precompiler's for SQLCA / SQLDA; else
+    when the expander skipped it; the precompiler's for SQLCA / SQLDA; the
+    product's for a copybook IBM supplies that no member carries; else
     NOT FOUND, and where a member with that name exists now, why the build
     did not use it."""
     from . import recover
@@ -2545,6 +2602,9 @@ def _not_found_cell(conn: sqlite3.Connection, copybook: str, member_id: int) -> 
     if why:
         return skipped_cell(why)
     noted = (member_id, copybook.upper()) in recover.not_found_copies(conn, [member_id])
+    product = recover.supplied_copybooks(conn).get(copybook.upper())
+    if product:
+        return supplied_cell(copybook, product, noted)
     if precompiler_row(copybook, noted):
         return precompiler_cell(copybook)
     note = same_named_note(conn, copybook, (member_id,))
@@ -2762,6 +2822,41 @@ def _recovered_shadowing(conn: sqlite3.Connection) -> str:
             "removes the recovered copies whose real member arrived and marks their programs - then your usual build.\n")
 
 
+def _supplied_table(conn: sqlite3.Connection, supplied: Dict[str, str], copiers: Dict[str, Dict[int, None]]) -> str:
+    """coverage's 'IBM-supplied copybooks, not in the estate': per copybook
+    IBM supplies (or the manifest's system_includes names) that no member
+    carries and a program copies, how many programs are parsed only in part
+    for it and how many copy it. The build of ROADMAP re-parse item 27
+    counts none of them as a gap, so the first column reads 0; an index
+    built before the item wrote NOT FOUND for each and marked every CICS
+    program partial (tools/synth/repro/F16) - the column counts those, and
+    the note says the next build clears them. '' when no program copies
+    one."""
+    if not copiers:
+        return ""
+    from . import recover
+    noted = recover.not_found_copies(conn, [i for ids in copiers.values() for i in ids])
+    rows = []
+    before: Set[int] = set()                                  # programs whose own note still says NOT FOUND for one
+    for book in sorted(copiers, key=lambda b: (-len(copiers[b]), b)):
+        part = {i for i in copiers[book] if (i, book) in noted}
+        before |= part
+        rows.append((book, len(part), len(copiers[book]), recover.supplied_where(supplied[book])))
+    out = ["\n### IBM-supplied copybooks, not in the estate\n",
+           table(["copybook", "programs parsed only in part for it", "programs copying it", "supplied with"], rows),
+           "\n> The compile reads these from the product's own library (CICS: SDFHCOB; MQ: SCSQCOBC; a name the "
+           "manifest's `system_includes` adds: the library the shop's compile names), which a shop does not keep among "
+           "its own copybooks: nothing is to fetch, and no program is parsed only in part for one. Their items (DFHENTER, "
+           "the MQ constants) are not in the index, so `field` finds none of them. A copy the shop keeps in its own "
+           "COPYLIB is expanded like any copybook, and is not in this table.\n"]
+    if before:
+        one = len(before) == 1
+        out.append(f"\n> {len(before)} program{'' if one else 's'} copying them still say{'s' if one else ''} NOT FOUND "
+                   f"for one and {'is' if one else 'are'} in 'Members parsed only in part' above: "
+                   f"{supplied_before(len(before))}.\n")
+    return "".join(out)
+
+
 def cmd_coverage(conn: sqlite3.Connection, everything: bool = False) -> str:
     limit = 10 ** 9 if everything else COVERAGE_ROWS
     out = ["# Coverage - what the index does and does not know\n", f"\n_{index_header(conn)}_\n"]
@@ -2827,13 +2922,21 @@ def cmd_coverage(conn: sqlite3.Connection, everything: bool = False) -> str:
     # under the table, not counted in it (LESSONS 185)
     from . import recover
     skipped = recover.skipped_copies(conn)
+    # a copybook IBM supplies that no member carries is not a copybook not found: the compile reads it from the
+    # product's library - its own table after this one (ROADMAP re-parse item 27; DFHAID sent him to fetch a library
+    # the estate never holds, tools/synth/repro/F16)
+    supplied = recover.supplied_copybooks(conn)
     uses: Dict[str, int] = {}
     copiers_of: Dict[str, Dict[int, None]] = defaultdict(dict)
+    supplied_by: Dict[str, Dict[int, None]] = defaultdict(dict)          # copybook -> programs copying it
     skips: Dict[Tuple[str, str], List[str]] = defaultdict(list)          # (copybook, why) -> programs
     for book, mid, mname in conn.execute(
             "SELECT c.copybook, c.member_id, m.name FROM copy_use c JOIN member m ON m.id = c.member_id "
             "WHERE c.resolved_member_id IS NULL AND m.kind = 'cobol' AND c.copybook NOT IN ('SQLCA','SQLDA') "
             "ORDER BY c.id").fetchall():
+        if (book or "").upper() in supplied:
+            supplied_by[(book or "").upper()][int(mid)] = None
+            continue
         why = skipped.get((int(mid), (book or "").upper()))
         if why:
             if mname not in skips[(book, why)]:
@@ -2903,6 +3006,7 @@ def cmd_coverage(conn: sqlite3.Connection, everything: bool = False) -> str:
                    "compile - so the build never expands it and the programs copying it are parsed only in part: they were "
                    "compiled against another copy. `python -m atlas.recover --db atlas.db --from FOLDER` writes the copybook "
                    "from their compiler listings; or fetch the library the listings name.\n")
+    out.append(_supplied_table(conn, supplied, supplied_by))
     out.append("\n### Unresolved by kind - what the index could NOT work out, and what closes each one\n")
     # a chosen copybook's rows apart from the rest; the ones the program's compiler listing decided (build.LISTING_HOW
     # in the note) or confirmed through a same-text copy (build.LISTING_SAME) apart again: those have nothing to declare.
@@ -4519,6 +4623,45 @@ def _osvs_library_root(conn: sqlite3.Connection, mid: int,
     return None
 
 
+def nested_copy_lines(conn: sqlite3.Connection, member_id: int) -> List[str]:
+    """Under a copybook's own layout, one line per COPY written in it. The
+    build of ROADMAP re-parse item 27 computes the layout with the nested
+    copybook in place: its bytes are counted in the offsets, its items are
+    its own member's rows (cited there, not listed here), and the copy_use
+    row names the member expanded. A COPY whose text is not in the layout
+    carries the copybook's 'layout_warning' row, said as it is. A row with
+    neither is one an index built before the item holds - every nested
+    COPY was left out of a copybook's own layout and each item after it sat
+    that many bytes too early (tools/synth/repro/F06)."""
+    rows = conn.execute("""SELECT c.copybook, c.line, c.resolved_member_id, r.path, r.norm_sha FROM copy_use c
+                           LEFT JOIN member r ON r.id = c.resolved_member_id
+                           WHERE c.member_id = ? ORDER BY c.line, c.id""", (member_id,)).fetchall()
+    if not rows:
+        return []
+    warned = [str(r[0]) for r in conn.execute(
+        "SELECT detail FROM unresolved WHERE member_id = ? AND kind = 'layout_warning'", (member_id,))]
+    out = []
+    for c in rows:
+        book = str(c["copybook"]).upper()
+        if c["resolved_member_id"]:
+            texts = conn.execute("SELECT COUNT(DISTINCT norm_sha) FROM member WHERE UPPER(name) = ? AND kind IN "
+                                 "('copybook', 'cobol', 'sql', 'unknown')", (book,)).fetchone()[0]
+            chosen = (f" - the copy in `{c['path']}`, one of {texts} texts of the name (`copybook {book}`)"
+                      if texts > 1 else "")
+            out.append(f"- `COPY {book}` at line {c['line']}: its bytes are counted in the offsets above; its items are "
+                       f"{book}'s own rows, not listed here (`layout {book}`){chosen}\n")
+            continue
+        said = next((w for w in warned if w.startswith(f"L{c['line']}: COPY {book}")), None)
+        if said:
+            out.append(f"- {said}\n")
+        else:
+            out.append(f"- `COPY {book}` at line {c['line']}: its bytes are NOT counted in the offsets above, so an item "
+                       f"after it in the same record sits further on by {book}'s length. An index built before ROADMAP "
+                       "re-parse item 27 leaves every nested copybook out of a copybook's own layout; `layout RECORD "
+                       "--program PGM` gives a program's view, which counts it\n")
+    return out
+
+
 def cmd_layout(conn: sqlite3.Connection, name: str, program: Optional[str] = None) -> str:
     """The byte layout of a copybook / 01 record from the parser's numbers:
     offsets, lengths, PIC, usage, OCCURS/ODO/REDEFINES, 88 values, record
@@ -4600,7 +4743,9 @@ def cmd_layout(conn: sqlite3.Connection, name: str, program: Optional[str] = Non
             groups[-1][1].append(root)
         else:
             groups.append((mid, [root]))
-    for mid, roots in groups:
+    nested_said: Set[int] = set()                     # a copybook's nested COPY lines, once under its last table
+    last_of = {m: k for k, (m, _r) in enumerate(groups)}
+    for gi, (mid, roots) in enumerate(groups):
         mem = conn.execute("SELECT name, path, kind FROM member WHERE id=?", (mid,)).fetchone()
         root = roots[0]
         title = shown(root) if len(roots) == 1 else f"(fragment: {len(roots)} top-level items, 01 is in the including program)"
@@ -4643,6 +4788,9 @@ def cmd_layout(conn: sqlite3.Connection, name: str, program: Optional[str] = Non
         aliases = [a for a in aliases if (a["program_id"], a["new_name"]) not in osvs]
         if aliases:
             out.append("- REPLACING in: " + "; ".join(f"{a['program_id']} ({a['orig_name']} -> {a['new_name']})" for a in aliases[:6]) + "\n")
+        if mem["kind"] == "copybook" and not program and last_of[mid] == gi and mid not in nested_said:
+            nested_said.add(mid)
+            out.extend(nested_copy_lines(conn, mid))
     out.append("\n> Offsets are 0-based bytes from the parser (COMP-3 packed, COMP 2/4/8, SIGN SEPARATE +1); SYNC "
                "alignment is NOT modelled. Cite as `[[MEMBER line \"05  FIELD-NAME\"]]`.\n")
     return "".join(out)
